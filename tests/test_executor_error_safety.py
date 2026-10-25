@@ -2868,7 +2868,7 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units(
             }
 
         async def publicGetPublicMarkPrice(self, params: dict[str, Any]) -> dict[str, Any]:
-            assert params["instId"] == "BTC-USDT-SWAP"
+            assert params == {"instType": "SWAP"}
             self.live_market_calls.append("mark_price")
             return {
                 "data": [

@@ -121,26 +121,24 @@ async def test_failed_funding_request_has_no_received_clock(monkeypatch, receipt
 
 
 @pytest.mark.asyncio
-async def test_reference_route_clocks_are_independent_and_unchanged_on_cache_hit(
+async def test_reference_route_clocks_are_preserved_on_cache_hit(
     monkeypatch, receipt_clock,
 ) -> None:
     client = OKXRestClient()
-    mark_completed = receipt_clock.current + timedelta(seconds=2)
-    index_completed = receipt_clock.current + timedelta(seconds=5)
+    completed_at = receipt_clock.current + timedelta(seconds=5)
     calls = []
 
     async def fetch(method, *args, **kwargs):
         calls.append(method)
+        receipt_clock.current = completed_at
         if method == "publicGetPublicMarkPrice":
-            receipt_clock.current = mark_completed
-            return {"data": [{
+            return {"code": "0", "data": [{
                 "instId": "BTC-USDT-SWAP",
                 "markPx": "100",
                 "ts": str(SOURCE_TIMESTAMP_MS),
             }]}
         assert method == "publicGetMarketIndexTickers"
-        receipt_clock.current = index_completed
-        return {"data": [{
+        return {"code": "0", "data": [{
             "instId": "BTC-USDT",
             "idxPx": "100.1",
             "ts": str(SOURCE_TIMESTAMP_MS + 1),
@@ -151,14 +149,52 @@ async def test_reference_route_clocks_are_independent_and_unchanged_on_cache_hit
     receipt_clock.current += timedelta(hours=1)
     cached = await client.fetch_reference_prices("BTC/USDT", contract_spec=CONTRACT_SPEC)
 
-    assert result["mark_price_fact"]["received_at"] == mark_completed.isoformat()
-    assert result["index_price_fact"]["received_at"] == index_completed.isoformat()
+    assert result["mark_price_fact"]["received_at"] == completed_at.isoformat()
+    assert result["index_price_fact"]["received_at"] == completed_at.isoformat()
     assert result["mark_price_fact"]["source_timestamp_ms"] == SOURCE_TIMESTAMP_MS
     assert result["index_price_fact"]["source_timestamp_ms"] == SOURCE_TIMESTAMP_MS + 1
     assert cached["reference_prices_cached"] is True
     assert cached["mark_price_fact"] == result["mark_price_fact"]
     assert cached["index_price_fact"] == result["index_price_fact"]
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_route", ["mark", "index"])
+async def test_reference_market_batch_without_source_clock_stays_unavailable(
+    monkeypatch,
+    receipt_clock,
+    missing_route: str,
+) -> None:
+    client = OKXRestClient()
+    source_ms = int(receipt_clock.current.timestamp() * 1000)
+
+    async def fetch(method, *_args, **_kwargs):
+        missing_timestamp = "mark" if method == "publicGetPublicMarkPrice" else "index"
+        mark = {
+            "instId": "BTC-USDT-SWAP",
+            "markPx": "100",
+            "ts": str(source_ms),
+        }
+        index = {
+            "instId": "BTC-USDT",
+            "idxPx": "100.1",
+            "ts": str(source_ms),
+        }
+        if missing_timestamp == missing_route:
+            (mark if missing_route == "mark" else index).pop("ts")
+        row = mark if missing_timestamp == "mark" else index
+        return {"code": "0", "data": [row]}
+
+    monkeypatch.setattr(client, "_ccxt_call", fetch)
+    result = await client.fetch_reference_prices(
+        "BTC/USDT",
+        contract_spec=CONTRACT_SPEC,
+    )
+
+    fact_key = "mark_price_fact" if missing_route == "mark" else "index_price_fact"
+    assert result["reference_prices_data_available"] is False
+    assert result[fact_key]["source_timestamp_ms"] == 0
 
 
 @pytest.mark.asyncio

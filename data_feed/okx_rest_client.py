@@ -49,6 +49,7 @@ DERIVATIVES_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
 # even though the shared single-flight request completed moments later.
 REFERENCE_PRICES_ROUTE_TIMEOUT_SECONDS = 5.5
 REFERENCE_PRICES_CACHE_TTL_SECONDS = 15.0
+REFERENCE_MARKET_BATCH_CACHE_TTL_SECONDS = 1.0
 REFERENCE_PRICES_RETRY_BACKOFF_SECONDS = 2.0
 # The order-book route shares the public request gate with ticker and
 # reference-price calls. Keep the wait bounded below the six-second
@@ -367,6 +368,12 @@ class OKXRestClient:
         self._reference_price_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._reference_price_tasks: dict[tuple[str, bool], asyncio.Task[dict[str, Any]]] = {}
         self._reference_route_tasks: dict[tuple[str, str, bool], asyncio.Task[Any]] = {}
+        self._reference_market_batch_cache: dict[
+            str, tuple[float, dict[str, dict[str, Any]], str]
+        ] = {}
+        self._reference_market_batch_tasks: dict[
+            tuple[str, bool], asyncio.Task[dict[str, Any]]
+        ] = {}
         self._reference_price_failure_cache: dict[tuple[str, bool], float] = {}
         self._ticker_tasks: dict[tuple[str, bool], asyncio.Task[dict[str, Any]]] = {}
         self._ticker_retry_at: dict[tuple[str, bool], float] = {}
@@ -1402,20 +1409,20 @@ class OKXRestClient:
             "mark": self._reference_route_task(
                 inst_id,
                 "mark",
-                lambda: self._ccxt_call(
-                    "publicGetPublicMarkPrice",
-                    {"instType": "SWAP", "instId": inst_id},
-                    _request_priority=bool(priority),
+                lambda: self._fetch_reference_market_row(
+                    "mark",
+                    inst_id,
+                    priority=bool(priority),
                 ),
                 priority=priority,
             ),
             "index": self._reference_route_task(
                 inst_id,
                 "index",
-                lambda: self._ccxt_call(
-                    "publicGetMarketIndexTickers",
-                    {"instId": uly},
-                    _request_priority=bool(priority),
+                lambda: self._fetch_reference_market_row(
+                    "index",
+                    uly,
+                    priority=bool(priority),
                 ),
                 priority=priority,
             ),
@@ -1525,6 +1532,102 @@ class OKXRestClient:
             self._reference_price_cache[inst_id] = (time.monotonic(), payload)
         return payload
 
+    async def _fetch_reference_market_row(
+        self,
+        route: str,
+        inst_id: str,
+        *,
+        priority: bool,
+    ) -> dict[str, Any]:
+        batch = await self._fetch_reference_market_batch(route, priority=priority)
+        if batch.get("available") is not True:
+            return {"data": []}
+        row = batch.get("rows_by_inst_id", {}).get(str(inst_id).upper())
+        return {
+            "data": [row] if isinstance(row, dict) else [],
+            "received_at": batch.get("received_at"),
+        }
+
+    async def _fetch_reference_market_batch(
+        self,
+        route: str,
+        *,
+        priority: bool,
+    ) -> dict[str, Any]:
+        now = time.monotonic()
+        cached = self._reference_market_batch_cache.get(route)
+        if (
+            cached is not None
+            and now - cached[0] <= REFERENCE_MARKET_BATCH_CACHE_TTL_SECONDS
+        ):
+            return {
+                "available": True,
+                "rows_by_inst_id": cached[1],
+                "received_at": cached[2],
+            }
+
+        task_key = (route, bool(priority))
+        task = self._reference_market_batch_tasks.get(task_key)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._refresh_reference_market_batch(
+                    route,
+                    priority=bool(priority),
+                )
+            )
+            self._reference_market_batch_tasks[task_key] = task
+
+            def cleanup(finished: asyncio.Task[dict[str, Any]]) -> None:
+                if self._reference_market_batch_tasks.get(task_key) is finished:
+                    self._reference_market_batch_tasks.pop(task_key, None)
+                _consume_cancelled_task(finished)
+
+            task.add_done_callback(cleanup)
+        return dict(await asyncio.shield(task))
+
+    async def _refresh_reference_market_batch(
+        self,
+        route: str,
+        *,
+        priority: bool,
+    ) -> dict[str, Any]:
+        if route == "mark":
+            method_name = "publicGetPublicMarkPrice"
+            params = {"instType": "SWAP"}
+        elif route == "index":
+            method_name = "publicGetMarketIndexTickers"
+            params = {"quoteCcy": "USDT"}
+        else:
+            raise ValueError(f"unsupported reference market route: {route}")
+
+        response = await self._ccxt_call(
+            method_name,
+            params,
+            _request_priority=priority,
+        )
+        received_at = datetime.now(UTC).isoformat()
+        rows = response.get("data", []) if isinstance(response, dict) else []
+        response_code = str(response.get("code", "0")) if isinstance(response, dict) else ""
+        if response_code != "0" or not isinstance(rows, list):
+            return {"available": False, "rows_by_inst_id": {}, "received_at": None}
+
+        rows_by_inst_id = {
+            str(row.get("instId") or "").strip().upper(): row
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("instId") or "").strip()
+        }
+        self._reference_market_batch_cache[route] = (
+            time.monotonic(),
+            rows_by_inst_id,
+            received_at,
+        )
+        return {
+            "available": True,
+            "rows_by_inst_id": rows_by_inst_id,
+            "received_at": received_at,
+        }
+
     def _reference_route_task(
         self,
         inst_id: str,
@@ -1540,6 +1643,11 @@ class OKXRestClient:
 
         async def fetch_with_receipt() -> Any:
             result = await fetcher()
+            if (
+                isinstance(result, dict)
+                and result.get("received_at") is not None
+            ):
+                return result
             received_at = datetime.now(UTC).isoformat()
             return {**result, "received_at": received_at} if isinstance(result, dict) else result
 

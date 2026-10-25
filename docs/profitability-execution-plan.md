@@ -5861,3 +5861,43 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   cost-aware candidate; G4/G5 remain unstarted. No honest calendar ETA for
   profitability exists. The next checkpoint must be a changed input or
   repaired blocker, not another identical training sweep or a reused exam.
+
+### Batched Reference-Market Request Repair (2026-10-25 16:33 Asia/Shanghai)
+
+- The current actionable transport defect was excessive per-instrument REST
+  fan-out: each symbol independently requested mark price and index price.
+  In a 240-symbol fallback scan this could issue up to 480 required reference
+  requests, competing with ticker and order-book facts.
+- `data_feed/okx_rest_client.py` now single-flights and caches the all-SWAP
+  mark-price response and USDT index-ticker response for one second, then maps
+  rows by exact `instId`. It preserves each batch response's network-completion
+  receipt and the exchange-provided source timestamp. Missing, mismatched,
+  failed, or clock-invalid facts remain unavailable; no price, receipt clock,
+  freshness threshold, or execution gate is synthesized or relaxed.
+- Local verification passed `306` tests across REST symbols, market receipt
+  clocks, execution facts, and data-service security. Ruff and compileall
+  passed. The staged targeted upload included only the REST client and its
+  three focused test files; online integrity returned
+  `source-integrity-ok:4`. The remote REST/receipt suite passed `67` tests.
+  No service was restarted and no order or permission was changed.
+- A one-shot, read-only public-market probe on the online host imported the
+  uploaded client in `paper` mode (`demo=true`), loaded 996 instruments, and
+  fetched BTC's all-SWAP mark and USDT-index batch rows. Both exact instrument
+  IDs, positive exchange source clocks, and network receipt clocks validated.
+  Output contained only booleans/reasons; the client was closed and no private
+  endpoint or order was used. This verifies the new public transport path, not
+  that the long-running paper process has loaded it.
+- Runtime boundary: the online source files are uploaded on disk, but the
+  long-running paper process has not loaded this change. The plan's latest
+  read-only resume preflight showed an active paper process and no registered
+  v4 quant artifact contracts; do not bypass the governed stopped-before-start
+  path. This transport repair can improve required-fact collection after a
+  safe load, but it cannot authorize an entry or turn a negative strategy
+  profitable.
+- Gate state remains G0 passed, G1 negative attribution only, G2 blocked
+  pending loaded-source and sustained clean-boundary evidence, G3 not passed
+  because no candidate has positive authoritative fee-after evidence, and
+  G4-G6 not started/blocked. Next: use the governed reload path only when its
+  preconditions pass, then measure a new post-load latency/availability
+  window. Keep entries denied until a genuinely profitable candidate passes
+  the frozen economic criteria.

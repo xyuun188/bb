@@ -976,15 +976,67 @@ async def test_reference_prices_keep_swap_and_index_native_identities(monkeypatc
     assert calls == [
         (
             "publicGetPublicMarkPrice",
-            ({"instType": "SWAP", "instId": "ROBO-USDT-SWAP"},),
+            ({"instType": "SWAP"},),
             False,
         ),
-        ("publicGetMarketIndexTickers", ({"instId": "ROBO-USDT"},), False),
+        ("publicGetMarketIndexTickers", ({"quoteCcy": "USDT"},), False),
     ]
     assert prices["mark_price_fact"]["inst_id"] == "ROBO-USDT-SWAP"
     assert prices["index_price_fact"]["inst_id"] == "ROBO-USDT"
     assert prices["mark_price"] == pytest.approx(0.01291)
     assert prices["index_price"] == pytest.approx(0.01290)
+
+
+@pytest.mark.asyncio
+async def test_reference_market_batches_are_shared_and_match_exact_instrument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+    calls: list[str] = []
+    timestamp = int(time.time() * 1000)
+
+    async def fake_ccxt_call(method_name: str, params: dict[str, Any], **kwargs):
+        calls.append(method_name)
+        assert kwargs.get("_request_priority") is False
+        if method_name == "publicGetPublicMarkPrice":
+            assert params == {"instType": "SWAP"}
+            rows = [
+                {"instId": "BTC-USDT-SWAP", "markPx": "100", "ts": str(timestamp)},
+                {"instId": "ETH-USDT-SWAP", "markPx": "50", "ts": str(timestamp)},
+            ]
+        else:
+            assert method_name == "publicGetMarketIndexTickers"
+            assert params == {"quoteCcy": "USDT"}
+            rows = [
+                {"instId": "BTC-USDT", "idxPx": "99", "ts": str(timestamp)},
+                {"instId": "ETH-USDT", "idxPx": "49", "ts": str(timestamp)},
+            ]
+        return {"code": "0", "data": rows}
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+    btc, eth = await asyncio.gather(
+        client.fetch_reference_prices(
+            "BTC/USDT",
+            contract_spec={"instId": "BTC-USDT-SWAP", "uly": "BTC-USDT"},
+        ),
+        client.fetch_reference_prices(
+            "ETH/USDT",
+            contract_spec={"instId": "ETH-USDT-SWAP", "uly": "ETH-USDT"},
+        ),
+    )
+    missing = await client.fetch_reference_prices(
+        "XRP/USDT",
+        contract_spec={"instId": "XRP-USDT-SWAP", "uly": "XRP-USDT"},
+    )
+
+    assert calls == ["publicGetPublicMarkPrice", "publicGetMarketIndexTickers"]
+    assert btc["mark_price"] == pytest.approx(100)
+    assert btc["index_price"] == pytest.approx(99)
+    assert eth["mark_price"] == pytest.approx(50)
+    assert eth["index_price"] == pytest.approx(49)
+    assert btc["mark_price_fact"]["inst_id"] == "BTC-USDT-SWAP"
+    assert eth["mark_price_fact"]["inst_id"] == "ETH-USDT-SWAP"
+    assert missing["reference_prices_data_available"] is False
 
 
 @pytest.mark.asyncio
@@ -1054,6 +1106,7 @@ async def test_priority_reference_refresh_bypasses_inflight_background_routes(
             await release_low.wait()
         if method_name == "publicGetPublicMarkPrice":
             return {
+                "code": "0",
                 "data": [
                     {
                         "instId": "ROBO-USDT-SWAP",
@@ -1064,6 +1117,7 @@ async def test_priority_reference_refresh_bypasses_inflight_background_routes(
                 ]
             }
         return {
+            "code": "0",
             "data": [
                 {
                     "instId": "ROBO-USDT",
@@ -1213,8 +1267,14 @@ async def test_reference_prices_are_single_flight_per_instrument(monkeypatch) ->
             started.set()
         await release.wait()
         if method_name == "publicGetPublicMarkPrice":
-            return {"data": [{"instId": "ROBO-USDT-SWAP", "markPx": "1.0"}]}
-        return {"data": [{"instId": "ROBO-USDT", "idxPx": "1.0"}]}
+            return {
+                "code": "0",
+                "data": [{"instId": "ROBO-USDT-SWAP", "markPx": "1.0"}],
+            }
+        return {
+            "code": "0",
+            "data": [{"instId": "ROBO-USDT", "idxPx": "1.0"}],
+        }
 
     monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
     first = asyncio.create_task(
