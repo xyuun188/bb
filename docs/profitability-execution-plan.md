@@ -4819,3 +4819,65 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   untouched evaluation window. Do not register the incompatible Phase 3
   artifacts, widen the 65-second freshness rule, or authorize entries from
   the negative `n=267` history.
+
+### Current User-Requested Status Recheck (2026-10-25 09:08 Asia/Shanghai)
+
+- A fresh bounded frozen-feature audit at `2026-10-25T00:50:53Z` inspected
+  the newest 64 market decisions and 64 shadow-training snapshots. All 128
+  rows carried the v1 availability contract, freeze timestamp and original
+  decision timestamp, and every frozen payload stayed below the 98,304-byte
+  budget. Decision rows were `61/64` availability-valid and training rows
+  were `60/64` valid. The three decision invalidations were two missing
+  technical contracts (CRV) and one missing index fact caused by an ADA
+  reference-price timeout; the training invalidations were the four CRV
+  rows in the same decision group. The newest valid streak was only 7
+  decision rows and 28 training rows, so G2 is still not accepted.
+- The bounded source projection identified the exact capture behavior:
+  CRV (`decision_id=694951`) had
+  `indicator_snapshot_reason=indicator_cached_source_delivery_unobserved`;
+  its derivatives orderbook/reference routes completed but funding/open
+  interest timed out. ADA (`decision_id=694909`) had complete technical
+  inputs but its reference-price route timed out and therefore no
+  `index_price_fact`. KAITO (`decision_id=694895`) had all derivative
+  routes completed in the stored row, but its indicator snapshot was
+  unavailable because the underlying kline delivery receipt was not
+  observed. These are correctly quarantined provenance/availability
+  failures, not reasons to synthesize clocks or widen the 65-second
+  freshness contract.
+- A fresh entry-flow projection through `2026-10-25T01:07:12Z` found 64
+  newest market decisions, all final actions `hold`, with no order attempt,
+  exchange rejection, open position or fill. The repeated permission
+  decision is explicit on every row:
+  `average_fee_after_return_not_positive`,
+  `fee_after_return_lcb_not_positive`, and
+  `fee_after_profit_factor_not_above_break_even`.
+  The shared authority remains `n=267`, average fee-after return
+  `-0.303832%`, lower bound `-0.431590%`, PF `0.549713`, gross profit
+  `99.035696`, gross loss `180.158844`, worst return `-12.34323%`, and
+  maximum drawdown `92.014573%`. The model service is not the blocker:
+  the read-only Phase 3 readiness audit at `2026-10-25T01:06:52Z` found the
+  target endpoint and GPU service ready, while live routing and the
+  specialization remain intentionally shadow-only.
+- The authoritative outcome audit at `2026-10-25T01:06:52Z` found 500
+  complete paper outcomes, but `0` trainable outcomes because all 500
+  historical decisions lack the point-in-time feature availability
+  contract. This is why the existing negative authority cannot be safely
+  refreshed into a new candidate and why the shadow rows cannot be treated
+  as trades. No backfill, order, permission change, restart, leverage
+  change or protection change was performed.
+- User-facing root cause: the system is currently not opening because the
+  governed profitability gate is correctly closed on measured negative
+  fee-after economics; a smaller secondary blocker is intermittent
+  point-in-time data capture (CRV/ADA/KAITO examples). It is not currently
+  an OKX submission failure. Profitability is still **not achieved**.
+- Remaining acceptance work is unchanged and explicit: G2 needs a sustained
+  clean native/executable feature-contract window; G3 needs a separately
+  preregistered candidate that passes nested chronological cost-aware
+  development (the fixed Ridge, random forest and HGB families each
+  selected `0/3` outer policies); G4 needs a frozen policy and untouched
+  independent exam; G5 needs governed paper fills with official settlement;
+  G6 needs subsequent independent-window acceptance. Five gates remain
+  incomplete or failed. The next action is to preserve quarantined rows,
+  keep collecting clean native fee-after groups, and only then run a new
+  preregistered development family; no gate or cost rule will be weakened
+  to manufacture trades.
