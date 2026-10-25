@@ -16,6 +16,8 @@ def test_remote_cohort_audit_is_bounded_and_read_only() -> None:
     assert "if decision_cohort_complete:" in audit.REMOTE_SCRIPT
     assert "database_mutated" in audit.REMOTE_SCRIPT
     assert "orders_submitted" in audit.REMOTE_SCRIPT
+    assert "status\": \"maturity_not_reached\"" in audit.REMOTE_SCRIPT
+    assert '"label_rows_queried": False' in audit.REMOTE_SCRIPT
 
 
 def test_rendered_cohort_audit_keeps_all_cutoffs() -> None:

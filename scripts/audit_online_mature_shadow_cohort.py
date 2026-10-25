@@ -154,6 +154,46 @@ def _row_classification(row: dict[str, Any]) -> tuple[str, list[str]]:
 
 
 async def main():
+    now = datetime.now(UTC)
+    if now < MATURITY_CUTOFF:
+        print(
+            json.dumps(
+                {
+                    "experiment": "bounded-sealed-shadow-cohort-native-label-provenance-audit",
+                    "status": "maturity_not_reached",
+                    "checked_at": now.isoformat(),
+                    "window": {
+                        "decision_since": DECISION_SINCE.isoformat(),
+                        "decision_cutoff_exclusive": DECISION_CUTOFF.isoformat(),
+                        "maturity_cutoff_exclusive": MATURITY_CUTOFF.isoformat(),
+                        "expected_decision_snapshot_count": EXPECTED_DECISION_COUNT,
+                        "horizons": list(HORIZONS),
+                        "native_source": NATIVE_SOURCE,
+                        "row_limit": ROW_LIMIT,
+                        "label_row_limit": ROW_LIMIT * len(HORIZONS),
+                    },
+                    "input": {
+                        "decision_snapshot_count": 0,
+                        "decision_candidate_count": 0,
+                        "decision_candidate_in_window_count": 0,
+                        "decision_cohort_complete": False,
+                        "source_row_count": 0,
+                        "cohort_row_count": 0,
+                    },
+                    "safety": {
+                        "read_only": True,
+                        "database_mutated": False,
+                        "label_rows_queried": False,
+                        "exam_labels_evaluated": False,
+                        "artifact_persisted": False,
+                        "promotion_authorized": False,
+                        "orders_submitted": False,
+                    },
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
     decision_candidate_limit = ROW_LIMIT * 4
     decision_candidate_statement = (
         select(
