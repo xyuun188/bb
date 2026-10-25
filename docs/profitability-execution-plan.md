@@ -5551,3 +5551,62 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   G4/G5 are not started; G6 is blocked. The next measurable checkpoint is a
   longer clean prospective v4 streak and a governed quant-service reload;
   profitability still has no honest calendar completion date.
+
+### Current User Recheck And Honest Time Boundary (2026-10-25 13:33 Asia/Shanghai)
+
+- The local SSH audit entrypoint initially failed before connecting because
+  the system Python did not have `cryptography`; the repository `.venv`
+  already contained the declared `cryptography` and `paramiko` dependencies.
+  All online checks were rerun with that environment. This was a local audit
+  tooling issue, not an exchange or trading-service failure.
+- A bounded entry recovery over `[2026-10-25T03:29:06Z,
+  2026-10-25T05:29:06Z)` observed `278` market decisions. Every final action
+  was `hold` and unexecuted. The recent funnel contained `169` shadow-training
+  selections and `109` no-candidate rows; selected rows had
+  `entry_permission.granted=false` because expected net was not positive,
+  observed loss probability was too high, and quantitative evidence was
+  missing. The authoritative local-ML paper permission remains false at
+  `n=267`, mean fee-after return `-0.303832%`, lower bound `-0.431590%`, and
+  PF `0.549713`.
+- The same recovery confirms the system is collecting shadow observations but
+  not producing executable trades: the recent window has no order attempts,
+  positions, or fills. Shadow settlements are not authoritative training
+  outcomes. Specialist trainers remain skipped because an authoritative
+  execution-cost distribution is unavailable; the local-ML scheduler is
+  `not_due` with new shadow samples but no eligible trade rows.
+- A fresh 240-minute frozen-feature budget audit at
+  `2026-10-25T05:33:17Z` inspected `64` decision and `64` training snapshots.
+  All payload seals were present and all rows stayed below the `98,304 B`
+  budget. Decision availability was `59/64` valid with a newest clean streak
+  of `11` across `11` symbols. Training availability was `52/64` valid with
+  a newest clean streak of `40` across `10` symbols. The remaining failures
+  are dominated by missing/ambiguous index-price receipt/clock facts plus
+  four stale technical-availability contracts in the training projection.
+  The preregistered G2 boundary (30 consecutive clean decisions across at
+  least 20 symbols with clean corresponding training snapshots) is therefore
+  still not met.
+- A bounded authoritative trade-training eligibility audit at
+  `2026-10-25T05:29:33Z` inspected `200` paper outcomes and found
+  `trainable_count=0`; all `200` were excluded for
+  `feature_availability:feature_availability_contract_missing`. OKX fee,
+  slippage, and funding facts are present, but the source snapshots predate
+  the point-in-time availability contract. No historical backfill or
+  relabeling is allowed.
+- The read-only paper-resume preflight at `2026-10-25T05:29:06Z` remains
+  blocked by exactly two operational conditions: the paper service is already
+  active (the preflight is a stopped-before-start check), and the four
+  Phase-3 quant child endpoint metadata contracts are unavailable because no
+  v4-compatible candidate artifact is registered. Account equity, OKX
+  integrity, dashboard, model service, and tunnel checks passed. No restart,
+  order, protection change, permission change, or risk relaxation was made.
+- The latest fixes are now pushed: local `HEAD` and `origin/main` are both
+  `f7c7b09` (`446a4c2` fail-closed liveness plus `f7c7b09` fresh v4 boundary
+  evidence). The running quant API is still the pre-existing process and has
+  not loaded the fail-closed source; loading it requires the governed
+  stopped-before-start path and must not be forced while paper is active.
+- Time boundary: G2 has a measurable operational checkpoint (obtain the
+  clean availability boundary and then perform a governed quant-service
+  reload), but profitability has no honest fixed duration. After G2, G3
+  still needs a genuinely positive fee-after candidate; only then can the
+  untouched G4 exam and governed G5 paper settlement begin. Do not claim a
+  profit date, manufacture fills, or reopen the rejected fixed-short window.
