@@ -6548,3 +6548,12 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   `2026-10-25T17:06:52Z`; record eligible count and each exclusion reason.
   If viable labels remain insufficient, explicitly close this cohort as
   insufficient and preregister/collect a new batch instead of retuning on it.
+- Follow-up trace of the Phase-3 producer found no separate artifact-writer
+  defect to patch: `persist_candidate_bundle()` is reached only after an
+  explicitly confirmed training rebuild, then the candidate still must pass
+  the governed comparison/activation contracts. `artifact_unavailable` is
+  therefore not repaired by restarting the observer or fabricating a pointer;
+  the latest verified gate state has no qualified candidate and lacks
+  positive fee-after evidence. Leave this endpoint/model gate closed until
+  valid mature inputs and an accepted candidate exist. This is a local
+  producer-contract trace, not a new online status probe.
