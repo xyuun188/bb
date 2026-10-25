@@ -6609,3 +6609,103 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   G2 minimum maturity boundary at `2026-10-25T17:07:52Z` is still 55m56s
   away, and this G3 window's maturity cutoff is still in the future. No new
   cohort labels were queried for this preregistration.
+
+### Sealed Cohort Audit Implementation Ready (2026-10-26 00:31 Asia/Shanghai)
+
+- Added `scripts/audit_online_mature_shadow_cohort.py`, a bounded read-only
+  audit for the exact sealed cohort. It filters by the frozen
+  `original_decision_timestamp` rather than insertion/update time, keeps
+  decision and maturity cutoffs separate, checks all four native horizons,
+  and reports group patterns, maturity state, native source identity,
+  fee-after completeness, point-in-time quality exclusions, and reason counts.
+  Rows outside the registered decision window are counted but cannot enter the
+  cohort; rows not completed before the maturity cutoff remain pending rather
+  than being treated as failures or successes.
+- The remote audit uses one repeatable-read read-only connection, a bounded
+  1,200-row query, 15-second SQL timeout, 25% CPU, 1 GiB memory and a
+  300-second deadline. It emits only aggregate/sample audit evidence and
+  explicit safety flags; it never writes rows, persists artifacts, changes
+  permissions, restarts services or submits orders.
+- Local verification passed `2` tests, Ruff, compileall and
+  `git diff --check`. Targeted upload of the new script and test returned
+  `source-integrity-ok:2`; remote isolated verification passed `2` tests in
+  10.10s with a unique temporary directory. No online cohort labels were read
+  by this implementation checkpoint.
+- At the current exact clock `2026-10-26T00:31:03+08:00`, the corrected G2
+  minimum maturity boundary `2026-10-26T01:07:52+08:00` is still in the
+  future. Run this audit once after that boundary with decision cutoff
+  `2026-10-25T13:06:52Z` and maturity cutoff `2026-10-25T17:07:52Z`; then
+  record the actual report and close the cohort as eligible or insufficient.
+
+### Sealed Cohort Audit Window-Integrity Repair (2026-10-26 01:02 Asia/Shanghai)
+
+- The first audit implementation was stopped before reading any online labels.
+  Review found two execution risks: its decision query used `AIDecision.created_at`
+  instead of the frozen `feature_snapshot.original_decision_timestamp`, and
+  its integer-hour CLI could not express the registered 30-minute cohort.
+- The audit now requires explicit `--minutes` and
+  `--expected-decision-count`, filters decisions by the frozen JSON timestamp,
+  and requests label rows only when the sealed decision count is exactly the
+  registered count. A mismatch produces `sealed_decision_cohort_mismatch`,
+  records `label_rows_queried=false`, and cannot inspect labels or produce a
+  profitability result. The 42-row cohort therefore uses
+  `[2026-10-25T12:36:52Z, 2026-10-25T13:06:52Z)`.
+- The maturity cutoff is validated locally to include the maximum 240-minute
+  horizon plus the registered 60-second source-lag buffer. The label query is
+  bounded to four rows per decision plus one sentinel row, and the report
+  exposes decision/label limit saturation, duplicate horizon rows, and the
+  decision-ID fingerprint.
+- Local verification after this repair: the focused audit tests passed `2`,
+  Ruff, compileall, and `git diff --check` passed. The online upload and
+  isolated remote test are the next bounded actions; no service restart or
+  cohort-label query has been performed for this repaired version.
+
+### Sealed Cohort Audit Query-Timeout Repair (2026-10-26 01:09 Asia/Shanghai)
+
+- The first post-boundary execution did not read labels: the decision query
+  exceeded its 15-second statement timeout because it cast and ordered the
+  JSON `original_decision_timestamp` across the live decision table. The
+  command failed before the label query and produced no report or promotion
+  evidence.
+- Repaired the query without changing the registered cohort: use the indexed
+  `AIDecision.created_at` only for a bounded two-hour envelope, project only
+  the scalar JSON timestamp, filter the exact `[2026-10-25T12:36:52Z,
+  2026-10-25T13:06:52Z)` window in Python, then fetch full snapshots only for
+  the exact candidate IDs. A four-times-row-limit sentinel detects candidate
+  saturation; label rows remain unqueried unless exactly 42 decision snapshots
+  are recovered.
+- The failed attempt is retained as a technical query failure, not as a G2
+  result. Local focused tests still pass `2`; Ruff, compileall and
+  `git diff --check` pass. Next action is targeted sync and isolated remote
+  regression, followed by one retry of the fixed audit. No service restart,
+  order, permission or database mutation occurred.
+
+### Sealed Cohort Label Audit Result (2026-10-26 01:13 Asia/Shanghai)
+
+- The fixed bounded audit completed at
+  `2026-10-25T17:12:53.313741Z` after the registered maturity boundary.
+  Evidence is saved at
+  `data/profitability_remediation/online-mature-shadow-cohort-d20261025T130652Z-m20261025T170752Z.json`;
+  the remote report was produced read-only with no order, permission, service,
+  or database mutation.
+- The exact 30-minute decision window recovered the registered `42` decision
+  snapshots (`decision_candidate_count=532`,
+  `decision_candidate_in_window_count=42`), with all four horizons present:
+  `168` rows, no duplicate decision/horizon rows, and no query-limit
+  saturation. `110` rows were `mature_eligible`, `57` were quarantined and
+  `1` was mature but excluded. Only `9/42` decision groups had all four
+  horizons eligible.
+- The dominant quarantine reason was the unexecutable historical market path:
+  `54` rows reported `historical_market_path_not_clean`,
+  `historical_label_availability_missing`, and
+  `historical_label_availability_basis_unverified`. One row additionally
+  lacked a native path/complete fee-after label. These rows remain excluded;
+  no imputation or relabeling is allowed.
+- This closes the sealed cohort as **G2 insufficient for promotion** and
+  blocks its preregistered G3 study: the primary five-minute horizon has only
+  `28` eligible rows and the all-four complete-group count is `9`, below the
+  fixed per-fold minimum of `16`. The next valid route is the already sealed
+  prospective rules-canary window `[2026-10-25T13:06:53Z,
+  2026-10-25T19:06:53Z)` after its maturity boundary
+  `2026-10-25T23:07:53Z` (2026-10-26 07:07:53 Asia/Shanghai). G3-G6 remain
+  unpassed; existing fee-after evidence remains negative.
