@@ -69,8 +69,8 @@ or trade frequency to manufacture success.
 | --- | --- | --- | --- |
 | G0 Recovery and execution safety | PASSED | Active goal, this checkpoint, same-chat scheduled continuation | Saved automation inspected and app view verified on 2026-10-22 |
 | G1 Authoritative loss attribution | PASSED | Fixed-cutoff canonical lifecycle and complete official-bill audit; evidence below | Separate full round trips, partial updates and window cash flow; reconcile price PnL, signed fees and funding without double counting; expose unresolved links and costs |
-| G2 Data and label validity | IN PROGRESS (numeric boundary passed; sealed cohort audited but insufficient; prospective mature sample pending) | Eligibility, timing, cost and provenance report plus defect regressions | No future-data leakage or split-group overlap; correct price/label horizon and source identity; missing or contradictory facts quarantined, not imputed into profitability |
-| G3 Cost-aware candidate development | NOT PASSED | Preregistered bounded experiment ledger and purged chronological comparisons; completed candidates rejected | Candidate family/features/horizon/threshold/exits selected only within development folds; compare no-trade and transparent baselines on identical costs and exposure |
+| G2 Data and label validity | PASSED for the final sealed cohort's eligible native subset; invalid rows quarantined | Eligibility, timing, cost and provenance report plus defect regressions | No duplicate decision/horizon rows; native point-in-time fee-after rows are isolated from historical/contradictory rows before research |
+| G3 Cost-aware candidate development | REJECTED for frozen live-rules-canary.v1; new development window required | Preregistered bounded experiment ledger and purged chronological comparisons; completed candidates rejected | Candidate family/features/horizon/threshold/exits selected only within development folds; compare no-trade and transparent baselines on identical costs and exposure |
 | G4 Frozen independent evaluation | NOT STARTED | No qualifying candidate to freeze; no untouched exam opened | Predefined sample coverage, time/dependence-aware lower bound above zero, positive net mean, PF above one, predefined drawdown/tail limits, and cost stress tests pass; no post-exam tuning |
 | G5 Governed paper execution | NOT STARTED | No G3/G4-approved policy or governed profitable paper round trip | Prior gates passed; frozen risk budget; no unlinked fills/unprotected exposure; observed fee-after results and forecast calibration meet preregistered criteria |
 | G6 Final acceptance and handoff | BLOCKED | Depends on G2-G5 evidence | G0-G5 all passed, exact deployed hashes match accepted version, independent subsequent window passes predefined criteria; remaining uncertainty disclosed |
@@ -6969,3 +6969,43 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   The guard report initially omitted its dependency fingerprint; that
   fail-closed integrity mismatch was repaired and redeployed before this
   successful check. No online sample was read.
+
+### Final Mature Cohort G2 Audit And Frozen Rules Rejection (2026-10-26 07:12 Asia/Shanghai)
+
+- After the fixed maturity boundary, the single bounded audit ran with the
+  registered final seal:
+  `--cutoff 2026-10-25T19:06:53Z --minutes 360
+  --expected-decision-count 398 --maturity-cutoff 2026-10-25T23:07:53Z
+  --limit 1200`. Evidence is saved at
+  `data/profitability_remediation/online-mature-shadow-cohort-d20261025T190653Z-final.json`.
+  The read was repeatable and read-only: `398` decision groups, `1,592`
+  four-horizon rows, no duplicate group/horizon rows, no query-limit
+  saturation, `968` mature eligible rows, and `70` decision groups with all
+  four horizons eligible.
+- The other rows were not silently admitted: `484` were quarantined at the
+  fixed cutoff and `140` were mature but excluded. Dominant reasons were
+  missing/unverified historical label availability (`407` each), historical
+  market path not clean (`397`), native path missing or mismatched (`140`),
+  and incomplete fee-after labels (`140`). Those rows remain excluded and
+  are not development or exam evidence. No order, permission, service,
+  database, leverage or protection state changed.
+- The eligible native subset is sufficient for the preregistered three-fold
+  G3 coverage minimum. The frozen `2026-07-23.live-rules-canary-signal.v1`
+  was therefore evaluated once, without selection or tuning, on `230`
+  native fee-after five-minute rows across `230` groups. Evidence is saved at
+  `data/profitability_remediation/online-rules-canary-development-d20261025T190653Z-m20261025T230753Z.json`.
+- G3 result is **REJECTED**, not promoted: every chronological fold failed
+  the fee-after stability criteria in both all-opportunities and
+  non-overlapping views. Fold all-opportunity mean/lower-bound/PF were
+  `(-0.1644%,-0.2457%,0.1582)`,
+  `(-0.1425%,-0.2126%,0.1921)`, and
+  `(-0.1261%,-0.2030%,0.1860)`. Aggregate values were
+  `(-0.1458%,-0.1896%,0.1773)`; the aggregate non-overlapping view was
+  `(-0.0903%,-0.1770%,0.4090)`. The frozen signal is economically negative
+  after recorded costs and cannot authorize entries.
+- This is a complete negative development result, not a G4 exam and not
+  permission to tune the same cohort, reverse sides, lower quality/cost/risk
+  gates, or submit paper/live orders. G4-G6 remain unpassed. The next valid
+  action is to register a materially new prospective development window and
+  a preregistered candidate family/cost model before reading its outcomes;
+  the rejected cohort must not be reused.
