@@ -6934,3 +6934,18 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   label/source/cost audit run with `--expected-decision-count 398`; until
   then, no labels from this cohort may be read. G2 remains pending and
   G3-G6 remain unpassed.
+
+### Mature Cohort Audit Execution Preparation (2026-10-26 04:20 Asia/Shanghai)
+
+- Added a bounded `--output` option to
+  `scripts/audit_online_mature_shadow_cohort.py`. The path is resolved under
+  `data/profitability_remediation/` only, so the final `398`-row report can be
+  written beside, rather than over, the earlier `sealed_decision_cohort_mismatch`
+  report. Local and remote focused tests both pass `3`; Ruff, compileall and
+  whitespace checks pass. Commit `7b88944` is pushed to `origin/main`.
+- No online labels were queried and no service, permission, database or order
+  state changed in this preparation step. The exact next command remains
+  deferred until `2026-10-25T23:07:53Z`:
+  `audit_online_mature_shadow_cohort.py --cutoff 2026-10-25T19:06:53Z
+  --minutes 360 --expected-decision-count 398
+  --maturity-cutoff 2026-10-25T23:07:53Z --limit 1200`.
