@@ -446,6 +446,25 @@ def _local_dependency_hashes() -> dict[str, str]:
     }
 
 
+def _resolve_evidence_path(value: str | None, default_name: str) -> Path:
+    """Resolve optional evidence output without allowing writes outside the audit dir."""
+
+    evidence_root = (ROOT / "data" / "profitability_remediation").resolve()
+    if not value:
+        return evidence_root / default_name
+    result_path = Path(value)
+    if not result_path.is_absolute():
+        result_path = ROOT / result_path
+    result_path = result_path.resolve()
+    try:
+        result_path.relative_to(evidence_root)
+    except ValueError as exc:
+        raise ValueError(
+            "--output must stay under data/profitability_remediation"
+        ) from exc
+    return result_path
+
+
 def _build_remote_command(
     *,
     decision_since: datetime,
@@ -492,6 +511,14 @@ def main() -> None:
     parser.add_argument("--expected-decision-count", type=int, required=True)
     parser.add_argument("--maturity-cutoff", required=True)
     parser.add_argument("--limit", type=int, default=1200)
+    parser.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Optional evidence path. Relative paths are rooted at the project "
+            "and must stay under data/profitability_remediation."
+        ),
+    )
     args = parser.parse_args()
 
     minutes = int(args.minutes)
@@ -519,12 +546,13 @@ def main() -> None:
     decision_stamp = decision_cutoff.strftime("%Y%m%dT%H%M%SZ")
     maturity_stamp = maturity_cutoff.strftime("%Y%m%dT%H%M%SZ")
     unit = f"bb-mature-shadow-cohort-d{decision_stamp}-m{maturity_stamp}"
-    result_path = (
-        ROOT
-        / "data"
-        / "profitability_remediation"
-        / f"online-mature-shadow-cohort-d{decision_stamp}-m{maturity_stamp}.json"
-    )
+    try:
+        result_path = _resolve_evidence_path(
+            args.output,
+            f"online-mature-shadow-cohort-d{decision_stamp}-m{maturity_stamp}.json",
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if result_path.exists():
         raise FileExistsError(f"refusing to overwrite existing report: {result_path}")
 

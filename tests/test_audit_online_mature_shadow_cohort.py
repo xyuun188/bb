@@ -42,3 +42,18 @@ def test_rendered_cohort_audit_keeps_all_cutoffs() -> None:
     assert "__DECISION_CUTOFF__" not in rendered
     assert "__MATURITY_CUTOFF__" not in rendered
     assert "__EXPECTED_DECISION_COUNT__" not in rendered
+
+
+def test_cli_supports_distinct_evidence_output_path() -> None:
+    resolved = audit._resolve_evidence_path(
+        "data/profitability_remediation/final.json",
+        "default.json",
+    )
+    assert resolved.name == "final.json"
+
+    try:
+        audit._resolve_evidence_path("../outside.json", "default.json")
+    except ValueError as exc:
+        assert "must stay under" in str(exc)
+    else:
+        raise AssertionError("unsafe evidence output path was accepted")
