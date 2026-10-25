@@ -6817,3 +6817,6 @@ on the mean. A favorable historical test is not a guarantee of future profit.
 - This checkpoint is evidence-only: no control state, permission, model,
   database, service, or order was changed. The fixed mature G2 cohort audit
   remains the next state-changing action after its registered boundary.
+- The diagnosis is committed locally as `1321bb7`. A push retry failed with
+  a GitHub connection reset; `origin/main` is still `d70f8a4`. Do not repeat
+  the read-only runtime audit solely to retry synchronization.
