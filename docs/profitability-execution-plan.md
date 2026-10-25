@@ -69,7 +69,7 @@ or trade frequency to manufacture success.
 | --- | --- | --- | --- |
 | G0 Recovery and execution safety | PASSED | Active goal, this checkpoint, same-chat scheduled continuation | Saved automation inspected and app view verified on 2026-10-22 |
 | G1 Authoritative loss attribution | PASSED | Fixed-cutoff canonical lifecycle and complete official-bill audit; evidence below | Separate full round trips, partial updates and window cash flow; reconcile price PnL, signed fees and funding without double counting; expose unresolved links and costs |
-| G2 Data and label validity | BLOCKED (clean boundary not sustained; reload pending) | Eligibility, timing, cost and provenance report plus defect regressions | No future-data leakage or split-group overlap; correct price/label horizon and source identity; missing or contradictory facts quarantined, not imputed into profitability |
+| G2 Data and label validity | BLOCKED (latest decision streak 26/30 across 26 symbols; loaded-source/preflight pending) | Eligibility, timing, cost and provenance report plus defect regressions | No future-data leakage or split-group overlap; correct price/label horizon and source identity; missing or contradictory facts quarantined, not imputed into profitability |
 | G3 Cost-aware candidate development | NOT PASSED | Preregistered bounded experiment ledger and purged chronological comparisons; completed candidates rejected | Candidate family/features/horizon/threshold/exits selected only within development folds; compare no-trade and transparent baselines on identical costs and exposure |
 | G4 Frozen independent evaluation | NOT STARTED | No qualifying candidate to freeze; no untouched exam opened | Predefined sample coverage, time/dependence-aware lower bound above zero, positive net mean, PF above one, predefined drawdown/tail limits, and cost stress tests pass; no post-exam tuning |
 | G5 Governed paper execution | NOT STARTED | No G3/G4-approved policy or governed profitable paper round trip | Prior gates passed; frozen risk budget; no unlinked fills/unprotected exposure; observed fee-after results and forecast calibration meet preregistered criteria |
@@ -5901,3 +5901,269 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   preconditions pass, then measure a new post-load latency/availability
   window. Keep entries denied until a genuinely profitable candidate passes
   the frozen economic criteria.
+
+### Dashboard State Semantics Repair (2026-10-25 18:06 Asia/Shanghai)
+
+- The attached dashboard screenshots exposed a presentation/diagnostic defect,
+  not a new trading authorization: a reachable Phase-3 quant service with no
+  compatible model bundle was counted as six `identity_failure` models, while
+  the same condition was also shown as a generic `0/4 unavailable` child
+  endpoint failure.
+- Repair is limited to state semantics. `services/model_training_registry.py`
+  now reports `identity_status=artifact_unavailable`,
+  `identity_failure_eligible=false`, an `artifact_unavailable` lifecycle and
+  an explicit artifact count. The identity-failure summary only counts actual
+  identity mismatches. No model bundle is synthesized and no entry permission
+  is changed.
+- `services/local_ai_tools_client.py` and
+  `services/server_monitor_status.py` now distinguish
+  `artifact_unavailable` from transport/status failure only after the
+  authoritative status contract has been received. Health-only or failed
+  metadata probes remain generic unavailable/unknown. The dashboard labels the
+  state as “模型产物未就绪 / 待产物验证” and keeps it warning-level.
+- `web_dashboard/api/system_audit.py` classifies only an explicitly verified,
+  online, fail-closed artifact wait as `observing`; other blockers remain
+  unresolved. `can_resume_paper`, entry permission, quality thresholds and
+  live-off controls are unchanged.
+- Focused verification passed `199` tests; Ruff, Python compileall,
+  JavaScript syntax check and `git diff --check` passed. The local working
+  tree has not yet been restarted online.
+- A fresh read-only online preflight at `2026-10-25T10:06:15Z` (18:06:15
+  Asia/Shanghai) found `bb-paper-trading.service` active, Phase-3 health and
+  status endpoints reachable, but the quant bundle unavailable and all four
+  child endpoint contracts missing. Account truth and OKX integrity were
+  available/clean; the underlying target model service and Dashboard were
+  healthy. Preflight remains blocked by the active paper process and the four
+  unavailable Phase-3 child contracts. It submitted no orders, changed no
+  routing and did not start or stop services.
+- The next action is a targeted source upload with
+  `--skip-restart --skip-secret-file-purge` and remote integrity verification,
+  followed by a Dashboard-only restart and semantic recheck. The long-running
+  paper process must not be bypassed or restarted while the v4 quant artifact
+  contract is unavailable.
+
+### Current User Recheck And Bounded Execution Plan (2026-10-25 18:50 Asia/Shanghai)
+
+- The dashboard-state repair is now loaded and verified online. The targeted
+  five-file sync found no disk differences and returned
+  `source-integrity-ok:4`; only `bb-dashboard.service` was restarted. It
+  returned HTTP `302`. `bb-paper-trading.service` remained active at PID
+  `2808899` before and after; it was not restarted. The post-restart runtime
+  registry reports `identity_failure_count=0` and
+  `artifact_unavailable_count=6`, so a missing Phase-3 model bundle is no
+  longer mislabeled as six model identity failures. Trading permissions and
+  artifacts were not changed.
+- Local verification for the dashboard repair: focused suite `199 passed`,
+  two authoritative feature-projection regressions `2 passed`, Ruff clean,
+  Python compile clean, JavaScript syntax clean and `git diff --check` clean.
+- A fresh four-hour frozen-feature projection at
+  `2026-10-25T10:50:23Z` checked 64 decisions and 64 training snapshots.
+  Decisions were `63/64` availability-valid; the only failure was a missing
+  index-price fact after a `reference_prices` timeout. The newest valid
+  decision streak is `26` across `26` symbols, below the preregistered
+  `30`-decision threshold. Training snapshots were `64/64` valid across 16
+  symbols. Maximum frozen payload was `96,990 B`, under the `98,304 B` limit.
+  This is measured progress, not a passed G2 gate.
+- The latest 30-minute entry recovery at `2026-10-25T10:42:33Z` returned 28
+  recent market decisions, all `hold` and unexecuted; there were no execution
+  contracts, new entries, open positions or recent orders. The last displayed
+  rejected orders predate this window (2026-10-23). Reconciliation had no
+  entry blockers. The active model strategy still has no fee-after-positive
+  side; 68 candidates were rejected and zero were governed. The root cause of
+  no new entries is therefore the current economics/strategy gate, not a
+  current exchange rejection.
+- A bounded audit of the latest 500 authoritative paper outcomes found zero
+  trainable rows. All 500 had authoritative fee, slippage and funding facts,
+  but all were excluded solely for
+  `feature_availability_contract_missing`; the contract version was absent
+  from the historical decision snapshots. `_decision_feature_projection`
+  already includes `FROZEN_TRAINING_FEATURE_KEYS`, including the availability
+  metadata, and existing regressions prove sealed contracts survive this
+  projection. Do not add a retrofit or reseal these old snapshots. Future
+  decisions are recording valid contracts; only new observations can create
+  valid examples under this rule.
+- Do not repeat the 2026-10-25 fixed-rules canary: it was rejected on its
+  registered sample and closed. Do not repeat the 15:44 training preflight
+  without changed inputs; it had zero authoritative trade samples and wrote
+  scheduler bookkeeping. No exploratory model sweep on the same inspected
+  window is authorized.
+
+#### Next Actions And Exit Conditions
+
+1. **Finish G2's numeric boundary.** Continue the existing observation stream;
+   make no feature, freshness, cost or risk threshold changes. The latest
+   streak is `26/30` across 26 symbols, so four more consecutive valid
+   decisions are needed; any invalid decision resets the streak. Once the
+   threshold is reached, record one bounded G2 checkpoint rather than
+   repeatedly polling the same window.
+2. **Resolve the runtime-load gate once.** Run the existing governed paper
+   preflight only after the clean boundary is reached. If the missing
+   quant bundle still blocks it, keep the current service untouched and
+   investigate the artifact contract/producer as a separate software gate.
+   Do not publish a placeholder, bypass the preflight, or restart the
+   order-capable paper process.
+3. **Do one new G3 development batch on fresh data.** Preregister the new
+   window, candidate family, purged chronological folds, exact execution-cost
+   assumptions, sample-count minimum and resource budget before reading its
+   labels. Use only mature, point-in-time-valid shadow market paths for
+   candidate development; label them as counterfactual, never as actual fills.
+   Stop the batch on its predefined budget. Reject every candidate that
+   misses the existing fee-after criteria; do not broaden the search on the
+   same sample.
+4. **Open G4 only for a frozen positive G3 candidate.** Specify an untouched
+   time interval and numerical coverage/confidence/tail/cost-stress criteria
+   before exposing labels. A negative or undersized exam rejects promotion.
+5. **Open G5 only after G4 passes.** Exercise the frozen candidate through the
+   existing governed paper pipeline with the preregistered risk budget and
+   authoritative fill/settlement verification. Live trading remains off.
+6. **Close G6 only after subsequent independent paper evidence passes.**
+   Verify deployed hashes and disclose remaining uncertainty. There is no
+   defensible calendar date for profitability; no software change can
+   guarantee positive future returns.
+
+- This execution is intentionally finite per batch: one G2 boundary
+  checkpoint, one preflight decision, one preregistered G3 batch per fresh
+  development window, and no repeat of a rejected experiment without new
+  data and a newly registered hypothesis. The existing same-chat continuation
+  remains active to resume the next unfinished action after interruption.
+
+### User Escalation: Qwen Failure Blast-Radius Repair (2026-10-25 19:17 Asia/Shanghai)
+
+- Read-only online entry recovery completed at
+  `2026-10-25T11:12:32Z`; the accompanying bounded economics projection
+  covered 120 market decisions from `2026-10-25T10:25:50Z` through
+  `2026-10-25T11:16:58Z`. All 120 final actions were `hold`; 90 analyses
+  completed with four experts and 30 were `insufficient_evidence`. The
+  expert status projection isolates 2 shared-batch format failures and 28
+  subsequent circuit-breaker deferrals. The persisted failure metadata says
+  `finish_reason=stop`, `completion_tokens=14`, `content_chars=27`,
+  `truncated=false`; this is a response-contract mismatch, not a model
+  timeout or demonstrated output-token truncation.
+- This confirms a real software defect with a bounded blast radius:
+  the target Qwen's parse/format response failure entered the generic
+  180-second format breaker, and the skipped requests were inaccurately
+  described as following a timeout. The repair changes only the target Qwen
+  format-failure cooldown to three seconds (minimum one second), leaving
+  transport/timeout handling and non-target provider breakers unchanged.
+  Cooldown rows remain fail-closed; no partial expert set can authorize a
+  trade.
+- `ai_brain/llm_agent.py` additionally normalizes the five explicit full-name
+  action aliases to the existing compact action codes. It does not infer
+  missing expert actions, accept incomplete vectors, or change action/risk
+  semantics. A regression exercises full-name vector parsing. The registry
+  regression confirms the Qwen failure gets the short cooldown and is
+  reported as a format error, not a timeout.
+- Local verification: `tests/test_batch_expert_json_stability.py` passed
+  `39` tests; Ruff passed on the four owned Python files; compileall and
+  `git diff --check` passed. The initial global-Python/RTK test invocations
+  were invalid environment attempts (wrong interpreter / no tests collected,
+  and global Python lacked Ruff); the repository `.venv` runs above are the
+  accepted results.
+- The same new 120-row projection confirms profitability is still a separate
+  hard blocker: all 240 direction-side candidate projections had nonpositive
+  return lower bounds; all 120 long and short sides were not production
+  eligible. Authoritative local-ML evidence remains `n=267`, fee-after mean
+  `-0.303832%`, lower bound `-0.431590%`, PF `0.549713`. The 17 long and 35
+  short positive-mean observations are exploratory only and do not pass
+  uncertainty or the historical quality permission. Forty-three latest rows
+  were `shadow_training`, not fills. There is still no defensible positive
+  candidate to authorize paper orders, much less live orders.
+- Fresh feature availability in the entry-recovery projection was `116/120`
+  valid; four current rows had a stale technical contract or missing index
+  price. Local ML had 509 new shadow examples but correctly returned
+  `not_due`; it still had zero realized trade examples in its training
+  cursor. Historical requalification again found zero eligible rows because
+  original path/timing lineage is absent. These are blockers, not reasons to
+  synthesize evidence or force entries.
+- State at this checkpoint: local Qwen failure recovery fix is implemented
+  and locally verified, but not uploaded or runtime-loaded. G0 remains passed;
+  G1 remains a negative attribution; G2 remains blocked by current feature
+  gaps and the runtime loaded-source contract; G3 has no qualifying candidate;
+  G4/G5 remain unstarted and G6 blocked. No restart, order, artifact,
+  permission, quality threshold, leverage or risk change was made.
+- Next exact action: targeted upload of only `ai_brain/llm_agent.py`,
+  `ai_brain/model_registry.py`, `config/settings.py`, and
+  `tests/test_batch_expert_json_stability.py` with restart disabled; verify
+  remote hashes and focused tests. Then perform one governed runtime-load
+  preflight. If Phase-3 artifact contracts still block the paper service
+  reload, leave the current process untouched and repair the real artifact
+  producer/registration contract; do not bypass preflight. After a safe load,
+  collect one bounded post-load window and compare `batch_failure` versus
+  `circuit_breaker_deferred`. Do not rerun the historical training
+  requalification or reuse inspected profitability rows. G3 may resume only
+  on a newly registered development window; entry permission remains false
+  until a candidate passes the existing fee-after stability contract.
+
+### Qwen Repair Deployment And Runtime Gate Recheck (2026-10-25 19:34 Asia/Shanghai)
+
+- The four-file Qwen recovery patch is now recorded in commit `343387e`
+  (`Fix Qwen batch response recovery`) and pushed to `origin/main`. Focused
+  local verification passed 39 tests; Ruff, compileall, and `git diff --check`
+  passed. A targeted `--skip-restart` synchronization prepared four files,
+  uploaded zero because remote bytes already matched, and returned
+  `source-integrity-ok:4`. The remote 39-test result from the preceding
+  validation remains valid for these unchanged bytes.
+- A single read-only online paper-resume preflight completed at
+  `2026-10-25T11:33:22Z`. OKX account truth and trade-fact integrity were
+  available/clean; no paper orders, positions, or fills were found. The Qwen
+  inference endpoint and Phase-3 quant API health/status endpoints responded.
+  The active paper process (`bb-paper-trading.service`, PID `2808899`) was
+  left untouched.
+- The governed reload remains blocked for two explicit reasons: paper is
+  already active, and all four required Phase-3 quant child contracts are
+  unavailable with `model_bundle_unavailable`. The quant registry reports no
+  current candidate artifact; its candidate pointer is unregistered and its
+  old challenger/current/rollback pointers do not satisfy the current
+  supervision contract. This is not evidence that the transport patch failed,
+  and it is not permission to manufacture a placeholder artifact or bypass
+  the reload preflight. The active process has not loaded the Qwen code from
+  disk; changing that requires a later governed paper stop/preflight/start
+  after a real compatible bundle exists.
+- The direct no-entry/economic veto is separate and remains unchanged:
+  authoritative local-ML evidence is `n=267`, fee-after mean `-0.303832%`,
+  lower bound `-0.431590%`, and PF `0.549713`. No code change can turn these
+  negative outcomes into a defensible profitable candidate. Entries remain
+  unauthorized; no order, position, permission, risk threshold, or live
+  routing was changed.
+- The preflight also reported the optional high-risk external reviewer as
+  unavailable due to authentication. No credential was read or changed.
+  This does not explain the current all-HOLD decisions, but it must be
+  restored through the operator-managed secret path before any workflow that
+  requires that reviewer can pass.
+- Next action is not another unchanged preflight or training sweep: continue
+  the prospective clean feature-availability boundary and develop only on a
+  newly preregistered, mature native-label window. Recheck the governed reload
+  only after the actual Phase-3 candidate artifact contract is ready and the
+  paper service is in its approved stopped state. Keep G2/G3 blocked and
+  G4/G5 unstarted until their evidence passes.
+
+### Fresh Feature Boundary Recheck (2026-10-25 19:43 Asia/Shanghai)
+
+- One new read-only four-hour frozen-feature projection completed at
+  `2026-10-25T11:43:39Z` with 64 decision and 64 training rows. All rows had
+  the v1 availability contract, freeze timestamp, original decision timestamp,
+  and stayed below the 98,304-byte frozen-payload limit.
+- Decision availability fell to `58/64`; the newest consecutive valid streak
+  was only `18` rows across `18` symbols, so the preregistered 30-row/20-symbol
+  G2 boundary is still not met. Training snapshots were `64/64` valid across
+  16 symbols. The six quarantined decisions were five reference-price defects
+  (three missing index receipts, two missing mark/index facts, and three
+  source-clock ambiguities) plus one stale technical contract. The source
+  route evidence records `reference_prices` timeout/failure for GMT, RESOLV,
+  UNI, ATOM and MAGIC, and a funding/open-interest timeout with stale technical
+  state for IRYS.
+- This confirms the remaining data defect is localized to the running paper
+  process's reference-price path, not a missing database contract. The local
+  source now has batched mark/index requests and the public endpoint currently
+  returns positive `ts` values for the affected index IDs, but the active paper
+  PID has not loaded that source. It cannot be restarted while the governed
+  reload preflight is blocked by the missing compatible quant artifact; no
+  freshness threshold was widened and no invalid rows were admitted.
+- The current artifact gate is a real dependency cycle, not a reason to fake
+  trades: local-ai-tools artifact persistence requires an authoritative
+  execution-cost distribution, while the current paper permission remains
+  false because the existing fee-after candidate is negative. The correct
+  resolution is a valid shadow/cost artifact path or newly matured native
+  authoritative evidence, with live and paper-entry permission still
+  fail-closed. No placeholder, order, leverage, risk, or permission change is
+  allowed.
