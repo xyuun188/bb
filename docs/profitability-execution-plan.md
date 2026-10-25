@@ -1,6 +1,6 @@
 # Profitability Remediation Execution Plan
 
-Updated: 2026-10-25, Asia/Shanghai.
+Updated: 2026-10-26, Asia/Shanghai.
 Status: ACTIVE. Profitability acceptance has NOT passed.
 Repository: `G:\数字量化\bb`; remote application: `/data/bb/app`.
 This file is the durable recovery checkpoint for the current Codex chat.
@@ -6744,3 +6744,26 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   executable and resumable. It uses the indexed bounded decision envelope,
   seals the exact decision count and ID fingerprint, and explicitly reports
   `shadow_labels_read=false`; it never queries `ShadowBacktest`.
+
+### Prospective Decision Cohort Sealed (2026-10-26 01:42 Asia/Shanghai)
+
+- The registered development window
+  `[2026-10-25T13:06:53Z, 2026-10-25T19:06:53Z)` was sealed with the
+  decision-only audit. The bounded query found `624` candidates and `356`
+  exact in-window decision snapshots; the candidate limit was not saturated.
+  Decision ID fingerprint:
+  `2c406a3f092a9761a1f3a4b06a0977eb7a3b4dc9efda4f2a6837235382b0cfd8`.
+- Evidence is saved at
+  `data/profitability_remediation/online-decision-cohort-d20261025T190653Z.json`.
+  The remote read used one bounded read-only transaction and did not query
+  `ShadowBacktest`, mutate the database, change permission, restart a service,
+  or submit an order. The report records eight snapshots with a stale/missing
+  technical availability contract; this is not a profitability result and
+  does not make those rows eligible.
+- The exact next action is one bounded four-horizon G2 audit using
+  `--expected-decision-count 356` after the fixed maturity boundary
+  `2026-10-25T23:07:53Z` (`2026-10-26 07:07:53 Asia/Shanghai`). Until that
+  boundary, no labels from this cohort may be inspected. If the native,
+  point-in-time, fee-after eligible count is insufficient, close this cohort
+  as G2 insufficient and register a later window; do not run G3 or tune on
+  its labels.
