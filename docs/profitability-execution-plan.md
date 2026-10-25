@@ -6464,3 +6464,35 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   elapsed, below the 240-minute maximum horizon. Revisit the maturity audit
   no earlier than `2026-10-25T17:06:52Z`, and only with a bounded native
   settlement/provenance query. Economic and promotion gates remain unchanged.
+
+### Read-Only Training Provenance Recovery (2026-10-25 22:56 Asia/Shanghai)
+
+- Fixed the training reader's compacted-label recovery path. The query now
+  projects only `training_market_fact_contract` from the original snapshot;
+  it does not write to rows or alter label eligibility.
+- Recovery requires both immutable data/path fingerprints to match the linked
+  label contract. Non-null stored fields that conflict with the source
+  contract reject recovery, except the documented legacy `path_status`
+  projection error when the stored value matches the nested raw path status.
+  Null compacted fields no longer mask recovered source values. Added
+  regressions for valid recovery, mismatched fingerprints, conflicting
+  non-path evidence, the legacy path-status case, and null fields.
+- Local verification: `tests/test_train_local_ai_tools_models.py` passed
+  `28` tests; Ruff, compileall, and `git diff --check` passed.
+- Targeted sync uploaded only the reader and its test with
+  `--skip-restart --skip-secret-file-purge`; remote source integrity returned
+  `source-integrity-ok:2`. Remote isolated focused verification passed
+  `3 passed, 25 deselected` as user `bb`, with a unique `/tmp` basetemp,
+  25% CPU quota, 1 GiB memory cap, and 300-second runtime cap.
+- No service was restarted, no database rows were modified, no model artifact
+  or entry permission was created, and no trading action occurred.
+- This is a G2 provenance-read repair only. The last sealed decision cohort
+  is still immature until `2026-10-26 01:06:52 Asia/Shanghai`; G3 has no
+  qualified candidate, G4-G6 remain unpassed, and existing fee-after
+  profitability evidence remains negative.
+- The code repair is remotely verified but does not make the trading process
+  load this reader; restart/deployment activation is intentionally not part
+  of this data-only training change.
+- Next action: commit/push only this plan, reader, and focused tests; retain
+  the verified repair in the `bb` project memory. Revisit the sealed-label
+  maturity audit only at/after its fixed 240-minute boundary.

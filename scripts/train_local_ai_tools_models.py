@@ -759,11 +759,75 @@ def _shadow_sample_columns() -> tuple[Any, ...]:
         ShadowBacktest.best_action,
         ShadowBacktest.missed_opportunity,
         ShadowBacktest.training_feature_snapshot,
+        ShadowBacktest.feature_snapshot["training_market_fact_contract"].label(
+            "raw_training_market_fact_contract"
+        ),
     )
+
+
+def _restore_linked_training_market_fact_contract(
+    features: dict[str, Any],
+    raw_contract: Any,
+) -> dict[str, Any]:
+    """Recover compacted label provenance only when the immutable label links it."""
+
+    if not isinstance(raw_contract, dict) or not raw_contract:
+        return features
+    label_contract = features.get("training_label_contract")
+    if not isinstance(label_contract, dict):
+        return features
+
+    compacted = compact_training_feature_snapshot(
+        {"training_market_fact_contract": raw_contract}
+    )
+    recovered = compacted.get("training_market_fact_contract")
+    if not isinstance(recovered, dict) or not recovered:
+        return features
+
+    data_fingerprint = str(recovered.get("data_fingerprint") or "")
+    path_fingerprint = str(recovered.get("path_fingerprint") or "")
+    if (
+        not data_fingerprint
+        or not path_fingerprint
+        or label_contract.get("market_fact_data_fingerprint") != data_fingerprint
+        or label_contract.get("path_fingerprint") != path_fingerprint
+    ):
+        return features
+
+    stored = features.get("training_market_fact_contract")
+    stored = stored if isinstance(stored, dict) else {}
+    raw_path = raw_contract.get("price_path")
+    raw_path = raw_path if isinstance(raw_path, dict) else {}
+    for key, stored_value in stored.items():
+        if stored_value is None:
+            continue
+        recovered_value = recovered.get(key)
+        if stored_value == recovered_value:
+            continue
+        if (
+            key == "path_status"
+            and stored_value == raw_path.get("status")
+            and recovered_value == raw_contract.get("path_status")
+        ):
+            continue
+        if key in recovered:
+            return features
+
+    linked_contract = {
+        **recovered,
+        **{key: value for key, value in stored.items() if value is not None},
+    }
+    if recovered.get("path_status") is not None:
+        linked_contract["path_status"] = recovered["path_status"]
+    return {**features, "training_market_fact_contract": linked_contract}
 
 
 def _shadow_sample_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     features = _snapshot(mapping.get("training_feature_snapshot"))
+    features = _restore_linked_training_market_fact_contract(
+        features,
+        mapping.get("raw_training_market_fact_contract"),
+    )
     due_at = mapping.get("due_at")
     return {
         "id": int(mapping.get("id") or 0),

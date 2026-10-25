@@ -9,6 +9,8 @@ import httpx
 import pytest
 
 from config.settings import settings
+from core.market_facts import MARKET_FACT_CONTRACT_VERSION
+from core.training_contracts import HISTORICAL_SHADOW_SOURCE
 from db.session import close_db, get_session_ctx, init_db
 from models.learning import ShadowBacktest
 from models.market_data import Kline
@@ -347,6 +349,162 @@ async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projectio
     )
     assert "unused_llm_context" not in samples[0]["features"]
     assert samples[1]["symbol"] == "ETH/USDT"
+
+
+@pytest.mark.asyncio
+async def test_shadow_loader_recovers_compacted_provenance_from_linked_source_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    created_at = PHASE3_CLEAN_START_UTC + timedelta(minutes=5)
+    data_fingerprint = "d" * 64
+    path_fingerprint = "p" * 64
+    market_contract = {
+        "version": MARKET_FACT_CONTRACT_VERSION,
+        "status": "historical_ohlcv_only",
+        "native_instrument_identity_verified": True,
+        "same_contract_price_path_verified": True,
+        "executable_market_fact_verified": False,
+        "source": HISTORICAL_SHADOW_SOURCE,
+        "price_path": {"status": "historical_ohlcv_only"},
+        "path_status": "clean",
+        "path_fingerprint": path_fingerprint,
+        "data_fingerprint": data_fingerprint,
+        "scheduled_label_at": "2026-07-14T00:05:25+00:00",
+        "result_source_available_at": "2026-07-14T00:06:00+00:00",
+        "label_maturity_lag_seconds": 35.0,
+        "availability_basis": "one_minute_candle_close_lower_bound",
+        "delivery_latency_observed": False,
+    }
+    label_contract = {
+        "market_fact_data_fingerprint": data_fingerprint,
+        "path_fingerprint": path_fingerprint,
+    }
+    source_features = {
+        "symbol": "BTC/USDT",
+        "current_price": 100.0,
+        "historical_market_path_only": True,
+        "training_market_fact_contract": market_contract,
+        "training_label_contract": label_contract,
+    }
+    async with get_session_ctx() as session:
+        row = ShadowBacktest(
+            model_name="ensemble_trader",
+            execution_mode="paper",
+            decision_id=901,
+            label_version="historical-label-v1",
+            symbol="BTC/USDT",
+            analysis_type="market",
+            decision_action="hold",
+            decision_confidence=0.7,
+            feature_snapshot=source_features,
+            status="completed",
+            due_at=created_at + timedelta(minutes=5),
+            horizon_minutes=5,
+            long_return_pct=0.2,
+            short_return_pct=-0.2,
+            best_action="long",
+            created_at=created_at,
+        )
+        session.add(row)
+        await session.commit()
+        row_id = row.id
+
+        row.training_feature_snapshot = {
+            "symbol": "BTC/USDT",
+            "current_price": 100.0,
+            "historical_market_path_only": True,
+            "training_market_fact_contract": {
+                "version": MARKET_FACT_CONTRACT_VERSION,
+                "status": "historical_ohlcv_only",
+                "source": HISTORICAL_SHADOW_SOURCE,
+                "path_status": "historical_ohlcv_only",
+                "path_fingerprint": path_fingerprint,
+                "data_fingerprint": data_fingerprint,
+                "scheduled_label_at": None,
+                "result_source_available_at": None,
+            },
+            "training_label_contract": label_contract,
+        }
+        await session.commit()
+
+    try:
+        samples = await train_script._load_shadow_samples()
+    finally:
+        await close_db()
+
+    assert len(samples) == 1
+    assert samples[0]["id"] == row_id
+    restored = samples[0]["features"]["training_market_fact_contract"]
+    assert restored["path_status"] == "clean"
+    assert restored["scheduled_label_at"] == "2026-07-14T00:05:25+00:00"
+    assert restored["result_source_available_at"] == "2026-07-14T00:06:00+00:00"
+    assert restored["availability_basis"] == "one_minute_candle_close_lower_bound"
+
+
+def test_shadow_loader_does_not_restore_unlinked_market_contract() -> None:
+    stored_features = {
+        "training_market_fact_contract": {
+            "data_fingerprint": "x" * 64,
+            "path_fingerprint": "y" * 64,
+        },
+        "training_label_contract": {
+            "market_fact_data_fingerprint": "d" * 64,
+            "path_fingerprint": "p" * 64,
+        },
+    }
+    raw_contract = {
+        "version": MARKET_FACT_CONTRACT_VERSION,
+        "status": "historical_ohlcv_only",
+        "path_status": "clean",
+        "path_fingerprint": "p" * 64,
+        "data_fingerprint": "d" * 64,
+        "scheduled_label_at": "2026-07-14T00:05:25+00:00",
+        "result_source_available_at": "2026-07-14T00:06:00+00:00",
+        "availability_basis": "one_minute_candle_close_lower_bound",
+    }
+
+    restored = train_script._restore_linked_training_market_fact_contract(
+        stored_features,
+        raw_contract,
+    )
+
+    assert restored is stored_features
+
+
+def test_shadow_loader_does_not_override_conflicting_compacted_contract() -> None:
+    data_fingerprint = "d" * 64
+    path_fingerprint = "p" * 64
+    stored_features = {
+        "training_market_fact_contract": {
+            "data_fingerprint": data_fingerprint,
+            "path_fingerprint": path_fingerprint,
+            "executable_market_fact_verified": True,
+        },
+        "training_label_contract": {
+            "market_fact_data_fingerprint": data_fingerprint,
+            "path_fingerprint": path_fingerprint,
+        },
+    }
+    raw_contract = {
+        "version": MARKET_FACT_CONTRACT_VERSION,
+        "status": "historical_ohlcv_only",
+        "executable_market_fact_verified": False,
+        "path_status": "clean",
+        "path_fingerprint": path_fingerprint,
+        "data_fingerprint": data_fingerprint,
+        "scheduled_label_at": "2026-07-14T00:05:25+00:00",
+        "result_source_available_at": "2026-07-14T00:06:00+00:00",
+        "availability_basis": "one_minute_candle_close_lower_bound",
+    }
+
+    restored = train_script._restore_linked_training_market_fact_contract(
+        stored_features,
+        raw_contract,
+    )
+
+    assert restored is stored_features
 
 
 def test_remote_training_transport_bounds_rows_and_drops_audit_payloads() -> None:
