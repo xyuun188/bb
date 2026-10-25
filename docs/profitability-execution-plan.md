@@ -5159,3 +5159,130 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   measure a fresh post-load availability boundary. Keep G3 model-family
   sweeps stopped; G4-G6 remain unstarted until a genuinely positive,
   cost-aware candidate exists.
+
+### Fixed 60-Minute Short Baseline Investigation (2026-10-25 11:52 Asia/Shanghai)
+
+- The preceding transparent six-hour baseline ledger was inspected before a
+  fixed 60-minute short hypothesis was written down. That ledger is therefore
+  exploratory development evidence only; its validation slice is not an
+  untouched test and cannot support preregistration, promotion or G4.
+- The intended question was whether a fixed, non-tuned `short` policy at the
+  existing 60-minute native fee-after label survives chronological folds.
+  However, the command mistakenly invoked
+  `audit_online_horizon_current_development.py`, which evaluates a multi-horizon
+  Ridge search over only decision groups complete at all four horizons. This
+  did not implement or test the fixed-side question.
+- The immutable run identity used was
+  `horizon-current-v1-20261025T035000Z`, cutoff-exclusive
+  `2026-10-25T03:50:00Z`, six-hour lookback, maximum 1,200 groups. It read
+  1,162 rows across 753 groups (300/277/305/280 for 5/15/60/240 minutes),
+  but only 14 groups had all four horizons. The tool correctly returned
+  `insufficient_development_data`, selected zero policies, and evaluated no
+  profitability metrics. Input SHA256:
+  `af643dce0123420f4e37933f5407e4046048cd31b26c8eeb328e3e1aab9c0317`;
+  snapshot SHA256:
+  `9af9221814dd29c4b62a73eed5c04fc5c8c641268ddf47688611e3d3acbab268`.
+- Safety fields confirmed no exam labels, artifact, database mutation,
+  promotion, runtime policy change or order. This is a failed/mismatched
+  research action, not evidence for or against fixed 60-minute short.
+- Next research action must be a bounded read-only evaluation on only the
+  preregistered 60-minute rows, with native executable path and
+  `fee_after_complete=true`; it must use chronological, purged groups and
+  report all-opportunity and one-position non-overlap statistics. The already
+  inspected six-hour window remains development data even if this follow-up
+  is implemented. Freeze any candidate before collecting a prospective
+  independent G4 window. No order or model permission change is allowed.
+
+### Latest User Status Recheck (2026-10-25 11:54 Asia/Shanghai)
+
+- Read-only preflight completed at `2026-10-25T03:42:32Z`. Exchange account
+  truth/equity, OKX authoritative fill and integrity checks, main target model,
+  Dashboard, model tunnel and specialist report were healthy. It was blocked
+  by two controls: `bb-paper-trading.service` was already active, while the
+  preflight is specifically a stopped-before-start resume check; and the
+  four Phase 3 quant child endpoints had no eligible registered quant bundle.
+  This preflight does not establish a reason to restart or stop the running
+  service. No service or trading control was changed.
+- A fresh bounded entry recovery through `2026-10-25T03:46:18Z` counted 69
+  market decisions in the preceding 30 minutes; all were `hold`, none
+  executed. The latest 100-row economics projection through
+  `2026-10-25T03:50:08Z` also had 100 `hold`, zero positive production
+  entries, and zero positive-LCB examples. Recent selected shadow-training
+  observations had directional/expected-net evidence but were denied entry
+  because the global local-ML paper permission remains false at `n=267`:
+  fee-after mean `-0.303832%`, return lower bound `-0.431590%`, PF `0.549713`.
+  Several individual proposed directions also had negative risk-adjusted
+  objective return or negative uncertainty-adjusted lower bound. This is an
+  economic/authorization veto, not an exchange order rejection.
+- The same 240-minute feature audit found decision snapshots `61/64` valid
+  with only a newest clean streak of 9 decisions across 9 symbols; training
+  snapshots were `60/64` valid with a 36-row clean streak across 9 symbols.
+  Recent invalidity was mainly missing/ambiguous index-price facts and one
+  missing order book. Payload sizes and seals passed their limits. The fresh
+  G2 boundary is not met.
+- A 6-hour transparent native fee-after baseline ledger contained 1,166 rows
+  across 757 groups. For the 60-minute horizon, fixed-short validation had
+  mean `+0.11614612%` and PF `1.65588247`, but the full 6-hour report was
+  inspected before the side/horizon hypothesis was registered. It remains
+  exploratory and is not an untouched test. The mistaken follow-up horizon
+  tool returned insufficient data (14 all-horizon groups) and produced no
+  fixed-side metrics, as recorded above.
+- Current gate state: G0 passed; G1 passed as negative authoritative
+  attribution; G2 blocked; G3 has not produced a qualified frozen policy
+  (four fixed model families selected `0/3`; fixed-short 60-minute remains
+  untested by the correct evaluator); G4 has no frozen candidate/exam; G5 has
+  no governed profitable paper round trip; G6 pending. Thus profitability is
+  not achieved and no defensible completion date exists. The next useful
+  action is to implement/run the correctly scoped 60-minute fixed-direction
+  development evaluator, then either reject the hypothesis or freeze it for
+  prospective independent testing. Do not keep sweeping model families or
+  treat data-collection fixes as profitability progress.
+
+### Correct Fixed 60-Minute Short Evaluator Registration (2026-10-25 12:06 Asia/Shanghai)
+
+- The corrected evaluator is registered as
+  `fixed-short-60m-v1-20261025T040000Z-6h-1200`, with cutoff-exclusive
+  `2026-10-25T04:00:00Z`, six-hour lookback, maximum 1,200 decision groups,
+  native executable 1-minute source, and `fee_after_complete=true`.
+- The policy is fixed `short` at `60` minutes. There is no feature fitting,
+  threshold search, side selection, horizon selection, sizing, leverage or
+  exit tuning. Three chronological folds are purged by decision-group label
+  end; each fold and the aggregate report both all-opportunity and
+  one-global-position non-overlap metrics. The development filter requires at
+  least 16 selected rows, positive fee-after mean, positive research lower
+  bound and PF above one in both views and every fold.
+- Resource/safety budget: one read-only connection, 15-second SQL timeout,
+  25% CPU, 1 GiB memory, 300-second deadline; no artifact, exam, mutation,
+  service restart, permission change or order. A qualifying development
+  result remains unpromoted until a newly preregistered frozen policy passes
+  an untouched G4 exam and governed paper settlement.
+- Exact command:
+  `scripts/audit_online_fixed_direction_development.py --side short
+  --horizon 60 --limit 1200 --hours 6 --cutoff 2026-10-25T04:00:00Z`.
+
+### Fixed 60-Minute Short Result (2026-10-25 12:07 Asia/Shanghai)
+
+- The corrected read-only run completed at `2026-10-25T04:06:32Z` for the
+  exact registered window `[2026-10-24T22:00:00Z, 2026-10-25T04:00:00Z)`.
+  It read `297` native executable fee-after rows across `297` decision groups;
+  all three chronological purged folds were estimable with validation counts
+  `50/49/49`. Input SHA256:
+  `5ba67af6199a6ec4353c60f6272d71aef9a544c78c229df60b00bef615dc5100`.
+- The fixed policy is **rejected**. All-opportunity fee-after means were
+  positive in the three folds (`+0.21696%`, `+0.18956%`, `+0.02615%`) and
+  PFs exceeded one (`1.7920`, `1.9010`, `1.1940`), but every all-opportunity
+  research lower bound was negative (`-0.29063%`, `-0.13877%`, `-0.07114%`).
+  The one-global-position non-overlap view selected only `2`, `1`, and `1`
+  rows, so it failed the minimum-16 coverage and PF requirements; aggregate
+  non-overlap PF was undefined and its lower bound was `-0.22379%`.
+- This is not a deployable candidate and does not justify opening positions.
+  No exam labels, artifact, database mutation, permission change, service
+  restart or order occurred. Remote focused regression for the new evaluator
+  passed `2` tests; local focused regression also passed `2`, with Ruff,
+  compile and diff checks clean.
+- Decision: close this fixed-side hypothesis and do not sweep more sides or
+  horizons on the same inspected window. G3 still has no qualified frozen
+  policy. Continue only with the documented clean-data boundary and a
+  materially new, preregistered research question; if no new candidate can
+  pass independent criteria, profitability acceptance remains correctly
+  unachieved.
