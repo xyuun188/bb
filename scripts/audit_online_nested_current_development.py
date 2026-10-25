@@ -24,6 +24,7 @@ DEPENDENCIES = (
     "services/ml_nested_development.py",
     "services/ml_nested_development_tree.py",
     "services/ml_nested_development_hgb.py",
+    "services/ml_nested_development_extra_trees.py",
     "services/ml_development_baselines.py",
     "services/ml_signal_service.py",
     "services/ml_training_dataset.py",
@@ -52,6 +53,9 @@ from services.ml_nested_development_tree import (
 from services.ml_nested_development_hgb import (
     build_nested_hgb_development_report,
 )
+from services.ml_nested_development_extra_trees import (
+    build_nested_extra_trees_development_report,
+)
 from services.ml_signal_service import (
     MIN_TRAINING_SAMPLE_COUNT,
     PRIMARY_PREDICTION_HORIZON_MINUTES,
@@ -71,6 +75,7 @@ DEPENDENCIES = (
     "services/ml_nested_development.py",
     "services/ml_nested_development_tree.py",
     "services/ml_nested_development_hgb.py",
+    "services/ml_nested_development_extra_trees.py",
     "services/ml_development_baselines.py",
     "services/ml_signal_service.py",
     "services/ml_training_dataset.py",
@@ -260,6 +265,8 @@ async def main():
             nested = build_nested_tree_development_report(frame)
         elif FAMILY == "hgb":
             nested = build_nested_hgb_development_report(frame)
+        elif FAMILY == "extra_trees":
+            nested = build_nested_extra_trees_development_report(frame)
         else:
             raise ValueError(f"unsupported development family: {FAMILY}")
         primary = frame[
@@ -511,7 +518,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--family",
-        choices=("ridge", "tree", "hgb"),
+        choices=("ridge", "tree", "hgb", "extra_trees"),
         default="ridge",
         help="Development-only candidate family.",
     )

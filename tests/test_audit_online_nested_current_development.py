@@ -27,6 +27,9 @@ def test_remote_nested_research_query_is_bounded_native_and_cost_complete() -> N
     assert "build_nested_hgb_development_report" in source
     assert 'FAMILY == "hgb"' in source
     assert "services/ml_nested_development_hgb.py" in source
+    assert "build_nested_extra_trees_development_report" in source
+    assert 'FAMILY == "extra_trees"' in source
+    assert "services/ml_nested_development_extra_trees.py" in source
 
 
 def test_remote_runner_uses_isolated_bounded_resources_and_unique_unit() -> None:

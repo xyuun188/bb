@@ -4881,3 +4881,107 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   keep collecting clean native fee-after groups, and only then run a new
   preregistered development family; no gate or cost rule will be weakened
   to manufacture trades.
+
+### Preregistered Fourth G3 Development Family: Fixed Extra Trees
+
+- Development-only identity:
+  `native-fee-after-extra-trees-v1-20261024T233000Z-48h-2500`, with exclusive
+  UTC cutoff `2026-10-24T23:30:00Z`, a 48-hour lookback, and at most 2,500
+  decision groups. This exact development window was already label-inspected
+  by the fixed Ridge/tree/HGB development studies; this ExtraTrees run is
+  another development comparison on known development data, never a fresh
+  sample or independent profitability claim. G4 remains sealed.
+- Fixed estimator:
+  `ExtraTreesRegressor(n_estimators=220, max_depth=10, min_samples_leaf=16,
+  max_features=0.7, random_state=42, n_jobs=1)`, with median imputation and
+  the existing feature-key set only. The only entry thresholds are `0`,
+  `0.05%`, and `0.1%` net. No parameter search or feature search is allowed.
+- Evaluation is the existing primary five-minute target, three chronological
+  purged outer folds, two chronological purged inner folds, decision-group
+  separation and primary-label-end purge, minimum 16 selections, positive fee-after
+  mean and lower bound, PF above one, and positive mean in both inner folds.
+  The query admits only completed native-path, fee-after-complete paper
+  labels; `build_training_frame` must additionally pass the shared shadow
+  sample quality and feature-availability supervision contracts.
+- Exact command:
+  `scripts/audit_online_nested_current_development.py --family extra_trees
+  --revision v1 --limit 2500 --hours 48 --cutoff 2026-10-24T23:30:00Z`.
+  Expected report:
+  `data/profitability_remediation/online-nested-development-extra_trees-v1-20261024T233000Z.json`.
+- Before launch: focused local tests and Ruff must pass; upload only the
+  estimator, dispatch script, and their focused tests with `--skip-restart`;
+  verify dependency hashes and run the bounded remote focused tests. The
+  audit is read-only, one DB connection, 15-second SQL statements, 25% CPU,
+  1 GiB memory, and a 300-second systemd deadline. It must not persist an
+  artifact, evaluate an exam, mutate the database, change runtime permission,
+  restart services, or submit orders. Inspect the named unit/report before
+  any retry.
+- Decision rule: a zero-qualified result is recorded as a rejection and no
+  additional model-family sweep will be used to claim progress. Even if
+  development qualifies, do not promote it: it must first be frozen and then
+  evaluated against a separately preregistered untouched independent sample.
+- Current status at registration: no result exists. G2 remains blocked by
+  incomplete point-in-time availability coverage; G3 has no qualified policy;
+  G4-G6 remain unpassed. Next action is the single bounded run above, followed
+  by returning to the documented G2 capture gaps and finite acceptance plan.
+
+### Fixed Extra Trees Result And Time-Bound Replan (2026-10-25 09:37 Asia/Shanghai)
+
+- The preregistered development-only run completed at
+  `2026-10-25T01:30:14Z` for the exact known window
+  `[2026-10-22T23:30:00Z, 2026-10-24T23:30:00Z)`. It read 3,815
+  native/executable fee-after-complete rows across 2,028 decision groups;
+  the primary five-minute horizon had 951 rows. This input fingerprint is
+  identical to the already-inspected HGB study:
+  `9603873eb2752a6c8dda1349f4ffd3528d0eddc71a31c1312156f3163a535df6`;
+  source frame fingerprint:
+  `616c41582e4d119f33e9940e0563989be9f3e998530d2b300c7a32c79ba1656a`.
+  Report:
+  `data/profitability_remediation/online-nested-development-extra_trees-v1-20261024T233000Z.json`.
+- The fixed ExtraTrees family selected **0 of 3** outer-fold policies.
+  All inner thresholds failed the registered fee-after rules. Across folds,
+  selected inner mean returns were negative (representative ranges
+  `-0.0668%` to `-0.5156%`), with PF `0.2586` to `0.5841`; measured selected
+  execution costs were approximately `0.114%` to `0.158%`. No artifact,
+  exam evaluation, permission change, database mutation, service restart or
+  order occurred. This rejects the family; it is not profitability evidence.
+- The same one-hour online recovery at `2026-10-25T01:32:38Z` found 137
+  market decisions, all `hold` and unexecuted. In the newest 80, 43 were
+  `no_candidate` and 37 were `shadow_training`; none granted entry. Local-ML
+  paper permission remains false at 267 authoritative samples:
+  mean fee-after return `-0.303832%`, lower bound `-0.431590%`, PF `0.549713`.
+  Its three direct blockers remain non-positive mean, non-positive lower
+  bound and PF not above break-even. The latest shadow artifact remains
+  `shadow`/`degraded`; its influence is disabled. The visible model-service
+  readiness is not an order-submission failure.
+- A fresh 240-minute availability audit at `2026-10-25T01:37:12Z` found:
+  decision snapshots `60/64` valid, newest clean streak `6` across `6`
+  symbols; training snapshots `52/64` valid, newest clean streak `20` across
+  `5` symbols. All 128 snapshots had contracts/seals, no seal/compaction
+  errors and were under the 98,304-byte budget (decision max 97,550 B,
+  training max 95,326 B). The four invalid decisions and twelve invalid
+  training rows were tied to missing/ambiguous index-price facts/clocks;
+  observed examples include reference-price timeouts and REST index facts
+  with source timestamp `0`. The preregistered G2 boundary is still not met:
+  at least 30 consecutive clean market decisions across at least 20 symbols,
+  with clean corresponding training snapshots.
+- Profitability status is unchanged: G0 passed; G1 passed as negative
+  authoritative attribution; G2 blocked; G3 **NOT PASSED** after fixed Ridge,
+  random-forest, HGB and ExtraTrees families each selected `0/3`; G4 has no
+  frozen candidate or untouched exam; G5 has no governed profitable paper
+  round trip; G6 remains pending. Thus five profitability gates remain
+  incomplete or failed. New shadow rows and training scheduler heartbeats are
+  not trades and do not improve realized PnL.
+- Corrective decision: stop estimator-family sweeps on this already-inspected
+  window. The next work is one bounded trace of the index-price capture path
+  for the recent invalid decision IDs, correlating route status/source clocks
+  with the existing request-queue telemetry. Within 24 hours of this checkpoint,
+  record either (a) a reproducible local defect with a focused fix, tests,
+  targeted no-restart upload and verified fresh G2 boundary, or (b) evidence
+  that the remaining failure is external/provider/queue behavior and its
+  explicit mitigation/owner. Do not extend timeouts or loosen freshness.
+- No honest completion date for profitability can be given: it depends on a
+  candidate producing genuinely positive fee-after evidence, then passing an
+  untouched exam and subsequent governed paper settlements. A 24-hour
+  infrastructure decision checkpoint is not a promise of profitability or
+  entry authorization. Keep live trading disabled and permissions unchanged.
