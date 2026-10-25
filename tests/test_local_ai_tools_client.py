@@ -1494,6 +1494,50 @@ async def test_local_ai_tools_status_defaults_ready_when_bundle_is_available(
 
 
 @pytest.mark.asyncio
+async def test_local_ai_tools_status_does_not_resurrect_rejected_bundle_from_liveness(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+
+    async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
+        if path == "/models/status":
+            return {
+                "available": False,
+                "model_bundle_available": False,
+                "status": "artifact_unavailable",
+                "child_endpoints": {
+                    "profit_prediction": {
+                        "available": False,
+                        "path": "/profit/predict",
+                    }
+                },
+            }
+        return {
+            "ok": True,
+            "service": "phase3_quant_api",
+            "model_bundle_available": True,
+            "child_endpoints": {
+                "profit_prediction": {
+                    "available": True,
+                    "path": "/profit/predict",
+                    "probe_mode": "metadata_contract",
+                }
+            },
+        }
+
+    monkeypatch.setattr(client, "_get", get_status)
+
+    result = await client.status()
+
+    assert result["status_refresh"] == "fresh"
+    assert result["model_bundle_available"] is False
+    assert result["artifact_status"] == "unavailable"
+    assert result["child_endpoints"]["profit_prediction"]["available"] is False
+    assert result["child_contract_status"] == "unavailable"
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_status_preserves_health_supervision_and_route_contract(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,

@@ -2987,6 +2987,80 @@ async def test_collect_platform_runtime_status_falls_back_to_liveness_when_statu
     assert tools["status"]["probe_mode"] == "metadata_status"
 
 
+async def test_collect_platform_runtime_status_does_not_resurrect_rejected_bundle(
+    monkeypatch,
+) -> None:
+    fake_settings = SimpleNamespace(
+        get_fixed_ai_models=lambda include_empty=False: [],
+        local_ai_tools_api_base="http://local-ai.test",
+        local_ai_tools_api_key="hidden-tools-key",
+    )
+    monkeypatch.setattr(server_monitor_status, "settings", fake_settings)
+
+    class FakeAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def request(
+            self,
+            method: str,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: dict[str, Any] | None = None,
+        ) -> httpx.Response:
+            request = httpx.Request(method, url)
+            if url.endswith("/models/status"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "service": "phase3_quant_api",
+                        "available": False,
+                        "model_bundle_available": False,
+                        "child_endpoints": {
+                            "profit_prediction": {
+                                "available": False,
+                                "path": "/profit/predict",
+                            }
+                        },
+                    },
+                    request=request,
+                )
+            if url.endswith("/health/live"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "service": "phase3_quant_api",
+                        "model_bundle_available": True,
+                        "child_endpoints": {
+                            "profit_prediction": {
+                                "available": True,
+                                "path": "/profit/predict",
+                            }
+                        },
+                    },
+                    request=request,
+                )
+            raise AssertionError(f"unexpected request: {url}")
+
+    monkeypatch.setattr(server_monitor_status.httpx, "AsyncClient", FakeAsyncClient)
+
+    result = await server_monitor_status.collect_platform_runtime_status()
+    tools = result["local_ai_tools"]
+
+    assert tools["model_bundle_available"] is False
+    assert tools["artifact_status"] == "unavailable"
+    assert tools["child_endpoints"]["profit_prediction"]["available"] is False
+    assert tools["child_contract_status"] == "unavailable"
+
+
 async def test_collect_platform_runtime_status_uses_env_local_tools_key_when_settings_empty(
     monkeypatch,
 ) -> None:

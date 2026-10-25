@@ -5427,3 +5427,38 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   cost-aware G3 candidate, then run a fresh independent G4 exam and governed
   G5 paper round trip. Until those observations exist, claiming a profit date
   would be fabricated.
+
+### Runtime Readiness Precedence Repair (2026-10-25 12:54 Asia/Shanghai)
+
+- Inspection of the actual paper-resume preflight path found a reporting
+  inconsistency: `/health/live` only checks that current bundle files are
+  present, while `/models/status` performs the full pointer/hash/supervision
+  validation. Both `LocalAIToolsClient.status()` and
+  `server_monitor_status.collect_platform_runtime_status()` OR-ed the two
+  results, allowing a successful liveness probe to report a rejected bundle as
+  ready when the full metadata probe had explicitly rejected it.
+- Both aggregators now treat a successful `/models/status` result as
+  authoritative for bundle readiness, including explicit `false`; liveness is
+  only a fallback when the metadata request fails. Child endpoint contracts
+  continue to follow the authoritative metadata response. This is a status
+  accuracy repair only; it does not grant model influence or trading
+  permission.
+- Regression coverage: the local client plus paper-resume-preflight suite
+  passed `70` tests; platform status aggregation passed `7` focused tests;
+  Ruff passed. The targeted remote regression run passed `8` tests. Four
+  allowlisted source/test files were uploaded with `--skip-restart` and remote
+  source integrity reported `source-integrity-ok:4`; no service was restarted.
+- Fresh read-only preflight at `2026-10-25T04:54:18Z` now correctly reports
+  `model_bundle_available=false`, `artifact_status=unavailable`, and
+  `0/4` child endpoints ready. It remains blocked by
+  `phase3_quant_api_child_endpoints_unavailable` and
+  `paper_trading_already_active`. OKX position/order/fill counts remain zero.
+  The quant API is healthy, but the validated v4 bundle is not registered;
+  do not relabel older artifacts or restart the active paper service through
+  this blocked preflight.
+- Gate decision is unchanged: G0 passed; G1 is negative-economics attribution
+  only; G2 remains blocked pending loaded-source and clean prospective v4
+  evidence; G3 has no qualified candidate; G4/G5 are not started; G6 remains
+  blocked. Next work is prospective contract-valid shadow evidence and a new
+  preregistered, cost-aware G3 question. Keep all trading and risk gates
+  unchanged.

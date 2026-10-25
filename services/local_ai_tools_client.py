@@ -896,15 +896,23 @@ class LocalAIToolsClient:
             for item in child_endpoints.values()
             if isinstance(item, dict)
         )
-        # A successful `/models/status` response normally carries `available`,
-        # but the liveness response also carries the explicit bundle state. Use
-        # both so status-endpoint timeouts do not erase known artifact readiness.
-        model_bundle_available = bool(
-            status.get("model_bundle_available")
-            or status.get("available")
-            or health.get("model_bundle_available")
-            or health.get("trained_models_available")
-        )
+        # `/models/status` is the authoritative artifact contract.  The cheap
+        # liveness response only proves that files are present; it must not
+        # resurrect a bundle that the full pointer/hash/supervision check
+        # rejected.  Fall back to liveness only when the authoritative request
+        # itself failed.
+        if status_ok:
+            if "model_bundle_available" in status:
+                model_bundle_available = bool(status.get("model_bundle_available"))
+            elif "trained_models_available" in status:
+                model_bundle_available = bool(status.get("trained_models_available"))
+            else:
+                model_bundle_available = bool(status.get("available"))
+        else:
+            model_bundle_available = bool(
+                health.get("model_bundle_available")
+                or health.get("trained_models_available")
+            )
         # `/health/live` is a transport/liveness contract.  A slow metadata
         # endpoint must not turn a reachable model service into "unavailable".
         service_available = bool(health_ok or status_ok or child_available)

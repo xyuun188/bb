@@ -1420,15 +1420,27 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                     or status_probe.get("ok")
                 )
             )
-            # Preserve artifact readiness from either response so a healthy
-            # quant service is not shown as "model unavailable" merely because
-            # the heavier metadata probe is temporarily busy.
-            model_bundle_available = bool(
-                status_metadata.get("model_bundle_available")
-                or status_metadata.get("available")
-                or metadata.get("model_bundle_available")
-                or metadata.get("trained_models_available")
-            )
+            # The metadata endpoint is authoritative when it answered
+            # successfully: liveness only proves that bundle files exist and
+            # must not resurrect a bundle rejected by pointer/hash/supervision
+            # validation.  Fall back to liveness only when metadata itself
+            # failed.
+            if status_probe.get("ok"):
+                if "model_bundle_available" in status_metadata:
+                    model_bundle_available = bool(
+                        status_metadata.get("model_bundle_available")
+                    )
+                elif "trained_models_available" in status_metadata:
+                    model_bundle_available = bool(
+                        status_metadata.get("trained_models_available")
+                    )
+                else:
+                    model_bundle_available = bool(status_metadata.get("available"))
+            else:
+                model_bundle_available = bool(
+                    metadata.get("model_bundle_available")
+                    or metadata.get("trained_models_available")
+                )
             child_endpoints = _local_ai_tools_child_endpoint_contracts(
                 metadata,
                 status_metadata,
