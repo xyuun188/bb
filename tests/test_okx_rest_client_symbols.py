@@ -26,7 +26,7 @@ def test_required_market_fact_routes_use_priority_lane() -> None:
         "publicGetPublicMarkPrice",
         "publicGetMarketIndexTickers",
     }.isdisjoint(PUBLIC_MARKET_PRIORITY_METHODS)
-    assert {"fetch_funding_rate", "fetch_open_interest"} == (
+    assert {"fetch_ohlcv", "fetch_funding_rate", "fetch_open_interest"} == (
         set(PUBLIC_MARKET_OPTIONAL_METHODS)
     )
 
@@ -50,6 +50,51 @@ def test_required_route_waits_fit_under_outer_snapshot_cap() -> None:
 def test_optional_derivatives_routes_use_a_separate_gate() -> None:
     client = OKXRestClient()
     assert client._public_market_gate() is not client._public_market_optional_gate()
+
+
+@pytest.mark.asyncio
+async def test_indicator_ohlcv_uses_optional_market_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+    calls: list[tuple[str, bool]] = []
+
+    class Gate:
+        async def acquire(self, *, priority: bool) -> None:
+            calls.append(("acquire", priority))
+
+        def release(self, *, priority: bool = False) -> None:
+            calls.append(("release", priority))
+
+    class Exchange:
+        async def fetch_ohlcv(
+            self,
+            _symbol: str,
+            _timeframe: str,
+            **_kwargs: Any,
+        ) -> list[list[float]]:
+            return []
+
+    optional_gate = Gate()
+    shared_gate = Gate()
+    monkeypatch.setattr(client, "_public_market_optional_gate", lambda: optional_gate)
+    monkeypatch.setattr(client, "_public_market_gate", lambda: shared_gate)
+    monkeypatch.setattr(
+        client,
+        "_get_exchange",
+        lambda: asyncio.sleep(0, result=Exchange()),
+    )
+    monkeypatch.setattr(client, "_ensure_rest_url", lambda: None)
+
+    result = await client._ccxt_call(
+        "fetch_ohlcv",
+        "BTC/USDT:USDT",
+        "1m",
+        limit=2,
+    )
+
+    assert result == []
+    assert calls == [("acquire", False), ("release", False)]
 
 
 def test_native_consistency_route_uses_a_separate_gate() -> None:

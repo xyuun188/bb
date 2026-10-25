@@ -126,6 +126,9 @@ PUBLIC_MARKET_PRIORITY_METHODS = frozenset(
 )
 PUBLIC_MARKET_OPTIONAL_METHODS = frozenset(
     {
+        # Indicator K-lines are analytical enrichment and must not consume
+        # the shared executable quote lane during a market scan.
+        "fetch_ohlcv",
         "fetch_funding_rate",
         "fetch_open_interest",
     }

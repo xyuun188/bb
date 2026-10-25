@@ -5614,3 +5614,35 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   still needs a genuinely positive fee-after candidate; only then can the
   untouched G4 exam and governed G5 paper settlement begin. Do not claim a
   profit date, manufacture fills, or reopen the rejected fixed-short window.
+
+### Queue Contention Repair And Boundary Regression (2026-10-25 14:04 Asia/Shanghai)
+
+- The next bounded feature-budget audit at `2026-10-25T05:52:22Z` did not
+  sustain the earlier clean streak: decisions were `59/64` valid with a
+  newest streak of `10` across `10` symbols, and training was `60/64` valid
+  with a newest streak of `36` across `9` symbols. The G2 boundary remains
+  unpassed; the prior `26`-row streak was transient and is not reusable as
+  acceptance evidence.
+- A bounded public-market latency audit at `2026-10-25T05:56:06Z` matched
+  `996` diagnostic events. Queue wait, rather than provider time, is the
+  dominant current defect: `publicGetMarketIndexTickers` p95/max
+  `9,947/30,177 ms`, `publicGetPublicMarkPrice` `10,286/30,177 ms`, and
+  `fetch_order_book` `8,985/17,585 ms`; provider p95s were only
+  `1,625/3,018/3,491 ms`. Index and mark calls therefore routinely exceed
+  the `5.5 s` required-route join budget while waiting in the shared lane.
+- Repair: analytical indicator `fetch_ohlcv` calls now use the separate
+  optional public-request gate, so they cannot consume the executable
+  ticker/order-book/mark/index lane during a scan. No timeout, freshness,
+  fact-validation, entry-permission, cost, or risk threshold was relaxed.
+  Local focused coverage is `94 passed`; Ruff and compile checks passed.
+  Targeted online upload of the source and regression passed
+  `source-integrity-ok:2` with no service restart.
+- The read-only preflight at `2026-10-25T05:52:25Z` still reports the same
+  two blockers: paper service already active and no eligible v4 quant child
+  endpoint contracts. The repair is staged on `/data/bb/app` but cannot be
+  treated as loaded until the governed stopped-before-start reload path
+  verifies it.
+- Next measurable action: collect a new post-upload latency/availability
+  window, then rerun the frozen-budget boundary. G2 passes only after the
+  predefined clean streak is sustained; G3 remains blocked by the negative
+  authoritative fee-after distribution and zero eligible v4 trade rows.
