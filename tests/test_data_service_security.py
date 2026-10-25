@@ -2283,6 +2283,66 @@ async def test_authoritative_ticker_refresh_never_falls_back_to_websocket_cache(
 
 
 @pytest.mark.asyncio
+async def test_authoritative_ticker_reuses_complete_websocket_native_snapshot() -> None:
+    service = _service()
+    timestamp_ms = int(time.time() * 1000)
+    ticker = {
+        "symbol": "PROS/USDT",
+        "last_price": 0.3902,
+        "bid": 0.3901,
+        "ask": 0.3903,
+        "high_24h": 0.4000,
+        "low_24h": 0.3800,
+        "timestamp": timestamp_ms,
+        "source_timestamp_ms": timestamp_ms,
+        "source": "websocket",
+    }
+    ready = {
+        **ticker,
+        "orderbook_fact": {"bid": 0.3901, "ask": 0.3903},
+        "mark_price_fact": {"price": 0.3902},
+        "index_price_fact": {"price": 0.3900},
+        "native_consistency_bars_1m": [[timestamp_ms, 0.39, 0.391, 0.389, 0.3902, 1.0]],
+        "market_source_consistency": {
+            "version": MARKET_SOURCE_CONSISTENCY_VERSION,
+            "status": "clean",
+            "reasons": [],
+            "assertions": {
+                "native_identity_verified": True,
+                "executable_quotes_verified": True,
+                "tick_alignment_verified": True,
+                "reference_prices_verified": True,
+                "market_continuity_verified": True,
+            },
+        },
+        "market_fact": {"quality": {"status": "clean"}},
+    }
+
+    class FakeWsClient:
+        latest_tickers = {"PROS/USDT": ticker}
+
+    class FakeRestClient:
+        async def fetch_ticker(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("complete websocket facts must suppress duplicate REST ticker")
+
+    async def attach(_symbol: str, _snapshot: dict[str, Any], *, block_on_remote: bool) -> dict[str, Any]:
+        assert block_on_remote is False
+        return ready
+
+    service.ws_client = FakeWsClient()
+    service.rest_client = FakeRestClient()
+    service._attach_native_market_fact = attach  # type: ignore[method-assign]
+
+    snapshot = await service._get_ticker_snapshot(
+        "PROS/USDT",
+        require_authoritative_snapshot=True,
+    )
+
+    assert snapshot["source"] == "websocket"
+    assert snapshot["ticker_authoritative_source"] == "websocket"
+
+
+@pytest.mark.asyncio
 async def test_blocking_ticker_refresh_keeps_rest_as_primary_over_fresh_ws_cache() -> None:
     service = _service()
     fresh_timestamp_ms = int(time.time() * 1000)

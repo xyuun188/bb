@@ -4985,3 +4985,70 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   untouched exam and subsequent governed paper settlements. A 24-hour
   infrastructure decision checkpoint is not a promise of profitability or
   entry authorization. Keep live trading disabled and permissions unchanged.
+
+### Current User Recheck And WebSocket Reuse Repair (2026-10-25 10:36 Asia/Shanghai)
+
+- The latest bounded entry recovery through `2026-10-25T02:13:46Z` covered
+  `147` market decisions. All final actions were `hold`; there were no order
+  attempts, exchange rejections, open positions or fills. The direct entry
+  veto remains the authoritative fee-after permission at `n=267`: mean
+  `-0.303832%`, lower bound `-0.431590%`, PF `0.549713`. The newest rows also
+  remain blocked by non-positive expected net return and missing quantitative
+  evidence. Shadow-training rows are not trades.
+- The same report shows the paper service and training heartbeat are active.
+  Recent component availability was `141/147` clean; the six invalid rows were
+  index-price fact/receipt/clock failures. Historical requalification remains
+  dry-run with `0` eligible rows because its point-in-time availability basis
+  is still unverified. No model permission, threshold, risk, leverage, mode,
+  order or protection state was changed.
+- A fresh bounded public-market latency audit at
+  `2026-10-25T02:08:29Z` read journald only (one 2 MiB tail, so this is
+  diagnostic evidence rather than a complete window census). It found
+  priority-route queue p95 waits of `23,280.6 ms` for index tickers,
+  `26,795.6 ms` for mark prices, `12,188.9 ms` for order books and
+  `17,736.6 ms` for single tickers; provider p95 durations were materially
+  lower (`1,993.2/3,015.5/3,108.7/4,342.0 ms`). This confirms local request
+  fan-out/queueing as a secondary G2 capture blocker, not an OKX submission
+  rejection and not evidence that profitability is positive.
+- Repair added a fail-closed WebSocket fast path in
+  `services/data_service.py`: an authoritative refresh may reuse a WebSocket
+  snapshot only when order book, mark, index, native 1m path, source
+  consistency assertions and clean market-fact quality are all present. Any
+  missing/stale/ambiguous component still uses the existing strict REST
+  refresh. This removes duplicate high-priority REST requests without
+  widening freshness or quality contracts.
+- Local verification after the repair: `481` focused data/latency/trading
+  boundary tests passed, including the new complete-WS reuse regression and
+  the existing fail-closed authoritative-refresh regression. Ruff,
+  compileall and `git diff --check` passed.
+- Current gate state is unchanged: G0 passed; G1 passed only as negative
+  attribution; G2 blocked; G3 not passed after four fixed development
+  families selected `0/3`; G4 has no frozen candidate/exam; G5 has no
+  governed profitable paper round trip; G6 pending. There is still no honest
+  profitability completion date. Next action is targeted no-restart upload,
+  remote hash/focused-test verification, then a new bounded post-load
+  availability/latency boundary. Do not restart or authorize entries until the
+  paper-only preflight is clear.
+
+### WebSocket Reuse Targeted Deployment Verification (2026-10-25 10:42 Asia/Shanghai)
+
+- Targeted sync completed with `--skip-restart`; only
+  `services/data_service.py` and `tests/test_data_service_security.py` changed
+  on the remote checkout. The three public-latency audit files were already
+  byte-identical. Remote integrity verification returned `source-integrity-ok:5`.
+- Remote focused validation passed `116` tests in `61.19s` for
+  `tests/test_data_service_security.py` and
+  `tests/test_public_market_latency_audit.py`. No database mutation, order,
+  position, protection, permission or model-routing change occurred.
+- The read-only paper-resume preflight at `2026-10-25T02:41:32Z` remains
+  blocked by the four Phase 3 quant child endpoint contracts being unavailable
+  and by `bb-paper-trading.service` already being active. Model server,
+  account truth, OKX integrity, Dashboard and tunnel checks are healthy.
+  Therefore the process was not restarted; the new WebSocket reuse code is
+  uploaded but not yet loaded by the long-running paper process.
+- Acceptance remains unchanged and honest: the direct no-entry cause is still
+  negative fee-after permission, while G2 has a secondary queue/freshness
+  blocker. Next action is to wait for a clear paper-only restart preflight,
+  then restart only the paper service and measure a new bounded component,
+  queue-latency and entry-funnel window. Keep live routing disabled and do not
+  treat any shadow row as a trade or profitability result.

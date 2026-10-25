@@ -1322,6 +1322,18 @@ class DataService:
                     ticker,
                     block_on_remote=False,
                 )
+            if require_authoritative_snapshot:
+                # A complete, fresh WS observation is already an authoritative
+                # native fact. Reuse it to avoid a duplicate priority REST
+                # request; incomplete facts remain on the strict REST path.
+                websocket_snapshot = await self._attach_native_market_fact(
+                    normalized,
+                    dict(ticker),
+                    block_on_remote=False,
+                )
+                if self._websocket_authoritative_snapshot_is_ready(websocket_snapshot):
+                    websocket_snapshot["ticker_authoritative_source"] = "websocket"
+                    return websocket_snapshot
         if ticker and ticker_consistency_issue:
             logger.warning(
                 "ticker cache inconsistent; refreshing from OKX REST",
@@ -2949,6 +2961,30 @@ class DataService:
         if low_24h <= last_price <= high_24h:
             return None
         return "last_price_outside_24h_range"
+
+    @staticmethod
+    def _websocket_authoritative_snapshot_is_ready(
+        snapshot: dict[str, Any],
+    ) -> bool:
+        """Accept WS facts only when the executable contract is already sealed."""
+
+        if str(snapshot.get("source") or "").lower() != "websocket":
+            return False
+        if not all(
+            isinstance(snapshot.get(key), dict)
+            for key in ("orderbook_fact", "mark_price_fact", "index_price_fact")
+        ):
+            return False
+        bars = snapshot.get("native_consistency_bars_1m")
+        if not isinstance(bars, list) or not bars:
+            return False
+        if market_source_consistency_reasons(
+            snapshot.get("market_source_consistency")
+        ):
+            return False
+        market_fact = snapshot.get("market_fact")
+        quality = market_fact.get("quality") if isinstance(market_fact, dict) else None
+        return isinstance(quality, dict) and quality.get("status") == "clean"
 
     def _start_kline_coverage_refresh(self) -> None:
         if self._kline_coverage_refresh_task and not self._kline_coverage_refresh_task.done():
