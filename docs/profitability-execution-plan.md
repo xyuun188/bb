@@ -6772,3 +6772,19 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   remains `d70f8a4`. The local worktree is clean and the push must be retried
   when connectivity returns, without rebuilding or rerunning this sealed
   cohort.
+
+### Continuation Automation Checkpoint Corrected (2026-10-26 01:50 Asia/Shanghai)
+
+- The saved heartbeat prompt had still referenced the already-closed `42`-
+  decision cohort and its old maturity boundary. That stale checkpoint could
+  cause repeated no-op audits.
+- Automation `automation` was updated in place, preserving the 30-minute
+  heartbeat and `failed_runs_only` notification policy. It now references the
+  sealed `356`-decision cohort, its ID fingerprint, and the exact next G2
+  command/cutoff:
+  `--cutoff 2026-10-25T19:06:53Z --minutes 360
+  --expected-decision-count 356 --maturity-cutoff 2026-10-25T23:07:53Z
+  --limit 1200`.
+- This is a continuation-control repair only. It does not read labels, change
+  trading permissions, restart services, submit orders, or alter the
+  profitability gates. G2 remains pending until the fixed maturity boundary.
