@@ -6558,16 +6558,22 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   valid mature inputs and an accepted candidate exist. This is a local
   producer-contract trace, not a new online status probe.
 
-### Maturity Boundary Clock Correction (2026-10-26 00:05 Asia/Shanghai)
+### Maturity Boundary Clock Correction And Source-Lag Buffer (2026-10-26 00:15 Asia/Shanghai)
 
-- Exact local clock recheck: `2026-10-26T00:05:18+08:00`. The sealed cohort's
-  240-minute maturity point is still in the future at
-  `2026-10-26T01:06:52+08:00` (`2026-10-25T17:06:52Z`). An earlier progress
-  message incorrectly inferred maturity from the calendar date alone.
-- No cohort-label query was launched at 00:05. Keep the audit pending until
-  the full timestamp has passed; then run it once with the registered
-  decision and maturity cutoffs. This correction supersedes any wording that
-  implies the cohort is already mature.
+- Exact local clock at the prior recheck was `2026-10-26T00:05:18+08:00`; the
+  cohort was not mature then. An earlier progress message incorrectly inferred
+  maturity from the calendar date alone; no cohort-label query was launched.
+- The source contract permits `result_source_at` to lag its scheduled horizon
+  by up to 60 seconds (`SHADOW_LABEL_MAX_SOURCE_LAG_SECONDS=60`), while the
+  quality contract also requires actual receipt/availability after that source
+  time. Therefore the audit's earliest stable cutoff is the exclusive decision
+  cutoff plus 240 minutes plus the allowed 60-second source lag:
+  `2026-10-25T17:07:52Z` (`2026-10-26T01:07:52+08:00`). This is a minimum
+  eligibility checkpoint, not a claim that every row will have completed:
+  later/missing receipts remain pending or excluded in the audit.
+- At the subsequent local clock check (`2026-10-26T00:11:56+08:00`) this
+  corrected boundary was still in the future. Only after the exact full
+  timestamp passes may the one bounded cohort audit run.
 
 ### Preregistered Fresh Rules-Canary Development Window (2026-10-26 00:12 Asia/Shanghai)
 
@@ -6576,8 +6582,9 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   labels from it. Decision timestamps must fall in
   `[2026-10-25T13:06:53Z, 2026-10-25T19:06:53Z)`; the lower bound is one
   second after the G2 cohort cutoff. The exclusive label-maturity cutoff is
-  `2026-10-25T23:06:53Z` (2026-10-26 07:06:53 Asia/Shanghai), four hours
-  after the decision cutoff. Do not run before this full cutoff.
+  `2026-10-25T23:07:53Z` (2026-10-26 07:07:53 Asia/Shanghai), four hours plus
+  the registered 60-second maximum source lag after the decision cutoff. Do
+  not run before this full cutoff.
 - The candidate is exactly the existing fixed
   `live_rules_canary_signal.v1` policy and primary five-minute native path.
   Reuse its already registered six inputs, vote/consensus rules, chronological
@@ -6598,7 +6605,7 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   orders. A failed batch closes this exact window; no retuning or rerun on
   its inspected labels.
 - Current exact clock at preregistration was
-  `2026-10-25T16:11:56Z` (2026-10-26 00:11:56 Asia/Shanghai): the earlier
-  G2 maturity boundary at `2026-10-25T17:06:52Z` is still 54m56s away, and
-  this G3 window's maturity cutoff is still in the future. No new cohort
-  labels were queried for this preregistration.
+  `2026-10-25T16:11:56Z` (2026-10-26 00:11:56 Asia/Shanghai): the corrected
+  G2 minimum maturity boundary at `2026-10-25T17:07:52Z` is still 55m56s
+  away, and this G3 window's maturity cutoff is still in the future. No new
+  cohort labels were queried for this preregistration.
