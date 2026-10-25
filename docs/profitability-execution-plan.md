@@ -6962,3 +6962,10 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   service restart, permission change, database mutation or order occurred.
   Commit `de15eaa` is pushed to `origin/main`. The final audit remains deferred
   until the fixed `2026-10-25T23:07:53Z` boundary.
+- A safe pre-cutoff invocation at `2026-10-25T20:28:45.213189Z` returned
+  `maturity_not_reached`, with zero decision/label rows and matching dependency
+  fingerprints. Evidence is saved at
+  `data/profitability_remediation/online-mature-shadow-cohort-precutoff-guard.json`.
+  The guard report initially omitted its dependency fingerprint; that
+  fail-closed integrity mismatch was repaired and redeployed before this
+  successful check. No online sample was read.

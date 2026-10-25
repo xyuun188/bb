@@ -179,6 +179,7 @@ async def main():
                         "decision_cohort_complete": False,
                         "source_row_count": 0,
                         "cohort_row_count": 0,
+                        "dependency_sha256": dependency_hashes(),
                     },
                     "safety": {
                         "read_only": True,
