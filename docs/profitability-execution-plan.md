@@ -69,7 +69,7 @@ or trade frequency to manufacture success.
 | --- | --- | --- | --- |
 | G0 Recovery and execution safety | PASSED | Active goal, this checkpoint, same-chat scheduled continuation | Saved automation inspected and app view verified on 2026-10-22 |
 | G1 Authoritative loss attribution | PASSED | Fixed-cutoff canonical lifecycle and complete official-bill audit; evidence below | Separate full round trips, partial updates and window cash flow; reconcile price PnL, signed fees and funding without double counting; expose unresolved links and costs |
-| G2 Data and label validity | BLOCKED | Eligibility, timing, cost and provenance report plus defect regressions | No future-data leakage or split-group overlap; correct price/label horizon and source identity; missing or contradictory facts quarantined, not imputed into profitability |
+| G2 Data and label validity | BLOCKED (fresh boundary met; reload verification pending) | Eligibility, timing, cost and provenance report plus defect regressions | No future-data leakage or split-group overlap; correct price/label horizon and source identity; missing or contradictory facts quarantined, not imputed into profitability |
 | G3 Cost-aware candidate development | PENDING | Preregistered bounded experiment ledger and purged chronological comparisons | Candidate family/features/horizon/threshold/exits selected only within development folds; compare no-trade and transparent baselines on identical costs and exposure |
 | G4 Frozen independent evaluation | PENDING | Policy/code/data fingerprints, untouched exam and acceptance report | Predefined sample coverage, time/dependence-aware lower bound above zero, positive net mean, PF above one, predefined drawdown/tail limits, and cost stress tests pass; no post-exam tuning |
 | G5 Governed paper execution | PENDING | Controlled paper fills, protection, exits and official lifecycle settlements | Prior gates passed; frozen risk budget; no unlinked fills/unprotected exposure; observed fee-after results and forecast calibration meet preregistered criteria |
@@ -5052,3 +5052,63 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   then restart only the paper service and measure a new bounded component,
   queue-latency and entry-funnel window. Keep live routing disabled and do not
   treat any shadow row as a trade or profitability result.
+
+### Current User Recheck And Clean Boundary Evidence (2026-10-25 10:57 Asia/Shanghai)
+
+- The controlled online paper-resume preflight was rerun read-only at
+  `2026-10-25T02:50:55Z`. OKX account truth, current OKX/local integrity,
+  target model-server readiness, dashboard, model tunnel and specialist report
+  were all readable/healthy. The report still contains two operational
+  blockers: the long-running `bb-paper-trading.service` is already active
+  (the preflight is designed for a stopped-before-start check), and the
+  runtime model-status contract currently reports no registered local quant
+  artifact. The child route definitions are present at the API health surface,
+  but they are not paper-eligible model evidence. No restart or control action
+  was performed.
+- A fresh bounded frozen-feature audit at `2026-10-25T02:53:37Z` inspected the
+  newest 64 market decisions and 64 paper shadow-training snapshots across the
+  preceding 240 minutes. All 128 rows carried the
+  `2026-10-22.observed-feature-availability.v1` contract, freeze timestamp and
+  original decision timestamp; all payloads were sealed and below the
+  `98,304 B` budget (decision maximum `97,252 B`, training maximum `95,622 B`).
+  The decision sample was `62/64` availability-valid, but its newest valid
+  streak was `31` consecutive decisions across `29` symbols. All 64 training
+  snapshots were availability-valid with a 64-row clean streak across 16
+  symbols. This meets the preregistered numeric G2 clean-boundary coverage
+  rule in the currently running process, while two isolated older decisions
+  remain quarantined for missing/ambiguous index-price receipts and clocks.
+  The running process has not loaded the uploaded WebSocket reuse repair, so
+  this boundary cannot yet be attributed to that code change.
+- A bounded 120-minute entry recovery through `2026-10-25T02:56:50Z` still
+  found `288/288` market decisions as `hold`, with zero order attempts,
+  exchange rejections, positions or fills. The newest 120 rows were 52
+  `no_candidate` and 68 `shadow_training`; shadow selections remain labels,
+  not paper entries. The direct permission veto is unchanged:
+  authoritative local-ML `n=267`, fee-after mean `-0.303832%`, lower bound
+  `-0.431590%`, PF `0.549713`. Recent direction support also remains blocked
+  by non-positive expected net return, elevated loss-probability quality
+  observations and missing quantitative evidence.
+- The authoritative trade-training eligibility audit at
+  `2026-10-25T02:55:42Z` still found `500/500` older outcomes excluded because
+  their source decisions predate the availability contract. Their OKX fill,
+  fee, slippage and funding facts are present, but they are not valid
+  point-in-time training rows. No historical seal was fabricated or backfilled.
+  Auto-training remains skipped for the same reason
+  (`authoritative_execution_cost_distribution_unavailable`); the current
+  shadow artifact remains `shadow`/`degraded` with influence disabled.
+- Decision: G2 fresh capture coverage is now evidenced, but the gate remains
+  operationally blocked until the uploaded WebSocket reuse path is loaded by a
+  governed paper-service reload and the runtime artifact/contract state is
+  rechecked. The main no-entry cause is not that reload: no candidate has
+  positive fee-after evidence, and the existing local-ML authority is
+  decisively negative. G3 remains **NOT PASSED** after fixed Ridge,
+  random-forest, HGB and ExtraTrees families each selected `0/3`; G4 has no
+  frozen candidate or untouched exam; G5 has no governed profitable round trip;
+  G6 is pending.
+- Exact next actions: (1) do not restart while the preflight is not clear; (2)
+  keep this clean native window immutable and collect a fresh post-load
+  boundary only after a safe paper-only reload path is available; (3) stop
+  model-family sweeps on the inspected window and register no candidate until
+  a materially new, cost-aware chronological development question is
+  preregistered; and (4) preserve the negative profitability permission and
+  live-disabled state.
