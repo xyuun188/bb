@@ -5386,3 +5386,44 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   to create training labels. After a legitimate G3/G4 pass, revisit governed
   paper execution and the v4 bundle dependency with the now-current evidence.
   Keep every profitability, quality and risk gate unchanged.
+
+### Latest 60-Minute Runtime And Training Recheck (2026-10-25 12:42 Asia/Shanghai)
+
+- A bounded online entry recovery through `2026-10-25T04:37:44Z` found
+  `138/138` market decisions as `hold`, with zero order attempts, positions or
+  fills. The recent funnel contained `47` `no_candidate` rows and `73`
+  shadow-training selections; every selected row had entry permission denied
+  because expected net return was not positive, observed loss probability was
+  too high, or quantitative evidence was missing.
+- The current local-ML paper permission remains false at authoritative
+  `n=267`: fee-after mean `-0.303832%`, lower bound `-0.431590%`, PF
+  `0.549713`. The running model remains `shadow`/`degraded` with influence
+  disabled. The four specialist child endpoints remain unavailable by
+  metadata contract, and all specialist promotion reports remain
+  `insufficient_authoritative_evidence`; no endpoint relabel or routing change
+  was made.
+- Current data capture is materially better but not yet accepted as a gate:
+  `119/120` recent decisions had valid availability contracts, with one
+  `index_price:fact_missing` row. Recent shadow settlement rows include
+  bounded overdue items across the 5/15/60/240-minute horizons; these are
+  observation/settlement latency findings, not permission to create trades or
+  to bypass cost gates.
+- A fresh authoritative trade-training eligibility audit at
+  `2026-10-25T04:42:43Z` inspected `200` paper outcomes and found
+  `trainable_count=0`; all `200` were excluded for
+  `feature_availability:feature_availability_contract_missing`. Their OKX
+  fee, slippage and funding facts are present and supervision is v4, but the
+  source feature snapshots predate the point-in-time availability contract.
+  No historical rows were backfilled or relabeled.
+- Paper-resume preflight at `2026-10-25T04:41:53Z` remains read-only and
+  blocked only by the already-active paper service and unavailable specialist
+  child endpoint contracts. Account equity, target model runtime, model tunnel,
+  dashboard and OKX integrity checks passed. No restart, order, protection or
+  risk-control change occurred.
+- This recheck does not change the gate decision: G0 passed; G1 passed as
+  negative attribution; G2 blocked; G3 has no qualified candidate; G4/G5 have
+  not started; G6 remains blocked. The remaining work is not a fixed number of
+  hours: first obtain a clean prospective v4 data boundary and a valid
+  cost-aware G3 candidate, then run a fresh independent G4 exam and governed
+  G5 paper round trip. Until those observations exist, claiming a profit date
+  would be fabricated.
