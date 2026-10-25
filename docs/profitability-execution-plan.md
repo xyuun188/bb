@@ -6568,3 +6568,37 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   the full timestamp has passed; then run it once with the registered
   decision and maturity cutoffs. This correction supersedes any wording that
   implies the cohort is already mature.
+
+### Preregistered Fresh Rules-Canary Development Window (2026-10-26 00:12 Asia/Shanghai)
+
+- To avoid an idle gap after the sealed G2 cohort audit, preregister one
+  subsequent, non-overlapping G3 development window now, before reading any
+  labels from it. Decision timestamps must fall in
+  `[2026-10-25T13:06:53Z, 2026-10-25T19:06:53Z)`; the lower bound is one
+  second after the G2 cohort cutoff. The exclusive label-maturity cutoff is
+  `2026-10-25T23:06:53Z` (2026-10-26 07:06:53 Asia/Shanghai), four hours
+  after the decision cutoff. Do not run before this full cutoff.
+- The candidate is exactly the existing fixed
+  `live_rules_canary_signal.v1` policy and primary five-minute native path.
+  Reuse its already registered six inputs, vote/consensus rules, chronological
+  decision-group folds purged by label end, and pre-existing criteria without
+  changes: each fold and aggregate must have at least 16 selected rows and
+  pass positive fee-after mean, positive research lower bound, and PF above
+  one in both all-opportunity and global non-overlap views. No feature,
+  threshold, side, horizon, sizing, cost, or exit search is permitted.
+- This batch is development-only and is conditional on the G2 mature-label
+  audit establishing valid point-in-time features, label identity/timing,
+  native executable path and complete cost provenance. If G2 fails or is
+  undersized, do not run the G3 outcome study on ineligible labels; keep the
+  policy/window sealed and collect a later valid cohort instead.
+- Fixed budget: maximum 1,200 decision groups, one read-only DB connection,
+  15-second statement timeout, 25% CPU, 1 GiB memory, 300-second runtime.
+  Only completed paper rows with native-path and fee-after contracts qualify.
+  No database writes, artifacts, permission changes, service restarts, or
+  orders. A failed batch closes this exact window; no retuning or rerun on
+  its inspected labels.
+- Current exact clock at preregistration was
+  `2026-10-25T16:11:56Z` (2026-10-26 00:11:56 Asia/Shanghai): the earlier
+  G2 maturity boundary at `2026-10-25T17:06:52Z` is still 54m56s away, and
+  this G3 window's maturity cutoff is still in the future. No new cohort
+  labels were queried for this preregistration.
