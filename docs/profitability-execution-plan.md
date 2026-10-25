@@ -6788,3 +6788,7 @@ on the mean. A favorable historical test is not a guarantee of future profit.
 - This is a continuation-control repair only. It does not read labels, change
   trading permissions, restart services, submit orders, or alter the
   profitability gates. G2 remains pending until the fixed maturity boundary.
+- The automation checkpoint is committed locally as `801ffa6`; the push
+  retry again failed on `github.com:443`, so `origin/main` remains
+  `d70f8a4`. Retry push when connectivity returns; do not rebuild or rerun
+  the sealed cohort.
