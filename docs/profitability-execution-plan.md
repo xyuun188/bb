@@ -5788,3 +5788,40 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   operational work is now bounded to the G2 boundary/reload and one genuinely
   positive fresh fee-after candidate. No profitability date can be promised
   without those results.
+
+### Isolated Account-Fee Recovery Runtime Verification (2026-10-25 15:15 Asia/Shanghai)
+
+- Rechecked the already-committed account-fee timeout repair from `0eff42f`.
+  The online app source matches local `services/trading_service.py`
+  (`source-integrity-ok:1`); no service restart occurred.
+- A bounded journald projection found two shared-executor account-fee
+  timeouts in the recent online window, at `2026-10-25T03:09:00.236254Z` and
+  `2026-10-25T06:39:51.021131Z`. No isolated-fallback success/failure event
+  followed either warning, consistent with the long-running paper process
+  predating the deployed fix.
+- Independently exercised the new fallback's underlying operation using a
+  one-shot `systemd-run` probe constrained to 10% CPU, 512 MiB and 30 seconds.
+  In paper mode, the read-only OKX account-fee request returned a positive fee
+  fact, fee source and receipt/source clocks; the executor was shut down in a
+  `finally` path. The probe emitted only booleans and did not expose fee
+  values, credentials, mutate state or submit orders.
+- Focused local verification passed: account-fee timeout/fail-closed tests
+  `2/2`; fee receipt/source-clock separation tests `2/2`; Ruff and
+  `git diff --check` passed. One initial test selector matched no test names;
+  it was corrected to `fee_receipt` and both parameterized cases passed.
+- The latest read-only preflight at `2026-10-25T07:12:52Z` still has two
+  blockers: the paper service is active (PID `2808899`) and the Phase-3
+  quant API has no registered model artifact, leaving all four child endpoint
+  contracts unavailable. Account truth, OKX integrity and the underlying
+  Phase-3 model server are healthy. Because the current entry service cannot
+  be stopped/restarted and then safely resumed through this blocked preflight,
+  the deployed fee-fallback and market-source repairs remain unverified in
+  the running trading process. Do not bypass the preflight or manufacture a
+  placeholder quant artifact.
+- Gate state is unchanged: G1 is negative attribution only; G2 source fixes
+  are staged/deployed but not runtime-loaded; G3 has no qualifying
+  fee-after candidate; G4/G5 have not started; G6 is blocked. The fee probe
+  verifies only a data-recovery path, not trade profitability or permission.
+  The next valid transition is a genuinely eligible quant candidate followed
+  by the governed stopped-before-start reload; until then paper entries remain
+  governed by the current negative economics and live trading stays disabled.
