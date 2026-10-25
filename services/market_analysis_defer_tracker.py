@@ -11,6 +11,7 @@ from typing import Any
 NormalizeSymbol = Callable[[Any], str]
 MAX_DEFER_ATTEMPTS_BEFORE_BLOCK = 8
 BLOCKED_RETRY_DELAY_SECONDS = 10 * 60
+TRANSIENT_FEATURE_RETRY_DELAY_SECONDS = 45
 BLOCKABLE_DEFER_REASONS = frozenset(
     {
         "feature_unavailable",
@@ -18,6 +19,9 @@ BLOCKABLE_DEFER_REASONS = frozenset(
         "model_timeout",
         "decision_persistence_failed",
     }
+)
+TRANSIENT_FEATURE_DEFER_REASONS = frozenset(
+    {"feature_unavailable", "fresh_feature_unavailable"}
 )
 
 
@@ -65,21 +69,41 @@ class MarketAnalysisDeferTracker:
         if not key:
             return
         observed_at = now or datetime.now(UTC)
+        normalized_reason = str(reason or "unspecified")
         previous = self.candidates.pop(key, None)
         if previous is None:
             previous = self.blocked_candidates.pop(key, None)
+        consecutive_defer_count = (
+            previous.consecutive_defer_count + 1
+            if previous is not None
+            and (
+                previous.reason == normalized_reason
+                or (
+                    previous.reason in TRANSIENT_FEATURE_DEFER_REASONS
+                    and normalized_reason in TRANSIENT_FEATURE_DEFER_REASONS
+                )
+            )
+            else 1
+        )
         candidate = MarketAnalysisDeferredCandidate(
             symbol=str(symbol),
-            reason=str(reason or "unspecified"),
+            reason=normalized_reason,
             defer_count=(previous.defer_count + 1 if previous is not None else 1),
-            consecutive_defer_count=(
-                previous.consecutive_defer_count + 1
-                if previous is not None and previous.reason == str(reason or "unspecified")
-                else 1
-            ),
+            consecutive_defer_count=consecutive_defer_count,
             first_deferred_at=(previous.first_deferred_at if previous is not None else observed_at),
             last_deferred_at=observed_at,
         )
+        if (
+            normalized_reason in TRANSIENT_FEATURE_DEFER_REASONS
+            and candidate.consecutive_defer_count >= 2
+        ):
+            # A failed feature refresh is not an entry veto, but retrying the
+            # same symbol every scheduler tick can monopolize the fetch pool.
+            # Keep the candidate in the queue and let the wider rotation work
+            # while the short, bounded retry window expires.
+            candidate.next_retry_at = observed_at + timedelta(
+                seconds=TRANSIENT_FEATURE_RETRY_DELAY_SECONDS
+            )
         if (
             candidate.reason in BLOCKABLE_DEFER_REASONS
             and candidate.consecutive_defer_count >= MAX_DEFER_ATTEMPTS_BEFORE_BLOCK
@@ -129,11 +153,12 @@ class MarketAnalysisDeferTracker:
         self,
         *,
         exclude_reasons: Iterable[str] = (),
+        now: datetime | None = None,
     ) -> list[str]:
         excluded = {str(reason or "").strip() for reason in exclude_reasons}
-        now = datetime.now(UTC)
+        observed_at = now or datetime.now(UTC)
         for key, candidate in list(self.blocked_candidates.items()):
-            if candidate.next_retry_at is None or now >= candidate.next_retry_at:
+            if candidate.next_retry_at is None or observed_at >= candidate.next_retry_at:
                 candidate.next_retry_at = None
                 self.candidates[key] = candidate
                 self.blocked_candidates.pop(key, None)
@@ -141,6 +166,10 @@ class MarketAnalysisDeferTracker:
             candidate.symbol
             for candidate in self.candidates.values()
             if candidate.reason not in excluded
+            and (
+                candidate.next_retry_at is None
+                or observed_at >= candidate.next_retry_at
+            )
         ]
 
     def snapshot(
@@ -156,6 +185,11 @@ class MarketAnalysisDeferTracker:
         blocked_reasons = Counter(
             candidate.reason for candidate in self.blocked_candidates.values()
         )
+        retry_waiting = [
+            candidate
+            for candidate in rows
+            if candidate.next_retry_at is not None and observed_at < candidate.next_retry_at
+        ]
         waits = [
             max((observed_at - candidate.first_deferred_at).total_seconds(), 0.0)
             for candidate in rows
@@ -188,6 +222,9 @@ class MarketAnalysisDeferTracker:
                 :50
             ],
             "blocked_retry_delay_seconds": BLOCKED_RETRY_DELAY_SECONDS,
+            "transient_feature_retry_delay_seconds": TRANSIENT_FEATURE_RETRY_DELAY_SECONDS,
+            "retry_waiting_count": len(retry_waiting),
+            "retry_waiting_symbols": [candidate.symbol for candidate in retry_waiting[:50]],
             "coverage_target_seconds": round(target_seconds, 3),
             "oldest_wait_seconds": round(max(waits, default=0.0), 3),
             "overdue_count": len(overdue),

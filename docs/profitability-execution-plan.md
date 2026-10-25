@@ -6820,3 +6820,63 @@ on the mean. A favorable historical test is not a guarantee of future profit.
 - The diagnosis is committed locally as `1321bb7`. A push retry failed with
   a GitHub connection reset; `origin/main` is still `d70f8a4`. Do not repeat
   the read-only runtime audit solely to retry synchronization.
+
+### Market Analysis Throughput Repair And Runtime Load (2026-10-26 02:40 Asia/Shanghai)
+
+- The bounded 15-minute online coverage check immediately before reload
+  showed the reported throughput defect in the running process: only `7`
+  completed market decisions across `5` symbols, a maximum inter-decision gap
+  of `505.409` seconds, and zero duplicate decisions within the fixed
+  `600`-second symbol cooldown. The service was not globally paused
+  (`mode=paper`, `paused=false`, `monitoring_active=true`); the queue had
+  `DOT/USDT` and `DNA/USDT` deferred for feature failures. There were no model
+  failures or entry signals in that window. This is a scheduler/feature-refresh
+  throughput issue, not evidence that opening permission should be restored.
+- Repaired the owned runtime path:
+  - `feature_unavailable` and `fresh_feature_unavailable` now share a bounded
+    `45`-second retry wait after repeated failures, so a single symbol cannot
+    monopolize the fetch pool or bypass the defer counter by changing failure
+    reason.
+  - Deferred retry selection skips only the waiting failed symbol and lets the
+    broader rotation continue; the existing `600`-second completed-symbol
+    cooldown remains unchanged.
+  - Analysis may retain a usable priced snapshot as explicit
+    `market_data_observation_only` when funding/native execution evidence is
+    incomplete. Final pre-order refresh, fee/funding/native quality, model,
+    cost and risk gates remain fail-closed and unchanged.
+- Local verification passed `378` affected trading/defer tests and `55`
+  market-quality/cost/profit/selection tests. Ruff, compileall and
+  `git diff --check` passed. Targeted upload of the four owned source/test
+  files returned `source-integrity-ok:4`; the same isolated remote suite
+  passed `378` tests under the `bb` user with a unique temporary directory.
+- After source verification, only `bb-paper-trading.service` was restarted to
+  load this observation-only throughput repair. At
+  `2026-10-25T18:40:12Z` it became active with `MainPID=2931509`,
+  `NRestarts=0`; persisted control remained `mode=paper`, `paused=false`.
+  No order, position, permission, leverage, protection or live-routing
+  change occurred. A post-reload coverage window is still required before
+  judging improvement.
+
+### Prospective Cohort Boundary Correction (2026-10-26 02:39 Asia/Shanghai)
+
+- The first attempted mature audit for the registered window
+  `[2026-10-25T13:06:53Z, 2026-10-25T19:06:53Z)` was safely refused before
+  reading any labels. At `2026-10-25T18:38:54.723026Z`, the bounded decision
+  projection found `382` exact in-window snapshots, not the previously
+  recorded `356`; the prior decision-only seal had therefore run before the
+  decision window closed. The report status is
+  `sealed_decision_cohort_mismatch`, with
+  `label_rows_queried=false`, `exam_labels_evaluated=false`, and no database,
+  permission, service or order mutation.
+- The earlier `356` fingerprint and maturity command are invalid as an
+  acceptance cohort and must not be reused. The correct next sequence is:
+  wait until the exclusive decision cutoff
+  `2026-10-25T19:06:53Z` (`2026-10-26 03:06:53 Asia/Shanghai`), run one
+  decision-only seal to obtain the final exact count/fingerprint, then wait
+  for its fixed maturity cutoff (decision cutoff plus four hours and the
+  registered 60-second source lag) before running one bounded four-horizon
+  native label/provenance audit. No G3 study or tuning is allowed on the
+  prematurely sealed rows.
+- G2 therefore remains **IN PROGRESS / not promotable**; G3-G6 remain
+  unpassed. The authoritative fee-after result is unchanged
+  (`n=267`, mean `-0.303832%`, lower bound `-0.431590%`, PF `0.549713`).

@@ -1295,13 +1295,13 @@ async def test_final_market_candidate_refresh_prefers_fresh_complete_local_sourc
         "allow_cached_indicator_build": True,
         "allow_indicator_background_refresh": False,
         "allow_derivatives_background_refresh": False,
-        "require_funding": True,
+        "require_funding": False,
         "prioritize_indicator_build": True,
     }
 
 
 @pytest.mark.asyncio
-async def test_final_market_candidate_refresh_defers_without_funding_evidence() -> None:
+async def test_final_market_candidate_refresh_keeps_price_observation_without_funding_evidence() -> None:
     service = TradingService.__new__(TradingService)
     calls: list[dict[str, Any]] = []
     incomplete = SimpleNamespace(current_price=100.0, close=100.0, bid=99.9, ask=100.1)
@@ -1314,9 +1314,11 @@ async def test_final_market_candidate_refresh_defers_without_funding_evidence() 
 
     result = await service._fresh_feature_vector_for_analysis("BTC/USDT")
 
-    assert result is None
-    assert len(calls) == 2
-    assert all(call["require_funding"] is True for call in calls)
+    assert result is incomplete
+    assert result.market_data_observation_only is True
+    assert result.market_data_observation_reasons == ["funding_evidence_unavailable"]
+    assert len(calls) == 1
+    assert calls[0]["require_funding"] is False
 
 
 @pytest.mark.asyncio
@@ -1351,8 +1353,8 @@ async def test_final_market_candidate_refresh_uses_remote_when_local_cache_is_in
     assert calls[1]["block_on_remote_indicators"] is True
     assert calls[1]["block_on_remote_derivatives"] is True
     assert calls[1]["allow_cached_indicator_build"] is False
-    assert calls[0]["require_funding"] is True
-    assert calls[1]["require_funding"] is True
+    assert calls[0]["require_funding"] is False
+    assert calls[1]["require_funding"] is False
     assert calls[1]["require_authoritative_snapshot"] is True
 
 
@@ -1411,8 +1413,8 @@ async def test_final_market_candidate_refresh_only_refreshes_native_sources_for_
     assert calls[1]["allow_cached_indicator_build"] is True
     assert calls[1]["allow_indicator_background_refresh"] is False
     assert calls[1]["allow_derivatives_background_refresh"] is False
-    assert calls[0]["require_funding"] is True
-    assert calls[1]["require_funding"] is True
+    assert calls[0]["require_funding"] is False
+    assert calls[1]["require_funding"] is False
     assert calls[1]["prioritize_native_market_data"] is True
     assert calls[1]["require_authoritative_snapshot"] is True
 

@@ -6042,7 +6042,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """
 
         def funding_ready(candidate: Any) -> bool:
-            """Final market analysis may not proceed on an optional funding stub."""
+            """Return whether the optional funding evidence is complete."""
 
             if candidate is None or getattr(candidate, "funding_data_available", False) is not True:
                 return False
@@ -6073,6 +6073,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     "recent_one_minute_price_path_incomplete",
                     "observed_price_outside_recent_native_path",
                     "executable_quote_sources_not_reconciled",
+                    "stale_market_fact",
                 )
             )
 
@@ -6085,28 +6086,52 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 if quality_policy is not None
                 else None
             )
-            if quality_issue is None:
-                return candidate, None
-            # Analysis and training may retain a priced snapshot as
-            # observation-only.  The strict EntryPriceGuard still calls the
-            # same policy at the execution boundary and will reject it there.
+            observation_blocker_callback = getattr(
+                quality_policy,
+                "observation_blocker",
+                None,
+            )
+            observation_blocker = (
+                observation_blocker_callback(candidate, stage_label="AI observation")
+                if callable(observation_blocker_callback)
+                else None
+            )
+            if observation_blocker is not None:
+                return None, quality_issue
+            # Market observation and executable entry deliberately have
+            # different contracts. A priced snapshot may be analyzed when
+            # funding or native execution provenance is incomplete, but it is
+            # explicitly observation-only and remains ineligible for training
+            # promotion or order submission. The final entry boundary still
+            # requires the complete fee/funding/native quote contract.
             try:
-                candidate.market_data_observation_only = True
-                candidate.market_data_observation_reasons = [
-                    str(getattr(quality_issue, "code", "market_data_quality"))
-                ]
-                issue_payload = (
-                    quality_issue.as_dict()
-                    if hasattr(quality_issue, "as_dict")
-                    else {"code": str(getattr(quality_issue, "code", "market_data_quality"))}
-                )
-                candidate.market_data_quality = issue_payload
-                candidate.training_quality_reason = (
-                    f"market_data_quality:{getattr(quality_issue, 'code', 'market_data_quality')}"
-                )
+                reasons: list[str] = []
+                if quality_issue is not None:
+                    quality_code = str(
+                        getattr(quality_issue, "code", "market_data_quality")
+                    )
+                    reasons.append(quality_code)
+                    issue_payload = (
+                        quality_issue.as_dict()
+                        if hasattr(quality_issue, "as_dict")
+                        else {"code": quality_code}
+                    )
+                    candidate.market_data_quality = issue_payload
+                if not funding_ready(candidate):
+                    reasons.append("funding_evidence_unavailable")
+                    candidate.funding_evidence_unavailable = True
+                if reasons:
+                    candidate.market_data_observation_only = True
+                    candidate.market_data_observation_reasons = list(dict.fromkeys(reasons))
+                    candidate.training_quality_reason = ";".join(
+                        f"market_data_quality:{reason}"
+                        if reason != "funding_evidence_unavailable"
+                        else reason
+                        for reason in candidate.market_data_observation_reasons
+                    )
             except (AttributeError, TypeError):
                 pass
-            if self._is_valid_feature_vector(candidate) and funding_ready(candidate):
+            if candidate is not None:
                 return candidate, quality_issue
             quality_details = getattr(quality_issue, "details", None)
             quality_details = quality_details if isinstance(quality_details, dict) else {}
@@ -6137,8 +6162,13 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 error=safe_error_text(exc),
             )
             fallback_candidate, fallback_quality_issue = None, None
+        quality_policy = getattr(self, "entry_market_data_quality", None)
         fallback_usable = bool(
-            fallback_candidate is not None and funding_ready(fallback_candidate)
+            fallback_candidate is not None
+            and (
+                quality_policy is not None
+                or funding_ready(fallback_candidate)
+            )
         )
         fallback_requires_native_path = native_path_refresh_required(
             fallback_quality_issue
@@ -6149,29 +6179,49 @@ class TradingService(ModelTrainingCoordinatorMixin):
         # budget waiting for mark/path reconciliation that the final order
         # boundary will perform again. This is the key separation between
         # observation throughput and executable-entry validation.
-        quality_policy = getattr(self, "entry_market_data_quality", None)
         if (
             fallback_usable
-            and fallback_quality_issue is not None
             and not fallback_requires_native_path
             and quality_policy is not None
         ):
-            if quality_policy.observation_blocker(
-                fallback_candidate,
-                stage_label="AI observation",
-            ) is None:
-                try:
-                    fallback_candidate.feature_refresh_fallback_used = True
-                    fallback_candidate.feature_refresh_fallback_reason = "observation_only_quality_issue"
-                except (AttributeError, TypeError):
-                    pass
-                logger.info(
-                    "using prewarmed snapshot for observation-only analysis",
-                    symbol=symbol,
-                    diagnostic_code=getattr(fallback_quality_issue, "code", "market_data_quality"),
-                    execution_refresh_required=True,
+            observation_blocker_callback = getattr(
+                quality_policy,
+                "observation_blocker",
+                None,
+            )
+            if callable(observation_blocker_callback) and (
+                observation_blocker_callback(
+                    fallback_candidate,
+                    stage_label="AI observation",
                 )
-                return fallback_candidate
+                is not None
+            ):
+                fallback_usable = False
+        if (
+            fallback_usable
+            and not fallback_requires_native_path
+            and quality_policy is not None
+        ):
+            try:
+                fallback_candidate.feature_refresh_fallback_used = True
+                fallback_candidate.feature_refresh_fallback_reason = (
+                    "observation_only_quality_issue"
+                    if fallback_quality_issue is not None
+                    else "observation_only_funding_gap"
+                )
+            except (AttributeError, TypeError):
+                pass
+            logger.info(
+                "using prewarmed snapshot for observation-only analysis",
+                symbol=symbol,
+                diagnostic_code=(
+                    getattr(fallback_quality_issue, "code", "funding_evidence_unavailable")
+                    if fallback_quality_issue is not None or not funding_ready(fallback_candidate)
+                    else None
+                ),
+                execution_refresh_required=True,
+            )
+            return fallback_candidate
 
         def use_fallback(reason: str) -> Any | None:
             if not fallback_usable:
@@ -6206,7 +6256,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     allow_cached_indicator_build=True,
                     allow_indicator_background_refresh=False,
                     allow_derivatives_background_refresh=False,
-                    require_funding=True,
+                    require_funding=False,
                     prioritize_indicator_build=True,
                 ),
                 timeout=MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS,
@@ -6218,7 +6268,6 @@ class TradingService(ModelTrainingCoordinatorMixin):
             local_requires_native_path = native_path_refresh_required(local_quality_issue)
             if (
                 cached is not None
-                and funding_ready(cached)
                 and not local_requires_native_path
             ):
                 return cached
@@ -6260,7 +6309,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     allow_cached_indicator_build=refresh_native_market_only,
                     allow_indicator_background_refresh=False,
                     allow_derivatives_background_refresh=False,
-                    require_funding=True,
+                    require_funding=False,
                     prioritize_indicator_build=True,
                     prioritize_native_market_data=True,
                     require_authoritative_snapshot=True,
@@ -6268,13 +6317,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 timeout=MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS,
             )
             fresh, _fresh_quality_issue = validated(fresh, source=refresh_source)
-            if fresh is not None and funding_ready(fresh):
-                return fresh
             if fresh is not None:
-                logger.warning(
-                    "fresh feature vector lacks complete funding evidence; deferring symbol",
-                    symbol=symbol,
-                )
+                return fresh
             logger.warning("fresh feature vector invalid; deferring symbol", symbol=symbol)
         except TimeoutError:
             logger.warning(

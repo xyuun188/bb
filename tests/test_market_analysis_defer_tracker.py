@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from services.market_analysis_defer_tracker import (
     BLOCKED_RETRY_DELAY_SECONDS,
+    TRANSIENT_FEATURE_RETRY_DELAY_SECONDS,
     MarketAnalysisDeferTracker,
 )
 
@@ -132,6 +133,26 @@ def test_changed_reason_resets_consecutive_block_counter() -> None:
     assert candidate.defer_count == 9
     assert candidate.consecutive_defer_count == 1
     assert candidate.reason == "feature_unavailable"
+
+
+def test_mixed_feature_failures_wait_before_retrying_the_same_symbol() -> None:
+    tracker = _tracker()
+    started_at = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+
+    tracker.defer("BTC/USDT", "feature_unavailable", now=started_at)
+    tracker.defer(
+        "BTC/USDT",
+        "fresh_feature_unavailable",
+        now=started_at + timedelta(seconds=1),
+    )
+
+    candidate = tracker.candidates["BTC/USDT"]
+    assert candidate.consecutive_defer_count == 2
+    assert candidate.next_retry_at == started_at + timedelta(
+        seconds=1 + TRANSIENT_FEATURE_RETRY_DELAY_SECONDS
+    )
+    assert tracker.ordered_symbols(now=started_at + timedelta(seconds=30)) == []
+    assert tracker.ordered_symbols(now=started_at + timedelta(seconds=46)) == ["BTC/USDT"]
 
 
 def test_blocked_candidate_reactivates_after_retry_window() -> None:
