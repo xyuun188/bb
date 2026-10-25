@@ -546,6 +546,16 @@ def test_required_market_contract_is_compacted_and_survives_optional_budget() ->
     assert assess_shadow_sample(sample).status == "included"
 
 
+def test_explicit_market_path_status_takes_precedence_over_nested_status() -> None:
+    contract = _large_native_market_fact_contract()
+    contract["path_status"] = "clean"
+    contract["price_path"]["status"] = "historical_ohlcv_only"
+
+    compacted = compact_market_fact_contract(contract)
+
+    assert compacted["path_status"] == "clean"
+
+
 def test_required_market_contract_does_not_change_frozen_input_fingerprint() -> None:
     features = _trainable_shadow_sample()["features"]
     original_fingerprint = features["feature_availability_contract"]["input_fingerprint"]

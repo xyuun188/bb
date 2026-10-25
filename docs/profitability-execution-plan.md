@@ -6430,3 +6430,33 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   Then use the guarded function activation workflow and audit only newly
   mature, provenance-complete labels. Keep G2-G6 unpassed where evidence is
   incomplete.
+
+### Nested Python Path-Status Precedence Follow-Up (2026-10-25 22:24 Asia/Shanghai)
+
+- Review of the generic nested-contract path found a sibling omission: Python's
+  `compact_market_fact_contract()` retained `price_path.status` only, while
+  PostgreSQL now follows SQL `COALESCE(source.path_status, path.status)`.
+  A nested source with an explicit top-level clean path and a nested
+  historical-only status could therefore still lose the verified path state
+  in the Python compactor.
+- Python now preserves explicit non-null `path_status`, falling back to the
+  nested path status only when the explicit field is absent/null. Added a
+  conflicting-status regression. This changes projection fidelity only; it
+  does not change historical/executable classification or eligibility rules.
+- Local focused verification now passes `39 passed, 1 skipped`; Ruff,
+  compileall, and `git diff --check` pass. PostgreSQL parity remains skipped
+  without a dedicated `BB_TEST_POSTGRES_URL`.
+- Targeted upload selected only `core/market_facts.py` and
+  `tests/test_feature_availability_compaction.py`, skipped service restart,
+  and returned `source-integrity-ok:2`. The remote historical-provenance,
+  required-contract-compaction, and new nested-status-precedence tests passed
+  `3 passed`; the new test used an isolated `/tmp/bb-path-status-20261025-2225`
+  pytest base directory. No database or account state was accessed.
+- Next: commit/push the bounded code, test, and this checkpoint, then sync
+  this durable result to `bb`. Do not retry database activation or ad hoc
+  parity against the runtime database.
+- No new labels were audited: the last sealed decisions were at
+  `2026-10-25T13:06:52Z`; at this checkpoint only about 78 minutes have
+  elapsed, below the 240-minute maximum horizon. Revisit the maturity audit
+  no earlier than `2026-10-25T17:06:52Z`, and only with a bounded native
+  settlement/provenance query. Economic and promotion gates remain unchanged.

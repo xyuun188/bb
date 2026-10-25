@@ -1111,6 +1111,9 @@ def compact_market_fact_contract(contract: Mapping[str, Any] | None) -> dict[str
     entry_identity = _dict(entry.get("native_identity"))
     result_identity = _dict(result.get("native_identity"))
     path = _dict(value.get("price_path"))
+    path_status = value.get("path_status")
+    if path_status is None:
+        path_status = path.get("status")
     reasons = [_text(item)[:160] for item in value.get("violation_reasons") or [] if _text(item)]
     return {
         "version": value.get("version"),
@@ -1154,7 +1157,7 @@ def compact_market_fact_contract(contract: Mapping[str, Any] | None) -> dict[str
         "result_inst_id": result_identity.get("inst_id"),
         "entry_contract_spec_version": entry_identity.get("contract_spec_version"),
         "result_contract_spec_version": result_identity.get("contract_spec_version"),
-        "path_status": path.get("status"),
+        "path_status": path_status,
         "path_fingerprint": path.get("path_fingerprint"),
     }
 
