@@ -10,7 +10,7 @@ import secrets
 import shlex
 import sys
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +29,8 @@ DEPENDENCIES = (
     "services/ml_training_dataset.py",
     "services/training_data_quality.py",
 )
+MAX_HORIZON_MINUTES = 240
+MAX_SOURCE_LAG_SECONDS = 60
 
 REMOTE_SCRIPT = r"""
 import asyncio
@@ -54,6 +56,8 @@ from services.rules_canary_development import (
 
 LIMIT = __LIMIT__
 HOURS = __HOURS__
+MAX_HORIZON_MINUTES = 240
+MAX_SOURCE_LAG_SECONDS = 60
 DECISION_CUTOFF = datetime.fromisoformat(
     __DECISION_CUTOFF__.replace("Z", "+00:00")
 ).astimezone(UTC)
@@ -79,6 +83,7 @@ async def main():
     )
     filters = (
         ShadowBacktest.execution_mode == "paper",
+        ShadowBacktest.analysis_type == "market",
         ShadowBacktest.status == "completed",
         ShadowBacktest.updated_at >= since,
         ShadowBacktest.updated_at < MATURITY_CUTOFF,
@@ -95,7 +100,7 @@ async def main():
         .where(*filters)
         .group_by(group_key)
         .order_by(func.max(ShadowBacktest.created_at), group_key)
-        .limit(LIMIT)
+        .limit(LIMIT + 1)
         .subquery()
     )
     statement = (
@@ -113,6 +118,48 @@ async def main():
                 shadow_training_row_from_mapping(row)
                 for row in result.mappings()
             ]
+        decision_group_count = len(
+            {
+                int(row.decision_id)
+                if int(row.decision_id or 0) > 0
+                else -int(row.id)
+                for row in rows
+            }
+        )
+        if decision_group_count > LIMIT:
+            report = {
+                "experiment": "bounded-native-fee-after-fixed-rules-canary-development",
+                "status": "insufficient_development_data",
+                "reason": "decision_group_limit_saturated",
+                "diagnostic_only": True,
+                "decision_group_count": decision_group_count,
+                "decision_group_limit": LIMIT,
+                "source_row_count": len(rows),
+                "training_frame_row_count": 0,
+                "window": {
+                    "decision_cutoff_exclusive": DECISION_CUTOFF.isoformat(),
+                    "maturity_cutoff_exclusive": MATURITY_CUTOFF.isoformat(),
+                    "hours": HOURS,
+                    "source": NATIVE_SOURCE,
+                    "maturity_guard": {
+                        "minimum_maturity_cutoff": (
+                            DECISION_CUTOFF
+                            + timedelta(
+                                minutes=MAX_HORIZON_MINUTES,
+                                seconds=MAX_SOURCE_LAG_SECONDS,
+                            )
+                        ).isoformat(),
+                    },
+                },
+                "input": {
+                    "dependency_sha256": dependency_hashes(),
+                },
+                "database_mutated": False,
+                "orders_submitted": False,
+                "promotion_authorized": False,
+            }
+            print(json.dumps(report, ensure_ascii=False, allow_nan=False, default=str))
+            return
         frame = build_training_frame(rows)
         frame, decision_window = filter_rules_canary_decision_window(
             frame,
@@ -139,6 +186,8 @@ async def main():
                     "maturity_cutoff_exclusive": MATURITY_CUTOFF.isoformat(),
                     "hours": HOURS,
                     "decision_group_limit": LIMIT,
+                    "decision_group_count": decision_group_count,
+                    "decision_group_limit_saturated": False,
                     "source": NATIVE_SOURCE,
                     "filter": (
                         "completed paper labels with fee_after_complete=true; "
@@ -150,6 +199,15 @@ async def main():
                         "training_feature_snapshot.original_decision_timestamp"
                     ),
                     "maturity_timestamp_source": "shadow_backtests.updated_at",
+                    "maturity_guard": {
+                        "minimum_maturity_cutoff": (
+                            DECISION_CUTOFF
+                            + timedelta(
+                                minutes=MAX_HORIZON_MINUTES,
+                                seconds=MAX_SOURCE_LAG_SECONDS,
+                            )
+                        ).isoformat(),
+                    },
                 },
                 "input": {
                     "source_row_count": len(rows),
@@ -175,6 +233,13 @@ def _parse_cutoff(value: str) -> datetime:
     if cutoff.tzinfo is None:
         raise ValueError("--cutoff must include a timezone")
     return cutoff.astimezone(UTC)
+
+
+def _minimum_maturity_cutoff(cutoff: datetime) -> datetime:
+    return cutoff + timedelta(
+        minutes=MAX_HORIZON_MINUTES,
+        seconds=MAX_SOURCE_LAG_SECONDS,
+    )
 
 
 def _render_remote_script(
@@ -266,6 +331,10 @@ def main() -> None:
     )
     if maturity_cutoff < cutoff:
         parser.error("--maturity-cutoff must be at or after --cutoff")
+    if maturity_cutoff < _minimum_maturity_cutoff(cutoff):
+        parser.error(
+            "--maturity-cutoff must include the maximum horizon and 60-second source lag"
+        )
     decision_stamp = cutoff.strftime("%Y%m%dT%H%M%SZ")
     maturity_stamp = maturity_cutoff.strftime("%Y%m%dT%H%M%SZ")
     unit = f"bb-rules-canary-development-d{decision_stamp}-m{maturity_stamp}"

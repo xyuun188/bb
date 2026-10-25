@@ -6709,3 +6709,21 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   2026-10-25T19:06:53Z)` after its maturity boundary
   `2026-10-25T23:07:53Z` (2026-10-26 07:07:53 Asia/Shanghai). G3-G6 remain
   unpassed; existing fee-after evidence remains negative.
+
+### G3 Runner Boundary And Saturation Repair (2026-10-26 01:25 Asia/Shanghai)
+
+- Before the next prospective window matured, reviewed the fixed rules-canary
+  runner and found three fail-open reporting risks: it did not constrain rows
+  to `analysis_type=market`, a `LIMIT`-sized group query could silently
+  truncate the development population, and the CLI accepted a maturity
+  cutoff earlier than the maximum 240-minute horizon plus 60-second source
+  lag.
+- The runner now filters market analysis explicitly, requests one sentinel
+  group beyond the registered limit and returns
+  `decision_group_limit_saturated` without evaluating a truncated sample.
+  It also enforces the maturity boundary and emits the minimum cutoff in the
+  report.
+- Local verification: `8` focused tests passed; Ruff, compileall and
+  `git diff --check` passed. Targeted online sync and isolated remote tests
+  are next; no service restart, order, permission, database mutation, or
+  new-window label read occurred.
