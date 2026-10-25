@@ -1381,7 +1381,8 @@ def test_local_ai_candidate_activation_is_atomic_and_rollbackable(tmp_path: Path
 
     assert second["version"] == second_candidate["version"]
     assert second["activation_manifest"]["execution_scope"] == "paper_only"
-    assert second["activation_manifest"]["paper_execution_permission"] is True
+    assert second["activation_manifest"]["paper_execution_permission"] is False
+    assert second["activation_manifest"]["observation_only"] is True
     assert second["activation_manifest"]["production_permission"] is False
     module._BUNDLE_CACHE = None
     module._CURRENT_POINTER_MTIME_NS = None
@@ -1466,6 +1467,8 @@ def test_local_ai_registry_rejects_live_activation_without_return_readiness(
             "live_ml_ready": True,
             "return_evidence_ready": True,
             "execution_scope": "production",
+            "paper_execution_permission": True,
+            "observation_only": False,
             "production_permission": True,
             "promotion_recommendation": {
                 "recommended_stage": "active",
@@ -1522,6 +1525,8 @@ def test_local_ai_registry_activates_governed_paper_canary(
     assert activation["production_permission"] is False
     assert activation["live_ml_ready"] is False
     assert activation["canary_authorized"] is True
+    assert activation["paper_execution_permission"] is True
+    assert activation["observation_only"] is False
     assert activation["return_evidence_ready"] is False
 
 
@@ -1560,7 +1565,56 @@ def test_local_ai_registry_activates_active_only_with_complete_evidence(
     assert activation["execution_scope"] == "production"
     assert activation["production_permission"] is True
     assert activation["live_ml_ready"] is True
+    assert activation["paper_execution_permission"] is True
+    assert activation["observation_only"] is False
     assert activation["return_evidence_ready"] is True
+
+    activation_path = current["version_root"] / "activation-active.json"
+    legacy_activation = module.read_json_object(activation_path)
+    legacy_activation["activation_manifest_version"] = (
+        module.LEGACY_ARTIFACT_ACTIVATION_MANIFEST_VERSION
+    )
+    legacy_activation.pop("observation_only")
+    module.write_json_atomic(activation_path, legacy_activation)
+    pointer = module.read_json_object(module.CURRENT_POINTER_PATH)
+    pointer["activation_manifest_sha256"] = module.sha256_file(activation_path)
+    module.write_json_atomic(module.CURRENT_POINTER_PATH, pointer)
+
+    assert (
+        module._resolve_artifact_pointer(
+            module.CURRENT_POINTER_PATH,
+            role="current",
+        )["activation_manifest"]["activation_manifest_version"]
+        == module.LEGACY_ARTIFACT_ACTIVATION_MANIFEST_VERSION
+    )
+
+
+def test_local_ai_registry_rejects_legacy_shadow_permission_contract(
+    tmp_path: Path,
+) -> None:
+    module = ModuleType("local_ai_tools_api_legacy_shadow_permission_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    current = _persist_test_shadow_artifact(module, tmp_path)
+    activation_path = current["version_root"] / "activation-shadow.json"
+    legacy_activation = module.read_json_object(activation_path)
+    legacy_activation["activation_manifest_version"] = (
+        module.LEGACY_ARTIFACT_ACTIVATION_MANIFEST_VERSION
+    )
+    legacy_activation["paper_execution_permission"] = True
+    legacy_activation.pop("observation_only")
+    module.write_json_atomic(activation_path, legacy_activation)
+    pointer = module.read_json_object(module.CURRENT_POINTER_PATH)
+    pointer["activation_manifest_sha256"] = module.sha256_file(activation_path)
+    module.write_json_atomic(module.CURRENT_POINTER_PATH, pointer)
+
+    with pytest.raises(
+        module.IncompatibleArtifactContractError,
+        match="Legacy shadow activation grants paper execution permission",
+    ):
+        module._resolve_artifact_pointer(
+            module.CURRENT_POINTER_PATH,
+            role="current",
+        )
 
 
 def test_local_ai_registry_rejects_regressive_active_challenger(
@@ -1724,12 +1778,13 @@ def test_local_ai_registry_replaces_incompatible_activation_permission_contract(
     module = ModuleType("local_ai_tools_api_activation_contract_migration_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
     current = _persist_test_shadow_artifact(module, tmp_path)
-    assert current["activation_manifest"]["paper_execution_permission"] is True
+    assert current["activation_manifest"]["paper_execution_permission"] is False
+    assert current["activation_manifest"]["observation_only"] is True
 
     monkeypatch.setattr(
         module,
         "ARTIFACT_ACTIVATION_MANIFEST_VERSION",
-        "2026-07-27.next-permission-contract.v5",
+        "2026-10-25.next-permission-contract.v6",
     )
     replacement, reason = module._replaceable_current_artifact()
 
@@ -3479,7 +3534,8 @@ def test_local_ai_tools_generated_service_confirmed_rebuild_persists_metadata(
     assert metadata["evaluation_report_hashes"] == module._evaluation_report_hashes(metadata)
     assert current["activation_manifest"]["activation_stage"] == "shadow"
     assert current["activation_manifest"]["execution_scope"] == "paper_only"
-    assert current["activation_manifest"]["paper_execution_permission"] is True
+    assert current["activation_manifest"]["paper_execution_permission"] is False
+    assert current["activation_manifest"]["observation_only"] is True
     assert current["activation_manifest"]["live_ml_ready"] is False
     activation_evidence = current["activation_manifest"]["return_evidence_report"]
     assert set(module.EVALUATION_REPORT_FIELDS).issubset(activation_evidence)

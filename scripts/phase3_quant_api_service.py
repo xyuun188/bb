@@ -48,6 +48,9 @@ MODEL_DIR = Path(
 )
 ARTIFACT_REGISTRY_VERSION = "2026-07-24.local-ai-tools.v3"
 ARTIFACT_ACTIVATION_MANIFEST_VERSION = (
+    "2026-10-25.shadow-observation-permission.v5"
+)
+LEGACY_ARTIFACT_ACTIVATION_MANIFEST_VERSION = (
     "2026-07-27.paper-live-permission-activation.v4"
 )
 ARTIFACT_MODEL_ID = "local_ai_tools_quant_bundle"
@@ -1699,10 +1702,11 @@ def _resolve_artifact_pointer(
         ):
             raise ValueError("Local AI activation manifest hash verification failed.")
         activation = read_json_object(activation_path)
-        if (
-            activation.get("activation_manifest_version")
-            != ARTIFACT_ACTIVATION_MANIFEST_VERSION
-        ):
+        activation_version = activation.get("activation_manifest_version")
+        if activation_version not in {
+            ARTIFACT_ACTIVATION_MANIFEST_VERSION,
+            LEGACY_ARTIFACT_ACTIVATION_MANIFEST_VERSION,
+        }:
             raise IncompatibleArtifactContractError(
                 "Local AI activation belongs to an incompatible permission contract."
             )
@@ -1726,6 +1730,35 @@ def _resolve_artifact_pointer(
         production_authorized = activation.get("live_ml_ready") is True
         if stage in {"shadow", "canary"} and production_authorized:
             raise ValueError("Observation-only local AI artifact has production authorization.")
+        expected_paper_permission = stage != "shadow"
+        if (
+            activation_version == ARTIFACT_ACTIVATION_MANIFEST_VERSION
+            and activation.get("paper_execution_permission") is not expected_paper_permission
+        ):
+            raise ValueError(
+                "Local AI activation paper permission does not match its stage."
+            )
+        if activation_version == ARTIFACT_ACTIVATION_MANIFEST_VERSION and (
+            activation.get("observation_only") is not (stage == "shadow")
+        ):
+            raise ValueError(
+                "Local AI activation observation-only flag does not match its stage."
+            )
+        if (
+            activation_version == LEGACY_ARTIFACT_ACTIVATION_MANIFEST_VERSION
+            and stage == "shadow"
+        ):
+            raise IncompatibleArtifactContractError(
+                "Legacy shadow activation grants paper execution permission."
+            )
+        if (
+            activation_version == LEGACY_ARTIFACT_ACTIVATION_MANIFEST_VERSION
+            and "observation_only" in activation
+            and activation.get("observation_only") is not (stage == "shadow")
+        ):
+            raise ValueError(
+                "Legacy local AI activation observation-only flag does not match its stage."
+            )
         if stage == "canary":
             recommendation = activation.get("promotion_recommendation") or {}
             if (
@@ -2097,7 +2130,9 @@ def _local_activation_manifest(
             if activation_stage == "active"
             else "paper_only"
         ),
-        "paper_execution_permission": True,
+        # Shadow is observation-only and must never advertise order capability.
+        "paper_execution_permission": activation_stage != "shadow",
+        "observation_only": activation_stage == "shadow",
         "production_permission": production_authorized,
         "canary_authorized": activation_stage == "canary",
         "promotion_recommendation": promotion_recommendation,

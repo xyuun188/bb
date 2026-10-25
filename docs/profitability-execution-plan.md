@@ -69,7 +69,7 @@ or trade frequency to manufacture success.
 | --- | --- | --- | --- |
 | G0 Recovery and execution safety | PASSED | Active goal, this checkpoint, same-chat scheduled continuation | Saved automation inspected and app view verified on 2026-10-22 |
 | G1 Authoritative loss attribution | PASSED | Fixed-cutoff canonical lifecycle and complete official-bill audit; evidence below | Separate full round trips, partial updates and window cash flow; reconcile price PnL, signed fees and funding without double counting; expose unresolved links and costs |
-| G2 Data and label validity | BLOCKED (latest decision streak 26/30 across 26 symbols; loaded-source/preflight pending) | Eligibility, timing, cost and provenance report plus defect regressions | No future-data leakage or split-group overlap; correct price/label horizon and source identity; missing or contradictory facts quarantined, not imputed into profitability |
+| G2 Data and label validity | IN PROGRESS (numeric feature boundary passed; label maturity/source audit pending) | Eligibility, timing, cost and provenance report plus defect regressions | No future-data leakage or split-group overlap; correct price/label horizon and source identity; missing or contradictory facts quarantined, not imputed into profitability |
 | G3 Cost-aware candidate development | NOT PASSED | Preregistered bounded experiment ledger and purged chronological comparisons; completed candidates rejected | Candidate family/features/horizon/threshold/exits selected only within development folds; compare no-trade and transparent baselines on identical costs and exposure |
 | G4 Frozen independent evaluation | NOT STARTED | No qualifying candidate to freeze; no untouched exam opened | Predefined sample coverage, time/dependence-aware lower bound above zero, positive net mean, PF above one, predefined drawdown/tail limits, and cost stress tests pass; no post-exam tuning |
 | G5 Governed paper execution | NOT STARTED | No G3/G4-approved policy or governed profitable paper round trip | Prior gates passed; frozen risk budget; no unlinked fills/unprotected exposure; observed fee-after results and forecast calibration meet preregistered criteria |
@@ -6266,3 +6266,100 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   shadow-only candidate semantics are resolved with tests. G3 development
   remains blocked pending a preregistered fresh mature-label batch; G4-G6
   remain not passed.
+
+### Artifact-Wait Status Repair Deployed (2026-10-25 21:04 Asia/Shanghai)
+
+- Finished the in-progress artifact-wait presentation and observation-start
+  changes in commit `3c09e21` (`Keep artifact wait fail-closed and observable`),
+  pushed to `origin/main`. The change distinguishes a reachable Phase-3 service
+  with no compatible model bundle from a service outage or model-identity
+  failure across the client, runtime monitor, model registry, system-audit
+  issue ledger, and dashboard. The issue is classified as observing only when
+  all four required child contracts explicitly report
+  `artifact_unavailable/model_bundle_unavailable`; other blockers remain
+  unresolved.
+- The dedicated observation-only start path requires a separate confirmation,
+  accepts only that single verified artifact blocker, persists `paused=true`
+  before starting, and reports `submits_orders=false`. Normal paper resume
+  still requires the original full preflight. No quality, profitability,
+  position-protection, or live-routing gate was weakened.
+- Focused verification passed: 17 start-entrypoint tests, 199 client/registry/
+  runtime-monitor/system-audit tests, and 99 Phase-3 artifact-service tests
+  (315 total); Ruff, compileall, and `git diff --check` passed.
+- Targeted source sync selected 13 owned runtime/test paths, uploaded no
+  changed bytes, and returned `source-integrity-ok:12`. Dashboard alone was
+  restarted to load the Python monitoring changes. At `2026-10-25 21:04
+  Asia/Shanghai`, the Dashboard was active and returned HTTP 200; the paper
+  trading service remained active with its prior PID `2904397`. No trading
+  service restart, account-control change, order, fill, or position action
+  occurred.
+- This fixes status classification and the fail-closed observation lifecycle;
+  it does not fix the economic no-entry condition or establish profitability.
+  The authoritative fee-after result remains negative at `n=267`, mean
+  `-0.303832%`, lower bound `-0.431590%`, PF `0.549713`. The last feature
+  checkpoint remains 14/30 clean decisions across 14/20 symbols; G2-G6 are
+  still pending/not passed.
+- Next action: allow the already-running observer to accumulate genuinely new
+  decisions, then run one bounded frozen-feature projection to close or reset
+  the preregistered G2 boundary. Continue investigating the real Phase-3
+  artifact producer contract without persisting a placeholder, inventing
+  execution costs, or granting paper-entry permission. Start G3 only with a
+  preregistered fresh mature-label window; keep live trading inactive.
+
+### G2 Feature Boundary Passed (2026-10-25 21:06 Asia/Shanghai)
+
+- One bounded read-only projection over the latest 30 minutes completed at
+  `2026-10-25T13:06:52Z`: 42/42 market decision snapshots passed the sealed
+  feature-availability contract, covering 22 distinct symbols. The newest
+  valid streak is 42 across 22 symbols, exceeding the preregistered 30/20
+  numeric boundary. All 42 had the expected contract version, freeze and
+  original-decision timestamps; no seal errors, availability failures, or
+  oversized payloads were found. Maximum payload was `94,788 B` against the
+  `98,304 B` limit.
+- This closes only G2's numeric prospective feature boundary. It does not
+  validate matured-label provenance, horizon alignment, purging, cost
+  evidence, or profitability; no outcomes were read by this projection.
+- The entry state remains non-trading by design: the observer account remains
+  paused, the compatible Phase-3 bundle remains unavailable, and authoritative
+  fee-after profitability evidence remains negative (`n=267`, mean
+  `-0.303832%`, lower bound `-0.431590%`, PF `0.549713`). Do not resume paper
+  entries or call this boundary a strategy pass.
+- Next action: audit only the mature labels linked to the newly sealed
+  decision groups for source identity, decision/label clock ordering, horizon,
+  split-group isolation, and native-price/cost provenance. Do not use these
+  G2 diagnostics to tune a candidate. Register a separate untouched G3
+  development window and numerical sample/cost/resource rules before reading
+  its outcomes. Keep G3-G6 not passed and live trading inactive.
+
+### G2 Mature-Label Eligibility Check (2026-10-25 21:10 Asia/Shanghai)
+
+- A bounded paper-outcome eligibility audit completed at
+  `2026-10-25T13:10:44Z` over the latest 500 authoritative outcomes. OKX
+  native fee, slippage, and funding facts were present for all 500, and all
+  rows used supervision contract
+  `2026-10-22.separated-profit-component-availability.v4`.
+- `trainable_count=0`: all 500 were excluded for the single reason
+  `feature_availability:feature_availability_contract_missing`. The feature
+  contract version was missing in every historical outcome, so these rows
+  cannot be resealed or retrofitted into the new point-in-time contract.
+  This confirms the current blocker is historical feature lineage, not
+  missing OKX cost data. No rows were relabeled, imputed, or used for G3.
+- The newly sealed 42 decision snapshots are prospective observations, not
+  yet mature outcomes; they must accrue their full native horizon and
+  settlement facts before a separate label audit can admit them.
+- Fixed a related permission-contract defect in the Phase-3 producer:
+  activation manifest `2026-10-25.shadow-observation-permission.v5` now writes
+  `paper_execution_permission=false` and `observation_only=true` for shadow,
+  while canary/active keep their governed permissions. The loader rejects
+  stage/permission mismatches and explicitly rejects legacy v4 shadow manifests
+  that advertised paper execution. This is a fail-closed semantics fix, not
+  a trading authorization.
+- Focused tests passed: the Phase-3 artifact suite passed `100` tests; the
+  combined affected suites passed `316` tests. Ruff, compileall, and
+  `git diff --check` passed. Targeted online sync uploaded only the service
+  module and its test, verified as `source-integrity-ok:2`, and skipped every
+  service restart. The running quant API has not loaded this new contract yet.
+- Next action: wait for the 42 prospective decisions to mature, then run one
+  bounded native-label/provenance audit. In parallel, keep G3 blocked until a
+  newly registered development window has enough clean, mature, cost-aware
+  labels; do not backfill old rows or manufacture paper fills.
