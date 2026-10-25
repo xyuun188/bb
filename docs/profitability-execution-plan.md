@@ -4643,3 +4643,179 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   rows have a seal in `AIDecision` but lose it during projection, fix that
   deterministic transport defect with focused tests. Do not create orders or
   start/restart the active service to obtain test data.
+
+### Recent Trade Lineage And New-Snapshot Capture Check (2026-10-25 07:24 Asia/Shanghai)
+
+- A follow-up bounded read-only join checked exactly the 12 newest
+  authoritative paper trade `decision_id`s from the preceding outcome query.
+  All 12 source `AIDecision` rows were found. Their creation times run from
+  `2026-10-21T11:49:01Z` through `2026-10-21T16:02:56Z`; all 12 have no
+  availability contract, freeze timestamp, or original decision timestamp.
+  This confirms these are pre-capture historical trades, not evidence that a
+  post-capture trade snapshot loses its seal in the authoritative projection.
+  No backfill or mutation was performed. This check supersedes the uncertainty
+  about whether the 500-row exclusion sample was caused by contract loss in
+  the current code path.
+- A separate read-only 240-minute frozen-feature audit inspected the newest
+  64 market decisions and 64 shadow-training snapshots. Every decision row
+  had the v1 availability contract, freeze timestamp, and original decision
+  timestamp; 57/64 passed point-in-time checks and 7/64 were quarantined:
+  five for missing account-fee receipt/availability and two for missing or
+  ambiguous index-price facts/clocks. Decision frozen payloads stayed under
+  the 96 KiB limit.
+- Among the 64 shadow-training rows, 40 passed and 24 failed availability
+  checks. This is row-level coverage, not 64 independent decision groups.
+  The latest clean decision streak was still only four rows when the audit
+  completed. Therefore the new capture contract is being written, but
+  completeness and clean streak coverage are not yet stable enough to claim
+  a fully verified post-fix pipeline.
+- Current direct entry status remains unchanged: 120/120 recent decisions were
+  `hold`, with no granted entry permissions or exchange rejections; 76 had no
+  candidate and 44 were shadow-training selections only. The direct ML
+  profitability gate is still false on negative authoritative evidence. The
+  3,582-row fixed-tree development experiment remains a negative result
+  (`0/3` outer policies).
+- Refined next action: first identify why one market-analysis batch lacks the
+  account-fee receipt and why two snapshots lack usable index-price clocks;
+  repair only reproducible source capture defects, then observe a longer fresh
+  clean streak and verify native executable-path contracts. Do not change
+  quality thresholds to accept missing clocks. Only after G2 evidence and a
+  separately preregistered G3 policy qualifies may G4 use an untouched exam.
+  There is still no profitable candidate to freeze, no exam, and no governed
+  paper profitability acceptance.
+
+### Preregistered Third G3 Candidate Family: Fixed Histogram Gradient Boosting
+
+- Development-only identity:
+  `native-fee-after-hgb-v1-20261024T233000Z-48h-2500`, with exclusive UTC
+  cutoff `2026-10-24T23:30:00Z`, a 48-hour lookback, and at most 2,500
+  decision groups. This family is preregistered before its labels are read and
+  is not a retune of the rejected Ridge or random-forest families.
+- The fixed estimator is
+  `HistGradientBoostingRegressor(max_iter=160, learning_rate=0.05,
+  max_leaf_nodes=15, min_samples_leaf=24, l2_regularization=1.0,
+  early_stopping=False, random_state=42)`, with median imputation and the
+  existing feature-key set only. The only entry thresholds are `0`, `0.05%`,
+  and `0.1%` net.
+- It uses the same primary five-minute label, three chronological purged outer
+  folds, two chronological purged inner folds, decision-group separation,
+  240-minute label-end purge, minimum 16 selections, positive fee-after mean
+  and lower bound, PF above one, and positive mean in both inner folds.
+  No exam labels, model artifact, permission change, database mutation, order,
+  or service restart is permitted. A failed result must remain rejected.
+- Recovery checkpoint at 2026-10-25 07:39 Asia/Shanghai: the fixed HGB
+  estimator module existed locally but the shared online nested-development
+  audit did not yet expose it as a selectable family, so the preregistered run
+  could not be launched. Added the HGB dependency hash, explicit `--family hgb`
+  dispatch, and isolated family coverage tests. Local focused verification:
+  12 tests passed across HGB, remote audit and fixed-tree suites; Ruff,
+  compileall and `git diff --check` passed.
+- Exact next operation: upload only
+  `services/ml_nested_development_hgb.py`,
+  `scripts/audit_online_nested_current_development.py`,
+  `tests/test_ml_nested_development_hgb.py`, and
+  `tests/test_audit_online_nested_current_development.py` with
+  `--skip-restart`; verify hashes and run the bounded remote focused tests.
+  Then run
+  `scripts/audit_online_nested_current_development.py --family hgb --revision v1 --limit 2500 --hours 48 --cutoff 2026-10-24T23:30:00Z`.
+  The report path is
+  `data/profitability_remediation/online-nested-development-hgb-v1-20261024T233000Z.json`.
+  Resource limits are one read-only DB connection, 15-second statement
+  timeout, 25% CPU, 1 GiB memory and 300 seconds. Recovery is to inspect the
+  named remote unit/report before any retry. The operation reads development
+  labels only and must not restart services, persist an artifact, change
+  permissions or submit orders.
+
+### Fixed HGB Development Result (2026-10-25 07:54 Asia/Shanghai)
+
+- The preregistered HGB run completed at `2026-10-24T23:53:46Z` using the
+  exact `[2026-10-22T23:30:00Z, 2026-10-24T23:30:00Z)` window. It read
+  3,815 native executable, fee-after-complete rows across 2,028 decision
+  groups; the primary five-minute horizon had 951 rows. All three outer and
+  six inner chronological purged folds were estimable with ready coverage.
+- Development input fingerprint:
+  `9603873eb2752a6c8dda1349f4ffd3528d0eddc71a31c1312156f3163a535df6`.
+  Source frame fingerprint:
+  `616c41582e4d119f33e9940e0563989be9f3e998530d2b300c7a32c79ba1656a`.
+  The complete bounded report is
+  `data/profitability_remediation/online-nested-development-hgb-v1-20261024T233000Z.json`.
+- The fixed family selected 0 policies in 3 outer folds. Every outer-fold
+  inner selection reason was `no_inner_policy_qualified`; all three tested
+  thresholds failed in all folds. Representative inner fee-after means were
+  -0.06263% to -0.14599%, lower bounds -0.15206% to -0.21388%, and profit
+  factors 0.1941 to 0.5976. The selected gross edge was generally only about
+  0.00%-0.07% against roughly 0.126%-0.136% measured execution cost.
+- Safety fields confirm no exam labels evaluated, no artifact persisted, no
+  DB mutation, no promotion, no order, and no runtime policy change. Remote
+  focused tests passed 10; the paper/dashboard services were not restarted.
+  The research code-path gap found during this work (HGB omitted from the
+  remote dependency fingerprint) was fixed and reverified before accepting
+  the report.
+- Result: this is a completed negative G3 development experiment, not a
+  profitability or trade authorization. G3 remains **NOT PASSED**; G4 has
+  no candidate/exam, G5 has no governed profitable paper round trip, and G6
+  remains pending. Do not retune on this inspected window.
+- Next exact action resumes the earlier G2 checkpoint: trace the five recent
+  account-fee receipt/availability misses and two index-price fact/clock
+  misses using their source IDs and bounded provenance projections. Repair
+  only a reproducible capture defect; do not infer missing clocks or promote
+  the quarantined rows. Then record fresh clean decision-group coverage and
+  verify the paper-only service reload preflight before any restart.
+
+### Current Runtime And Entry Blocker Recheck (2026-10-25 08:42 Asia/Shanghai)
+
+- A bounded read-only entry recovery covering
+  `2026-10-24T20:25:21Z` through `2026-10-25T00:25:21Z` found `559` market
+  decisions. Every final action was `hold`; there were no order attempts or
+  exchange rejections. The latest `120` rows split into `81 no_candidate` and
+  `39 shadow_training`; selected shadow rows remain labels only.
+- The direct permission veto is unchanged and is the primary no-entry cause:
+  local ML paper permission is false at `n=267`, fee-after mean
+  `-0.303832%`, lower bound `-0.431590%`, and profit factor `0.549713`.
+  Recent selected rows also report
+  `direction_support_expected_net_not_positive` and
+  `direction_support_quant_evidence_missing`; several short rows additionally
+  fail the loss-probability quality gate. This is an internal authorization
+  decision, not an OKX rejection.
+- The same audit confirms shadow maintenance is live and settling. A
+  subsequent bounded native pipeline check at `2026-10-25T00:40:39Z` counted
+  `1,166` completed native fee-after rows across `745` decision groups and
+  verified `200/200` sampled native lineage fingerprints. It also showed
+  `418` recent decision groups with four horizons, one still incomplete.
+  Historical-path rows remain separate and quarantined.
+- Runtime transport is healthy: paper process is running and unpaused,
+  WebSocket is connected, all `1,992/1,992` subscription arguments are
+  acknowledged with zero errors, and all `498/498` instruments have messages
+  on books5, mark-price, index-tickers and tickers. This rules out a
+  disconnected WebSocket as the current broad no-entry explanation.
+- A fresh 240-minute frozen-feature audit at `2026-10-25T00:36:03Z` found
+  all `64` decision and `64` training snapshots sealed and under the
+  `98,304`-byte budget. Decisions were `62/64` availability-valid; the two
+  invalid rows were one missing index fact caused by a reference-price
+  timeout (`ADA/USDT`) and one stale technical contract (`KAITO/USDT`).
+  The training view was `60/64` valid because the four invalid rows shared the
+  same ADA decision group. The newest clean decision streak reached `14`;
+  this is improved coverage, but not the preregistered sustained G2 gate.
+- Runtime diagnostics show the remaining reference-price weakness is
+  freshness, not subscription loss: some index receipts reached
+  `66-75` seconds while the contract correctly rejects index facts older than
+  `65` seconds. No threshold was widened. Account-fee receipts were present
+  in the fresh boundary, so the earlier fee-receipt defect is not reproduced
+  in this window.
+- Acceptance remains: G0 passed; G1 passed only as negative attribution; G2
+  blocked; G3 not passed after the fixed Ridge, random-forest and HGB
+  development families selected `0/3` outer policies; G4 has no frozen
+  candidate or untouched exam; G5 has no governed paper round trip; G6 is
+  pending. Five of six gates therefore remain incomplete or failed.
+- This recheck changed no model permission, threshold, risk, leverage,
+  service mode, order, or protection. The bounded frozen-feature audit now
+  carries the linked `decision_id` for each invalid row, so future tracing
+  can distinguish a capture defect from a derived-snapshot projection issue.
+- Next exact action: use the linked `decision_id`s to inspect the ADA
+  reference-route timeout and KAITO technical-contract source path with
+  bounded provenance only; preserve both rows as quarantined. Continue
+  collecting new native fee-after groups, and preregister a materially
+  different chronological candidate only after specifying its horizon and
+  untouched evaluation window. Do not register the incompatible Phase 3
+  artifacts, widen the 65-second freshness rule, or authorize entries from
+  the negative `n=267` history.

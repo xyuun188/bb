@@ -23,6 +23,7 @@ from core.safe_output import safe_print  # noqa: E402
 DEPENDENCIES = (
     "services/ml_nested_development.py",
     "services/ml_nested_development_tree.py",
+    "services/ml_nested_development_hgb.py",
     "services/ml_development_baselines.py",
     "services/ml_signal_service.py",
     "services/ml_training_dataset.py",
@@ -48,6 +49,9 @@ from services.ml_nested_development import build_nested_development_report
 from services.ml_nested_development_tree import (
     build_nested_tree_development_report,
 )
+from services.ml_nested_development_hgb import (
+    build_nested_hgb_development_report,
+)
 from services.ml_signal_service import (
     MIN_TRAINING_SAMPLE_COUNT,
     PRIMARY_PREDICTION_HORIZON_MINUTES,
@@ -66,6 +70,7 @@ NATIVE_SOURCE = "shadow_entry_result_and_okx_native_1m_path"
 DEPENDENCIES = (
     "services/ml_nested_development.py",
     "services/ml_nested_development_tree.py",
+    "services/ml_nested_development_hgb.py",
     "services/ml_development_baselines.py",
     "services/ml_signal_service.py",
     "services/ml_training_dataset.py",
@@ -249,11 +254,14 @@ async def main():
             ]
 
         frame = build_training_frame(rows)
-        nested = (
-            build_nested_development_report(frame)
-            if FAMILY == "ridge"
-            else build_nested_tree_development_report(frame)
-        )
+        if FAMILY == "ridge":
+            nested = build_nested_development_report(frame)
+        elif FAMILY == "tree":
+            nested = build_nested_tree_development_report(frame)
+        elif FAMILY == "hgb":
+            nested = build_nested_hgb_development_report(frame)
+        else:
+            raise ValueError(f"unsupported development family: {FAMILY}")
         primary = frame[
             frame["horizon_minutes"] == PRIMARY_PREDICTION_HORIZON_MINUTES
         ].copy()
@@ -503,7 +511,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--family",
-        choices=("ridge", "tree"),
+        choices=("ridge", "tree", "hgb"),
         default="ridge",
         help="Development-only candidate family.",
     )

@@ -119,6 +119,7 @@ def main_summary(rows, checked_at, source):
                 availability_invalid_examples.append(
                     {
                         "id": row.id,
+                        "decision_id": getattr(row, "decision_id", None),
                         "symbol": row.symbol,
                         "reasons": availability_reasons[:12],
                         "derivatives_route_status": {
@@ -244,6 +245,7 @@ async def main():
         statements["decision_snapshot"] = (
             select(
                 AIDecision.id,
+                    AIDecision.id.label("decision_id"),
                 AIDecision.symbol,
                 AIDecision.created_at,
                 AIDecision.feature_snapshot.label("feature_snapshot"),
@@ -260,6 +262,7 @@ async def main():
         statements["training_snapshot"] = (
             select(
                 ShadowBacktest.id,
+                    ShadowBacktest.decision_id,
                 ShadowBacktest.symbol,
                 ShadowBacktest.created_at,
                 ShadowBacktest.training_feature_snapshot.label("feature_snapshot"),

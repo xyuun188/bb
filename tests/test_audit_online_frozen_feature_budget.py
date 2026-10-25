@@ -20,4 +20,5 @@ def test_remote_audit_compiles_and_validates_availability_contracts() -> None:
     assert "derivatives_route_status" in audit.REMOTE_SCRIPT
     assert "derivatives_unavailable_reason" in audit.REMOTE_SCRIPT
     assert "fact_sources" in audit.REMOTE_SCRIPT
+    assert '"decision_id": getattr(row, "decision_id", None)' in audit.REMOTE_SCRIPT
 

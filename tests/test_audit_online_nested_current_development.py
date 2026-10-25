@@ -24,6 +24,9 @@ def test_remote_nested_research_query_is_bounded_native_and_cost_complete() -> N
     assert "exam_labels_evaluated" in source
     assert "outer_fold_coverage" in source
     assert "legacy_all_horizon_development_sha256" in source
+    assert "build_nested_hgb_development_report" in source
+    assert 'FAMILY == "hgb"' in source
+    assert "services/ml_nested_development_hgb.py" in source
 
 
 def test_remote_runner_uses_isolated_bounded_resources_and_unique_unit() -> None:
@@ -40,6 +43,20 @@ def test_remote_runner_uses_isolated_bounded_resources_and_unique_unit() -> None
     assert "--property=RuntimeMaxSec=300s" in command
     assert "--setenv=DATABASE_POOL_SIZE=1" in command
     assert "primary-horizon-label-time-only" in audit.REMOTE_SCRIPT
+
+
+def test_hgb_family_uses_a_distinct_remote_unit_and_report_path() -> None:
+    command = audit._build_remote_command(
+        1000,
+        48,
+        datetime(2026, 10, 24, 23, 30, tzinfo=UTC),
+        "bb-nested-dev-hgb-v1-20261024T233000Z",
+        revision="v1",
+        family="hgb",
+    )
+
+    assert "--unit=bb-nested-dev-hgb-v1-20261024T233000Z" in command
+    assert "build_nested_hgb_development_report" in audit.REMOTE_SCRIPT
 
 
 def test_cutoff_requires_timezone_and_normalizes_to_utc() -> None:
