@@ -6740,3 +6740,7 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   provenance audit. If the new cohort is incomplete or undersized, close it
   as insufficient and register a later window; do not run the G3 outcome
   study on ineligible rows.
+- Added `scripts/audit_online_decision_cohort.py` to make the first step
+  executable and resumable. It uses the indexed bounded decision envelope,
+  seals the exact decision count and ID fingerprint, and explicitly reports
+  `shadow_labels_read=false`; it never queries `ShadowBacktest`.
