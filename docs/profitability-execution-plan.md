@@ -5602,8 +5602,10 @@ on the mean. A favorable historical test is not a guarantee of future profit.
 - The latest fixes are now pushed: local `HEAD` and `origin/main` are both
   `684ad87` (`446a4c2` fail-closed liveness, `f7c7b09` fresh v4 boundary
   evidence, and `684ad87` current data-quality version test alignment). The
-  targeted online test upload passed `source-integrity-ok:2` with no service
-  restart. The running quant API is still the pre-existing process and has
+  focused availability/training regression is `135 passed`; Ruff and
+  compileall passed. The targeted online test upload passed
+  `source-integrity-ok:2` with no service restart. The running quant API is
+  still the pre-existing process and has
   not loaded the fail-closed source; loading it requires the governed
   stopped-before-start path and must not be forced while paper is active.
 - Time boundary: G2 has a measurable operational checkpoint (obtain the
