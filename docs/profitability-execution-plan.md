@@ -5825,3 +5825,39 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   The next valid transition is a genuinely eligible quant candidate followed
   by the governed stopped-before-start reload; until then paper entries remain
   governed by the current negative economics and live trading stays disabled.
+
+### Completed Non-Persisting Training Preflight And ETA Boundary (2026-10-25 15:44 Asia/Shanghai)
+
+- Operational correction: an attempted `--help` call to
+  `scripts/diagnose_online_training_preflight.py` did not display help because
+  the wrapper has no argument parser. It ran the wrapper's default bounded
+  training preflight instead. The run completed successfully at
+  `2026-10-25T07:43:04Z` (Asia/Shanghai 15:43:04), taking about 5m43s. Do not
+  repeat this preflight unchanged.
+- The report is diagnostic only: `artifact_persisted=false`,
+  `promotion_authorized=false`, and `submits_orders=false`. It loaded `7,358`
+  shadow rows into a `5,273`-row frame and found `0` authoritative trade
+  samples. The temporary split had no decision-group overlap, but this was
+  not a fresh G4 exam and cannot qualify a model for paper entries.
+- Reported shadow-ranking holdout diagnostics remain poor despite nonzero
+  classifier AUC: top-long mean `-0.071287%`, lower bound `-0.117886%`, PF
+  `0.287614`; top-short mean `-0.096244%`, lower bound `-0.140425%`, PF
+  `0.135283`. These are shadow-market diagnostics, not realized fee-after
+  paper returns. Separate counterfactual cost estimates in the report are
+  also not executed fills or authoritative profitability evidence.
+- Important side-effect correction: although no labels were quarantined and
+  no model artifact was persisted, the wrapper invokes the normal training
+  CLI. That CLI acquired the local-ML scheduler lease and wrote heartbeat,
+  check/run completion metadata, and a replay-governance report before
+  releasing the lease in its `finally` path. The successful exit and absent
+  local preflight process at 15:44 are consistent with normal cleanup. This
+  changes scheduler bookkeeping and is not strictly read-only; do not describe
+  it as a zero-write audit.
+- This result reinforces the existing entry blocker: the current model has no
+  authoritative trade-training rows and its shadow-ranking holdout does not
+  pass. It does not establish an exchange failure or justify forcing entries.
+  G2 still requires a sustained clean point-in-time boundary and governed
+  loaded-source verification; G3 still requires a genuinely positive
+  cost-aware candidate; G4/G5 remain unstarted. No honest calendar ETA for
+  profitability exists. The next checkpoint must be a changed input or
+  repaired blocker, not another identical training sweep or a reused exam.
