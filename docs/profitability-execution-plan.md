@@ -5647,3 +5647,51 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   window, then rerun the frozen-budget boundary. G2 passes only after the
   predefined clean streak is sustained; G3 remains blocked by the negative
   authoritative fee-after distribution and zero eligible v4 trade rows.
+
+### Post-Upload Window And Current User Recheck (2026-10-25 14:15 Asia/Shanghai)
+
+- The first bounded post-upload window after commit `441c970` completed at
+  `2026-10-25T06:13:29Z`. The frozen-feature audit inspected 64 decision and
+  64 training snapshots. Decision snapshots were `62/64` availability-valid,
+  with a newest valid streak of `37` consecutive decisions across `31`
+  symbols; training snapshots were `64/64` valid. All rows carried the
+  v1 availability contract, original/frozen timestamps and seals, and no
+  payload exceeded the `98,304 B` budget. The two decision failures were one
+  stale technical contract and one missing/ambiguous index-price receipt,
+  availability and source clock. This is the first post-upload window that
+  exceeds the numeric `30`-row/`20`-symbol G2 boundary; it is not yet
+  accepted as loaded-source evidence because the long-running paper process
+  has not loaded the staged code.
+- The companion public-latency audit covered 962 diagnostic events. Provider
+  time was lower than local queue wait, but priority-route queueing remains
+  material: index tickers p95/max `11,835/14,969 ms`, mark price
+  `11,930/14,838 ms`, order book `10,113/14,802 ms`, and single ticker
+  `9,151/16,684 ms`; provider p95s were `2,095/3,034/3,065/4,777 ms`.
+  The optional indicator gate no longer shares the executable lane, but the
+  executable public lane itself remains congested. No timeout, freshness,
+  cost, risk or permission threshold was relaxed.
+- A bounded entry recovery through `2026-10-25T06:13:31Z` covered 278
+  market decisions. Every final action was `hold`, with zero order attempts,
+  positions or fills. The latest 120 rows split into 76 shadow-training and
+  44 no-candidate decisions; selected rows were denied because expected net
+  return was not positive, loss-probability quality was too high, and
+  quantitative evidence was missing. The authoritative local-ML permission
+  remains false at `n=267`, fee-after mean `-0.303832%`, lower bound
+  `-0.431590%`, PF `0.549713`.
+- Training is still not producing an eligible authoritative set: all six
+  specialist trainers remain skipped for
+  `authoritative_execution_cost_distribution_unavailable`, and the current
+  local-ML scheduler reports `not_due` with new shadow rows. Historical
+  requalification remains dry-run with zero eligible rows because the
+  original decisions lack the point-in-time availability contract. Shadow
+  rows are observations, not trades, and cannot be relabeled to clear the
+  gate.
+- Gate state is unchanged: G0 passed; G1 passed only as negative
+  authoritative attribution; G2 has numeric fresh coverage but remains
+  blocked pending governed reload and sustained loaded-source evidence; G3
+  has no qualifying fee-after candidate; G4 and G5 have not started; G6 is
+  blocked. There is still no honest fixed profitability date. The next
+  operational action is a read-only governed preflight/reload decision after
+  the active paper process can be handled by the existing control path; no
+  restart, order, protection, model relabel, leverage or gate relaxation is
+  authorized while the v4 artifact contract is unavailable.
