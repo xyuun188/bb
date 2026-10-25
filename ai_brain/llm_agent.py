@@ -461,7 +461,14 @@ def _normalize_compact_batch_value(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):
         return dict(value)
     if isinstance(value, str):
-        code = value.strip().lower()
+        code = value.strip().lower().replace("-", "_").replace(" ", "_")
+        code = {
+            "long": "l",
+            "short": "s",
+            "hold": "h",
+            "close_long": "cl",
+            "close_short": "cs",
+        }.get(code, code)
         if code in {"l", "s", "h", "cl", "cs"}:
             return {"a": code, "c": 0.5, "r": "紧凑诊断", "x": None}
     return None

@@ -324,6 +324,11 @@ class Settings(BaseSettings):
     ai_target_qwen_max_completion_tokens: int = 96
     # The target queue budget is part of the Phase 3 model contract.
     ai_target_qwen_timeout_seconds: float = 26.0
+    # A malformed compact response must not suppress every following symbol
+    # for the generic 180-second format-failure window.  Keep a short retry
+    # cooldown for the single-worker carrier while preserving fail-closed
+    # analysis for the affected symbol.
+    ai_target_qwen_format_failure_circuit_breaker_seconds: float = 3.0
     ai_batch_expert_circuit_breaker_seconds: float = 0.0
     ai_batch_expert_transient_circuit_breaker_seconds: float = 3.0
     ai_batch_expert_format_failure_circuit_breaker_seconds: float = 180.0

@@ -241,6 +241,15 @@ def _batch_failure_breaker_seconds(
             0.0,
         )
     if _is_batch_format_failure(exc, error_text):
+        if target_qwen:
+            return max(
+                float(
+                    settings.ai_target_qwen_format_failure_circuit_breaker_seconds
+                    or settings.ai_batch_expert_transient_circuit_breaker_seconds
+                    or 1.0
+                ),
+                1.0,
+            )
         format_configured = max(
             float(settings.ai_batch_expert_format_failure_circuit_breaker_seconds or 0.0),
             0.0,
@@ -757,9 +766,15 @@ class ModelRegistry:
         now_perf = time.perf_counter()
         disabled_until = self._batch_expert_disabled_until_by_provider.get(provider_key, 0.0)
         if disabled_until > now_perf:
+            last_error = self._batch_expert_last_error_by_provider.get(provider_key) or ""
+            failure_kind = (
+                "格式错误"
+                if _is_batch_format_failure(RuntimeError(last_error), last_error)
+                else "模型调用失败"
+            )
             reason = (
-                "batch expert circuit breaker active after recent timeout: "
-                f"{self._batch_expert_last_error_by_provider.get(provider_key) or 'recent batch expert failure'}"
+                f"batch expert circuit breaker active after recent {failure_kind}: "
+                f"{last_error or 'recent batch expert failure'}"
             )
             logger.warning(
                 (

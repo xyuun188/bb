@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -134,6 +135,30 @@ def test_target_qwen_timeout_uses_short_recovery_breaker(
         == 3.0
     )
     assert _batch_failure_breaker_seconds(error, str(error)) == 60.0
+
+
+def test_target_qwen_format_failure_uses_short_recovery_breaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        settings,
+        "ai_batch_expert_format_failure_circuit_breaker_seconds",
+        180.0,
+    )
+    monkeypatch.setattr(
+        settings,
+        "ai_target_qwen_format_failure_circuit_breaker_seconds",
+        3.0,
+    )
+
+    error = LLMResponseParseError("batch expert response missing experts object")
+
+    assert _batch_failure_breaker_seconds(
+        error,
+        str(error),
+        target_qwen=True,
+    ) == 3.0
+    assert _batch_failure_breaker_seconds(error, str(error)) == 180.0
 
 
 def test_batch_transport_retry_has_separate_single_use_budget() -> None:
@@ -796,6 +821,47 @@ async def test_qwen_batch_failure_exposes_bounded_response_contract(
             {"execution_mode": "paper"},
             ["trend_expert", "momentum_expert", "sentiment_expert", "risk_expert"],
         )
+
+
+@pytest.mark.asyncio
+async def test_qwen_batch_vector_accepts_full_action_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeChatOpenAI:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def ainvoke(self, _messages: list[Any]) -> SimpleNamespace:
+            return SimpleNamespace(
+                content='{"a":["long","short","hold","close_long"]}',
+                response_metadata={"finish_reason": "stop"},
+                usage_metadata={"completion_tokens": 14},
+            )
+
+    monkeypatch.setattr("ai_brain.llm_agent.ChatOpenAI", FakeChatOpenAI)
+    agent = LLMAgent(
+        name="trend_expert",
+        api_config={
+            "api_base": LOCAL_QWEN_TEST_BASE,
+            "api_key": "test-key",
+            "model": "qwen3.8-27b",
+            "role": "trend_direction",
+        },
+    )
+    await agent.initialize()
+
+    decisions = await agent.decide_batch_experts(
+        FeatureVector(symbol="BTC/USDT"),
+        {"execution_mode": "paper"},
+        ["trend_expert", "momentum_expert", "sentiment_expert", "risk_expert"],
+    )
+
+    assert [decisions[name].action.value for name in (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    )] == ["long", "short", "hold", "close_long"]
 
 
 @pytest.mark.asyncio
@@ -1555,6 +1621,58 @@ async def test_paper_complete_plans_use_one_shared_batch_request(
     assert _ProviderBatchExpert.individual_calls == []
     assert all(row.get("batch_expert", False) is True for row in context["_model_timings"])
     assert "_force_independent_expert" not in context
+
+
+@pytest.mark.asyncio
+async def test_target_qwen_format_failure_uses_short_cooldown_and_reports_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(settings, "ai_batch_expert_circuit_breaker_seconds", 0.0)
+    monkeypatch.setattr(
+        settings,
+        "ai_batch_expert_format_failure_circuit_breaker_seconds",
+        180.0,
+    )
+    monkeypatch.setattr(
+        settings,
+        "ai_target_qwen_format_failure_circuit_breaker_seconds",
+        3.0,
+    )
+    _ProviderBatchExpert.batch_calls = []
+    registry = ModelRegistry()
+    names = (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    )
+    for name in names:
+        registry.register(
+            _ProviderBatchExpert(
+                name,
+                base_url=LOCAL_QWEN_TEST_BASE,
+                model_name="qwen3.8-27b",
+                fail_batch=True,
+            )
+        )
+
+    await registry.decide_all(FeatureVector(symbol="BTC/USDT"), {})
+    provider_key = (LOCAL_QWEN_TEST_BASE, "qwen3.8-27b")
+    remaining = (
+        registry._batch_expert_disabled_until_by_provider[provider_key]
+        - time.perf_counter()
+    )
+    assert 0.0 < remaining <= 3.0
+
+    second_context: dict[str, Any] = {}
+    await registry.decide_all(FeatureVector(symbol="ETH/USDT"), second_context)
+
+    assert len(_ProviderBatchExpert.batch_calls) == 1
+    failure = second_context["_model_failures"][0]
+    assert failure["status"] == "circuit_breaker_deferred"
+    assert "格式错误" in failure["reason"]
+    assert "timeout" not in failure["reason"].lower()
 
 
 @pytest.mark.asyncio
