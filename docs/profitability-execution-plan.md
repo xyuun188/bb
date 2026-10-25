@@ -5754,3 +5754,37 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   profitability. The next work is limited to completing the G2 loaded-source
   boundary and obtaining a genuinely positive, cost-aware candidate on fresh
   data; if that never passes, the correct result is to keep trading disabled.
+
+### Latest Online Entry And Availability Recheck (2026-10-25 14:50 Asia/Shanghai)
+
+- A bounded entry recovery through `2026-10-25T06:49:50Z` covered `555`
+  market decisions. Every row was final `hold` and unexecuted; there were no
+  order attempts, positions or fills. The recent `300`-row funnel contained
+  `185` `shadow_training` selections and `115` `no_candidate` rows. Selected
+  rows were denied by `direction_support_expected_net_not_positive`,
+  `direction_support_quality_observation_loss_probability_too_high`, and
+  `direction_support_quant_evidence_missing`; no exchange rejection was
+  observed.
+- The authoritative local-ML permission is still false at `n=267`, fee-after
+  mean `-0.303832%`, lower bound `-0.431590%`, PF `0.549713`. The current
+  runtime artifact remains `shadow` with degraded readiness and influence
+  disabled. Specialist local-AI trainers remain skipped because the
+  authoritative execution-cost distribution is unavailable; local-ML reports
+  `not_due` despite `884` new shadow samples. Historical dry-run
+  requalification remains `eligible=0` because the old rows lack the
+  point-in-time market/label availability contract.
+- The current four-hour frozen-feature projection had zero over-budget rows,
+  but availability is not yet stable: decision snapshots were `59/64` valid
+  with a newest clean streak of `11` across `11` symbols, and training
+  snapshots were `52/64` valid with a newest clean streak of `44` across `11`
+  symbols. The recurring failures are account-fee receipt/availability gaps,
+  index-price receipt/availability/source-clock gaps, and stale technical
+  contracts. This remains below the preregistered G2 boundary of `30`
+  consecutive clean decisions across at least `20` symbols plus clean
+  training and loaded-source verification.
+- The result does not change the gate state: G0 passed; G1 negative
+  attribution only; G2 blocked; G3 has no qualifying candidate after the
+  fixed rules-canary rejection; G4/G5 not started; G6 blocked. The
+  operational work is now bounded to the G2 boundary/reload and one genuinely
+  positive fresh fee-after candidate. No profitability date can be promised
+  without those results.
