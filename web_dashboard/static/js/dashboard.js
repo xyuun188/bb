@@ -8361,6 +8361,9 @@ function runtimeEndpointStatusLabel(item, options = {}) {
     if (options.model && item.model_mismatch) return '模型路由不匹配';
     const statusCode = Number(item.status_code || 0);
     const category = String(item.status_category || '').toLowerCase();
+    if (category === 'artifact_unavailable' || String(item.status || '').toLowerCase() === 'artifact_unavailable') {
+        return '模型产物未就绪';
+    }
     if (category === 'auth_failed' || statusCode === 401) return '认证失败';
     if (category === 'auth_forbidden' || statusCode === 403) return '权限拒绝';
     if (category === 'not_found' || statusCode === 404) return '路径不存在';
@@ -11962,6 +11965,12 @@ function renderLocalAIToolsStatus() {
         : Object.values(childEndpoints).filter(item => item && (item.live_probe_ok || item.actual_inference_probe)).length;
     const childTotalCount = Object.keys(childEndpoints).length || 4;
     const childContractStatus = status.child_contract_status || (childLiveProbeOkCount ? 'live_probe_ok' : childMetadataReadyCount ? 'metadata_ready' : 'unavailable');
+    const childContractLabel = {
+        live_probe_ok: '实时探针正常',
+        metadata_ready: '状态契约已登记',
+        artifact_unavailable: '模型产物未就绪',
+        unavailable: '服务未返回就绪契约',
+    }[childContractStatus] || childContractStatus;
     const latestTraining = status.latest_training || {};
     const latestTrainingAt = latestTraining.trained_at || status.latest_training_at || status.trained_at;
     const activeArtifact = status.artifact_version || '-';
@@ -11969,7 +11978,7 @@ function renderLocalAIToolsStatus() {
     const latestQuality = latestTraining.data_quality_version || status.latest_training_data_quality_version || '-';
     if (updatedEl) {
         updatedEl.textContent = serviceAvailable
-            ? `影子市场 ${mlSampleCountLabel(samples.localShadowMarket)} 条 · 反事实成本 ${mlSampleCountLabel(samples.localShadowCost)} 条 · OKX 实际费后收益 ${mlSampleCountLabel(samples.localActualReturn)} 条 · 子接口登记 ${childMetadataReadyCount}/${childTotalCount} · 实时探针 ${childLiveProbeOkCount}/${childTotalCount} · 状态 ${childContractStatus}`
+            ? `影子市场 ${mlSampleCountLabel(samples.localShadowMarket)} 条 · 反事实成本 ${mlSampleCountLabel(samples.localShadowCost)} 条 · OKX 实际费后收益 ${mlSampleCountLabel(samples.localActualReturn)} 条 · 子接口登记 ${childMetadataReadyCount}/${childTotalCount} · 实时探针 ${childLiveProbeOkCount}/${childTotalCount} · 状态 ${childContractLabel}`
             : '服务不可用';
     }
 
@@ -11989,8 +11998,10 @@ function renderLocalAIToolsStatus() {
         {
             label: '子接口状态',
             value: `${childMetadataReadyCount}/${childTotalCount}`,
-            subtitle: `登记 ${childMetadataReadyCount}/${childTotalCount}；实时推理探针 ${childLiveProbeOkCount}/${childTotalCount}；状态 ${childContractStatus}`,
-            tone: childMetadataReadyCount >= childTotalCount && childLiveProbeOkCount >= childTotalCount ? 'good' : (childMetadataReadyCount > 0 ? 'warn' : 'bad'),
+            subtitle: `登记 ${childMetadataReadyCount}/${childTotalCount}；实时推理探针 ${childLiveProbeOkCount}/${childTotalCount}；状态 ${childContractLabel}`,
+            tone: childMetadataReadyCount >= childTotalCount && childLiveProbeOkCount >= childTotalCount
+                ? 'good'
+                : (serviceAvailable ? 'warn' : 'bad'),
         },
         {
             label: '影子市场机会样本',
@@ -12060,6 +12071,7 @@ function renderTrainableModels() {
         diagnostic_warming: '状态加载中', optional_disabled: '可选增强未启用',
         optional_blocked: '本地模型预检未通过', cloud_unconfigured: '云端未配置',
         cloud_configured_unverified: '云端已配置，连接未验证',
+        artifact_unavailable: '模型产物未就绪',
     };
     const executionPlaneLabels = {
         local: '本地服务器',
@@ -12101,7 +12113,7 @@ function renderTrainableModels() {
         metrics: [
             { label: '可训练', value: model.trainable ? '是' : '否' },
             { label: '产物', value: model.artifact_available ? '已验证' : '无' },
-            { label: '身份', value: model.identity_verified ? '已验证' : '未验证' },
+            { label: '身份', value: model.identity_status === 'artifact_unavailable' ? '待产物验证' : model.identity_verified ? '已验证' : '未验证' },
             { label: '运行服务', value: model.runtime_available
                 ? '可用'
                 : model.lifecycle === 'diagnostic_timeout'
@@ -12119,7 +12131,7 @@ function renderTrainableModels() {
             model.trainable ? { label: '当前 Champion 产物', value: model.artifact_trained_at ? toBeijingTime(model.artifact_trained_at) : '-' } : null,
         ].filter(Boolean),
         note: Array.isArray(model.blocking_reasons) && model.blocking_reasons.length
-            ? `阻塞原因：${model.blocking_reasons.join('、')}`
+            ? `阻塞原因：${model.blocking_reasons.map(dashboardReasonText).join('、')}`
             : `质量状态：${model.quality_state || '-'}`,
     }));
 
@@ -12134,6 +12146,7 @@ function renderTrainableModels() {
             ${mlMetricCard('可训练模型', String(Number(summary.trainable_count || 0)), '只有这些模型允许产生项目训练产物', 'good')}
             ${mlMetricCard('仅推理/评估', String(Number(summary.inference_or_evaluation_only_count || 0)), '不会冒充持续训练', 'muted')}
             ${mlMetricCard('身份异常', String(Number(summary.identity_failure_count || 0)), summary.identity_failure_models?.join('、') || '无', Number(summary.identity_failure_count || 0) ? 'bad' : 'good')}
+            ${mlMetricCard('产物未就绪', String(Number(summary.artifact_unavailable_count || 0)), summary.artifact_unavailable_models?.join('、') || '无', Number(summary.artifact_unavailable_count || 0) ? 'warn' : 'muted')}
         </div>
         <div class="ml-train-model-list ml-train-model-list-clear">
             ${models.map(renderReadableTrainableModelCard).join('')}

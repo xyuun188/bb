@@ -1395,7 +1395,15 @@ async def test_local_ai_tools_status_uses_child_endpoint_health_when_bundle_miss
     assert result["api_base"] == "http://local-ai-tools.test"
     assert result["enabled_for_trading"] is True
     assert result["status"] == "artifact_unavailable"
+    assert result["child_contract_status"] == "artifact_unavailable"
+    assert result["child_contract_reason"] == "model_bundle_unavailable"
+    assert result["child_unavailable_count"] == 1
     assert result["child_endpoints"]["profit_prediction"]["available"] is False
+    assert result["child_endpoints"]["profit_prediction"]["status"] == "artifact_unavailable"
+    assert (
+        result["child_endpoints"]["profit_prediction"]["error"]
+        == "model_bundle_unavailable"
+    )
     assert result["child_endpoints"]["profit_prediction"]["probe_mode"] == ("metadata_contract")
     assert result["child_endpoints"]["profit_prediction"]["actual_inference_probe"] is False
 
@@ -1534,7 +1542,12 @@ async def test_local_ai_tools_status_does_not_resurrect_rejected_bundle_from_liv
     assert result["model_bundle_available"] is False
     assert result["artifact_status"] == "unavailable"
     assert result["child_endpoints"]["profit_prediction"]["available"] is False
-    assert result["child_contract_status"] == "unavailable"
+    assert result["child_contract_status"] == "artifact_unavailable"
+    assert result["child_endpoints"]["profit_prediction"]["status"] == "artifact_unavailable"
+    assert (
+        result["child_endpoints"]["profit_prediction"]["error"]
+        == "model_bundle_unavailable"
+    )
 
 
 @pytest.mark.asyncio

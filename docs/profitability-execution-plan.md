@@ -6181,3 +6181,88 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   No clock, freshness, or feature-quality rule was weakened. The next reload
   must be the existing governed stop/preflight/start sequence after a real
   compatible quant artifact is present.
+
+### Controlled Observation-Only Reload Path (2026-10-25, current turn)
+
+- The remaining online data defect is now actionable without changing entry
+  permission: the running paper PID has not loaded the batched reference-price
+  client, but a normal restart is correctly blocked while the Phase-3 bundle
+  is absent.
+- Added `--observation-only` to
+  `scripts/start_phase3_paper_with_preflight.py` and its online wrapper. It
+  accepts exactly one fail-closed preflight condition: all four quant child
+  contracts explicitly report `artifact_unavailable` with
+  `model_bundle_unavailable`, with no exchange, account, specialist, target
+  model, or active-service blocker. It persists paper control as paused before
+  starting, so market observation and existing-position management can run but
+  new entries cannot submit.
+- Default resume behavior is unchanged and still requires
+  `can_resume_paper=true`; observation-only mode never resumes the account and
+  never changes model routing or live permission. A failed start leaves the
+  account paused.
+- Local verification: `214` focused tests passed, Ruff passed on owned Python
+  files, compileall passed, and `git diff --check` passed. The new path has
+  not been executed online and must not be used while
+  `bb-paper-trading.service` is active. The next action is targeted upload and
+  remote integrity verification, followed by one operator-controlled
+  stop/preflight/start only after the service is confirmed stopped and current
+  account/order truth is clean.
+- Profitability acceptance remains pending: authoritative fee-after evidence
+  is still negative (`n=267`, mean `-0.303832%`, lower bound `-0.431590%`,
+  PF `0.549713`), so this path is for collecting valid prospective data only;
+  it does not authorize paper entries or claim profit.
+
+### Observation Runtime Recovery And Fresh Data Checkpoint (2026-10-25 20:50 Asia/Shanghai)
+
+- The observation-only confirmation wiring was verified locally: the focused
+  start-entrypoint suite passed `17` tests; Ruff, compileall and
+  `git diff --check` passed. The targeted upload selected only the two start
+  scripts and their two tests, skipped restart and secret-file purge, uploaded
+  the two changed scripts, and returned `source-integrity-ok:4`.
+- One read-only online preflight at `2026-10-25T12:39:28Z` found the paper
+  service stopped, OKX/account/order integrity clean, no positions or orders,
+  and exactly one blocker: the four Phase-3 quant child contracts are
+  `artifact_unavailable/model_bundle_unavailable`. It did not authorize normal
+  paper resume.
+- The explicitly confirmed observation-only start completed at
+  `2026-10-25T12:39:53Z`: `bb-paper-trading.service` is active as PID
+  `2904397`; persisted account control remains `paused=true`; live routing is
+  off and the start report states `submits_orders=false`. A direct remote
+  systemd/proc check confirmed the running command is
+  `/data/bb/app/.venv/bin/python scripts/run_paper_trading.py` and that the
+  service start timestamp follows the targeted source upload.
+- A bounded 15-minute feature projection at `2026-10-25T12:49:48Z` returned
+  14 new market decisions, all 14 with valid frozen-feature contracts and
+  distinct symbols. Payload maximum was `94,788 B` against the `98,304 B`
+  limit; seal errors and availability failures were zero. This confirms the
+  restarted market-analysis process is collecting valid prospective data.
+  The preregistered G2 boundary is still pending: 14/30 consecutive valid
+  decisions and 14/20 distinct symbols; 16 more consecutive valid decisions
+  are needed, and any invalid observation resets the streak.
+- The `run_market_analysis=false` / `all scan symbols skipped` log lines
+  observed after start belong to the separate `position` review loop, not the
+  market-analysis loop. They are expected with zero open positions and are not
+  evidence that market observation is stopped. Market-scope logs show feature
+  fetch, candidate shortlist and decision work. Do not change pause semantics
+  based on position-scope diagnostics.
+- A 10-minute redacted public-market latency projection over
+  `2026-10-25T12:32:21Z`–`12:42:21Z` counted 355 events. Required order-book
+  and reference-price requests still had queue waits up to about 23.9 seconds;
+  later service logs also show timeouts for some symbols. This remains a
+  localized data-throughput issue to measure against the prospective feature
+  boundary, not a reason to relax freshness or validity checks. The current
+  14 decision snapshots were all valid.
+- The normal no-entry state is deliberate and not an exchange rejection:
+  account control is still paused, the quant bundle is absent, and the latest
+  qualified fee-after evidence remains negative (`n=267`, mean
+  `-0.303832%`, lower bound `-0.431590%`, PF `0.549713`). No entries or profit
+  are claimed. One previous local invocation of the post-resume observation
+  script was not an online probe and is explicitly excluded from evidence.
+- Next action: do not repeat the online preflight or historical profitability
+  audits. Let this already-running paused observer accumulate until the G2
+  30/20 boundary, then record one checkpoint. In parallel, trace the
+  Phase-3 candidate artifact contract locally; do not persist a bundle or
+  change entry permission until the authoritative-trade requirement and
+  shadow-only candidate semantics are resolved with tests. G3 development
+  remains blocked pending a preregistered fresh mature-label batch; G4-G6
+  remain not passed.

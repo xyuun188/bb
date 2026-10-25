@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from scripts.start_online_phase3_paper_with_preflight import (
     CONFIRMATION_PHRASE,
+    OBSERVATION_ONLY_CONFIRMATION_PHRASE,
     build_remote_command,
 )
 
@@ -26,3 +27,19 @@ def test_online_paper_start_forwards_explicit_confirmation() -> None:
     assert "--start-service" in command
     assert f"--confirm-resume-paper {CONFIRMATION_PHRASE}" in command
     assert "--json-indent 2" in command
+
+
+def test_online_paper_start_forwards_observation_only_mode() -> None:
+    command = build_remote_command(
+        start_service=True,
+        confirmation=CONFIRMATION_PHRASE,
+        json_indent=0,
+        observation_only=True,
+        observation_confirmation=OBSERVATION_ONLY_CONFIRMATION_PHRASE,
+    )
+
+    assert "--observation-only" in command
+    assert (
+        f"--confirm-observation-only {OBSERVATION_ONLY_CONFIRMATION_PHRASE}"
+        in command
+    )

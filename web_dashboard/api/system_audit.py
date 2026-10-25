@@ -5690,6 +5690,65 @@ def _phase3_profitability_gate_observation_only(card: dict[str, Any]) -> bool:
     return bool(codes) and codes.issubset(_PHASE3_PROFITABILITY_GATE_CODES)
 
 
+def _phase3_artifact_wait_observation_only(card: dict[str, Any]) -> bool:
+    """Classify an online, fail-closed artifact wait as observation.
+
+    A reachable paper loop with no compatible quant bundle is not a service
+    outage and must remain non-trading.  Keep the blocker visible in card
+    details, but do not count the same artifact absence as an additional
+    unresolved runtime incident.
+    """
+
+    key = str(card.get("key") or "")
+    details = _safe_dict(card.get("details"))
+
+    def artifact_wait_is_proven() -> bool:
+        inputs = _safe_dict(details.get("inputs"))
+        runtime = _safe_dict(inputs.get("platform_runtime"))
+        local_tools = _safe_dict(runtime.get("local_ai_tools"))
+        children = _safe_dict(local_tools.get("child_endpoints"))
+        required = {
+            "profit_prediction",
+            "time_series_prediction",
+            "sentiment_analysis",
+            "exit_advice",
+        }
+        return bool(
+            local_tools.get("available") is True
+            and local_tools.get("service_available") is True
+            and local_tools.get("transport_status") == "ok"
+            and local_tools.get("model_bundle_available") is False
+            and required.issubset(children)
+            and all(
+                _safe_dict(children.get(name)).get("status") == "artifact_unavailable"
+                and _safe_dict(children.get(name)).get("error") == "model_bundle_unavailable"
+                for name in required
+            )
+        )
+
+    if key == "phase3_paper_resume_preflight":
+        if not bool(details.get("consumed_after_resume")) or not artifact_wait_is_proven():
+            return False
+        blockers = _safe_list(details.get("effective_blockers"))
+        codes = {
+            str(item.get("code") or "")
+            for item in blockers
+            if isinstance(item, dict)
+        }
+        return codes == {"phase3_quant_api_child_endpoints_unavailable"}
+    if key == "phase3_paper_resume_observation":
+        if not bool(details.get("paper_active")) or not artifact_wait_is_proven():
+            return False
+        blockers = _safe_list(details.get("blockers"))
+        codes = {
+            str(item.get("code") or "")
+            for item in blockers
+            if isinstance(item, dict)
+        }
+        return codes == {"phase3_quant_api_child_endpoint_unhealthy_after_resume"}
+    return False
+
+
 def _issue_ledger_state(
     card: dict[str, Any],
     *,
@@ -5707,6 +5766,11 @@ def _issue_ledger_state(
         return "observing", "历史/样本观察 / 当前未复现硬错误"
     if _phase3_profitability_gate_observation_only(card):
         return "observing", "实盘收益门槛未满足 / 运行链路保持可用"
+    if (
+        status in {"warning", "critical"}
+        and _phase3_artifact_wait_observation_only(card)
+    ):
+        return "observing", "服务链路在线 / 模型产物或收益门禁待满足"
     if (
         key == "trade_execution_contract"
         and status == "warning"

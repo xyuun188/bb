@@ -15,7 +15,10 @@ if str(ROOT) not in sys.path:
 
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
-from scripts.start_phase3_paper_with_preflight import CONFIRMATION_PHRASE  # noqa: E402
+from scripts.start_phase3_paper_with_preflight import (  # noqa: E402
+    CONFIRMATION_PHRASE,
+    OBSERVATION_ONLY_CONFIRMATION_PHRASE,
+)
 
 REMOTE_APP_DIR = "/data/bb/app"
 
@@ -52,6 +55,8 @@ def build_remote_command(
     start_service: bool,
     confirmation: str,
     json_indent: int,
+    observation_only: bool = False,
+    observation_confirmation: str = "",
 ) -> str:
     argv = [
         ".venv/bin/python",
@@ -68,12 +73,26 @@ def build_remote_command(
                 str(confirmation or ""),
             ]
         )
+    if observation_only:
+        argv.extend(
+            [
+                "--observation-only",
+                "--confirm-observation-only",
+                str(observation_confirmation or ""),
+            ]
+        )
     return f"cd {_quote(REMOTE_APP_DIR)} && exec " + " ".join(_quote(item) for item in argv)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start-service", action="store_true")
+    parser.add_argument("--observation-only", action="store_true")
+    parser.add_argument(
+        "--confirm-observation-only",
+        default="",
+        help=f"Required token for observation-only start: {OBSERVATION_ONLY_CONFIRMATION_PHRASE}",
+    )
     parser.add_argument(
         "--confirm-resume-paper",
         default="",
@@ -91,6 +110,8 @@ def main() -> int:
         start_service=bool(args.start_service),
         confirmation=str(args.confirm_resume_paper or ""),
         json_indent=args.json_indent,
+        observation_only=bool(args.observation_only),
+        observation_confirmation=str(args.confirm_observation_only or ""),
     )
     ssh = connect_remote_ssh(ROOT, timeout=25)
     try:

@@ -157,6 +157,53 @@ def test_dashboard_system_audit_payload_drops_unrendered_heavy_card_inputs() -> 
     assert "specialist_shadow_evaluation" not in training
 
 
+def test_artifact_wait_is_observing_only_when_runtime_contract_is_explicit() -> None:
+    child_names = (
+        "profit_prediction",
+        "time_series_prediction",
+        "sentiment_analysis",
+        "exit_advice",
+    )
+    card = {
+        "key": "phase3_paper_resume_preflight",
+        "status": "critical",
+        "details": {
+            "consumed_after_resume": True,
+            "effective_blockers": [
+                {"code": "phase3_quant_api_child_endpoints_unavailable"}
+            ],
+            "inputs": {
+                "platform_runtime": {
+                    "local_ai_tools": {
+                        "available": True,
+                        "service_available": True,
+                        "transport_status": "ok",
+                        "model_bundle_available": False,
+                        "child_endpoints": {
+                            name: {
+                                "status": "artifact_unavailable",
+                                "error": "model_bundle_unavailable",
+                            }
+                            for name in child_names
+                        },
+                    }
+                }
+            },
+        },
+    }
+
+    state, label = system_audit._issue_ledger_state(card, cards_by_key={card["key"]: card})
+
+    assert state == "observing"
+    assert "模型产物" in label
+
+    card["details"]["inputs"]["platform_runtime"]["local_ai_tools"][
+        "transport_status"
+    ] = "unavailable"
+    state, _label = system_audit._issue_ledger_state(card, cards_by_key={card["key"]: card})
+    assert state == "unresolved"
+
+
 @pytest.fixture(autouse=True)
 def _stable_model_training_scheduler_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(

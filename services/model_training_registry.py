@@ -291,6 +291,7 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
     for model_id, display_name, model_key, task in _LOCAL_TOOL_MODELS:
         model_name = str(models.get(model_key) or "").strip()
         artifact_available = bool(bundle_available and model_name)
+        artifact_unavailable = bool(runtime_available and not bundle_available)
         if diagnostic_timeout:
             lifecycle = "diagnostic_timeout"
         elif diagnostic_warming:
@@ -301,10 +302,22 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
             lifecycle = "canary"
         elif artifact_available:
             lifecycle = "promotion_blocked"
+        elif artifact_unavailable:
+            lifecycle = "artifact_unavailable"
         elif runtime_available:
             lifecycle = "not_trained"
         else:
             lifecycle = "service_unavailable"
+        identity_verified = artifact_available
+        identity_status = (
+            "verified"
+            if identity_verified
+            else "artifact_unavailable"
+            if artifact_unavailable
+            else "unverified"
+            if runtime_available
+            else "unavailable"
+        )
         rows.append(
             {
                 "model_id": model_id,
@@ -319,6 +332,7 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
                 "lifecycle": lifecycle,
                 "runtime_available": runtime_available,
                 "artifact_available": artifact_available,
+                "artifact_status": "ready" if artifact_available else "unavailable",
                 "trained_at": status.get("trained_at"),
                 "sample_count": _safe_int(
                     status.get("trade_sample_count")
@@ -332,9 +346,15 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
                     if diagnostic_timeout
                     else ["status_refresh_in_progress"]
                     if diagnostic_warming
+                    else ["model_bundle_unavailable"]
+                    if artifact_unavailable
                     else _safe_list(promotion.get("live_blocking_reasons"))
                 ),
-                "identity_verified": artifact_available,
+                # A reachable service without a compatible bundle is an
+                # artifact-readiness problem, not an identity mismatch.
+                "identity_verified": identity_verified,
+                "identity_status": identity_status,
+                "identity_failure_eligible": not artifact_unavailable,
             }
         )
     return rows
@@ -917,7 +937,14 @@ def build_model_training_registry(
     identity_failures = [
         row["model_id"]
         for row in models
-        if bool(row.get("runtime_available")) and not bool(row.get("identity_verified"))
+        if bool(row.get("runtime_available"))
+        and bool(row.get("identity_failure_eligible", True))
+        and not bool(row.get("identity_verified"))
+    ]
+    artifact_unavailable = [
+        row["model_id"]
+        for row in models
+        if row.get("identity_status") == "artifact_unavailable"
     ]
     return {
         "version": MODEL_TRAINING_REGISTRY_VERSION,
@@ -930,5 +957,7 @@ def build_model_training_registry(
             "lifecycle_counts": dict(lifecycle_counts),
             "identity_failure_count": len(identity_failures),
             "identity_failure_models": identity_failures,
+            "artifact_unavailable_count": len(artifact_unavailable),
+            "artifact_unavailable_models": artifact_unavailable,
         },
     }

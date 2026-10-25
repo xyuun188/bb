@@ -249,6 +249,42 @@ def test_server_monitor_probe_marks_vllm_port_model_mismatch() -> None:
     assert "BB-FinQuant-Expert-14B" in str(result["error"])
 
 
+def test_phase3_child_contract_distinguishes_missing_artifact_from_service_failure() -> None:
+    children = {
+        name: {"available": False, "error": "child_endpoint_contract_missing_or_not_ready"}
+        for name in (
+            "profit_prediction",
+            "time_series_prediction",
+            "sentiment_analysis",
+            "exit_advice",
+        )
+    }
+
+    artifact_wait = server_monitor_status._local_ai_tools_child_endpoint_contracts(
+        {
+            "service_available": True,
+            "model_bundle_available": False,
+            "artifact_readiness_known": True,
+            "child_endpoints": children,
+        }
+    )
+    assert {
+        item["status"] for item in artifact_wait.values()
+    } == {"artifact_unavailable"}
+    assert {
+        item["error"] for item in artifact_wait.values()
+    } == {"model_bundle_unavailable"}
+
+    service_failure = server_monitor_status._local_ai_tools_child_endpoint_contracts(
+        {
+            "service_available": False,
+            "model_bundle_available": False,
+            "child_endpoints": children,
+        }
+    )
+    assert {item["status"] for item in service_failure.values()} == {"unavailable"}
+
+
 def test_server_monitor_probe_omits_untargeted_fallback_from_duplicate_service_rows() -> None:
     script = render_server_monitor_probe("deepseek-v4-pro", "deepseek-v4-pro")
     namespace = _load_probe_namespace(script)

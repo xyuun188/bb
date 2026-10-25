@@ -382,6 +382,33 @@ def test_registry_preserves_zero_authoritative_profit_target() -> None:
     assert rows["timesfm_2_5"][PROFIT_TRAINING_TARGET] == 0.0
 
 
+def test_missing_phase3_bundle_is_not_reported_as_model_identity_failure() -> None:
+    payload = build_model_training_registry(
+        local_tools_status={
+            "available": True,
+            "service_available": True,
+            "model_bundle_available": False,
+            "models": {},
+        },
+    )
+    rows = _by_id(payload)
+    phase3_rows = [
+        row for row in rows.values() if row["model_id"].startswith("local_ai_")
+    ]
+
+    assert len(phase3_rows) == 6
+    assert all(row["runtime_available"] is True for row in phase3_rows)
+    assert all(row["artifact_available"] is False for row in phase3_rows)
+    assert all(row["lifecycle"] == "artifact_unavailable" for row in phase3_rows)
+    assert all(row["identity_status"] == "artifact_unavailable" for row in phase3_rows)
+    assert payload["summary"]["identity_failure_count"] == 0
+    assert payload["summary"]["identity_failure_models"] == []
+    assert payload["summary"]["artifact_unavailable_count"] == 6
+    assert set(payload["summary"]["artifact_unavailable_models"]) == {
+        row["model_id"] for row in phase3_rows
+    }
+
+
 def test_registry_keeps_finbert_identity_evidence_separate_from_runtime_probe() -> None:
     payload = build_model_training_registry(
         local_ml_status={},

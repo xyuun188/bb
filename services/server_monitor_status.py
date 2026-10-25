@@ -1237,6 +1237,25 @@ def _local_ai_tools_child_endpoint_contracts(
     }
     raw_contracts = status_metadata.get("child_endpoints")
     raw_contracts = raw_contracts if isinstance(raw_contracts, dict) else {}
+    service_available = bool(
+        status_metadata.get("service_available")
+        or status_metadata.get("available")
+        or status_metadata.get("health_available")
+    )
+    model_bundle_available = bool(
+        status_metadata.get("model_bundle_available")
+        or status_metadata.get("trained_models_available")
+        or status_metadata.get("artifact_status") == "ready"
+    )
+    artifact_unavailable = (
+        service_available
+        and (
+            status_metadata.get("artifact_readiness_known") is True
+            or "model_bundle_available" in status_metadata
+            or "trained_models_available" in status_metadata
+        )
+        and not model_bundle_available
+    )
     rows: dict[str, dict[str, Any]] = {}
     for name, path in specs.items():
         raw = raw_contracts.get(name)
@@ -1257,6 +1276,8 @@ def _local_ai_tools_child_endpoint_contracts(
             if live_probe_ok
             else "metadata_ready"
             if metadata_ready
+            else "artifact_unavailable"
+            if artifact_unavailable
             else "unavailable"
             if raw
             else "contract_missing"
@@ -1278,10 +1299,20 @@ def _local_ai_tools_child_endpoint_contracts(
                 or (
                     "状态契约已确认；实际推理由影子评估持续验证。"
                     if metadata_ready
+                    else "服务可达，但模型产物尚未就绪。"
+                    if artifact_unavailable
                     else "状态接口尚未返回该子接口的就绪契约。"
                 )
             ),
-            "error": "" if live_probe_ok else "inference_probe_not_run" if metadata_ready else "child_endpoint_contract_missing_or_not_ready",
+            "error": (
+                ""
+                if live_probe_ok
+                else "inference_probe_not_run"
+                if metadata_ready
+                else "model_bundle_unavailable"
+                if artifact_unavailable
+                else "child_endpoint_contract_missing_or_not_ready"
+            ),
         }
     return rows
 
@@ -1369,6 +1400,7 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
             "child_contract_status": "unavailable",
             "transport_status": "unavailable",
             "artifact_status": "unavailable",
+            "artifact_readiness_known": False,
             "inference_probe_status": "unavailable",
             "training_status": "unknown",
             "evaluation_status": "unknown",
@@ -1433,7 +1465,12 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
             else:
                 model_bundle_available = False
             child_endpoints = _local_ai_tools_child_endpoint_contracts(
-                status_metadata,
+                {
+                    **status_metadata,
+                    "service_available": service_available,
+                    "model_bundle_available": model_bundle_available,
+                    "artifact_readiness_known": bool(status_probe.get("ok")),
+                },
             )
             child_available = any(
                 bool(item.get("metadata_ready"))
@@ -1456,7 +1493,8 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                 if isinstance(item, dict)
             )
             child_unavailable_count = sum(
-                item.get("status") in {"unavailable", "contract_missing"}
+                item.get("status")
+                in {"unavailable", "contract_missing", "artifact_unavailable"}
                 for item in child_endpoints.values()
                 if isinstance(item, dict)
             )
@@ -1473,6 +1511,7 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                     "tunnel_contract": tunnel_contract,
                     "available": platform_call_available,
                     "service_available": service_available,
+                    "artifact_readiness_known": bool(status_probe.get("ok")),
                     "child_available": child_available,
                     "child_metadata_ready_count": child_metadata_ready_count,
                     "child_live_probe_ok_count": child_live_probe_ok_count,
@@ -1483,15 +1522,36 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                         if child_live_probe_ok_count == len(child_endpoints) and child_endpoints
                         else "metadata_ready"
                         if child_metadata_ready_count
+                        else "artifact_unavailable"
+                        if (
+                            service_available
+                            and status_probe.get("ok")
+                            and not model_bundle_available
+                        )
                         else "unavailable"
                     ),
                     "transport_status": "ok" if service_available else "unavailable",
                     "artifact_status": "ready" if model_bundle_available else "unavailable",
+                    "child_contract_reason": (
+                        "model_bundle_unavailable"
+                        if (
+                            service_available
+                            and status_probe.get("ok")
+                            and not model_bundle_available
+                        )
+                        else ""
+                    ),
                     "inference_probe_status": (
                         "live_probe_ok"
                         if child_live_probe_ok_count == len(child_endpoints) and child_endpoints
                         else "metadata_ready"
                         if child_metadata_ready_count
+                        else "artifact_unavailable"
+                        if (
+                            service_available
+                            and status_probe.get("ok")
+                            and not model_bundle_available
+                        )
                         else "unavailable"
                     ),
                     "training_status": str(

@@ -721,7 +721,52 @@ class LocalAIToolsClient:
         """Return one stable status contract for fresh, cached, and early-error paths."""
 
         status = dict(payload) if isinstance(payload, Mapping) else {}
-        child_endpoints = self._metadata_child_endpoints(status)
+        raw_children = status.get("child_endpoints")
+        raw_children = raw_children if isinstance(raw_children, Mapping) else {}
+        raw_child_available = any(
+            isinstance(item, Mapping)
+            and bool(
+                item.get("metadata_ready")
+                or item.get("available")
+                or item.get("status") == "metadata_ready"
+                or item.get("status_category") == "metadata_contract"
+            )
+            for item in raw_children.values()
+        )
+        service_available = bool(
+            status.get("service_available")
+            if "service_available" in status
+            else status.get("available")
+            or status.get("health_available")
+            or raw_child_available
+        )
+        model_bundle_available = bool(
+            status.get("model_bundle_available")
+            if "model_bundle_available" in status
+            else status.get("trained_models_available")
+            or status.get("artifact_persisted")
+            or status.get("artifact_status") == "ready"
+        )
+        artifact_readiness_known = bool(
+            status.get("artifact_readiness_known")
+            if "artifact_readiness_known" in status
+            else not status.get("status_error")
+            and not status.get("health_error")
+            and (
+                "model_bundle_available" in status
+                or "trained_models_available" in status
+                or "artifact_persisted" in status
+                or status.get("status") == "artifact_unavailable"
+            )
+        )
+        child_endpoints = self._metadata_child_endpoints(
+            {
+                **status,
+                "service_available": service_available,
+                "model_bundle_available": model_bundle_available,
+                "artifact_readiness_known": artifact_readiness_known,
+            }
+        )
         child_metadata_ready_count = sum(
             bool(item.get("metadata_ready"))
             for item in child_endpoints.values()
@@ -738,23 +783,11 @@ class LocalAIToolsClient:
             if isinstance(item, dict)
         )
         child_unavailable_count = sum(
-            item.get("status") in {"unavailable", "contract_missing"}
+            item.get("status") in {"unavailable", "contract_missing", "artifact_unavailable"}
             for item in child_endpoints.values()
             if isinstance(item, dict)
         )
         child_available = child_metadata_ready_count > 0
-        service_available = bool(
-            status.get("service_available")
-            if "service_available" in status
-            else status.get("available") or status.get("health_available") or child_available
-        )
-        model_bundle_available = bool(
-            status.get("model_bundle_available")
-            if "model_bundle_available" in status
-            else status.get("trained_models_available")
-            or status.get("artifact_persisted")
-            or status.get("artifact_status") == "ready"
-        )
         status.update(
             {
                 "available": service_available,
@@ -772,10 +805,27 @@ class LocalAIToolsClient:
                     if child_live_probe_ok_count == len(child_endpoints) and child_endpoints
                     else "metadata_ready"
                     if child_metadata_ready_count
+                    else "artifact_unavailable"
+                    if (
+                        service_available
+                        and artifact_readiness_known
+                        and not model_bundle_available
+                        and child_endpoints
+                    )
                     else "unavailable"
                 ),
                 "transport_status": "ok" if service_available else "unavailable",
                 "artifact_status": "ready" if model_bundle_available else "unavailable",
+                "child_contract_reason": (
+                    "model_bundle_unavailable"
+                    if (
+                        service_available
+                        and artifact_readiness_known
+                        and not model_bundle_available
+                        and child_endpoints
+                    )
+                    else ""
+                ),
             }
         )
         status.setdefault("inference_probe_status", status["child_contract_status"])
@@ -914,10 +964,40 @@ class LocalAIToolsClient:
         service_available = bool(health_ok or status_ok or child_available)
 
         status["model_bundle_available"] = model_bundle_available
+        status["artifact_readiness_known"] = bool(status_ok)
         status["service_available"] = service_available
         status["health_available"] = health_ok
         status["enabled_for_trading"] = enabled_for_trading
         status["health"] = health
+        child_endpoints = self._metadata_child_endpoints(
+            {
+                **status,
+                "service_available": service_available,
+                "model_bundle_available": model_bundle_available,
+                "artifact_readiness_known": bool(status_ok),
+            }
+        )
+        child_metadata_ready_count = sum(
+            bool(item.get("metadata_ready"))
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
+        child_live_probe_ok_count = sum(
+            bool(item.get("live_probe_ok"))
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
+        child_degraded_count = sum(
+            item.get("status") == "degraded"
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
+        child_unavailable_count = sum(
+            item.get("status")
+            in {"unavailable", "contract_missing", "artifact_unavailable"}
+            for item in child_endpoints.values()
+            if isinstance(item, dict)
+        )
         status["child_endpoints"] = child_endpoints
         status["child_metadata_ready_count"] = child_metadata_ready_count
         status["child_live_probe_ok_count"] = child_live_probe_ok_count
@@ -928,6 +1008,13 @@ class LocalAIToolsClient:
             if child_live_probe_ok_count == len(child_endpoints) and child_endpoints
             else "metadata_ready"
             if child_metadata_ready_count
+            else "artifact_unavailable"
+            if (
+                service_available
+                and status_ok
+                and not model_bundle_available
+                and child_endpoints
+            )
             else "unavailable"
         )
         status["transport_status"] = "ok" if service_available else "unavailable"
@@ -939,6 +1026,16 @@ class LocalAIToolsClient:
             else "unavailable"
         )
         status["artifact_status"] = "ready" if model_bundle_available else "unavailable"
+        status["child_contract_reason"] = (
+            "model_bundle_unavailable"
+            if (
+                service_available
+                and status_ok
+                and not model_bundle_available
+                and child_endpoints
+            )
+            else ""
+        )
         status["inference_probe_status"] = status["child_contract_status"]
         training_state = status.get("training_status") or status.get("training_state")
         if not training_state:
@@ -1046,6 +1143,7 @@ class LocalAIToolsClient:
                     "error": error,
                     "api_base": self._public_api_base(),
                     "model_bundle_available": False,
+                    "artifact_readiness_known": False,
                     "service_available": False,
                     "child_endpoints": child_endpoints,
                     **self._breaker_fields(),
@@ -1063,6 +1161,21 @@ class LocalAIToolsClient:
         raw = status.get("child_endpoints")
         if not isinstance(raw, dict):
             return {}
+        service_available = bool(
+            status.get("service_available")
+            or status.get("available")
+            or status.get("health_available")
+        )
+        model_bundle_available = bool(
+            status.get("model_bundle_available")
+            or status.get("trained_models_available")
+            or status.get("artifact_status") == "ready"
+        )
+        artifact_unavailable = (
+            service_available
+            and status.get("artifact_readiness_known") is True
+            and not model_bundle_available
+        )
         rows: dict[str, dict[str, Any]] = {}
         for name, item in raw.items():
             if not str(name).strip() or not isinstance(item, dict):
@@ -1082,6 +1195,8 @@ class LocalAIToolsClient:
                 state = "live_probe_ok"
             elif metadata_ready:
                 state = "metadata_ready"
+            elif artifact_unavailable:
+                state = "artifact_unavailable"
             elif item:
                 state = "unavailable"
             else:
@@ -1101,6 +1216,8 @@ class LocalAIToolsClient:
                         if live_probe_ok
                         else "inference_probe_not_run"
                         if metadata_ready
+                        else "model_bundle_unavailable"
+                        if artifact_unavailable
                         else "child_endpoint_contract_missing"
                     ),
                 }

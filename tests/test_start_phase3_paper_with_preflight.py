@@ -7,6 +7,7 @@ import pytest
 from scripts import start_phase3_paper_with_preflight as start_cli
 from scripts.start_phase3_paper_with_preflight import (
     CONFIRMATION_PHRASE,
+    OBSERVATION_ONLY_CONFIRMATION_PHRASE,
     CommandResult,
     build_phase3_paper_start_report,
     collect_phase3_paper_resume_preflight_via_command,
@@ -40,6 +41,33 @@ def _blocked_preflight() -> dict[str, Any]:
         "starts_trading_service": False,
         "submits_orders": False,
         "blockers": [{"code": "okx_authoritative_sync_has_differences"}],
+    }
+
+
+def _artifact_wait_preflight() -> dict[str, Any]:
+    children = {
+        name: {
+            "status": "artifact_unavailable",
+            "error": "model_bundle_unavailable",
+        }
+        for name in (
+            "profit_prediction",
+            "time_series_prediction",
+            "sentiment_analysis",
+            "exit_advice",
+        )
+    }
+    return {
+        "status": "blocked",
+        "can_resume_paper": False,
+        "starts_trading_service": False,
+        "submits_orders": False,
+        "blockers": [
+            {
+                "code": "phase3_quant_api_child_endpoints_unavailable",
+                "evidence": {"child_endpoints": children},
+            }
+        ],
     }
 
 
@@ -181,6 +209,107 @@ async def test_paper_start_entrypoint_starts_only_after_ready_and_confirmed() ->
 
 
 @pytest.mark.asyncio
+async def test_observation_only_start_keeps_paper_paused_for_artifact_wait() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], _timeout: float) -> CommandResult:
+        calls.append(args)
+        if args[1].endswith("apply_phase3_paper_resume_control.py"):
+            assert args[args.index("--action") + 1] == "pause"
+            assert (
+                args[args.index("--confirm-resume-paper") + 1]
+                == CONFIRMATION_PHRASE
+            )
+            return CommandResult(
+                status=0,
+                stdout='{"status":"ok","action":"pause","after":{"paused":true}}',
+            )
+        if args[:2] == ["systemctl", "start"]:
+            return CommandResult(status=0, stdout="")
+        if args[:2] == ["systemctl", "is-active"]:
+            return CommandResult(status=0, stdout="active")
+        raise AssertionError(args)
+
+    report = await build_phase3_paper_start_report(
+        preflight_provider=_artifact_wait_preflight,
+        command_runner=runner,
+        start_service=True,
+        observation_only=True,
+        confirm_observation_only=OBSERVATION_ONLY_CONFIRMATION_PHRASE,
+    )
+
+    assert report["status"] == "started_observation_only"
+    assert report["observation_only_allowed"] is True
+    assert report["control_state_paused"] is True
+    assert report["control_state_resumed"] is False
+    assert report["submits_orders"] is False
+    assert [call[call.index("--action") + 1] for call in calls if "--action" in call] == [
+        "pause"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_observation_only_start_rejects_unrelated_blocker() -> None:
+    report = await build_phase3_paper_start_report(
+        preflight_provider=_blocked_preflight,
+        command_runner=lambda *_args: CommandResult(status=0, stdout="active"),
+        start_service=True,
+        observation_only=True,
+        confirm_observation_only=OBSERVATION_ONLY_CONFIRMATION_PHRASE,
+    )
+
+    assert report["status"] == "blocked"
+    assert report["observation_only_allowed"] is False
+    assert "observation_only_not_safe" in {item["code"] for item in report["blockers"]}
+
+
+@pytest.mark.asyncio
+async def test_observation_only_start_requires_distinct_confirmation() -> None:
+    calls: list[list[str]] = []
+    report = await build_phase3_paper_start_report(
+        preflight_provider=_artifact_wait_preflight,
+        command_runner=lambda args, _timeout: (
+            calls.append(args) or CommandResult(status=0, stdout="active")
+        ),
+        start_service=True,
+        observation_only=True,
+        confirm_resume_paper=CONFIRMATION_PHRASE,
+    )
+
+    assert report["status"] == "blocked"
+    assert report["confirmation_present"] is False
+    assert "resume_confirmation_missing" in {item["code"] for item in report["blockers"]}
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_observation_only_start_requires_persisted_pause_state() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: list[str], _timeout: float) -> CommandResult:
+        calls.append(args)
+        if args[1].endswith("apply_phase3_paper_resume_control.py"):
+            return CommandResult(
+                status=0,
+                stdout='{"status":"ok","action":"pause","after":{"paused":false}}',
+            )
+        raise AssertionError(args)
+
+    report = await build_phase3_paper_start_report(
+        preflight_provider=_artifact_wait_preflight,
+        command_runner=runner,
+        start_service=True,
+        observation_only=True,
+        confirm_observation_only=OBSERVATION_ONLY_CONFIRMATION_PHRASE,
+    )
+
+    assert report["status"] == "blocked"
+    assert report["control_state_paused"] is False
+    assert report["action_status"] == "control_pause_failed"
+    assert all(call[:2] != ["systemctl", "start"] for call in calls)
+
+
+@pytest.mark.asyncio
 async def test_paper_start_entrypoint_default_path_runs_preflight_command_before_start() -> None:
     calls: list[list[str]] = []
 
@@ -225,7 +354,14 @@ async def test_paper_start_failure_rolls_control_state_back_to_paused() -> None:
         calls.append(args)
         if args[1].endswith("apply_phase3_paper_resume_control.py"):
             action = args[args.index("--action") + 1]
-            return CommandResult(status=0, stdout=f'{{"status":"ok","action":"{action}"}}')
+            paused = action == "pause"
+            return CommandResult(
+                status=0,
+                stdout=(
+                    f'{{"status":"ok","action":"{action}",'
+                    f'"after":{{"paused":{str(paused).lower()}}}}}'
+                ),
+            )
         if args[:2] == ["systemctl", "start"]:
             return CommandResult(status=1, stderr="failed")
         raise AssertionError(args)
