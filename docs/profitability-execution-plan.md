@@ -6949,3 +6949,16 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   `audit_online_mature_shadow_cohort.py --cutoff 2026-10-25T19:06:53Z
   --minutes 360 --expected-decision-count 398
   --maturity-cutoff 2026-10-25T23:07:53Z --limit 1200`.
+
+### Mature Audit Fail-Closed Cutoff Guard (2026-10-26 04:22 Asia/Shanghai)
+
+- The remote mature-cohort runner now checks its own UTC clock before opening
+  the read-only database session. If the fixed maturity cutoff has not passed,
+  it returns `status=maturity_not_reached` with
+  `label_rows_queried=false` and no decision or label query. This protects the
+  sealed cohort even if the heartbeat fires early.
+- Local and remote focused tests both pass `3`; Ruff, compileall and whitespace
+  checks pass. Targeted online sync returned `source-integrity-ok:2`; no
+  service restart, permission change, database mutation or order occurred.
+  Commit `de15eaa` is pushed to `origin/main`. The final audit remains deferred
+  until the fixed `2026-10-25T23:07:53Z` boundary.
