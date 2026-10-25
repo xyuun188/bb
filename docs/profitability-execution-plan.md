@@ -70,10 +70,10 @@ or trade frequency to manufacture success.
 | G0 Recovery and execution safety | PASSED | Active goal, this checkpoint, same-chat scheduled continuation | Saved automation inspected and app view verified on 2026-10-22 |
 | G1 Authoritative loss attribution | PASSED | Fixed-cutoff canonical lifecycle and complete official-bill audit; evidence below | Separate full round trips, partial updates and window cash flow; reconcile price PnL, signed fees and funding without double counting; expose unresolved links and costs |
 | G2 Data and label validity | BLOCKED (fresh boundary met; reload verification pending) | Eligibility, timing, cost and provenance report plus defect regressions | No future-data leakage or split-group overlap; correct price/label horizon and source identity; missing or contradictory facts quarantined, not imputed into profitability |
-| G3 Cost-aware candidate development | PENDING | Preregistered bounded experiment ledger and purged chronological comparisons | Candidate family/features/horizon/threshold/exits selected only within development folds; compare no-trade and transparent baselines on identical costs and exposure |
-| G4 Frozen independent evaluation | PENDING | Policy/code/data fingerprints, untouched exam and acceptance report | Predefined sample coverage, time/dependence-aware lower bound above zero, positive net mean, PF above one, predefined drawdown/tail limits, and cost stress tests pass; no post-exam tuning |
-| G5 Governed paper execution | PENDING | Controlled paper fills, protection, exits and official lifecycle settlements | Prior gates passed; frozen risk budget; no unlinked fills/unprotected exposure; observed fee-after results and forecast calibration meet preregistered criteria |
-| G6 Final acceptance and handoff | PENDING | Complete evidence inventory, verified deployment, regression report and monitor | G0-G5 all passed, exact deployed hashes match accepted version, independent subsequent window passes predefined criteria; remaining uncertainty disclosed |
+| G3 Cost-aware candidate development | NOT PASSED | Preregistered bounded experiment ledger and purged chronological comparisons; completed candidates rejected | Candidate family/features/horizon/threshold/exits selected only within development folds; compare no-trade and transparent baselines on identical costs and exposure |
+| G4 Frozen independent evaluation | NOT STARTED | No qualifying candidate to freeze; no untouched exam opened | Predefined sample coverage, time/dependence-aware lower bound above zero, positive net mean, PF above one, predefined drawdown/tail limits, and cost stress tests pass; no post-exam tuning |
+| G5 Governed paper execution | NOT STARTED | No G3/G4-approved policy or governed profitable paper round trip | Prior gates passed; frozen risk budget; no unlinked fills/unprotected exposure; observed fee-after results and forecast calibration meet preregistered criteria |
+| G6 Final acceptance and handoff | BLOCKED | Depends on G2-G5 evidence | G0-G5 all passed, exact deployed hashes match accepted version, independent subsequent window passes predefined criteria; remaining uncertainty disclosed |
 
 Gate G1 may pass as an audit even when its PnL is negative. Gates G4-G6 cannot
 pass on negative or insufficient profitability evidence. Do not confuse
@@ -5286,3 +5286,72 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   materially new, preregistered research question; if no new candidate can
   pass independent criteria, profitability acceptance remains correctly
   unachieved.
+
+### Current User Recheck And Queue Attribution (2026-10-25 12:20 Asia/Shanghai)
+
+- A bounded entry recovery through `2026-10-25T04:15:02Z` covered the prior
+  90 minutes and returned `206/206` market decisions as `hold`, with zero
+  executed entries. The newest selection examples remain either `no_candidate`
+  or `shadow_training`; the latter have `entry_permission.granted=false` and
+  are not paper fills. The global local-ML paper permission is still false at
+  authoritative `n=267`: mean fee-after return `-0.303832%`, lower bound
+  `-0.431590%`, PF `0.549713`. Recent selected directions also explicitly
+  report expected net not positive, excessive observed loss probability, and
+  missing quantitative evidence. This confirms the direct entry blocker is
+  economic/authorization evidence, not a failed exchange order.
+- The same online entry projection reports 412 new shadow samples since the
+  last local-ML fit, but training correctly returned `not_due`; the artifact
+  remains `shadow`/`degraded`, influence disabled. Six specialist trainers
+  remain skipped because an authoritative execution-cost distribution is
+  unavailable. These shadow observations do not count as realized outcomes.
+- A new bounded 240-minute availability audit at
+  `2026-10-25T04:14:33Z` found decision snapshots `63/64` valid and a newest
+  clean streak of `35` across `29` symbols; training snapshots were `64/64`
+  valid. Payload seals and the `98,304 B` budget passed. The single invalid
+  decision was ONDO (`decision_id=695400`): orderbook and mark facts were
+  available from the native WebSocket, while `reference_prices` timed out and
+  no index-price fact was captured. This is an isolated current-process
+  capture miss, not a missing timestamp from a completed REST response.
+- The bounded 45-minute public-route audit at `2026-10-25T04:14:47Z` contained
+  907 latency events. For `publicGetMarketIndexTickers`, queue-wait p95/max
+  were `12,825/28,162 ms` while provider-duration p95/max were
+  `1,343/3,626 ms`; mark-price and orderbook queue-wait p95 were
+  `13,169 ms` and `11,692 ms`. The route successfully completed most sampled
+  calls. This attributes the remaining intermittent index/reference misses
+  primarily to local shared-request queue contention, not a consistently slow
+  OKX provider. Current latency logs contain aggregate route/method timing but
+  no instrument correlation ID or raw response, so they cannot attribute a
+  timed-out request to a specific provider payload.
+- Current code already has a strict WebSocket-fact reuse path and the targeted
+  source upload was verified earlier, but the long-running paper process has
+  not loaded that upload; its governed reload preflight remains blocked by the
+  active-service/stopped-before-start requirement and missing eligible
+  Phase-3 quant bundle contracts. No restart, control change, order or
+  permission change was made. G2 remains blocked pending governed reload
+  verification even though the current process has a fresh numeric clean
+  streak.
+- A fresh read-only paper preflight at `2026-10-25T04:22:03Z` reconfirmed the
+  same two resume blockers: the paper service was already active, and the
+  online quant API had no eligible child-endpoint metadata contracts for its
+  four specialist routes. Account truth, model-server runtime, exchange
+  integrity, dashboard and tunnel checks passed. The API process is reachable;
+  missing child contracts are model-bundle readiness, not an exchange outage.
+  This preflight is a stopped-before-start resume contract, not permission to
+  interrupt the active service. These operational blockers prevent verifying
+  the uploaded market-data code in the running process, but do not explain the
+  negative economic permission that currently vetoes entries.
+- Gate decision: G0 passed; G1 passed as negative authoritative attribution;
+  G2 blocked pending loaded-source verification; G3 not passed (all completed
+  preregistered candidate families so far rejected, including fixed 60-minute
+  short); G4-G6 have not started/passed. Five profitability gates remain
+  unresolved. There is no defensible calendar date for profitability: G2 has a
+  measurable next operational checkpoint, but G3 depends on finding a
+  genuinely positive fee-after candidate, which cannot be guaranteed by
+  waiting or by relaxing gates.
+- Next: resolve the paper-only reload readiness without interrupting the
+  active service or fabricating endpoint eligibility; once a governed reload
+  is available, collect the required fresh 30-decision/20-symbol zero
+  missing-book/mark/index boundary and verify the loaded source hash. In
+  parallel, do not resume model-family sweeps on inspected windows; register
+  only a materially new development question. Keep live disabled and all
+  profitability, quality and risk gates unchanged.
