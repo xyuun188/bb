@@ -6727,3 +6727,16 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   `git diff --check` passed. Targeted online sync and isolated remote tests
   are next; no service restart, order, permission, database mutation, or
   new-window label read occurred.
+
+### Next Prospective Window Seal Sequence (2026-10-26 01:27 Asia/Shanghai)
+
+- The new rules-canary decision window remains
+  `[2026-10-25T13:06:53Z, 2026-10-25T19:06:53Z)`. At or after its close,
+  first run a decision-only bounded projection to seal the exact decision
+  count and ID fingerprint; this reads no `ShadowBacktest` labels.
+- Only after the fixed maturity boundary
+  `2026-10-25T23:07:53Z` (2026-10-26 07:07:53 Asia/Shanghai), use that sealed
+  count with `audit_online_mature_shadow_cohort.py` for the four-horizon G2
+  provenance audit. If the new cohort is incomplete or undersized, close it
+  as insufficient and register a later window; do not run the G3 outcome
+  study on ineligible rows.
