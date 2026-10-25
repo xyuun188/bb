@@ -6792,3 +6792,28 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   retry again failed on `github.com:443`, so `origin/main` remains
   `d70f8a4`. Retry push when connectivity returns; do not rebuild or rerun
   the sealed cohort.
+
+### Online Runtime Pause-Versus-Entry Diagnosis (2026-10-26 02:07 Asia/Shanghai)
+
+- A bounded read-only runtime check disproved a global analysis pause. The
+  persisted control state is `mode=paper, paused=false`; both
+  `bb-paper-trading.service` and `bb-dashboard.service` are active with zero
+  restarts. The 15-minute coverage report had `monitoring_active=true`,
+  six completed market decisions, zero model failures, and no duplicate
+  cooldown violations.
+- The zero-entry state is an execution/evidence gate, not an analysis
+  shutdown. Recent decisions were `no_direction` or `paper_training_entry`.
+  Two short-side observations had positive expected fee-after returns
+  (`0.4653%` and `0.3957%`) but were explicitly blocked by
+  `direction_support_quant_evidence_missing` and kept training-only. Other
+  sides were blocked by non-positive expected net return or excessive loss
+  probability.
+- OKX reconciliation currently reports `can_open_new_entries=true`,
+  `requires_attention=false`, and no entry blockers. The separate strategy
+  scheduler still has `67` rejected candidates and `0` governed candidates;
+  the model blueprint has no positive fee-after side. Therefore restoring a
+  pause flag would not restore normal entries; the missing governed
+  cost-aware evidence is the actual remaining gate.
+- This checkpoint is evidence-only: no control state, permission, model,
+  database, service, or order was changed. The fixed mature G2 cohort audit
+  remains the next state-changing action after its registered boundary.
