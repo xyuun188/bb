@@ -90,7 +90,7 @@ def test_uncontradicted_executable_snapshot_still_has_cost_supervision(features)
     assert shadow_fee_after_return_labels(sample)["complete"] is True
 
 
-def test_rebuilt_historical_row_with_complete_copied_costs_is_not_a_net_training_row(
+def test_rebuilt_historical_row_without_frozen_features_is_excluded_from_net_training(
     features,
 ):
     from services.historical_shadow_rebuild import build_historical_shadow_sample
@@ -117,10 +117,14 @@ def test_rebuilt_historical_row_with_complete_copied_costs_is_not_a_net_training
         "label_timestamp": payload["due_at"],
     }
     annotated = annotate_sample(sample, "shadow")
-    assert annotated["exclude_from_training"] is False
+    assert annotated["exclude_from_training"] is True
+    assert "feature_availability:feature_availability_contract_missing" in (
+        annotated["quality_reasons"]
+    )
     tasks = annotated["profit_supervision"]["tasks"]
-    assert tasks[MARKET_OPPORTUNITY_TASK]["eligible"] is True
+    assert tasks[MARKET_OPPORTUNITY_TASK]["eligible"] is False
     assert tasks[COUNTERFACTUAL_EXECUTION_COST_TASK]["eligible"] is False
+    assert annotated["fee_after_label_complete"] is False
     assert build_training_frame([SimpleNamespace(id=91, **payload)]).empty
 
 

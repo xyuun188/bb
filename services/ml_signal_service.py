@@ -2050,7 +2050,7 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                 "decision_group": _safe_dict(quality_sample.get("correlation_weight")).get(
                     "correlation_group"
                 ),
-                "decision_timestamp": getattr(row, "created_at", None),
+                "decision_timestamp": snapshot.get("original_decision_timestamp"),
                 "label_timestamp": getattr(row, "due_at", None) or getattr(row, "created_at", None),
                 "symbol": str(getattr(row, "symbol", "") or ""),
                 "market_regime": _market_regime_label(snapshot),

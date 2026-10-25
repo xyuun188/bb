@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -26,6 +27,42 @@ def rules_canary_side(snapshot: dict[str, Any] | None) -> str:
     signal = build_live_rules_canary_signal(snapshot)
     action = str(signal.get("action") or "hold").lower()
     return action if action in {"long", "short"} else "hold"
+
+
+def filter_rules_canary_decision_window(
+    frame: pd.DataFrame,
+    *,
+    since: datetime,
+    cutoff: datetime,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Select observations by frozen decision time, not label update time."""
+
+    if since.tzinfo is None or cutoff.tzinfo is None or since >= cutoff:
+        raise ValueError("decision window must have ordered timezone-aware bounds")
+    row_count = len(frame)
+    if row_count == 0 or "decision_timestamp" not in frame:
+        return frame.iloc[0:0].copy(), {
+            "decision_timestamp_source": "feature_snapshot.original_decision_timestamp",
+            "candidate_row_count": row_count,
+            "valid_decision_timestamp_row_count": 0,
+            "selected_row_count": 0,
+            "missing_decision_timestamp_row_count": row_count,
+            "outside_decision_window_row_count": 0,
+        }
+
+    timestamps = pd.to_datetime(frame["decision_timestamp"], utc=True, errors="coerce")
+    valid = timestamps.notna()
+    in_window = valid & (timestamps >= pd.Timestamp(since)) & (
+        timestamps < pd.Timestamp(cutoff)
+    )
+    return frame.loc[in_window].copy(), {
+        "decision_timestamp_source": "feature_snapshot.original_decision_timestamp",
+        "candidate_row_count": row_count,
+        "valid_decision_timestamp_row_count": int(valid.sum()),
+        "selected_row_count": int(in_window.sum()),
+        "missing_decision_timestamp_row_count": int((~valid).sum()),
+        "outside_decision_window_row_count": int((valid & ~in_window).sum()),
+    }
 
 
 def _fold_view(frame: pd.DataFrame, sides: np.ndarray) -> dict[str, Any]:

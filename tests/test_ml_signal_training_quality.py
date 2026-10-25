@@ -1497,6 +1497,7 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
     row = SimpleNamespace(
         id=7,
         decision_id=10007,
+        created_at=due_at,
         label_version=SHADOW_LABEL_VERSION,
         symbol="BTC/USDT",
         analysis_type="market",
@@ -1552,6 +1553,9 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
     assert frame.loc[0, "short_mfe_pct"] == pytest.approx(0.18)
     assert frame.loc[0, "short_mae_pct"] == pytest.approx(0.0)
     assert frame.loc[0, "feature_contract_version"] == (ml_signal_module.FEATURE_CONTRACT_VERSION)
+    assert pd.Timestamp(frame.loc[0, "decision_timestamp"]) == due_at - timedelta(
+        minutes=30
+    )
 
 
 @pytest.mark.asyncio

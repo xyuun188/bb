@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from services.rules_canary_development import (
     RULES_CANARY_DEVELOPMENT_VERSION,
     build_rules_canary_development_report,
+    filter_rules_canary_decision_window,
     rules_canary_side,
 )
 
@@ -61,3 +63,53 @@ def test_rules_canary_report_is_read_only_when_coverage_is_insufficient() -> Non
     assert report["status"] == "insufficient_development_data"
     assert report["orders_submitted"] is False
     assert report["promotion_authorized"] is False
+
+
+def test_rules_canary_window_uses_decision_time_not_label_completion_time() -> None:
+    since = pd.Timestamp("2026-10-25T13:06:52Z").to_pydatetime()
+    cutoff = pd.Timestamp("2026-10-25T19:06:52Z").to_pydatetime()
+    frame = pd.DataFrame(
+        [
+            {
+                "id": 1,
+                "decision_timestamp": "2026-10-25T13:00:00Z",
+                "label_timestamp": "2026-10-25T13:05:00Z",
+            },
+            {
+                "id": 2,
+                "decision_timestamp": "2026-10-25T13:06:52Z",
+                "label_timestamp": "2026-10-25T17:06:52Z",
+            },
+            {
+                "id": 3,
+                "decision_timestamp": "2026-10-25T19:06:52Z",
+                "label_timestamp": "2026-10-25T19:11:52Z",
+            },
+            {"id": 4, "decision_timestamp": None, "label_timestamp": None},
+        ]
+    )
+
+    selected, report = filter_rules_canary_decision_window(
+        frame,
+        since=since,
+        cutoff=cutoff,
+    )
+
+    assert selected["id"].tolist() == [2]
+    assert report == {
+        "decision_timestamp_source": "feature_snapshot.original_decision_timestamp",
+        "candidate_row_count": 4,
+        "valid_decision_timestamp_row_count": 3,
+        "selected_row_count": 1,
+        "missing_decision_timestamp_row_count": 1,
+        "outside_decision_window_row_count": 2,
+    }
+
+
+def test_rules_canary_window_requires_ordered_aware_bounds() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        filter_rules_canary_decision_window(
+            pd.DataFrame(),
+            since=pd.Timestamp("2026-10-25T13:00:00Z").to_pydatetime(),
+            cutoff=pd.Timestamp("2026-10-25T12:00:00Z").to_pydatetime(),
+        )

@@ -6501,3 +6501,50 @@ on the mean. A favorable historical test is not a guarantee of future profit.
 - Next action: retry the push once network connectivity is restored, then
   revisit the sealed-label maturity audit only at/after its fixed 240-minute
   boundary. Do not repeat already completed local/remote code tests.
+
+### Separate Decision And Label-Maturity Cutoffs (2026-10-25 23:55 Asia/Shanghai)
+
+- Fixed a G3 audit-window defect: one `--cutoff` had been used both as the
+  exclusive end of the frozen decision cohort and as the exclusive
+  `ShadowBacktest.updated_at` maturity cutoff. Labels that completed after the
+  decision window were therefore excluded even when they belonged to the
+  cohort and were mature by the audit time.
+- The audit now keeps `--cutoff` as the decision-time boundary and accepts an
+  independent `--maturity-cutoff` for label updates; omitting the latter
+  preserves legacy behavior. The SQL bounds label completion by maturity
+  cutoff, then the training frame selects decisions only in
+  `[decision_cutoff - hours, decision_cutoff)`. Both cutoffs are emitted in
+  the report and identify the output/unit, preventing accidental overwrite or
+  collision. Added regressions for separate rendering and legacy default.
+- The training frame now sources its decision timestamp from the frozen
+  snapshot's `original_decision_timestamp`; rules-canary window filtering
+  explicitly counts missing and out-of-window decision clocks. Updated the
+  historical reconstruction regression to require exclusion when the
+  original frozen feature-availability contract is absent; no historical
+  feature clock or executable cost was inferred.
+- Local affected-suite result: `103 passed`; changed-file Ruff, compileall,
+  and `git diff --check` passed. Targeted upload of seven owned code/test files
+  returned `source-integrity-ok:7`; the same isolated remote test group passed
+  `103 passed` in 57.58s with 25% CPU, 1 GiB memory, and a unique `/tmp`
+  pytest directory. No service restart, DB write, order, permission, risk, or
+  live-mode change occurred.
+- Current local changes include the three runtime/audit modules, four
+  regression files, and this plan update. Earlier local commits
+  `5bd248e` and `9fe914f` remain ahead of `origin/main`; their push previously
+  failed on a GitHub connection reset. Do not retry GitHub until connectivity
+  is available.
+- The latest sealed G2 cohort remains the 42-decision window ending at
+  `2026-10-25T13:06:52Z`, with its fixed 240-minute maturity boundary at
+  `2026-10-25T17:06:52Z` (2026-10-26 01:06:52 Asia/Shanghai). At this
+  checkpoint it is still before that boundary; do not inspect its labels
+  early or re-run any completed historical study.
+- G2 label eligibility/provenance remains pending; G3 has no qualified
+  profitable policy; G4/G5 remain not started and G6 blocked. Authoritative
+  fee-after evidence remains negative (`n=267`, mean `-0.303832%`, lower
+  bound `-0.431590%`, PF `0.549713`). This repair corrects study membership,
+  not profitability or entry permission. Next action: at/after the fixed
+  maturity boundary, run one bounded source-native audit of only the sealed
+  cohort with decision cutoff `2026-10-25T13:06:52Z` and maturity cutoff
+  `2026-10-25T17:06:52Z`; record eligible count and each exclusion reason.
+  If viable labels remain insufficient, explicitly close this cohort as
+  insufficient and preregister/collect a new batch instead of retuning on it.

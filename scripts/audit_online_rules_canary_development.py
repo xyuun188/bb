@@ -49,11 +49,17 @@ from services.ml_training_dataset import (
 from services.rules_canary_development import (
     RULES_CANARY_PRIMARY_HORIZON_MINUTES,
     build_rules_canary_development_report,
+    filter_rules_canary_decision_window,
 )
 
 LIMIT = __LIMIT__
 HOURS = __HOURS__
-CUTOFF = datetime.fromisoformat(__CUTOFF__.replace("Z", "+00:00")).astimezone(UTC)
+DECISION_CUTOFF = datetime.fromisoformat(
+    __DECISION_CUTOFF__.replace("Z", "+00:00")
+).astimezone(UTC)
+MATURITY_CUTOFF = datetime.fromisoformat(
+    __MATURITY_CUTOFF__.replace("Z", "+00:00")
+).astimezone(UTC)
 DEPENDENCIES = __DEPENDENCIES__
 NATIVE_SOURCE = "shadow_entry_result_and_okx_native_1m_path"
 
@@ -66,7 +72,7 @@ def dependency_hashes():
 
 
 async def main():
-    since = CUTOFF - timedelta(hours=HOURS)
+    since = DECISION_CUTOFF - timedelta(hours=HOURS)
     group_key = func.coalesce(
         func.nullif(ShadowBacktest.decision_id, 0),
         -ShadowBacktest.id,
@@ -75,7 +81,7 @@ async def main():
         ShadowBacktest.execution_mode == "paper",
         ShadowBacktest.status == "completed",
         ShadowBacktest.updated_at >= since,
-        ShadowBacktest.updated_at < CUTOFF,
+        ShadowBacktest.updated_at < MATURITY_CUTOFF,
         ShadowBacktest.horizon_minutes == RULES_CANARY_PRIMARY_HORIZON_MINUTES,
         ShadowBacktest.training_feature_snapshot[
             "training_market_fact_contract"
@@ -88,7 +94,7 @@ async def main():
         select(group_key.label("decision_group_key"))
         .where(*filters)
         .group_by(group_key)
-        .order_by(func.max(ShadowBacktest.updated_at), group_key)
+        .order_by(func.max(ShadowBacktest.created_at), group_key)
         .limit(LIMIT)
         .subquery()
     )
@@ -108,10 +114,16 @@ async def main():
                 for row in result.mappings()
             ]
         frame = build_training_frame(rows)
+        frame, decision_window = filter_rules_canary_decision_window(
+            frame,
+            since=since,
+            cutoff=DECISION_CUTOFF,
+        )
+        selected_ids = set(frame["id"].astype(int)) if not frame.empty else set()
         snapshots_by_id = {
             int(row.id): row.feature_snapshot
             for row in rows
-            if isinstance(row.feature_snapshot, dict)
+            if int(row.id) in selected_ids and isinstance(row.feature_snapshot, dict)
         }
         report = build_rules_canary_development_report(
             frame,
@@ -123,20 +135,28 @@ async def main():
                 "generated_at": datetime.now(UTC).isoformat(),
                 "window": {
                     "since": since.isoformat(),
-                    "cutoff_exclusive": CUTOFF.isoformat(),
+                    "decision_cutoff_exclusive": DECISION_CUTOFF.isoformat(),
+                    "maturity_cutoff_exclusive": MATURITY_CUTOFF.isoformat(),
                     "hours": HOURS,
                     "decision_group_limit": LIMIT,
                     "source": NATIVE_SOURCE,
                     "filter": (
                         "completed paper labels with fee_after_complete=true; "
-                        "fixed live-rules-canary signal; primary five-minute horizon"
+                        "fixed live-rules-canary signal; primary five-minute horizon; "
+                        "decision time in [since, decision_cutoff); "
+                        "updated_at before maturity_cutoff"
                     ),
+                    "decision_timestamp_source": (
+                        "training_feature_snapshot.original_decision_timestamp"
+                    ),
+                    "maturity_timestamp_source": "shadow_backtests.updated_at",
                 },
                 "input": {
                     "source_row_count": len(rows),
                     "training_frame_row_count": int(len(frame)),
                     "dependency_sha256": dependency_hashes(),
                 },
+                "decision_window_filter": decision_window,
                 "database_mutated": False,
                 "orders_submitted": False,
             }
@@ -157,11 +177,25 @@ def _parse_cutoff(value: str) -> datetime:
     return cutoff.astimezone(UTC)
 
 
-def _render_remote_script(*, limit: int, hours: int, cutoff: datetime) -> str:
+def _render_remote_script(
+    *,
+    limit: int,
+    hours: int,
+    cutoff: datetime,
+    maturity_cutoff: datetime | None = None,
+) -> str:
+    maturity_cutoff = maturity_cutoff or cutoff
     return (
         REMOTE_SCRIPT.replace("__LIMIT__", str(limit))
         .replace("__HOURS__", str(hours))
-        .replace("__CUTOFF__", repr(cutoff.isoformat().replace("+00:00", "Z")))
+        .replace(
+            "__DECISION_CUTOFF__",
+            repr(cutoff.isoformat().replace("+00:00", "Z")),
+        )
+        .replace(
+            "__MATURITY_CUTOFF__",
+            repr(maturity_cutoff.isoformat().replace("+00:00", "Z")),
+        )
         .replace("__DEPENDENCIES__", repr(DEPENDENCIES))
     )
 
@@ -171,9 +205,15 @@ def _build_remote_command(
     limit: int,
     hours: int,
     cutoff: datetime,
+    maturity_cutoff: datetime | None = None,
     unit: str,
 ) -> str:
-    script = _render_remote_script(limit=limit, hours=hours, cutoff=cutoff)
+    script = _render_remote_script(
+        limit=limit,
+        hours=hours,
+        cutoff=cutoff,
+        maturity_cutoff=maturity_cutoff,
+    )
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     runner = f"import base64;exec(base64.b64decode({encoded!r}))"
     return " ".join(
@@ -211,16 +251,29 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=1200)
     parser.add_argument("--hours", type=int, default=6)
     parser.add_argument("--cutoff", required=True)
+    parser.add_argument(
+        "--maturity-cutoff",
+        help="exclusive label updated_at cutoff; defaults to --cutoff",
+    )
     args = parser.parse_args()
     limit = max(1, min(int(args.limit), 2500))
     hours = max(1, min(int(args.hours), 168))
     cutoff = _parse_cutoff(args.cutoff)
-    unit = f"bb-rules-canary-development-{cutoff.strftime('%Y%m%dT%H%M%SZ')}"
+    maturity_cutoff = (
+        _parse_cutoff(args.maturity_cutoff)
+        if args.maturity_cutoff
+        else cutoff
+    )
+    if maturity_cutoff < cutoff:
+        parser.error("--maturity-cutoff must be at or after --cutoff")
+    decision_stamp = cutoff.strftime("%Y%m%dT%H%M%SZ")
+    maturity_stamp = maturity_cutoff.strftime("%Y%m%dT%H%M%SZ")
+    unit = f"bb-rules-canary-development-d{decision_stamp}-m{maturity_stamp}"
     result_path = (
         ROOT
         / "data"
         / "profitability_remediation"
-        / f"online-rules-canary-development-{cutoff.strftime('%Y%m%dT%H%M%SZ')}.json"
+        / f"online-rules-canary-development-d{decision_stamp}-m{maturity_stamp}.json"
     )
     if result_path.exists():
         raise FileExistsError(f"refusing to overwrite existing report: {result_path}")
@@ -236,7 +289,7 @@ def main() -> None:
         command = (
             "set -e\numask 077\n"
             "install -d -m 0700 /data/bb/app/tmp/codex-rules-canary-development\n"
-            f"{_build_remote_command(limit=limit, hours=hours, cutoff=cutoff, unit=unit)}"
+            f"{_build_remote_command(limit=limit, hours=hours, cutoff=cutoff, maturity_cutoff=maturity_cutoff, unit=unit)}"
             f" > {shlex.quote(remote_result)}"
         )
         run_remote_text(ssh, command, timeout=320, max_output_chars=4000)
