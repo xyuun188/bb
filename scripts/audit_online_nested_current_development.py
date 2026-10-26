@@ -10,7 +10,7 @@ import secrets
 import shlex
 import sys
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,7 +41,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
-from sqlalchemy import func, select
+from sqlalchemy import DateTime, cast, func, select
 
 from db.session import close_db, get_read_session_ctx
 from models.learning import ShadowBacktest
@@ -68,6 +68,9 @@ from services.ml_training_dataset import shadow_training_columns, shadow_trainin
 GROUP_LIMIT = __GROUP_LIMIT__
 HOURS = __HOURS__
 CUTOFF = datetime.fromisoformat(__CUTOFF__.replace("Z", "+00:00")).astimezone(UTC)
+DECISION_SINCE = datetime.fromisoformat(
+    __DECISION_SINCE__.replace("Z", "+00:00")
+).astimezone(UTC)
 REVISION = __REVISION__
 FAMILY = __FAMILY__
 NATIVE_SOURCE = "shadow_entry_result_and_okx_native_1m_path"
@@ -222,11 +225,19 @@ async def main():
         func.nullif(ShadowBacktest.decision_id, 0),
         -ShadowBacktest.id,
     )
+    decision_timestamp = cast(
+        ShadowBacktest.training_feature_snapshot[
+            "original_decision_timestamp"
+        ].as_string(),
+        DateTime(timezone=True),
+    )
     filters = (
         ShadowBacktest.execution_mode == "paper",
         ShadowBacktest.status == "completed",
         ShadowBacktest.updated_at >= since,
         ShadowBacktest.updated_at < CUTOFF,
+        decision_timestamp >= DECISION_SINCE,
+        decision_timestamp < CUTOFF,
         ShadowBacktest.training_feature_snapshot[
             "training_market_fact_contract"
         ]["source"].as_string() == NATIVE_SOURCE,
@@ -346,6 +357,8 @@ async def main():
             "window": {
                 "since": since.isoformat(),
                 "cutoff_exclusive": CUTOFF.isoformat(),
+                "decision_since": DECISION_SINCE.isoformat(),
+                "decision_cutoff_exclusive": CUTOFF.isoformat(),
                 "hours": HOURS,
                 "decision_group_limit": GROUP_LIMIT,
                 "source": NATIVE_SOURCE,
@@ -417,11 +430,17 @@ def _build_remote_command(
     unit: str,
     revision: str = "v1",
     family: str = "ridge",
+    decision_since: datetime | None = None,
 ) -> str:
+    decision_since = decision_since or cutoff - timedelta(hours=hours)
     rendered = (
         REMOTE_SCRIPT.replace("__GROUP_LIMIT__", str(limit))
         .replace("__HOURS__", str(hours))
         .replace("__CUTOFF__", repr(cutoff.isoformat().replace("+00:00", "Z")))
+        .replace(
+            "__DECISION_SINCE__",
+            repr(decision_since.isoformat().replace("+00:00", "Z")),
+        )
         .replace("__REVISION__", repr(revision))
         .replace("__FAMILY__", repr(family))
     )
@@ -512,6 +531,13 @@ def main() -> None:
     parser.add_argument("--hours", type=int, default=24)
     parser.add_argument("--cutoff", help="Exclusive UTC/offset timestamp.")
     parser.add_argument(
+        "--since",
+        help=(
+            "Exclusive UTC/offset decision-window start. Defaults to "
+            "--cutoff minus --hours."
+        ),
+    )
+    parser.add_argument(
         "--revision",
         choices=("v1", "v2", "v3", "v4"),
         default="v1",
@@ -528,6 +554,13 @@ def main() -> None:
     limit = max(1, min(int(args.limit), 2500))
     hours = max(1, min(int(args.hours), 168))
     cutoff = _parse_cutoff(args.cutoff) if args.cutoff else datetime.now(UTC)
+    decision_since = (
+        _parse_cutoff(args.since)
+        if args.since
+        else cutoff - timedelta(hours=hours)
+    )
+    if decision_since >= cutoff:
+        parser.error("--since must be before --cutoff")
     unit = (
         f"bb-nested-dev-{args.family}-{args.revision}-"
         f"{cutoff.strftime('%Y%m%dT%H%M%SZ')}"
@@ -574,7 +607,7 @@ def main() -> None:
         command = (
             "set -e\numask 077\n"
             "install -d -m 0700 /data/bb/app/tmp/codex-nested-development\n"
-            f"{_build_remote_command(limit, hours, cutoff, unit, args.revision, args.family)} "
+            f"{_build_remote_command(limit, hours, cutoff, unit, args.revision, args.family, decision_since)} "
             f"> {shlex.quote(remote_result)}"
         )
         run_remote_text(

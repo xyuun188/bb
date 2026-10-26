@@ -16,6 +16,9 @@ def test_remote_nested_research_query_is_bounded_native_and_cost_complete() -> N
 
     assert "ShadowBacktest.updated_at >= since" in source
     assert "ShadowBacktest.updated_at < CUTOFF" in source
+    assert "original_decision_timestamp" in source
+    assert "decision_timestamp >= DECISION_SINCE" in source
+    assert "decision_timestamp < CUTOFF" in source
     assert "== NATIVE_SOURCE" in source
     assert '.as_boolean().is_(True)' in source
     assert ".limit(GROUP_LIMIT)" in source
@@ -60,6 +63,22 @@ def test_hgb_family_uses_a_distinct_remote_unit_and_report_path() -> None:
 
     assert "--unit=bb-nested-dev-hgb-v1-20261024T233000Z" in command
     assert "build_nested_hgb_development_report" in audit.REMOTE_SCRIPT
+
+
+def test_remote_command_can_pin_a_distinct_decision_window() -> None:
+    command = audit._build_remote_command(
+        79,
+        6,
+        datetime(2026, 10, 26, 18, 45, tzinfo=UTC),
+        "bb-nested-dev-ridge-v3-20261026T184500Z",
+        revision="v3",
+        family="ridge",
+        decision_since=datetime(2026, 10, 26, 12, 45, tzinfo=UTC),
+    )
+
+    assert "DECISION_SINCE" in audit.REMOTE_SCRIPT
+    assert "--unit=bb-nested-dev-ridge-v3-20261026T184500Z" in command
+    assert "__DECISION_SINCE__" not in command
 
 
 def test_cutoff_requires_timezone_and_normalizes_to_utc() -> None:

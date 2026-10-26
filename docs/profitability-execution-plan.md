@@ -7351,3 +7351,75 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   once after `18:45Z`, then wait until the fixed maturity cutoff before the
   one bounded G2 audit. Do not read labels early or change the frozen
   candidate/gates.
+
+### Ridge V3 Window Closure (2026-10-27 07:04 Asia/Shanghai)
+
+- The frozen post-repair window
+  `prospective-g3-horizon-ridge-v3-d20261026T184500Z` was sealed exactly once
+  after its exclusive cutoff. The decision-only evidence is
+  `data/profitability_remediation/online-decision-cohort-d20261026T184500Z-final.json`:
+  `79` decision snapshots, `175` bounded candidates, unsaturated, ordered-ID
+  fingerprint
+  `afcc3a121544a41f0f70af171cf021dd0a1ebf6c8829de4846ea8b9de4d97488`.
+  The seal read no shadow labels and submitted no orders.
+- The single mature G2 audit completed after the fixed
+  `2026-10-26T22:46:00Z` cutoff. Evidence:
+  `data/profitability_remediation/online-mature-shadow-cohort-d20261026T184500Z-final.json`.
+  It found `79` complete four-horizon groups and `22` groups with all four
+  native, point-in-time, fee-after rows eligible. There were no duplicate
+  group/horizon rows; `228` rows were eligible, `83` were explicitly excluded
+  for native-path/fee-after/historical-path defects, and `5` remained
+  quarantined for native market-fact quality. This is a valid G2 provenance
+  result, not profitability evidence.
+- The preregistered frozen Ridge G3 then ran once with `--hours 6`,
+  `--limit 79`, `--cutoff 2026-10-26T18:45:00Z`, revision `v3`, family
+  `ridge`. Evidence:
+  `data/profitability_remediation/online-nested-development-ridge-v3-20261026T184500Z.json`.
+  It returned `insufficient_development_data`: only `5` native fee-after
+  primary (5-minute) rows were available to the nested partition, leaving
+  all three outer folds empty and no selected policy. No artifact, permission,
+  service, database, risk, leverage, protection or order state changed.
+- This window is closed as **G3 not passed**. Do not rerun it, add rows,
+  change the primary horizon, shorten the purge, or tune on these labels.
+  Register a materially new window with the same frozen gates only after
+  enough clean native 5-minute groups accumulate; until then paper remains
+  observation/training-only and live remains disabled.
+
+### Nested G3 Window-Selection Repair And New Window (2026-10-27 07:06 Asia/Shanghai)
+
+- Root cause of the v3 coverage discrepancy: the mature G2 audit sealed
+  decision IDs from the registered original-decision window, while the nested
+  G3 runner selected the latest groups by label `updated_at` only. It did not
+  constrain `training_feature_snapshot.original_decision_timestamp` to the
+  same decision interval. Therefore its `79` selected groups were not
+  guaranteed to be the sealed `79`; the resulting frame had only `5` primary
+  5-minute rows even though G2 reported `56` eligible 5-minute rows in the
+  sealed cohort. The v3 G3 result is retained as rejected/insufficient and is
+  not rerun.
+- Repair in
+  `scripts/audit_online_nested_current_development.py`: the bounded remote
+  query now filters the original decision timestamp to an explicit
+  `--since`/`--cutoff` interval. The option defaults to the prior
+  `--cutoff` minus `--hours` behavior for compatibility, while prospective
+  windows must pass their registered decision start explicitly. The report
+  records both label-update and decision windows. This is an audit-selection
+  repair only; it does not change model features, thresholds, costs, risk,
+  permissions or runtime services.
+- Focused verification passed: `8` nested-audit tests, Ruff, compileall and
+  `git diff --check`. No remote service was restarted, no database was
+  mutated, and no order or position was touched.
+- A materially new, untouched window is preregistered as
+  `prospective-g3-horizon-ridge-v4-d20261026T231000Z` with decision interval
+  `[2026-10-26T23:10:00Z, 2026-10-27T05:10:00Z)`, maturity cutoff
+  `2026-10-27T15:11:00Z` (北京时间 `2026-10-27 23:11:00`). Candidate family
+  and gates remain frozen: standardized Ridge net, horizons `5/15/60/240`,
+  existing/market-only features, alpha `1/10/100`, thresholds
+  `0/0.05/0.1%`, two purged inner and three chronological outer folds,
+  native point-in-time fee-after rows only, minimum `16` and positive
+  mean/LCB/PF>1 in both views. The corrected G3 runner revision is `v4`.
+- Before `05:10Z`, observe only. After that cutoff seal this window exactly
+  once with the registered decision-only command; after `15:11Z` run one
+  bounded G2 audit using its sealed count, then run corrected frozen G3 once
+  only if G2 coverage passes. If it fails, record insufficiency and register
+  another untouched window. Paper/live entry remains observation-only/live
+  disabled.
