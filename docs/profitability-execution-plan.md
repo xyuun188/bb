@@ -7333,3 +7333,21 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   and seal once after `18:45Z`. Do not read labels before the `22:46Z` maturity
   cutoff. Separately investigate the latency tail with a complete bounded
   sample before proposing another runtime change.
+
+### Checkpoint Publication (2026-10-26 21:02 Asia/Shanghai)
+
+- The plan-only runtime follow-up commit `1d10411` had remained one commit
+  ahead of `origin/main` after earlier HTTPS connection resets. A fresh fetch
+  confirmed the remote had not advanced; `1d10411` was then pushed
+  successfully to `origin/main`. The worktree was clean immediately before
+  this note. The commit records the existing read-only observation and does
+  not alter source, entry permission, risk, orders, positions or protection.
+- The frozen Ridge v3 decision window remains
+  `[2026-10-26T12:45:00Z, 2026-10-26T18:45:00Z)`. At this checkpoint
+  (`2026-10-26T13:02:17Z`), the window is still collecting; no labels from it
+  have been queried. Its fixed maturity cutoff remains
+  `2026-10-26T22:46:00Z`.
+- Next action: observation only until the exclusive decision cutoff; seal
+  once after `18:45Z`, then wait until the fixed maturity cutoff before the
+  one bounded G2 audit. Do not read labels early or change the frozen
+  candidate/gates.
