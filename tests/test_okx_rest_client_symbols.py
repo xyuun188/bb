@@ -11,8 +11,10 @@ import data_feed.okx_rest_client as okx_rest_client_module
 from data_feed.feature_vector import build_feature_vector
 from data_feed.okx_rest_client import (
     PUBLIC_MARKET_DIAGNOSTIC_METHODS,
+    PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY,
     PUBLIC_MARKET_OPTIONAL_METHODS,
     PUBLIC_MARKET_PRIORITY_METHODS,
+    PUBLIC_MARKET_REQUEST_CONCURRENCY,
     OKXRestClient,
     _PriorityRequestGate,
 )
@@ -26,7 +28,7 @@ def test_required_market_fact_routes_use_priority_lane() -> None:
         "publicGetPublicMarkPrice",
         "publicGetMarketIndexTickers",
     }.isdisjoint(PUBLIC_MARKET_PRIORITY_METHODS)
-    assert {"fetch_ohlcv", "fetch_funding_rate", "fetch_open_interest"} == (
+    assert {"fetch_ohlcv", "fetch_open_interest"} == (
         set(PUBLIC_MARKET_OPTIONAL_METHODS)
     )
 
@@ -360,25 +362,34 @@ async def test_history_backfill_cannot_occupy_native_fact_request_lane() -> None
 
 
 @pytest.mark.asyncio
-async def test_priority_market_gate_reserves_capacity_for_executable_routes() -> None:
-    gate = _PriorityRequestGate(limit=4, normal_limit=2)
+async def test_priority_market_gate_reserves_one_slot_for_executable_routes() -> None:
+    assert PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY == (
+        PUBLIC_MARKET_REQUEST_CONCURRENCY - 1
+    )
+    gate = _PriorityRequestGate(
+        limit=PUBLIC_MARKET_REQUEST_CONCURRENCY,
+        normal_limit=PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY,
+    )
 
-    await gate.acquire(priority=False)
-    await gate.acquire(priority=False)
+    for _ in range(PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY):
+        await gate.acquire(priority=False)
 
     waiting_normal = asyncio.create_task(gate.acquire(priority=False))
     await asyncio.sleep(0)
     assert waiting_normal.done() is False
 
-    # A third enrichment cannot consume the reserved slots, so an executable
-    # order-book/mark-price request is admitted immediately.
+    # Routine routes can fill three slots, but the fourth stays reserved for
+    # a strict ticker/order-book/mark/index refresh.
     await gate.acquire(priority=True)
     assert waiting_normal.done() is False
 
     gate.release(priority=True)
     gate.release(priority=False)
     await asyncio.wait_for(waiting_normal, timeout=0.1)
-    gate.release(priority=False)
+    for _ in range(PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY):
+        gate.release(priority=False)
+    assert gate._active == 0
+    assert gate._active_normal == 0
 
 
 class _AliasMarketExchange:
@@ -1496,13 +1507,40 @@ async def test_funding_snapshot_derives_interval_from_okx_times(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_required_funding_snapshot_uses_priority_market_lane(monkeypatch) -> None:
+    client = OKXRestClient()
+    calls: list[bool] = []
+
+    async def fake_ccxt_call(method_name: str, *args, **kwargs):
+        assert method_name == "fetch_funding_rate"
+        calls.append(bool(kwargs.get("_request_priority")))
+        return {
+            "fundingRate": 0.0001,
+            "fundingDatetime": "1783958400000",
+            "nextFundingDatetime": "1783987200000",
+            "info": {
+                "fundingRate": "0.0001",
+                "fundingTime": "1783958400000",
+                "nextFundingTime": "1783987200000",
+                "ts": "1783931769300",
+            },
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fake_ccxt_call)
+
+    await client.fetch_funding_rate("BTC/USDT", priority=True)
+
+    assert calls == [True]
+
+
+@pytest.mark.asyncio
 async def test_derivatives_snapshot_returns_completed_routes_before_deadline(
     monkeypatch,
 ) -> None:
     client = OKXRestClient()
     cancelled = asyncio.Event()
 
-    async def funding(_symbol: str) -> dict:
+    async def funding(_symbol: str, **_kwargs: Any) -> dict:
         return {"funding_rate": 0.0001}
 
     async def open_interest(_symbol: str) -> dict:
@@ -1562,7 +1600,7 @@ async def test_derivatives_snapshot_does_not_wait_for_optional_routes(
     optional_cancelled = asyncio.Event()
     release_optional = asyncio.Event()
 
-    async def slow_funding(_symbol: str) -> dict:
+    async def slow_funding(_symbol: str, **_kwargs: Any) -> dict:
         optional_started.set()
         try:
             await release_optional.wait()
@@ -1636,8 +1674,10 @@ async def test_derivatives_snapshot_can_require_funding_for_final_analysis(
     client = OKXRestClient()
     funding_started = asyncio.Event()
     release_funding = asyncio.Event()
+    funding_priorities: list[bool] = []
 
-    async def funding(_symbol: str) -> dict:
+    async def funding(_symbol: str, **kwargs: Any) -> dict:
+        funding_priorities.append(bool(kwargs.get("priority")))
         funding_started.set()
         await release_funding.wait()
         return {
@@ -1710,6 +1750,7 @@ async def test_derivatives_snapshot_can_require_funding_for_final_analysis(
     assert result["derivatives_required_data_available"] is True
     assert "funding" in result["derivatives_route_status"]["completed"]
     assert "open_interest" not in result["derivatives_route_status"]["completed"]
+    assert funding_priorities == [True]
 
 
 @pytest.mark.asyncio

@@ -69,8 +69,8 @@ or trade frequency to manufacture success.
 | --- | --- | --- | --- |
 | G0 Recovery and execution safety | PASSED | Active goal, this checkpoint, same-chat scheduled continuation | Saved automation inspected and app view verified on 2026-10-22 |
 | G1 Authoritative loss attribution | PASSED | Fixed-cutoff canonical lifecycle and complete official-bill audit; evidence below | Separate full round trips, partial updates and window cash flow; reconcile price PnL, signed fees and funding without double counting; expose unresolved links and costs |
-| G2 Data and label validity | PASSED for the final sealed cohort's eligible native subset; invalid rows quarantined | Eligibility, timing, cost and provenance report plus defect regressions | No duplicate decision/horizon rows; native point-in-time fee-after rows are isolated from historical/contradictory rows before research |
-| G3 Cost-aware candidate development | REJECTED for frozen live-rules-canary.v1; new development window required | Preregistered bounded experiment ledger and purged chronological comparisons; completed candidates rejected | Candidate family/features/horizon/threshold/exits selected only within development folds; compare no-trade and transparent baselines on identical costs and exposure |
+| G2 Data and label validity | PASSED for the final sealed cohort's eligible native subset; the later 987-decision cohort was insufficient; a post-repair cohort is pending | Eligibility, timing, cost and provenance report plus defect regressions | No duplicate decision/horizon rows; native point-in-time fee-after rows are isolated from historical/contradictory rows before research |
+| G3 Cost-aware candidate development | REJECTED for frozen live-rules-canary.v1; Ridge v2 remains unrun because its 987-decision G2 cohort was insufficient; a new post-repair window is preregistered | Bounded experiment ledger and purged chronological comparisons; no candidate approved | Candidate family/features/horizon/threshold/exits selected only within development folds; compare no-trade and transparent baselines on identical costs and exposure |
 | G4 Frozen independent evaluation | NOT STARTED | No qualifying candidate to freeze; no untouched exam opened | Predefined sample coverage, time/dependence-aware lower bound above zero, positive net mean, PF above one, predefined drawdown/tail limits, and cost stress tests pass; no post-exam tuning |
 | G5 Governed paper execution | NOT STARTED | No G3/G4-approved policy or governed profitable paper round trip | Prior gates passed; frozen risk budget; no unlinked fills/unprotected exposure; observed fee-after results and forecast calibration meet preregistered criteria |
 | G6 Final acceptance and handoff | BLOCKED | Depends on G2-G5 evidence | G0-G5 all passed, exact deployed hashes match accepted version, independent subsequent window passes predefined criteria; remaining uncertainty disclosed |
@@ -7064,3 +7064,227 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   the preregistered G3 only if this G2 audit establishes sufficient native,
   point-in-time, fee-after eligible coverage; otherwise close this cohort as
   insufficient and register a later window.
+
+### Same-Round Indicator Hydration Repair (2026-10-26 17:03 Asia/Shanghai)
+
+- A bounded read-only decision projection over the latest 12 paper market
+  decisions found 11 without a valid technical availability contract. Most
+  missing-indicator snapshots were explicitly marked
+  `indicator_cached_source_delivery_unobserved`; one was
+  `indicator_snapshot_build_in_progress`. Recent paper-service logs also
+  recorded repeated 15-second candidate-prewarm timeouts. These are data
+  availability symptoms, not evidence that entry permission is globally
+  paused or that profitability gates should be relaxed.
+- Confirmed code-path defect: when an initial observation vector lacked
+  indicators, same-round hydration returned it immediately, even if the
+  asynchronous prewarm worker had populated the local indicator cache after
+  that vector was created. The final per-symbol refresh also accepted an
+  explicitly unavailable/stale indicator vector as observation-only input.
+- Repair in `services/trading_service.py`: hydration now re-reads the existing
+  local feature cache within its existing three-second bound before falling
+  back; final refresh requires current indicators and defers the symbol if
+  they remain unavailable. It adds no remote requests in the hydration stage,
+  creates no synthetic features, and leaves cost, quality, risk, and order
+  permission contracts unchanged. Hydration diagnostics now expose which
+  symbols were recovered from the prewarmed indicator cache.
+- Added regressions for a cache that becomes ready between initial fetch and
+  hydration, and for fail-closed deferral when both local and authoritative
+  refreshes still lack indicators. Local complete
+  `tests/test_trading_service_boundaries.py`: 368 passed;
+  `tests/test_data_service_security.py` plus
+  `tests/test_data_feature_availability.py`: 141 passed. Ruff and
+  `git diff --check` passed.
+- Only the two owned files (`services/trading_service.py` and
+  `tests/test_trading_service_boundaries.py`) were uploaded with
+  `--split-services --skip-restart --include-tests`; remote source integrity
+  matched both local SHA256 values. The isolated remote trading-boundary suite
+  passed 368 tests. Then only `bb-paper-trading.service` was restarted at
+  `2026-10-26T09:01:04Z`; it is active/running, `NRestarts=0`; dashboard is
+  active. This deployment does not reopen paper entry, enable live routing,
+  alter leverage/protection, or submit orders.
+- G2 labels for the current 987-decision cohort remain unread and the
+  preregistered maturity boundary remains `2026-10-26T10:01:00Z`
+  (`18:01 Asia/Shanghai`). Next: gather one clean post-restart bounded
+  observation-only coverage window and record the rate of missing technical
+  contracts/prewarm timeouts, without querying labels. After the fixed cutoff,
+  run the already registered G2 audit exactly once. Do not claim this
+  throughput/data repair proves profitability; G2-G6 are still pending for
+  this new candidate.
+
+### Public Market Queue Capacity Adjustment Prepared (2026-10-26 17:54 Asia/Shanghai)
+
+- A bounded 20-minute read-only online latency audit at
+  `2026-10-26T09:31:07Z` found 680 diagnostic events. The main shared
+  public-market gate recorded queue-wait p95 of `8,606 ms` for order book,
+  `8,854 ms` for index ticker, `7,364 ms` for mark price, and `6,521 ms` for
+  per-symbol ticker. Those routes were almost entirely non-priority (`priority
+  = false`). Provider-duration p95 was lower for order book/index/mark
+  (`3,181/1,767/1,772 ms`) but elevated for ticker (`4,463 ms`), so both
+  queue occupancy and provider time contribute; this is not attributed solely
+  to the provider or solely to the local gate.
+- The companion 20-minute coverage projection found 46 completed market
+  decisions over 36 symbols, maximum decision gap `77.721 s`, zero duplicate
+  decisions inside the fixed 600-second cooldown, zero model failures, zero
+  incomplete analyses, zero entry signals, and zero paper positions. The
+  service is active in paper mode with `paused=false`; those facts do not
+  constitute an entry authorization or a profitable result.
+- In `data_feed/okx_rest_client.py`, routine requests on the shared four-slot
+  market gate were capped at two concurrent normal requests, reserving two
+  slots even when strict-priority traffic was absent. The cap is now three,
+  keeping the total at four and reserving one slot for strict-priority
+  refreshes. The new regression verifies the fourth normal waiter remains
+  queued while a priority request can occupy the reserved slot. Focused local
+  client/receipt-clock tests passed `67`; Ruff, compileall and `git diff
+  --check` passed.
+- Only `data_feed/okx_rest_client.py` and
+  `tests/test_okx_rest_client_symbols.py` were staged to the online source
+  tree; `source-integrity-ok:2` passed. The modified service has not yet been
+  restarted. Do not activate this change before the fixed G2 maturity boundary
+  `2026-10-26T10:01:00Z` (`18:01 Asia/Shanghai`), to avoid interrupting the
+  final settlement interval for the sealed 987-decision cohort.
+- Next exact sequence: after the maturity cutoff, run the single registered
+  `audit_online_mature_shadow_cohort.py` command for cutoff
+  `2026-10-26T06:00:00Z`, expected decision count `987`, maturity cutoff
+  `2026-10-26T10:01:00Z`, limit `1200`, and output
+  `data/profitability_remediation/online-mature-shadow-cohort-d20261026T060000Z-final.json`.
+  If G2 passes, run only the frozen preregistered Ridge G3; otherwise record
+  insufficiency without tuning this cohort. After the G2 read is complete,
+  restart only `bb-paper-trading.service` to load the already-uploaded bounded
+  queue adjustment, then collect a fresh post-restart latency/coverage window.
+  No entry permission, risk limit, order, position, protection or live-routing
+  state is changed by this adjustment.
+
+### Required Funding Route Priority Repair (2026-10-26 20:10 Asia/Shanghai)
+
+- The mature G2 audit for the `987`-decision window is insufficient
+  (`65` eligible rows, `0` all-four-horizon groups), so it cannot authorize a
+  candidate or paper entries. A fresh read-only online decision projection
+  nevertheless exposed a separate operational cause of the current
+  `paper_training_entry` loop: required funding snapshots were timing out
+  alongside derivative/reference routes. Recent service evidence recorded
+  `funding` in the timed-out route set and the persisted feature snapshots had
+  `funding_data_available=false` with no receipt clock. This is a collection
+  failure, not permission to relax the negative G1 quality gate.
+- Repair in `data_feed/okx_rest_client.py`: required funding requests no longer
+  share the single low-priority enrichment lane with the indicator K-line
+  fan-out. The funding route is sent through the shared strict market lane
+  when `require_funding=true`, and its bounded route wait is `5.5s`, below the
+  outer `6.0s` derivatives deadline. Normal/background funding remains
+  non-priority; missing responses remain fail-closed and cannot create synthetic
+  costs.
+- Added regressions for priority forwarding and required-funding route
+  selection. Local funding/receipt tests passed `68`; local trading-boundary
+  and data-availability tests passed `510`; Ruff, compileall and
+  `git diff --check` passed. Targeted online sync uploaded only
+  `data_feed/okx_rest_client.py` and the two owned OKX test modules;
+  `source-integrity-ok:3` and the same remote isolated suite passed `68` tests
+  using a unique user-owned temporary directory. No service was restarted by
+  this upload, no order or database mutation occurred.
+- Exact next action: restart only `bb-paper-trading.service`, verify
+  `active/running` and `NRestarts=0`, then collect one bounded post-restart
+  observation window comparing funding receipt availability, derivative-route
+  timeouts, analysis throughput and entry-funnel reasons. Even if this restores
+  complete funding snapshots, G1 remains economically negative and the
+  observation path remains paper-only until a materially new G3/G4 evidence
+  chain passes.
+
+### Post-Funding-Restart Runtime Verification (2026-10-26 20:32 Asia/Shanghai)
+
+- The market queue-capacity change and required-funding priority fix are both
+  now loaded by `bb-paper-trading.service`. Its active-enter boundary is
+  `2026-10-26T12:12:36Z`; at the bounded checks below, trading, dashboard and
+  model-tunnel services were `active/running`, each with `NRestarts=0`.
+  Persisted control remains `mode=paper`, `paused=false`.
+- A six-minute post-restart coverage snapshot at `2026-10-26T12:20:42Z`
+  contained nine completed market decisions across nine symbols, no model
+  failures, no incomplete rows, no cooldown duplicates and no entry signal.
+  Candidate-coverage rotation still had three due symbols; this short snapshot
+  is operational evidence, not a coverage-window acceptance.
+- A ten-minute feature-availability projection at `2026-10-26T12:23:56Z`
+  contained 15 decision snapshots, all with valid sealed availability
+  contracts, 15 distinct symbols and zero compaction/seal errors. In the
+  bounded 10-minute decision economics projection, 19/19 records had complete
+  funding projections and the authorized five-minute local-ML horizon.
+- The 15-minute post-restart coverage projection at `2026-10-26T12:31:28Z`
+  contained 32 completed decisions across 30 symbols. Maximum decision gap was
+  `86.342s`; there were zero model failures, incomplete rows, cooldown
+  duplicates or entry signals. Candidate-universe coverage was still pending
+  (`7` due symbols; no overdue symbols), so the longer 30-minute coverage gate
+  remains open.
+- The matching bounded 15-minute decision economics projection covered those
+  32 decisions: all final actions were `hold`, with all four experts completed;
+  28/32 had all experts hold. Funding projections were complete for `32/32`.
+  The entry funnel classified `24` as `shadow_training` and `8` as
+  `no_candidate`. The current short-side model had positive point-estimated
+  fee-after mean in `23/32`, but non-positive lower bounds in every row;
+  both long and short permission summaries retained the authoritative G1
+  blockers (`n=267`, mean `-0.303832%`, lower bound `-0.431590%`,
+  PF `0.549713`). Thus funding collection is restored in these observations,
+  but the lack of entries is not a global service pause or a funding blocker:
+  the current policy has no statistically acceptable fee-after edge. Do not
+  loosen it or treat model point estimates as realized profit.
+- The same 15-minute public-market latency projection had 446 slow/error
+  events. Normal-priority route queue-wait p95 remained elevated:
+  order book `10,024ms`, index ticker `6,239ms`, mark price `6,239ms`,
+  ticker `3,078ms`; provider-duration p95 was `2,782ms`, `2,847ms`,
+  `2,578ms`, and `6,139ms`, respectively. These diagnostics include normal
+  screening traffic; only two order-book events were marked priority. The
+  data-validity and analysis-throughput sample improved, but public-route
+  latency is still a separate operational concern and must be monitored in a
+  longer sample, not "fixed" by unbounded concurrency or weakened evidence.
+- All observations were bounded and read-only; no order, position, protection,
+  live-routing or permission state changed. Local Ruff and whitespace checks
+  pass for the current owned code diff. The two prior 987-decision prospective
+  cohort result remains insufficient (`65` eligible label rows and `0`
+  all-four-horizon eligible groups); do not reuse it or run its Ridge study.
+
+### New Post-Repair Ridge Development Window Preregistered (2026-10-26 20:38 Asia/Shanghai)
+
+- To avoid mixing the pre-fix cohort with repaired funding/indicator snapshots,
+  the next untouched development decision window is fixed as
+  `prospective-g3-horizon-ridge-v3-d20261026T184500Z`:
+  `[2026-10-26T12:45:00Z, 2026-10-26T18:45:00Z)`. It starts after this
+  preregistration and after the last decision timestamp inspected in this
+  turn. No labels from this window have been queried or examined. The
+  decision-only seal is allowed once after `2026-10-26T18:45:00Z`; its
+  expected count and ordered-ID fingerprint must
+  be recorded before any label audit.
+- Fixed maturity boundary: `2026-10-26T22:46:00Z`
+  (`2026-10-27 06:46:00 Asia/Shanghai`), accounting for the six-hour
+  collection interval, the maximum 240-minute horizon and a 60-second source
+  lag. Do not inspect this window's `ShadowBacktest` labels before that time.
+- Candidate family and scoring contract are frozen, without post-label
+  changes: `standardized_ridge_net`; horizons `5/15/60/240`; feature policies
+  `existing` and `market_only`; Ridge alpha `1/10/100`; net thresholds
+  `0/0.05/0.1%`; two purged inner selection folds and three chronological
+  purged outer folds. Only native
+  `shadow_entry_result_and_okx_native_1m_path` labels with
+  `fee_after_complete=true` and validated point-in-time features are eligible.
+  Historical/incomplete costs remain quarantined. Report both
+  all-opportunity and one-position non-overlapping views; each outer fold and
+  aggregate must have at least 16 rows, mean and lower bound above zero, and
+  PF above one. Any failure rejects this candidate; no same-window tuning,
+  side reversal, or permission change.
+- Collection budget is at most 1,200 decision snapshots / 4,800 label rows.
+  At the exclusive decision cutoff, run the decision-only seal exactly once,
+  write `data/profitability_remediation/online-decision-cohort-d20261026T184500Z-final.json`,
+  and preserve its expected snapshot count/fingerprint. Only after the fixed
+  maturity boundary, run the matching mature-cohort provenance audit once,
+  with that sealed expected count and output
+  `data/profitability_remediation/online-mature-shadow-cohort-d20261026T184500Z-final.json`.
+  Run the frozen Ridge G3 once only if G2 establishes sufficient native,
+  point-in-time, fee-after rows; otherwise record insufficiency and register
+  a later untouched window. Do not repeat either seal/audit or overrun the
+  bounded row budget.
+- G4-G6 remain unpassed. Paper entry remains observation/training-only and
+  live trading remains disabled. Current entry blockers are negative
+  authoritative fee-after quality and non-positive current lower bounds, not
+  a paused service. A healthy service or complete funding is not profitability
+  evidence. The 15-minute latency follow-up and this prospective research
+  cohort are separate tracks.
+- Next exact action before the cutoff: observe only, without labels, orders or
+  parameter changes. After cutoff, seal this window once; after
+  `2026-10-27T06:46:00 Asia/Shanghai`, mature-audit it once, then either run
+  its frozen G3 or record G2 insufficiency. Recheck bounded public-market
+  latency/coverage after at least 30 continuous post-restart minutes and keep
+  any resulting repair isolated, tested and permission-neutral.

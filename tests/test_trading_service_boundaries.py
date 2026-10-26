@@ -70,6 +70,19 @@ from services.trading_service import (
 from services.training_data_quality import DATA_QUALITY_VERSION
 
 
+def _current_funding_fields() -> dict[str, Any]:
+    now = datetime.now(UTC)
+    observed_at = now - timedelta(seconds=2)
+    return {
+        "funding_data_available": True,
+        "funding_rate": 0.0001,
+        "funding_interval_minutes": 480.0,
+        "next_funding_time": (now + timedelta(hours=8)).isoformat(),
+        "funding_rate_observed_at": observed_at.isoformat(),
+        "funding_rate_received_at": (observed_at + timedelta(seconds=1)).isoformat(),
+    }
+
+
 def test_local_ai_tools_training_subprocess_requests_governed_walk_forward() -> None:
     source = inspect.getsource(
         trading_service.TradingService._run_local_ai_tools_training_subprocess
@@ -1269,11 +1282,7 @@ async def test_final_market_candidate_refresh_prefers_fresh_complete_local_sourc
         close=100.0,
         bid=99.9,
         ask=100.1,
-        funding_data_available=True,
-        funding_rate=0.0001,
-        funding_interval_minutes=480.0,
-        next_funding_time="2026-08-23T08:00:00+00:00",
-        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
+        **_current_funding_fields(),
     )
 
     async def feature_snapshot(symbol: str, **kwargs: Any) -> Any:
@@ -1317,8 +1326,46 @@ async def test_final_market_candidate_refresh_keeps_price_observation_without_fu
     assert result is incomplete
     assert result.market_data_observation_only is True
     assert result.market_data_observation_reasons == ["funding_evidence_unavailable"]
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0]["require_funding"] is False
+    assert calls[1]["require_funding"] is True
+
+
+@pytest.mark.asyncio
+async def test_final_market_candidate_refreshes_funding_when_receipt_clock_is_missing() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[dict[str, Any]] = []
+    local_funding = _current_funding_fields()
+    local_funding.pop("funding_rate_received_at")
+    local = SimpleNamespace(
+        current_price=100.0,
+        close=100.0,
+        bid=99.9,
+        ask=100.1,
+        **local_funding,
+    )
+    fresh = SimpleNamespace(
+        current_price=100.0,
+        close=100.0,
+        bid=99.9,
+        ask=100.1,
+        **_current_funding_fields(),
+    )
+
+    async def feature_snapshot(_symbol: str, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return local if len(calls) == 1 else fresh
+
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+
+    result = await service._fresh_feature_vector_for_analysis("BTC/USDT")
+
+    assert result is fresh
+    assert len(calls) == 2
+    assert calls[0]["block_on_remote_derivatives"] is False
+    assert calls[0]["require_funding"] is False
+    assert calls[1]["block_on_remote_derivatives"] is True
+    assert calls[1]["require_funding"] is True
 
 
 @pytest.mark.asyncio
@@ -1331,11 +1378,7 @@ async def test_final_market_candidate_refresh_uses_remote_when_local_cache_is_in
         close=100.0,
         bid=99.9,
         ask=100.1,
-        funding_data_available=True,
-        funding_rate=0.0001,
-        funding_interval_minutes=480.0,
-        next_funding_time="2026-08-23T08:00:00+00:00",
-        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
+        **_current_funding_fields(),
     )
 
     async def feature_snapshot(_symbol: str, **kwargs: Any) -> Any:
@@ -1354,7 +1397,7 @@ async def test_final_market_candidate_refresh_uses_remote_when_local_cache_is_in
     assert calls[1]["block_on_remote_derivatives"] is True
     assert calls[1]["allow_cached_indicator_build"] is False
     assert calls[0]["require_funding"] is False
-    assert calls[1]["require_funding"] is False
+    assert calls[1]["require_funding"] is True
     assert calls[1]["require_authoritative_snapshot"] is True
 
 
@@ -1377,11 +1420,7 @@ async def test_final_market_candidate_refresh_only_refreshes_native_sources_for_
         bid=99.9,
         ask=100.1,
         indicator_snapshot_available=True,
-        funding_data_available=True,
-        funding_rate=0.0001,
-        funding_interval_minutes=480.0,
-        next_funding_time="2026-08-23T08:00:00+00:00",
-        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
+        **_current_funding_fields(),
     )
     stale_issue = SimpleNamespace(
         code="native_market_fact_invalid",
@@ -1414,7 +1453,7 @@ async def test_final_market_candidate_refresh_only_refreshes_native_sources_for_
     assert calls[1]["allow_indicator_background_refresh"] is False
     assert calls[1]["allow_derivatives_background_refresh"] is False
     assert calls[0]["require_funding"] is False
-    assert calls[1]["require_funding"] is False
+    assert calls[1]["require_funding"] is True
     assert calls[1]["prioritize_native_market_data"] is True
     assert calls[1]["require_authoritative_snapshot"] is True
 
@@ -1429,11 +1468,7 @@ async def test_market_candidate_refreshes_capture_time_native_path_before_observ
         bid=99.9,
         ask=100.1,
         indicator_snapshot_available=True,
-        funding_data_available=True,
-        funding_rate=0.0001,
-        funding_interval_minutes=480.0,
-        next_funding_time="2026-08-23T08:00:00+00:00",
-        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
+        **_current_funding_fields(),
     )
     fresh = SimpleNamespace(
         current_price=100.0,
@@ -1441,11 +1476,7 @@ async def test_market_candidate_refreshes_capture_time_native_path_before_observ
         bid=99.9,
         ask=100.1,
         indicator_snapshot_available=True,
-        funding_data_available=True,
-        funding_rate=0.0001,
-        funding_interval_minutes=480.0,
-        next_funding_time="2026-08-23T08:00:00+00:00",
-        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
+        **_current_funding_fields(),
     )
     path_issue = SimpleNamespace(
         code="native_market_fact_invalid",
@@ -1693,12 +1724,12 @@ async def test_prewarmed_market_candidates_are_hydrated_from_full_indicators() -
 
 
 @pytest.mark.asyncio
-async def test_pending_indicator_snapshot_is_not_rebuilt_in_same_round() -> None:
+async def test_pending_indicator_snapshot_rechecks_local_cache_in_same_round() -> None:
     service = TradingService.__new__(TradingService)
-    calls: list[str] = []
+    calls: list[tuple[str, dict[str, Any]]] = []
 
     async def feature_snapshot(symbol: str, **_kwargs: Any) -> Any:
-        calls.append(symbol)
+        calls.append((symbol, dict(_kwargs)))
         return SimpleNamespace(
             symbol=symbol,
             current_price=100.0,
@@ -1719,10 +1750,14 @@ async def test_pending_indicator_snapshot_is_not_rebuilt_in_same_round() -> None
     )
 
     assert list(hydrated) == ["BTC/USDT"]
-    assert hydrated["BTC/USDT"].market_data_observation_only is True
-    assert diagnostics["observation_only_symbols"] == ["BTC/USDT"]
+    assert hydrated["BTC/USDT"].indicator_snapshot_available is True
+    assert diagnostics["prewarmed_indicator_cache_symbols"] == ["BTC/USDT"]
+    assert diagnostics["observation_only_symbols"] == []
     assert diagnostics["unavailable_symbols"] == []
-    assert calls == []
+    assert len(calls) == 1
+    assert calls[0][0] == "BTC/USDT"
+    assert calls[0][1]["block_on_remote_indicators"] is False
+    assert calls[0][1]["allow_indicator_background_refresh"] is False
 
 
 @pytest.mark.asyncio
@@ -1764,12 +1799,8 @@ async def test_final_market_candidate_refresh_defers_market_data_quality_failure
         close=100.0,
         bid=99.9,
         ask=100.1,
-        indicator_snapshot_available=False,
-        funding_data_available=True,
-        funding_rate=0.0001,
-        funding_interval_minutes=480.0,
-        next_funding_time="2026-08-23T08:00:00+00:00",
-        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
+        indicator_snapshot_available=True,
+        **_current_funding_fields(),
     )
     fallback = SimpleNamespace(
         current_price=99.0,
@@ -1800,6 +1831,46 @@ async def test_final_market_candidate_refresh_defers_market_data_quality_failure
 
 
 @pytest.mark.asyncio
+async def test_final_market_candidate_defers_when_indicators_remain_unavailable() -> None:
+    service = TradingService.__new__(TradingService)
+    calls: list[dict[str, Any]] = []
+    unavailable = SimpleNamespace(
+        current_price=100.0,
+        close=100.0,
+        bid=99.9,
+        ask=100.1,
+        indicator_snapshot_available=False,
+        indicator_snapshot_reason="indicator_cached_source_delivery_unobserved",
+    )
+
+    async def feature_snapshot(_symbol: str, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return unavailable
+
+    class QualityPolicy:
+        @staticmethod
+        def observation_issue(_vector: Any, *, stage_label: str) -> Any:
+            assert stage_label == "AI observation"
+            return SimpleNamespace(code="indicator_snapshot_unavailable")
+
+        @staticmethod
+        def observation_blocker(_vector: Any, *, stage_label: str) -> None:
+            assert stage_label == "AI observation"
+            return None
+
+    service.entry_market_data_quality = QualityPolicy()  # type: ignore[assignment]
+    service._get_feature_vector_snapshot = feature_snapshot  # type: ignore[method-assign]
+
+    result = await service._fresh_feature_vector_for_analysis("BTC/USDT", unavailable)
+
+    assert result is None
+    assert len(calls) == 2
+    assert calls[0]["block_on_remote_ticker"] is False
+    assert calls[1]["block_on_remote_ticker"] is True
+    assert calls[1]["block_on_remote_indicators"] is True
+
+
+@pytest.mark.asyncio
 async def test_final_market_candidate_refresh_reuses_complete_fallback_after_timeout() -> None:
     service = TradingService.__new__(TradingService)
     fallback = SimpleNamespace(
@@ -1807,11 +1878,7 @@ async def test_final_market_candidate_refresh_reuses_complete_fallback_after_tim
         close=99.0,
         bid=98.9,
         ask=99.1,
-        funding_data_available=True,
-        funding_rate=0.0001,
-        funding_interval_minutes=480.0,
-        next_funding_time="2026-08-23T08:00:00+00:00",
-        funding_rate_observed_at="2026-08-23T00:00:00+00:00",
+        **_current_funding_fields(),
     )
     calls = 0
 

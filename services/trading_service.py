@@ -35,7 +35,7 @@ from config.settings import (
     MARKET_ANALYSIS_EXPERT_NAMES,
     settings,
 )
-from core.feature_availability import seal_feature_availability
+from core.feature_availability import availability_timestamp, seal_feature_availability
 from core.phase3_model_contract import PHASE3_TARGET_CALLER_TIMEOUT_SECONDS
 from core.safe_output import safe_error_tail, safe_error_text
 from core.trading_mode import mode_manager
@@ -6046,20 +6046,45 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """
 
         def funding_ready(candidate: Any) -> bool:
-            """Return whether the optional funding evidence is complete."""
+            """Return whether funding values carry a valid observed/received clock."""
 
             if candidate is None or getattr(candidate, "funding_data_available", False) is not True:
                 return False
-            if getattr(candidate, "funding_rate", None) is None:
+            try:
+                funding_rate = float(getattr(candidate, "funding_rate", None))
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(funding_rate):
                 return False
             try:
-                if float(getattr(candidate, "funding_interval_minutes", 0) or 0) <= 0:
+                interval_minutes = float(
+                    getattr(candidate, "funding_interval_minutes", 0) or 0
+                )
+                if not math.isfinite(interval_minutes) or interval_minutes <= 0:
                     return False
             except (TypeError, ValueError):
                 return False
-            return bool(
+            if not getattr(candidate, "next_funding_time", None):
+                return False
+            next_funding_at = availability_timestamp(
                 getattr(candidate, "next_funding_time", None)
-                and getattr(candidate, "funding_rate_observed_at", None)
+            )
+            observed_at = availability_timestamp(
+                getattr(candidate, "funding_rate_observed_at", None)
+            )
+            received_at = availability_timestamp(
+                getattr(candidate, "funding_rate_received_at", None)
+            )
+            now = datetime.now(UTC)
+            return bool(
+                next_funding_at is not None
+                and next_funding_at > now
+                and observed_at is not None
+                and received_at is not None
+                and observed_at < next_funding_at
+                and observed_at <= received_at <= now
+                and (now - observed_at).total_seconds()
+                <= max(interval_minutes * 2.0, 30.0) * 60.0
             )
 
         def native_path_refresh_required(issue: Any) -> bool:
@@ -6079,6 +6104,16 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     "executable_quote_sources_not_reconciled",
                     "stale_market_fact",
                 )
+            )
+
+        def indicator_snapshot_quality_blocked(candidate: Any) -> bool:
+            """Require a current technical snapshot before analysis proceeds."""
+
+            if candidate is None:
+                return False
+            return (
+                getattr(candidate, "indicator_snapshot_available", None) is False
+                or bool(getattr(candidate, "indicator_snapshot_stale", False))
             )
 
         def validated(candidate: Any, *, source: str) -> tuple[Any | None, Any | None]:
@@ -6177,6 +6212,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         fallback_requires_native_path = native_path_refresh_required(
             fallback_quality_issue
         )
+        fallback_indicator_blocked = indicator_snapshot_quality_blocked(fallback_candidate)
 
         # A priced fallback with an execution-only quality issue is already a
         # valid observation snapshot. Do not spend the entire market-round
@@ -6186,6 +6222,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if (
             fallback_usable
             and not fallback_requires_native_path
+            and not fallback_indicator_blocked
+            and funding_ready(fallback_candidate)
             and quality_policy is not None
         ):
             observation_blocker_callback = getattr(
@@ -6204,6 +6242,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if (
             fallback_usable
             and not fallback_requires_native_path
+            and not fallback_indicator_blocked
+            and funding_ready(fallback_candidate)
             and quality_policy is not None
         ):
             try:
@@ -6228,7 +6268,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             return fallback_candidate
 
         def use_fallback(reason: str) -> Any | None:
-            if not fallback_usable:
+            if not fallback_usable or fallback_indicator_blocked:
                 return None
             try:
                 fallback_candidate.feature_refresh_fallback_used = True
@@ -6270,9 +6310,12 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 source="fresh_local_market_cache",
             )
             local_requires_native_path = native_path_refresh_required(local_quality_issue)
+            local_indicator_blocked = indicator_snapshot_quality_blocked(cached)
             if (
                 cached is not None
                 and not local_requires_native_path
+                and not local_indicator_blocked
+                and funding_ready(cached)
             ):
                 return cached
             if cached is not None:
@@ -6313,7 +6356,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     allow_cached_indicator_build=refresh_native_market_only,
                     allow_indicator_background_refresh=False,
                     allow_derivatives_background_refresh=False,
-                    require_funding=False,
+                    require_funding=True,
                     prioritize_indicator_build=True,
                     prioritize_native_market_data=True,
                     require_authoritative_snapshot=True,
@@ -6321,7 +6364,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 timeout=MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS,
             )
             fresh, _fresh_quality_issue = validated(fresh, source=refresh_source)
-            if fresh is not None:
+            fresh_indicator_blocked = indicator_snapshot_quality_blocked(fresh)
+            if fresh is not None and not fresh_indicator_blocked:
                 return fresh
             logger.warning("fresh feature vector invalid; deferring symbol", symbol=symbol)
         except TimeoutError:
@@ -6655,31 +6699,6 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     return None
                 return candidate
 
-            # The observation pool may contain vectors whose indicators are
-            # still being built by the background prewarm worker.  Re-running
-            # the full feature pipeline here for every such candidate just
-            # recreates the same 3-second timeout storm. Keep a usable price
-            # snapshot as an explicit observation-only row while the worker
-            # populates the cache; executable entry quality remains enforced
-            # by the final per-symbol refresh and strict prefilter.
-            if (
-                existing is not None
-                and getattr(existing, "indicator_snapshot_available", None) is False
-            ):
-                reason = str(
-                    getattr(existing, "indicator_snapshot_reason", "")
-                    or "background_indicator_prewarm_pending"
-                )
-                observation = observation_snapshot(existing, reason)
-                if observation is not None:
-                    return symbol, observation, reason, "observation_only_snapshot"
-                return (
-                    symbol,
-                    None,
-                    reason,
-                    "background_prewarm_pending",
-                )
-
             def existing_full_snapshot() -> Any | None:
                 if self._is_valid_feature_vector(existing) and bool(
                     getattr(existing, "indicator_snapshot_available", False)
@@ -6690,6 +6709,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
             def existing_observation_snapshot(reason: str) -> Any | None:
                 return observation_snapshot(existing, reason)
 
+            # Re-read the local feature cache once before falling back. The
+            # background prewarm may have finished after the initial market
+            # fetch; returning its earlier unavailable vector here would miss
+            # the ready snapshot for this entire analysis round.
             async with semaphore:
                 try:
                     refreshed = await asyncio.wait_for(
@@ -6846,6 +6869,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "reused_existing_full_snapshot_count": sum(
                 source == "existing_full_snapshot" for _symbol, _refreshed, _reason, source in rows
             ),
+            "prewarmed_indicator_cache_symbols": [
+                symbol
+                for symbol, _refreshed, _reason, source in rows
+                if source == "prewarmed_indicator_cache"
+            ],
             "timeout_seconds": round(timeout_seconds, 3),
             "source": "prewarmed_indicator_cache",
             "is_entry_permission": False,

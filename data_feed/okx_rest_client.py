@@ -36,6 +36,10 @@ OKX_HOSTNAME = "www.okx.com"
 SUSPICIOUS_CONTRACT_BASE_TOKENS = ("TEST", "DEMO", "DUMMY", "MOCK", "SAMPLE")
 DERIVATIVES_SNAPSHOT_ROUTE_TIMEOUT_SECONDS = 6.0
 DERIVATIVES_ROUTE_TIMEOUT_SECONDS = 2.5
+# A required funding snapshot must be able to wait for one provider response
+# after entering the strict market-fact lane. It still remains below the
+# outer derivatives deadline so a dead exchange route cannot stall analysis.
+FUNDING_REQUIRED_ROUTE_TIMEOUT_SECONDS = 5.5
 DERIVATIVES_ROUTE_CACHE_TTL_SECONDS = 20.0
 # A funding snapshot remains useful between rounds as long as its own
 # observed-at timestamp is still within the funding-cost freshness contract.
@@ -76,12 +80,11 @@ TICKER_ROUTE_FAILURE_BACKOFF_SECONDS = 3.0
 # one feature-fetch wave, preventing the 240-symbol scan from creating an
 # eight-request burst against the public exchange routes.
 PUBLIC_MARKET_REQUEST_CONCURRENCY = 4
-# Funding and open-interest are useful enrichments, but they must never be
-# able to consume every public-request slot while executable quotes are being
-# refreshed. Keep a fixed reserve for ticker/orderbook/mark/index routes.
+# Keep one slot available for strict priority refreshes while allowing routine
+# ticker/orderbook/reference requests to use the other three bounded slots.
 PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY = max(
     1,
-    PUBLIC_MARKET_REQUEST_CONCURRENCY // 2,
+    PUBLIC_MARKET_REQUEST_CONCURRENCY - 1,
 )
 PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY = 1
 # Native one-minute candles are part of the executable-market-fact proof. They
@@ -130,7 +133,6 @@ PUBLIC_MARKET_OPTIONAL_METHODS = frozenset(
         # Indicator K-lines are analytical enrichment and must not consume
         # the shared executable quote lane during a market scan.
         "fetch_ohlcv",
-        "fetch_funding_rate",
         "fetch_open_interest",
     }
 )
@@ -997,10 +999,19 @@ class OKXRestClient:
             _request_priority=False,
         )
 
-    async def fetch_funding_rate(self, symbol: str) -> dict[str, Any]:
+    async def fetch_funding_rate(
+        self,
+        symbol: str,
+        *,
+        priority: bool = False,
+    ) -> dict[str, Any]:
         """Return OKX perpetual funding data, normalized for feature building."""
         try:
-            data = await self._ccxt_call("fetch_funding_rate", self._to_swap_symbol(symbol))
+            data = await self._ccxt_call(
+                "fetch_funding_rate",
+                self._to_swap_symbol(symbol),
+                _request_priority=bool(priority),
+            )
             received_at = datetime.now(UTC).isoformat()
         except Exception as exc:
             logger.debug("fetch funding rate failed", symbol=symbol, error=safe_error_text(exc))
@@ -1743,7 +1754,15 @@ class OKXRestClient:
                 self._cached_derivatives_route(
                     "funding",
                     symbol,
-                    lambda: self.fetch_funding_rate(symbol),
+                    lambda: self.fetch_funding_rate(
+                        symbol,
+                        priority=bool(require_funding),
+                    ),
+                    timeout_seconds=(
+                        FUNDING_REQUIRED_ROUTE_TIMEOUT_SECONDS
+                        if require_funding
+                        else DERIVATIVES_ROUTE_TIMEOUT_SECONDS
+                    ),
                 )
             )
         if not required_only:
