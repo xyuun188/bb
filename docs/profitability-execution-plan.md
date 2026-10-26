@@ -7423,3 +7423,8 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   only if G2 coverage passes. If it fails, record insufficiency and register
   another untouched window. Paper/live entry remains observation-only/live
   disabled.
+- The repair and this checkpoint are committed locally as `f380816`. The
+  targeted online sync completed with `source-integrity-ok:517` and skipped
+  service restart. Two GitHub HTTPS push attempts at this checkpoint failed
+  with connection-reset/connection-timeout errors; the local commit is
+  preserved and must be pushed after network recovery.
