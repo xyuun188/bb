@@ -7037,3 +7037,30 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   `4,800` label rows in one read-only bounded run. Until the maturity boundary,
   do not query labels or tune on this window. Paper/live entry remains
   observation-only, and G4-G6 remain blocked.
+- The decision-only seal ran once after the exclusive decision cutoff at
+  `2026-10-26T07:32:26.456916Z`, before label maturity. It recovered exactly
+  `987` snapshots in `[2026-10-26T00:00:00Z, 2026-10-26T06:00:00Z)`;
+  candidate count was `1,545` of `4,800` and was not saturated. The ordered
+  decision-ID fingerprint is
+  `807fcc32727080f9080d7c51691b835d9155e61ca0472d468701b8a50b365273`.
+  Evidence is saved at
+  `data/profitability_remediation/online-decision-cohort-d20261026T060000Z-final.json`.
+  The projection explicitly reports `shadow_labels_read=false`,
+  `database_mutated=false`, and `orders_submitted=false`.
+- Snapshot availability diagnostics include `853` technical
+  `availability_contract_missing_or_stale` reasons, `783` funding receipt
+  missing/ambiguous and `783` funding availability missing/ambiguous reasons,
+  plus six index-price source/receipt/availability issues and 21 missing
+  index-price facts. These are decision-snapshot reason counts, not label
+  eligibility counts; keep affected data quarantined unless the mature
+  provenance audit proves eligibility.
+- Exact next action: after the fixed maturity boundary
+  `2026-10-26T10:01:00Z` (`2026-10-26 18:01:00 Asia/Shanghai`), run once:
+  `audit_online_mature_shadow_cohort.py --cutoff 2026-10-26T06:00:00Z
+  --minutes 360 --expected-decision-count 987
+  --maturity-cutoff 2026-10-26T10:01:00Z --limit 1200
+  --output data/profitability_remediation/online-mature-shadow-cohort-d20261026T060000Z-final.json`.
+  Do not repeat the decision seal or query any cohort labels before then. Run
+  the preregistered G3 only if this G2 audit establishes sufficient native,
+  point-in-time, fee-after eligible coverage; otherwise close this cohort as
+  insufficient and register a later window.
