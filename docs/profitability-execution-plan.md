@@ -7288,3 +7288,48 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   its frozen G3 or record G2 insufficiency. Recheck bounded public-market
   latency/coverage after at least 30 continuous post-restart minutes and keep
   any resulting repair isolated, tested and permission-neutral.
+
+### Thirty-Minute Post-Restart Follow-Up (2026-10-26 20:51 Asia/Shanghai)
+
+- The read-only coverage audit at `2026-10-26T12:51:01Z` covered
+  `[12:21:01Z, 12:51:01Z)`, after the `12:12:36Z` paper-service restart.
+  Trading, dashboard and model-tunnel services remained `active/running`,
+  `NRestarts=0`; control remained `paper`, `paused=false`.
+- The window contained `50` complete market analyses across `34` symbols,
+  maximum inter-decision gap `143.009s`, zero model failures, zero incomplete
+  analyses, zero decisions inside the 600-second duplicate cooldown, zero
+  entry signals, and zero open positions. Candidate rotation was not yet
+  complete: `9` due symbols remained, although none was overdue and no symbol
+  was marked blocked. The 30-minute market-coverage assessment therefore
+  remains not ready; this is separate from duplicate analysis and profitability.
+- The matching bounded decision-economics projection covered the same
+  `50` decisions through `12:49:44Z`. Every final action was `hold`; the
+  authorized five-minute local-ML horizon and complete funding projection
+  appeared in `50/50`. Funnel reasons were `32 shadow_training` and
+  `18 no_candidate`. All 50 current lower bounds were non-positive on each
+  side; the authoritative historical fee-after gate still reports
+  `n=267`, mean `-0.303832%`, lower bound `-0.431590%`, PF `0.549713`.
+  This confirms that a healthy/unpaused paper service and repaired funding
+  route do not imply that entries are economically authorized.
+- A 30-minute public-market latency audit saw `590` matching slow/error
+  events in the bounded journal tail, but the 2 MiB tail was truncated.
+  Within that incomplete tail, normal-priority queue-wait p95 was
+  `6,545ms` for order book, `7,285ms` for index ticker, `7,277ms` for mark
+  price, and `3,945ms` for ticker. Treat these percentiles as indicative only,
+  not a complete-window acceptance. Do not increase concurrency again until
+  a complete bounded log sample and provider-versus-queue attribution support
+  a specific change; unbounded concurrency can worsen exchange throttling.
+- No order, position, permission, protection, database, or live-routing state
+  changed. The code repair is deployed and operationally stable for this
+  window; the universe coverage and latency criteria remain open. The
+  untouched Ridge v3 decision window remains
+  `[2026-10-26T12:45:00Z, 2026-10-26T18:45:00Z)` with fixed maturity
+  `2026-10-26T22:46:00Z`. The final six minutes of this runtime projection
+  overlap the prospective decision interval, but it queried only bounded
+  AIDecision/runtime diagnostics; it did not select `ShadowBacktest` rows,
+  inspect outcome labels, or change the frozen candidate family. No labels
+  from that prospective window have been read.
+- Next: retain the frozen candidate and gates, collect only prospective rows,
+  and seal once after `18:45Z`. Do not read labels before the `22:46Z` maturity
+  cutoff. Separately investigate the latency tail with a complete bounded
+  sample before proposing another runtime change.
