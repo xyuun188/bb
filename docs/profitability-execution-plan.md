@@ -7469,3 +7469,17 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   G3-G6 remain unpassed. Do not promote the model, restore live routing,
   fabricate labels, or relax quality/cost/risk gates. Continue the already
   registered v4 prospective window and its fixed maturity/audit sequence.
+
+### Scheduler Repair Follow-Up (2026-10-27 14:01 Asia/Shanghai)
+
+- A second read-only check through
+  `2026-10-27T06:00:39Z` (`14:00:39 Asia/Shanghai`) saw `18` complete market
+  decisions across `18` symbols in the bounded 10-minute window
+  `[05:50:39Z,06:00:39Z)`. The largest observed activity gap was
+  `162.9s`; analysis status was `completed` for all rows, model failures and
+  incomplete analyses remained `0`, and no duplicate occurred inside the
+  600-second cooldown.
+- The queue no longer reports `fresh_feature_unavailable` or blocked retries
+  in this follow-up. Remaining `shortlist_capacity` deferrals are bounded
+  universe rotation, not a market-loop failure. Entry signals remain `0`
+  because the current fee-after direction evidence is still non-positive.
