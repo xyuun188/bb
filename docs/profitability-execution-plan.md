@@ -7483,3 +7483,22 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   in this follow-up. Remaining `shortlist_capacity` deferrals are bounded
   universe rotation, not a market-loop failure. Entry signals remain `0`
   because the current fee-after direction evidence is still non-positive.
+
+### Ridge V4 Decision Seal (2026-10-27 21:17 Asia/Shanghai)
+
+- The prospective v4 decision window
+  `[2026-10-26T23:10:00Z, 2026-10-27T05:10:00Z)` was sealed exactly once
+  after its exclusive cutoff. Evidence:
+  `data/profitability_remediation/online-decision-cohort-d20261027T051000Z-final.json`.
+- The sealed cohort contains `0` in-window decisions and `0` candidates;
+  candidate-limit saturation is false and the ordered ID fingerprint is the
+  empty-set SHA-256
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+  The seal is read-only: no shadow labels were read, no database or order
+  state changed, and no permission or promotion was authorized.
+- This zero-sample result cannot pass G2 or support G3. It is consistent with
+  the window ending before the later scheduler-readiness deployment; it must
+  not be backfilled from post-window decisions or used as profitability
+  evidence. After the fixed maturity cutoff
+  `2026-10-27T15:11:00Z` (`23:11 Asia/Shanghai`), run the single bounded G2
+  audit once, record insufficiency, and register a materially new window.
