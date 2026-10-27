@@ -75,6 +75,44 @@ def test_execution_verified_candidates_survive_score_and_coverage_reranking() ->
     assert result.diagnostics["is_entry_gate"] is False
 
 
+def test_incomplete_indicator_candidates_do_not_fill_analysis_shortlist() -> None:
+    policy = _policy()
+    fallback = _feature("FALLBACK/USDT", 100.0)
+    fallback.indicator_snapshot_available = False
+    result = policy.select(
+        {
+            "FALLBACK/USDT": fallback,
+            "BTC/USDT": _feature("BTC/USDT", 10.0),
+            "ETH/USDT": _feature("ETH/USDT", 9.0),
+        },
+        2,
+    )
+
+    # The fallback row is explicitly incomplete; complete rows remain
+    # eligible even when their score is lower.
+    assert list(result.selected) == ["BTC/USDT", "ETH/USDT"]
+    assert result.diagnostics["analysis_snapshot_ready_candidate_count"] == 2
+    assert result.diagnostics["analysis_snapshot_unready_symbols"] == ["FALLBACK/USDT"]
+    assert result.diagnostics["analysis_snapshot_ready_selected_count"] == 2
+
+
+def test_all_incomplete_indicator_candidates_underfill_without_analysis_calls() -> None:
+    policy = _policy()
+    candidates = {
+        symbol: _feature(symbol, score)
+        for symbol, score in (("A/USDT", 10.0), ("B/USDT", 9.0))
+    }
+    for feature in candidates.values():
+        feature.indicator_snapshot_available = False
+
+    result = policy.select(candidates, 2)
+
+    assert result.selected == {}
+    assert result.diagnostics["underfill_reason"] == "indicator_snapshot_unavailable"
+    assert result.diagnostics["analysis_snapshot_ready_candidate_count"] == 0
+    assert result.diagnostics["analysis_snapshot_unready_candidate_count"] == 2
+
+
 def test_execution_priority_preserves_cooldown_and_observation_fallback() -> None:
     now = datetime(2026, 10, 15, tzinfo=UTC)
     policy = _policy()

@@ -55,7 +55,7 @@ class MarketAnalysisSelectionResult:
 class MarketAnalysisSelectionPolicy:
     """Balance ranked advantage with the incremental value of another AI review."""
 
-    VERSION = "2026-10-15.execution-aware-coverage.v9"
+    VERSION = "2026-10-27.execution-aware-coverage.v10"
 
     def __init__(
         self,
@@ -126,9 +126,18 @@ class MarketAnalysisSelectionPolicy:
         }
         for row in rows:
             row["execution_verified"] = row["symbol_key"] in verified_keys
+        analysis_ready_rows = [
+            row for row in rows if bool(row["analysis_snapshot_ready"])
+        ]
+        # Fallback market anchors are useful for diagnostics, but they cannot
+        # survive the final fresh-feature contract. Keep them out of the
+        # analysis queue whenever a complete snapshot is available; otherwise
+        # the single-worker market loop spends its budget on symbols that are
+        # guaranteed to be deferred.
         ranked = sorted(
-            rows,
+            analysis_ready_rows,
             key=lambda row: (
+                bool(row["analysis_snapshot_ready"]),
                 bool(row["execution_verified"]),
                 _safe_float(row["evaluation_score"]),
                 _safe_float(row["base_advantage_score"]),
@@ -330,7 +339,20 @@ class MarketAnalysisSelectionPolicy:
             "material_change": material_change,
             "material_change_reasons": changes,
             "selection_status": status,
+            "analysis_snapshot_ready": self._analysis_snapshot_ready(feature),
         }
+
+    @staticmethod
+    def _analysis_snapshot_ready(feature: Any) -> bool:
+        marker = _feature_value(feature, "indicator_snapshot_available")
+        if isinstance(marker, str):
+            marker = marker.strip().lower() in {"1", "true", "yes", "y"}
+        if marker is False:
+            return False
+        stale = _feature_value(feature, "indicator_snapshot_stale")
+        if isinstance(stale, str):
+            stale = stale.strip().lower() in {"1", "true", "yes", "y"}
+        return not bool(stale)
 
     def _material_changes(
         self,
@@ -408,6 +430,9 @@ class MarketAnalysisSelectionPolicy:
             for row in cooldown_excluded
             if row["symbol_key"] not in selected_keys
         ]
+        analysis_snapshot_unready = [
+            row for row in rows if not bool(row["analysis_snapshot_ready"])
+        ]
         selected_details = [self._public_row(row) for row in selected_rows]
         coverage_selected = [
             str(row["symbol"]) for row in selected_rows if row.get("selection_role") == "coverage"
@@ -447,14 +472,23 @@ class MarketAnalysisSelectionPolicy:
                 cooldown_excluded and len(selected_rows) < final_limit
             ),
             "underfill_reason": (
-                "all_candidates_in_cooldown"
-                if cooldown_excluded
-                and not any(not bool(row["recent"]) for row in rows)
+                "indicator_snapshot_unavailable"
+                if analysis_snapshot_unready
+                and not any(bool(row["analysis_snapshot_ready"]) for row in rows)
                 and len(selected_rows) < final_limit
                 else (
-                    "fresh_candidate_pool_exhausted"
-                    if len(selected_rows) < final_limit
-                    else None
+                    "all_candidates_in_cooldown"
+                    if cooldown_excluded
+                    and not any(
+                        bool(row["analysis_snapshot_ready"]) and not bool(row["recent"])
+                        for row in rows
+                    )
+                    and len(selected_rows) < final_limit
+                    else (
+                        "fresh_candidate_pool_exhausted"
+                        if len(selected_rows) < final_limit
+                        else None
+                    )
                 )
             ),
             "selected": selected_details,
@@ -469,6 +503,16 @@ class MarketAnalysisSelectionPolicy:
             "coverage_configured_slots": int(self.params.coverage_slots),
             "single_slot_coverage_interval": int(self.params.single_slot_coverage_interval),
             "selection_round": int(self._selection_round),
+            "analysis_snapshot_ready_candidate_count": sum(
+                bool(row["analysis_snapshot_ready"]) for row in rows
+            ),
+            "analysis_snapshot_unready_candidate_count": len(analysis_snapshot_unready),
+            "analysis_snapshot_unready_symbols": [
+                str(row["symbol"]) for row in analysis_snapshot_unready
+            ],
+            "analysis_snapshot_ready_selected_count": sum(
+                bool(row["analysis_snapshot_ready"]) for row in selected_rows
+            ),
             "coverage_due_candidate_count": sum(bool(row["coverage_due"]) for row in rows),
             "coverage_due_symbols": [str(row["symbol"]) for row in coverage_due_rows],
             "coverage_due_unselected_count": len(coverage_due_unselected),
@@ -538,5 +582,6 @@ class MarketAnalysisSelectionPolicy:
                 "material_change",
                 "material_change_reasons",
                 "selection_status",
+                "analysis_snapshot_ready",
             )
         }

@@ -7428,3 +7428,44 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   service restart. Two GitHub HTTPS push attempts at this checkpoint failed
   with connection-reset/connection-timeout errors; the local commit is
   preserved and must be pushed after network recovery.
+
+### Market Analysis Scheduler Readiness Repair (2026-10-27 13:57 Asia/Shanghai)
+
+- Root cause of the post-v4 zero-decision runtime was isolated to the
+  analysis scheduler, not a permanent market-loop pause. The selection policy
+  ranked `analysis_only` / `fallback_market_anchor` rows together with
+  complete indicator snapshots. The later fresh-feature contract correctly
+  rejected those incomplete rows, so a single-worker market round repeatedly
+  spent its budget on candidates that could never reach AI analysis.
+- `services/market_analysis_selection.py` now treats an indicator snapshot as
+  analysis-ready only when it is not explicitly unavailable and not stale. If
+  any ready rows exist, only those rows can consume the analysis shortlist; if
+  every row is incomplete, the selector returns an intentional underfill with
+  `indicator_snapshot_unavailable` rather than dispatching doomed candidates.
+  Diagnostics expose ready/unready counts and symbols. This is an analysis
+  scheduling boundary only; entry permission, costs, model influence, risk,
+  leverage, orders and live routing are unchanged.
+- Added regression coverage for complete rows outranking a high-score
+  incomplete fallback and for all-incomplete pools underfilling without an AI
+  call. The focused selection/ranking/trading boundary suite passed
+  `395` tests; Ruff, compileall and `git diff --check` passed.
+- The owned source file was synchronized online with
+  `source-integrity-ok:1`; only `bb-paper-trading.service` was restarted.
+  At `2026-10-27T05:45:41Z` (`13:45:41 Asia/Shanghai`) the service was
+  `active/running`, `NRestarts=0`, mode `paper`, control `paused=false`;
+  Dashboard and model tunnels remained active.
+- The first clean post-restart observation window
+  `[2026-10-27T05:46:43Z, 2026-10-27T05:56:43Z)` produced `11` complete market
+  decisions across `11` symbols. It recorded zero `fresh_feature_unavailable`
+  deferrals, zero model failures, zero incomplete analyses and zero duplicate
+  analyses inside the 600-second cooldown. All actions were `hold`: there
+  were `0` entry signals and `0` positions because current direction/quality
+  evidence remains blocked by non-positive fee-after return quality
+  (`average_fee_after_return_not_positive`,
+  `fee_after_return_lcb_not_positive`,
+  `fee_after_profit_factor_not_above_break_even`).
+- This proves the no-decision scheduling blocker is repaired, not that
+  profitability or entry permission has passed. G1 remains negative and
+  G3-G6 remain unpassed. Do not promote the model, restore live routing,
+  fabricate labels, or relax quality/cost/risk gates. Continue the already
+  registered v4 prospective window and its fixed maturity/audit sequence.
