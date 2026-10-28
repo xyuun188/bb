@@ -1575,7 +1575,10 @@ async def test_background_indicator_prewarm_does_not_use_round_deadline() -> Non
         background=True,
     )
 
-    assert received["timeout_seconds"] >= 15.0
+    assert (
+        received["timeout_seconds"]
+        == trading_service.MARKET_BACKGROUND_INDICATOR_PREWARM_TIMEOUT_SECONDS
+    )
     assert diagnostics["status"] == "ok"
     assert diagnostics["is_entry_permission"] is False
 

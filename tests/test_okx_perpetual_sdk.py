@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 import time
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -429,7 +431,7 @@ async def test_historical_candles_use_history_endpoint_and_exclude_unclosed_bars
 async def test_ohlcv_can_anchor_a_historical_shadow_window_at_result_time() -> None:
     exchange = OkxPerpetualSdkExchange("paper")
     market_api = _MarketApi()
-    exchange._market_api = market_api
+    exchange._indicator_market_apis = [market_api]
 
     rows = await exchange.fetch_ohlcv(
         "BTC/USDT",
@@ -450,6 +452,82 @@ async def test_ohlcv_can_anchor_a_historical_shadow_window_at_result_time() -> N
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_indicator_candles_use_distinct_sdk_clients_concurrently() -> None:
+    state_lock = threading.Lock()
+    state = {"active": 0, "max_active": 0}
+
+    class ConcurrentMarketApi:
+        def get_candlesticks(self, **_kwargs: Any) -> dict[str, Any]:
+            with state_lock:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+            try:
+                time.sleep(0.05)
+                return {
+                    "code": "0",
+                    "data": [["1780000120000", "1", "2", "0.9", "1.5", "10"]],
+                }
+            finally:
+                with state_lock:
+                    state["active"] -= 1
+
+    exchange = OkxPerpetualSdkExchange("paper")
+    exchange._indicator_market_apis = [ConcurrentMarketApi() for _ in range(4)]
+
+    results = await asyncio.gather(
+        *(
+            exchange.fetch_ohlcv("BTC/USDT", timeframe=timeframe, limit=2)
+            for timeframe in ("1m", "5m", "15m", "1h")
+        )
+    )
+
+    assert all(rows for rows in results)
+    assert state["max_active"] == 4
+    assert exchange._market_api is None
+    await exchange.close()
+    assert exchange._indicator_market_apis == []
+    assert exchange._sdk_call_locks == {}
+
+
+@pytest.mark.asyncio
+async def test_indicator_market_api_pool_is_bounded_rotated_and_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instances: list[Any] = []
+
+    class MarketApi:
+        def __init__(self, **_kwargs: Any) -> None:
+            self.close_count = 0
+            instances.append(self)
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    okx_package = ModuleType("okx")
+    okx_package.__path__ = []
+    market_module = ModuleType("okx.MarketData")
+    market_module.MarketAPI = MarketApi
+    monkeypatch.setitem(sys.modules, "okx", okx_package)
+    monkeypatch.setitem(sys.modules, "okx.MarketData", market_module)
+
+    exchange = OkxPerpetualSdkExchange("paper")
+    monkeypatch.setattr(exchange, "_configure_api_timeout", lambda api: api)
+    monkeypatch.setattr(exchange, "_public_kwargs", lambda: {})
+
+    selected = [exchange._next_indicator_market_api() for _ in range(5)]
+
+    assert len(instances) == okx_perpetual_sdk.OKX_INDICATOR_MARKET_API_POOL_SIZE
+    assert selected[:4] == instances
+    assert selected[4] is instances[0]
+
+    await exchange.close()
+
+    assert all(api.close_count == 1 for api in instances)
+    assert exchange._indicator_market_apis == []
+    assert exchange._sdk_call_locks == {}
 
 
 @pytest.mark.asyncio

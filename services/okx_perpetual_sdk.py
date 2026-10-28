@@ -39,6 +39,7 @@ OKX_SERVER_TIME_SYNC_TTL_SECONDS = 30.0
 # caller.  Without this, cancelling an outer wait leaves a requests worker
 # blocked on the OS socket timeout and every balance refresh piles up behind it.
 OKX_SDK_HTTP_TIMEOUT_SECONDS = 8.0
+OKX_INDICATOR_MARKET_API_POOL_SIZE = 4
 OKX_WS_PUBLIC_URL = "wss://ws.okx.com/ws/v5/public"
 OKX_WS_TICKER_EMIT_INTERVAL_SECONDS = 5.0
 OKX_WS_TICKER_CHANNEL_RE = re.compile(r'"channel"\s*:\s*"tickers"')
@@ -511,6 +512,8 @@ class OkxPerpetualSdkExchange:
         self._account_api: Any | None = None
         self._trade_api: Any | None = None
         self._market_api: Any | None = None
+        self._indicator_market_apis: list[Any] = []
+        self._indicator_market_api_cursor = 0
         self._native_consistency_market_api: Any | None = None
         self._historical_market_api: Any | None = None
         self._public_api: Any | None = None
@@ -551,6 +554,18 @@ class OkxPerpetualSdkExchange:
 
             self._market_api = self._configure_api_timeout(MarketAPI(**self._public_kwargs()))
         return self._market_api
+
+    def _next_indicator_market_api(self) -> Any:
+        """Use an isolated bounded client pool for parallel indicator candles."""
+
+        from okx.MarketData import MarketAPI
+
+        while len(self._indicator_market_apis) < OKX_INDICATOR_MARKET_API_POOL_SIZE:
+            api = self._configure_api_timeout(MarketAPI(**self._public_kwargs()))
+            self._indicator_market_apis.append(api)
+        index = self._indicator_market_api_cursor % len(self._indicator_market_apis)
+        self._indicator_market_api_cursor = (index + 1) % len(self._indicator_market_apis)
+        return self._indicator_market_apis[index]
 
     @property
     def native_consistency_market_api(self) -> Any:
@@ -791,6 +806,11 @@ class OkxPerpetualSdkExchange:
         ):
             if getattr(self, attribute) is api:
                 setattr(self, attribute, None)
+        self._indicator_market_apis = [
+            candidate for candidate in self._indicator_market_apis if candidate is not api
+        ]
+        if not self._indicator_market_apis:
+            self._indicator_market_api_cursor = 0
 
     def _track_retired_sdk_call(
         self,
@@ -857,6 +877,11 @@ class OkxPerpetualSdkExchange:
             ):
                 if getattr(self, attribute) is api:
                     setattr(self, attribute, None)
+            self._indicator_market_apis = [
+                candidate for candidate in self._indicator_market_apis if candidate is not api
+            ]
+            if not self._indicator_market_apis:
+                self._indicator_market_api_cursor = 0
             self._sdk_call_locks.pop(id(api), None)
 
     async def close(self) -> None:
@@ -872,6 +897,7 @@ class OkxPerpetualSdkExchange:
                         self._account_api,
                         self._trade_api,
                         self._market_api,
+                        *self._indicator_market_apis,
                         self._native_consistency_market_api,
                         self._historical_market_api,
                         self._public_api,
@@ -1525,8 +1551,9 @@ class OkxPerpetualSdkExchange:
             # than the supplied timestamp. Anchoring at the result fact keeps
             # delayed shadow samples on their actual decision-to-result window.
             request["after"] = str(int(end_timestamp_ms or 0))
+        api = self._next_indicator_market_api()
         response = await self._call_sdk(
-            lambda: self.market_api,
+            lambda: api,
             "get_candlesticks",
             **request,
         )

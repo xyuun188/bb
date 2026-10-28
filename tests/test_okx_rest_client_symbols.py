@@ -52,6 +52,11 @@ def test_required_route_waits_fit_under_outer_snapshot_cap() -> None:
 def test_optional_derivatives_routes_use_a_separate_gate() -> None:
     client = OKXRestClient()
     assert client._public_market_gate() is not client._public_market_optional_gate()
+    assert (
+        client._public_market_optional_gate()._limit
+        == okx_rest_client_module.PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY
+        == 4
+    )
 
 
 @pytest.mark.asyncio
@@ -113,6 +118,7 @@ def test_native_consistency_route_uses_a_separate_gate() -> None:
 def test_latency_diagnostics_cover_quote_and_native_path_routes() -> None:
     assert PUBLIC_MARKET_DIAGNOSTIC_METHODS == {
         "fetch_order_book",
+        "fetch_ohlcv",
         "fetch_ticker",
         "fetch_native_consistency_ohlcv",
         "publicGetMarketIndexTickers",
@@ -160,6 +166,79 @@ async def test_public_market_latency_logs_bounded_queue_diagnostic(
     assert events[0]["queue_wait_ms"] >= 250.0
     assert events[0]["provider_duration_ms"] >= 0.0
     assert events[0]["outcome"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_indicator_ohlcv_latency_logs_queue_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+    events: list[dict[str, Any]] = []
+
+    class SlowGate:
+        async def acquire(self, *, priority: bool) -> None:
+            assert priority is False
+            await asyncio.sleep(0.26)
+
+        def release(self, *, priority: bool) -> None:
+            assert priority is False
+
+    class Exchange:
+        async def fetch_ohlcv(
+            self,
+            _symbol: str,
+            _timeframe: str,
+            **_kwargs: Any,
+        ) -> list[list[float]]:
+            return []
+
+    monkeypatch.setattr(client, "_public_market_optional_gate", lambda: SlowGate())
+    monkeypatch.setattr(client, "_get_exchange", lambda: asyncio.sleep(0, result=Exchange()))
+    monkeypatch.setattr(client, "_ensure_rest_url", lambda: None)
+    monkeypatch.setattr(
+        okx_rest_client_module.logger,
+        "info",
+        lambda _event, **kwargs: events.append(kwargs),
+    )
+
+    result = await client._ccxt_call(
+        "fetch_ohlcv",
+        "BTC/USDT:USDT",
+        "1m",
+        limit=2,
+    )
+
+    assert result == []
+    assert len(events) == 1
+    assert events[0]["method"] == "fetch_ohlcv"
+    assert events[0]["queue_wait_ms"] >= 250.0
+    assert events[0]["provider_duration_ms"] >= 0.0
+    assert events[0]["priority"] is False
+    assert events[0]["outcome"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_request_gate_returns_slot_when_granted_waiter_is_cancelled() -> None:
+    gate = _PriorityRequestGate(1, normal_limit=1)
+    await gate.acquire(priority=False)
+
+    waiter = asyncio.create_task(gate.acquire(priority=False))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    # `release()` grants the queued waiter synchronously.  Cancelling before
+    # the task resumes exercises the slot-leak race in the gate.
+    gate.release(priority=False)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert gate._active == 0
+    assert gate._active_normal == 0
+
+    follow_up = asyncio.create_task(gate.acquire(priority=False))
+    await asyncio.wait_for(follow_up, timeout=1.0)
+    gate.release(priority=False)
 
 
 @pytest.mark.asyncio

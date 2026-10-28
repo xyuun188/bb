@@ -27,7 +27,10 @@ from core.symbols import (
 )
 from core.trading_mode import mode_manager
 from data_feed.okx_ticker_volume import okx_swap_volume_fields
-from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
+from services.okx_perpetual_sdk import (
+    OKX_INDICATOR_MARKET_API_POOL_SIZE,
+    OkxPerpetualSdkExchange,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -86,7 +89,11 @@ PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY = max(
     1,
     PUBLIC_MARKET_REQUEST_CONCURRENCY - 1,
 )
-PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY = 1
+# Indicator snapshots fetch four independent candle horizons. Keep those
+# enrichment calls on their own bounded lane so a slow K-line provider cannot
+# consume executable quote slots, while allowing one snapshot to complete
+# within its caller budget instead of serializing four ~8s requests.
+PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY = OKX_INDICATOR_MARKET_API_POOL_SIZE
 # Native one-minute candles are part of the executable-market-fact proof. They
 # must not queue behind the larger indicator K-line fan-out. Four bounded slots
 # let a four-horizon shadow-maintenance batch drain without turning a provider
@@ -104,6 +111,7 @@ PUBLIC_MARKET_SLOW_PROVIDER_LOG_MS = 750.0
 PUBLIC_MARKET_DIAGNOSTIC_METHODS = frozenset(
     {
         "fetch_order_book",
+        "fetch_ohlcv",
         "fetch_ticker",
         "fetch_native_consistency_ohlcv",
         "publicGetMarketIndexTickers",
@@ -320,32 +328,51 @@ class _PriorityRequestGate:
         waiters.append(future)
         try:
             await future
-        except asyncio.CancelledError:
-            try:
-                waiters.remove(future)
-            except ValueError:
-                pass
+        except BaseException:
+            # `release()` may have already assigned this waiter a slot and
+            # completed its future before cancellation was delivered to the
+            # task.  In that race the slot must be returned or the gate can
+            # remain permanently saturated.
+            if future.done() and not future.cancelled():
+                self.release(priority=priority)
+            else:
+                try:
+                    waiters.remove(future)
+                except ValueError:
+                    pass
+                future.cancel()
+                self._wake_next()
             raise
 
     def release(self, *, priority: bool = False) -> None:
         self._active = max(self._active - 1, 0)
         if not priority:
             self._active_normal = max(self._active_normal - 1, 0)
-        while self._priority_waiters:
-            future = self._priority_waiters.popleft()
-            if future.done():
-                continue
-            self._active += 1
-            future.set_result(None)
-            return
-        while self._normal_waiters and self._active_normal < self._normal_limit:
-            future = self._normal_waiters.popleft()
-            if future.done():
-                continue
-            self._active += 1
-            self._active_normal += 1
-            future.set_result(None)
-            return
+        self._wake_next()
+
+    def _wake_next(self) -> None:
+        while self._active < self._limit:
+            while self._priority_waiters:
+                future = self._priority_waiters.popleft()
+                if future.done():
+                    continue
+                self._active += 1
+                future.set_result(None)
+                break
+            else:
+                while (
+                    self._normal_waiters
+                    and self._active_normal < self._normal_limit
+                ):
+                    future = self._normal_waiters.popleft()
+                    if future.done():
+                        continue
+                    self._active += 1
+                    self._active_normal += 1
+                    future.set_result(None)
+                    break
+                else:
+                    return
 
 def _is_suspicious_contract_base(base: str | None) -> bool:
     value = str(base or "").upper()

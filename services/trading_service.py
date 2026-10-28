@@ -322,6 +322,13 @@ EXPERT_MEMORY_CONTEXT_CACHE_TTL_SECONDS = 300.0
 EXPERT_MEMORY_CONTEXT_CACHE_LIMIT = 128
 EXPERT_MEMORY_CONTEXT_REFRESH_CONCURRENCY = 2
 MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS = 9.0
+# A background batch contains two candidates and each candidate needs four
+# candle horizons. The isolated OKX enrichment lane is bounded, so allow two
+# provider waves plus scheduler overhead before declaring the batch unavailable.
+MARKET_BACKGROUND_INDICATOR_PREWARM_TIMEOUT_SECONDS = max(
+    MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS * 2.0 + 5.0,
+    25.0,
+)
 MARKET_PREWARMED_FEATURE_REFRESH_TIMEOUT_SECONDS = 3.0
 # Background indicator builds share the OKX public-request and indicator
 # compute gates with live analysis.  A large batch made the prewarm worker
@@ -6424,7 +6431,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
         started = loop.time()
         timeout_seconds = max(float(MARKET_INDICATOR_PREWARM_TIMEOUT_SECONDS), 0.5)
         if background:
-            timeout_seconds = max(timeout_seconds, 15.0)
+            timeout_seconds = max(
+                timeout_seconds,
+                MARKET_BACKGROUND_INDICATOR_PREWARM_TIMEOUT_SECONDS,
+            )
         outer_timeout_seconds = (
             max(timeout_seconds * max(len(requested), 1) + 5.0, 30.0)
             if background
