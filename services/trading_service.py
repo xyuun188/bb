@@ -171,7 +171,6 @@ from services.okx_balance_snapshot import (
     balance_snapshot_verified,
 )
 from services.okx_entry_environment_compatibility import (
-    entry_instrument_definitively_unavailable,
     entry_instrument_unavailable_cache_ttl,
 )
 from services.okx_error_classifier import is_okx_temporary_service_error
@@ -4462,14 +4461,14 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if not isinstance(facts, dict):
             return {}
 
-        # A definitive OKX capability rejection can happen during the
-        # immediate pre-order environment refresh without reaching
-        # ``place_order``.  Feed that result into the same candidate-pool
-        # negative cache used by shortlist probes and submit-time failures;
-        # otherwise the next market round can select the same unsupported
-        # instrument again.
+        # A pre-order capability or environment rejection can happen during
+        # the immediate refresh without reaching ``place_order``. Feed every
+        # retryable capability result into the same short-lived candidate-pool
+        # cache used by shortlist probes; otherwise an incompatible symbol can
+        # be re-selected on every market round until the final gate rejects it
+        # again. Definitive 51001 responses still use the longer cache TTL.
         unavailable_ttl = entry_instrument_unavailable_cache_ttl(facts)
-        if unavailable_ttl is not None and entry_instrument_definitively_unavailable(facts):
+        if unavailable_ttl is not None:
             self._remember_unavailable_entry_symbol(
                 model_mode,
                 decision.symbol,

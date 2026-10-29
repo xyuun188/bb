@@ -31,6 +31,7 @@ from services.okx_training_facts import (
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.training_data_quality import annotate_training_payload
+from tests.feature_availability_fixtures import seal_synthetic_feature_availability
 from tests.legacy_paper_contract_fixtures import (
     HISTORICAL_NORMAL_PAPER_TRADE_VERSION,
     LEGACY_NORMAL_PAPER_TRADE_V4_VERSION,
@@ -130,6 +131,16 @@ def _slippage_fact(
 
 
 def _complete_lineage() -> dict:
+    entry_features = {
+        "symbol": "BTC/USDT",
+        "returns_1": 0.01,
+        "spread_pct": 0.02,
+        "horizon_minutes": 60,
+    }
+    seal_synthetic_feature_availability(
+        entry_features,
+        decision_at=datetime(2026, 7, 11, 1, tzinfo=UTC),
+    )
     return {
         "positions_by_id": {
             7: SimpleNamespace(
@@ -229,12 +240,7 @@ def _complete_lineage() -> dict:
             }
         },
         "decision_feature_by_order_id": {
-            "entry-1": {
-                "symbol": "BTC/USDT",
-                "returns_1": 0.01,
-                "spread_pct": 0.02,
-                "horizon_minutes": 60,
-            }
+            "entry-1": entry_features,
         },
     }
 

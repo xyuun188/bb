@@ -788,6 +788,29 @@ class LocalAIToolsClient:
             if isinstance(item, dict)
         )
         child_available = child_metadata_ready_count > 0
+        child_contracts_ready_for_trading = bool(
+            child_endpoints
+            and child_metadata_ready_count == len(child_endpoints)
+        )
+        paper_trading_permission = bool(
+            model_bundle_available
+            and status.get("paper_trading_permission") is True
+            and child_contracts_ready_for_trading
+        )
+        paper_blockers = list(status.get("paper_trading_blockers") or [])
+        if not model_bundle_available:
+            paper_blockers.append("model_bundle_unavailable")
+        elif not child_contracts_ready_for_trading:
+            paper_blockers.append("phase3_quant_child_endpoints_not_ready")
+        elif not paper_trading_permission:
+            paper_blockers.append("paper_model_permission_not_authorized")
+        status["paper_trading_blockers"] = list(dict.fromkeys(paper_blockers))
+        status["paper_trading_permission"] = paper_trading_permission
+        status["live_trading_permission"] = bool(
+            model_bundle_available
+            and status.get("live_trading_permission") is True
+            and child_contracts_ready_for_trading
+        )
         status.update(
             {
                 "available": service_available,
@@ -1121,6 +1144,10 @@ class LocalAIToolsClient:
             )
             status["status"] = "connected_trading_disabled"
         if service_available:
+            status = self._status_contract_payload(
+                status,
+                enabled_for_trading=enabled_for_trading,
+            )
             self._record_success()
             status.update(self._breaker_fields())
             self._last_successful_status = (monotonic(), copy.deepcopy(status))

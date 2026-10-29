@@ -2845,6 +2845,9 @@ class MLSignalService:
                 "live_ml_ready": False,
                 "paper_analysis_permission": False,
                 "paper_trading_permission": False,
+                "paper_model_eligible": False,
+                "paper_model_blockers": ["model_bundle_unavailable"],
+                "model_bundle_available": False,
                 "live_trading_permission": False,
                 "model_path": str(self.model_path),
                 "artifact_registry": self._artifact_registry_status(),
@@ -2887,6 +2890,7 @@ class MLSignalService:
             activation=activation,
             artifact_version=self._artifact_version(metadata),
         )
+        paper_model_eligible = strategy_blueprint.get("paper_execution_eligible") is True
         return {
             "available": True,
             "model_path": str(self.model_path),
@@ -2911,7 +2915,13 @@ class MLSignalService:
             "readiness": readiness,
             "live_ml_ready": live_ml_ready,
             "paper_analysis_permission": True,
-            "paper_trading_permission": True,
+            "paper_trading_permission": paper_model_eligible,
+            "paper_model_eligible": paper_model_eligible,
+            "paper_model_blockers": (
+                []
+                if paper_model_eligible
+                else list(strategy_blueprint.get("blocking_reasons") or [])
+            ),
             "live_trading_permission": live_ml_ready,
             "advisory_enabled": advisory_enabled,
             "influence_policy": influence,
@@ -2919,7 +2929,7 @@ class MLSignalService:
             "note": (
                 "模型已获得实盘候选资格；实盘订单仍需逐笔通过生产门禁。"
                 if live_ml_ready
-                else "模型可正常参与模拟盘分析和交易；晋升状态只阻断实盘权限。"
+                else "模型可提供纸盘候选信号；纸盘运行状态和单笔开仓仍由独立门禁决定。"
             ),
             **auto_status,
         }
@@ -2948,6 +2958,8 @@ class MLSignalService:
                 "artifact_status": "unavailable",
                 "live_ml_ready": False,
                 "paper_trading_permission": False,
+                "paper_model_eligible": False,
+                "paper_model_blockers": ["model_bundle_unavailable"],
                 "model_bundle_available": False,
                 "artifact_registry": self.artifact_registry.status_metadata(),
                 "message": "本地 ML 尚未注册当前模型 Artifact。",
@@ -2977,6 +2989,15 @@ class MLSignalService:
         advisory_enabled = bool(
             influence.get("advisory_enabled") and readiness.get("state") == "shadow_ready"
         )
+        strategy_blueprint = build_model_strategy_blueprint(
+            metadata=metadata,
+            readiness=readiness,
+            activation=activation,
+            artifact_version=str(
+                metadata.get("artifact_version") or metadata.get("version") or ""
+            ),
+        )
+        paper_model_eligible = strategy_blueprint.get("paper_execution_eligible") is True
         return {
             "available": True,
             "service_available": True,
@@ -2991,11 +3012,18 @@ class MLSignalService:
             "latest_training_shadow_cursor": latest_training["sample_cursor"]["shadow"],
             "artifact_lifecycle": activation.get("activation_stage") or "unregistered",
             "artifact_activation_manifest": activation,
+            "strategy_blueprint": strategy_blueprint,
             "readiness_state": readiness.get("state"),
             "readiness": readiness,
             "live_ml_ready": live_ml_ready,
             "paper_analysis_permission": True,
-            "paper_trading_permission": True,
+            "paper_trading_permission": paper_model_eligible,
+            "paper_model_eligible": paper_model_eligible,
+            "paper_model_blockers": (
+                []
+                if paper_model_eligible
+                else list(strategy_blueprint.get("blocking_reasons") or [])
+            ),
             "live_trading_permission": live_ml_ready,
             "advisory_enabled": advisory_enabled,
             "influence_policy": influence,
@@ -3015,7 +3043,7 @@ class MLSignalService:
             ),
             "mode": "entry_profit_filter" if live_ml_ready else "paper_model",
             "note": (
-                "模型可正常参与模拟盘分析和交易；晋升状态只阻断实盘权限。"
+                "模型可提供纸盘候选信号；纸盘运行状态和单笔开仓仍由独立门禁决定。"
                 if not live_ml_ready
                 else "模型已获得实盘候选资格；实盘订单仍需逐笔通过生产门禁。"
             ),

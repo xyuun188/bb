@@ -2698,6 +2698,7 @@ def _model_artifact_status() -> dict[str, Any]:
     activation_status = activation_status if isinstance(activation_status, dict) else {}
     model_bundle_available = current is not None and bool(raw_metadata)
     activation_stage = str((activation or {}).get("activation_stage") or "unregistered")
+    paper_lifecycle_valid = activation_stage in {"candidate", "shadow", "canary", "active"}
     def candidate_summary(resolved: dict[str, Any] | None) -> dict[str, Any]:
         metadata = resolved.get("metadata") if isinstance(resolved, dict) else {}
         metadata = metadata if isinstance(metadata, dict) else {}
@@ -2770,6 +2771,16 @@ def _model_artifact_status() -> dict[str, Any]:
         "artifact_lifecycle": activation_stage,
         "model_stage": activation_stage if model_bundle_available else "candidate",
         "artifact_activation_manifest": activation_status,
+        "paper_trading_permission": bool(
+            model_bundle_available and paper_lifecycle_valid
+        ),
+        "paper_trading_blockers": (
+            []
+            if model_bundle_available and paper_lifecycle_valid
+            else ["model_bundle_unavailable"]
+            if not model_bundle_available
+            else ["artifact_lifecycle_invalid"]
+        ),
         "live_ml_ready": bool(
             (activation or {}).get("live_ml_ready")
         ),
@@ -4346,6 +4357,7 @@ def with_model_metadata(
         payload["production_permission"] = live_authorized
         payload["live_ml_ready"] = live_authorized
         payload["paper_trading_permission"] = distribution_inputs_ready
+        payload["paper_trading_blockers"] = []
         contract_ready = bool(
             payload.get("objective_name") == RETURN_OBJECTIVE_NAME
             and payload.get("objective_version") == RETURN_OBJECTIVE_VERSION
@@ -4382,6 +4394,15 @@ def with_model_metadata(
             and prediction_quality.get("anomalous") is not True
             and not quality_blockers
         )
+        if not quality_contract_complete:
+            payload["paper_trading_permission"] = False
+            payload["paper_trading_blockers"] = list(
+                dict.fromkeys(
+                    [
+                        "runtime_return_artifact_contract_incomplete",
+                    ]
+                )
+            )
         original_production_eligible = bool(
             prediction_quality.get("production_eligible") is True
         )
@@ -5249,18 +5270,28 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
     try:
         market_split = _purged_chronological_holdout(rows)
     except ValueError as exc:
+        reason = (
+            "chronological_market_training_holdout_unavailable"
+            if str(exc) == "decision_group_holdout_unavailable"
+            else "chronological_market_training_identity_incomplete"
+        )
         return {
             "trained": False,
-            "reason": "chronological_market_training_identity_incomplete",
+            "reason": reason,
             "shadow_sample_count": len(rows),
             "message": str(exc),
         }
     try:
         cost_split = _purged_chronological_holdout(cost_rows)
     except ValueError as exc:
+        reason = (
+            "chronological_cost_training_holdout_unavailable"
+            if str(exc) == "decision_group_holdout_unavailable"
+            else "chronological_cost_training_identity_incomplete"
+        )
         return {
             "trained": False,
-            "reason": "chronological_cost_training_identity_incomplete",
+            "reason": reason,
             "shadow_sample_count": len(rows),
             "authoritative_cost_sample_count": len(cost_rows),
             "message": str(exc),
@@ -6686,10 +6717,13 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
             source_authority="artifact_unavailable",
         ),
         "prediction_quality": {
+            "contract_complete": False,
+            "paper_eligible": False,
             "production_eligible": False,
             "anomalous": True,
             "reason": fallback_reason,
             "blockers": [fallback_reason],
+            "production_blockers": [fallback_reason],
         },
     }, features=features, fallback_reason=fallback_reason)
 

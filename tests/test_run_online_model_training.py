@@ -46,6 +46,9 @@ def test_online_training_command_terminates_before_ssh_timeout() -> None:
     assert "timeout --signal=INT --kill-after=30s 7140s $PYBIN -" in command
     assert "contextlib.redirect_stdout(captured_stdout)" in command
     assert 'compact_payload["full_result_chars"]' in command
+    assert '"message"' in command
+    assert '"shadow_sample_count"' in command
+    assert '"authoritative_cost_sample_count"' in command
 
 
 def test_online_preflight_does_not_require_persisted_result_frame() -> None:

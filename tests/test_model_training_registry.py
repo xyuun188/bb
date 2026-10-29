@@ -399,6 +399,7 @@ def test_missing_phase3_bundle_is_not_reported_as_model_identity_failure() -> No
     assert len(phase3_rows) == 6
     assert all(row["runtime_available"] is True for row in phase3_rows)
     assert all(row["artifact_available"] is False for row in phase3_rows)
+    assert all(row["paper_model_eligible"] is False for row in phase3_rows)
     assert all(row["lifecycle"] == "artifact_unavailable" for row in phase3_rows)
     assert all(row["identity_status"] == "artifact_unavailable" for row in phase3_rows)
     assert payload["summary"]["identity_failure_count"] == 0
@@ -407,6 +408,44 @@ def test_missing_phase3_bundle_is_not_reported_as_model_identity_failure() -> No
     assert set(payload["summary"]["artifact_unavailable_models"]) == {
         row["model_id"] for row in phase3_rows
     }
+
+
+def test_registry_reports_each_phase3_model_artifact_independently() -> None:
+    payload = build_model_training_registry(
+        local_tools_status={
+            "available": True,
+            "service_available": True,
+            "model_bundle_available": True,
+            "paper_trading_permission": True,
+            "models": {
+                "profit": "profit-model",
+                "loss_filter": "loss-filter-model",
+                "timeseries": {
+                    "name": "stale-timeseries-name",
+                    "artifact_available": False,
+                },
+            },
+        },
+    )
+    rows = _by_id(payload)
+
+    assert rows["local_ai_profit_prediction"]["artifact_available"] is True
+    assert rows["local_ai_profit_prediction"]["paper_model_eligible"] is True
+    assert rows["local_ai_loss_filter"]["artifact_available"] is True
+    assert rows["local_ai_loss_filter"]["paper_model_eligible"] is True
+    for model_id in (
+        "local_ai_timeseries",
+        "local_ai_sequence",
+        "local_ai_sentiment_calibration",
+        "local_ai_exit_profile",
+    ):
+        assert rows[model_id]["artifact_available"] is False
+        assert rows[model_id]["paper_model_eligible"] is False
+        assert rows[model_id]["lifecycle"] == "artifact_unavailable"
+        assert rows[model_id]["identity_status"] == "artifact_unavailable"
+    assert rows["local_ai_timeseries"]["blocking_reasons"] == [
+        "model_artifact_unavailable"
+    ]
 
 
 def test_registry_keeps_finbert_identity_evidence_separate_from_runtime_probe() -> None:

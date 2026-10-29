@@ -13624,6 +13624,42 @@ async def test_pre_order_51001_is_written_to_candidate_negative_cache() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pre_order_environment_incompatibility_is_temporarily_cached() -> None:
+    service = TradingService.__new__(TradingService)
+    service._entry_unavailable_cache_persist_enabled = False
+    service._unavailable_entry_symbols_by_mode = {"paper": {}, "live": {}}
+
+    class IncompatibleEnvironmentExecutor:
+        async def pre_order_execution_facts(self, _symbol: str, _side: str) -> dict[str, Any]:
+            return {
+                "production_eligible": False,
+                "reason": "okx_entry_live_execution_environment_incompatible",
+                "symbol": "IRYS/USDT",
+                "inst_id": "IRYS-USDT-SWAP",
+                "feature_snapshot": {},
+                "environment_compatibility": {
+                    "compatible": False,
+                    "blockers": ["environment_price_drift_exceeded"],
+                },
+            }
+
+    async def get_executor(_mode: str) -> IncompatibleEnvironmentExecutor:
+        return IncompatibleEnvironmentExecutor()
+
+    service._get_okx_executor_for_mode = get_executor  # type: ignore[method-assign]
+    decision = _decision(Action.LONG)
+    decision.symbol = "IRYS/USDT"
+
+    result = await service.pre_order_execution_facts("paper", decision)
+
+    assert result["production_eligible"] is False
+    cached = service._unavailable_entry_symbols_by_mode["paper"]["IRYS/USDT"]
+    assert cached["reason"] == "okx_entry_live_execution_environment_incompatible"
+    assert cached["analysis_only"] is True
+    assert cached["execution_verified"] is False
+
+
+@pytest.mark.asyncio
 async def test_pre_order_facts_reuse_recent_balance_after_empty_okx_snapshot() -> None:
     service = TradingService.__new__(TradingService)
     service._okx_balance_snapshot_cache = {

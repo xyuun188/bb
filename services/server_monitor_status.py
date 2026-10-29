@@ -1405,6 +1405,9 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
             "training_status": "unknown",
             "evaluation_status": "unknown",
             "permission_status": "shadow",
+            "paper_trading_permission": False,
+            "live_trading_permission": False,
+            "paper_trading_blockers": ["model_bundle_unavailable"],
             "child_endpoints": {},
         }
         if local_base:
@@ -1498,6 +1501,30 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                 for item in child_endpoints.values()
                 if isinstance(item, dict)
             )
+            child_contracts_ready_for_trading = bool(
+                child_endpoints
+                and child_metadata_ready_count == len(child_endpoints)
+            )
+            paper_trading_permission = bool(
+                model_bundle_available
+                and status_metadata.get("paper_trading_permission") is True
+                and child_contracts_ready_for_trading
+            )
+            live_trading_permission = bool(
+                model_bundle_available
+                and status_metadata.get("live_trading_permission") is True
+                and child_contracts_ready_for_trading
+            )
+            paper_trading_blockers = (
+                list(status_metadata.get("paper_trading_blockers") or [])
+                if model_bundle_available
+                else ["model_bundle_unavailable"]
+            )
+            if model_bundle_available and not child_contracts_ready_for_trading:
+                paper_trading_blockers.append(
+                    "phase3_quant_child_endpoints_not_ready"
+                )
+            paper_trading_blockers = list(dict.fromkeys(paper_trading_blockers))
             platform_call_available = bool(
                 tunnel_contract.get("ok") and (service_available or child_available)
             )
@@ -1567,11 +1594,14 @@ async def collect_platform_runtime_status() -> dict[str, Any]:
                     ),
                     "permission_status": (
                         "live_candidate"
-                        if status_metadata.get("live_trading_permission") is True
+                        if live_trading_permission
                         else "paper_canary"
-                        if status_metadata.get("paper_trading_permission") is True
+                        if paper_trading_permission
                         else "shadow"
                     ),
+                    "paper_trading_permission": paper_trading_permission,
+                    "live_trading_permission": live_trading_permission,
+                    "paper_trading_blockers": paper_trading_blockers,
                     "config_issue": (
                         "" if tunnel_contract.get("ok") else tunnel_contract.get("message", "")
                     ),

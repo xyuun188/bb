@@ -200,6 +200,7 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
             status.get("training_shadow_sample_count") or status.get("sample_count")
         ),
         "live_ml_ready": live,
+        "paper_model_eligible": status.get("paper_model_eligible") is True,
         "quality_state": "diagnostic_timeout" if diagnostic_timeout else readiness,
         "return_lcb_pct": _first_present(
             metrics.get("return_lcb_pct"),
@@ -287,11 +288,39 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
     promotion = _safe_dict(status.get("promotion_recommendation"))
     live_ml_ready = promotion.get("live_ml_ready") is True
     canary_ready = bool(promotion.get("canary_ready"))
+    paper_permission = status.get("paper_trading_permission") is True
     rows: list[dict[str, Any]] = []
     for model_id, display_name, model_key, task in _LOCAL_TOOL_MODELS:
-        model_name = str(models.get(model_key) or "").strip()
-        artifact_available = bool(bundle_available and model_name)
-        artifact_unavailable = bool(runtime_available and not bundle_available)
+        model_entry = models.get(model_key)
+        if isinstance(model_entry, dict):
+            model_name = str(
+                model_entry.get("name")
+                or model_entry.get("model")
+                or model_entry.get("path")
+                or model_entry.get("version")
+                or ""
+            ).strip()
+            availability_key = next(
+                (
+                    key
+                    for key in ("artifact_available", "available")
+                    if key in model_entry
+                ),
+                None,
+            )
+            model_artifact_present = (
+                model_entry.get(availability_key) is True
+                if availability_key
+                else bool(model_name)
+            )
+        else:
+            model_name = str(model_entry or "").strip()
+            model_artifact_present = bool(model_name)
+        artifact_available = bool(bundle_available and model_artifact_present)
+        artifact_unavailable = bool(
+            runtime_available and (not bundle_available or not model_artifact_present)
+        )
+        paper_model_eligible = bool(artifact_available and paper_permission)
         if diagnostic_timeout:
             lifecycle = "diagnostic_timeout"
         elif diagnostic_warming:
@@ -340,14 +369,21 @@ def _local_tool_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
                     else status.get("shadow_sample_count")
                 ),
                 "live_ml_ready": live_ml_ready,
+                "paper_model_eligible": paper_model_eligible,
                 "quality_state": lifecycle,
                 "blocking_reasons": (
                     ["status_query_timeout"]
                     if diagnostic_timeout
                     else ["status_refresh_in_progress"]
                     if diagnostic_warming
-                    else ["model_bundle_unavailable"]
+                    else [
+                        "model_bundle_unavailable"
+                        if not bundle_available
+                        else "model_artifact_unavailable"
+                    ]
                     if artifact_unavailable
+                    else ["paper_model_permission_not_authorized"]
+                    if not paper_model_eligible
                     else _safe_list(promotion.get("live_blocking_reasons"))
                 ),
                 # A reachable service without a compatible bundle is an

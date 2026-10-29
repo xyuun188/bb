@@ -194,8 +194,8 @@ def test_market_analysis_distinguishes_observed_direction_from_open_permission()
     assert "zeroPositionSize || Boolean(record.execution_reason) ? 'hold' : value" in script
     assert "观望（看多观察）" in script
     assert "观望（看空观察）" in script
-    assert "dashboard.js?v=20261008-training-status-v1" in html
-    assert "模拟盘交易权限" in script
+    assert "dashboard.js?v=20261029-model-permission-v3" in html
+    assert "本地 ML 模型资格" in script
     assert "实盘候选权限" in script
 
 
@@ -235,6 +235,19 @@ def test_dashboard_distinguishes_ml_status_refresh_from_model_unavailable() -> N
     assert "'状态刷新中'" in script
     assert "模型状态读取较慢，系统正在后台重试。" in script
     assert "暂时无法取得模型状态，系统正在自动重试。" in script
+
+
+def test_dashboard_local_ai_tools_distinguishes_transport_from_model_readiness() -> None:
+    script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+
+    assert "const modelBundleAvailable = status.model_bundle_available === true;" in script
+    assert "const paperTradingPermission = modelBundleAvailable" in script
+    assert "&& status.paper_trading_permission === true;" in script
+    assert "value: serviceAvailable" in script
+    assert "'模型已就绪' : '服务已连接'" in script
+    assert "训练模型产物未就绪；子接口不可用于模型交易" in script
+    assert "'仅分析/采样'" in script
+    assert "实际交易还需纸盘运行与逐笔门禁通过" in script
 
 
 def test_strategy_learning_distinguishes_stale_snapshot_from_request_failure() -> None:
@@ -290,7 +303,7 @@ def test_expert_memory_table_uses_readable_structured_outcomes() -> None:
     assert "<th>标的与方向</th>" in html
     assert "<th>结算结果</th>" in html
     assert "<th>经验结论</th>" in html
-    assert "dashboard.js?v=20261008-training-status-v1" in html
+    assert "dashboard.js?v=20261029-model-permission-v3" in html
     assert "function expertMemoryPresentation(memory = {})" in script
     assert "function expertMemoryOutcome(memory = {})" in script
     assert "观察并复核分布" in script
@@ -840,7 +853,7 @@ def test_server_monitor_rendering_isolated_from_numeric_format_errors() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
 
-    assert "dashboard.js?v=20261008-training-status-v1" in html
+    assert "dashboard.js?v=20261029-model-permission-v3" in html
     assert "const rawDigits = Number(digits);" in script
     assert "Math.max(0, Math.min(Math.trunc(rawDigits), 6))" in script
     assert "monitorNumber(tools.completed_shadow_sample_count, monitorNumber(" not in script
@@ -982,7 +995,7 @@ def test_system_audit_static_assets_keep_new_version() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "dashboard.css?v=20260828-training-effectiveness-layout-v1" in html
-    assert "dashboard.js?v=20261008-training-status-v1" in html
+    assert "dashboard.js?v=20261029-model-permission-v3" in html
     assert "dashboard.css?v=20260621-data-sync" not in html
     assert "dashboard.js?v=20260621-data-sync" not in html
 
@@ -1152,7 +1165,7 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert ".data-source-editor-row" in style
     assert ".data-source-editor-status" in style
     assert "dashboard.css?v=20260828-training-effectiveness-layout-v1" in html
-    assert "dashboard.js?v=20261008-training-status-v1" in html
+    assert "dashboard.js?v=20261029-model-permission-v3" in html
     assert "overflow-wrap: anywhere;" in style
 
 
@@ -1411,7 +1424,7 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert "learning_only: '仅学习观察'" in reason_block
     assert (
         "artifact_activation_not_production_authorized: "
-        "'当前 Artifact 可参与模拟盘，尚未获得实盘权限'" in reason_block
+        "'当前 Artifact 可提供纸盘候选信号，尚未获得实盘权限'" in reason_block
     )
     assert "okx_executor_unavailable: 'OKX 执行器尚未初始化，无法读取保护证据'" in reason_block
     assert "risk_contract_version_missing: '历史入场记录未保存风险合同版本'" in reason_block
@@ -1422,7 +1435,11 @@ def test_dashboard_localizes_blockers_and_explains_pending_training_count() -> N
     assert "当前干净完成 ${samples.completedMl} - 最近已训练游标" in overview_block
     assert "map(dashboardReasonText)" in overview_block
     assert "mlMetricCard('就绪判断'" in script
-    assert "mlMetricCard('模拟盘交易权限'" in script
+    assert "mlMetricCard('本地 ML 模型资格'" in script
+    assert "const paperModelEligible = ready" in script
+    assert "&& status.model_bundle_available === true" in script
+    assert "&& status.paper_model_eligible === true" in script
+    assert "不代表纸盘服务运行或本次开仓获准" in script
     assert "mlMetricCard('实盘候选权限'" in script
     assert "const SYSTEM_AUDIT_NODE_LABELS" in script
     assert "upstream.map(systemAuditNodeLabel)" in script
@@ -1448,7 +1465,7 @@ def test_dashboard_localizes_okx_settlement_reconciliation_gaps() -> None:
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
-    assert "/static/js/dashboard.js?v=20261008-training-status-v1" in html
+    assert "/static/js/dashboard.js?v=20261029-model-permission-v3" in html
 
 
 def test_dashboard_splits_legacy_comma_delimited_execution_diagnostics() -> None:
@@ -1630,7 +1647,7 @@ def test_ml_signal_dashboard_renders_controlled_degraded_as_observing() -> None:
     assert "const readinessDisplayState = controlledReadinessDegrade" in overview_block
     assert ": dashboardReasonText(readinessState);" in overview_block
     assert (
-        "const readinessTone = allowLivePositionInfluence ? 'good' : (ready ? 'warn' : 'bad');"
+            "const readinessTone = allowLivePositionInfluence ? 'good' : (paperModelEligible ? 'warn' : 'bad');"
         in overview_block
     )
     assert "readinessState === 'degraded' ? 'bad' : 'warn'" not in overview_block

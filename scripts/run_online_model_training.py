@@ -195,6 +195,9 @@ compact_payload = {{
         "training_data_sha256",
         "sample_count",
         "trainable_sample_count",
+        "message",
+        "shadow_sample_count",
+        "authoritative_cost_sample_count",
     )
     if key in full_payload
 }}

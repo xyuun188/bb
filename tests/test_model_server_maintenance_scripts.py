@@ -164,6 +164,24 @@ def test_sync_to_online_server_installs_loopback_model_tunnels() -> None:
     assert "systemctl start {_remote_quote(REMOTE_MODEL_READINESS_SERVICE_NAME)}" in source
 
 
+def test_sync_to_online_server_can_preserve_existing_runtime_env() -> None:
+    from scripts import sync_to_online_server as sync
+
+    command = sync._install_split_service_command(
+        remote_app_dir="/data/bb/app",
+        owner="bb:bb",
+        trading_service="bb-paper-trading.service",
+        dashboard_service="bb-dashboard.service",
+        model_tunnel_service="bb-model-tunnels.service",
+        model_topology_profile="target_single_model",
+        preserve_runtime_env=True,
+    )
+
+    assert "preserving-existing-runtime-env" in command
+    assert "runtime_env_script" not in command
+    assert "systemctl daemon-reload" in command
+
+
 def test_dashboard_stays_running_while_model_tunnels_recover() -> None:
     from scripts.sync_to_online_server import _render_dashboard_service
 

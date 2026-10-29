@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from config.settings import ENSEMBLE_TRADER_NAME, settings
+from core.training_contracts import SHADOW_LABEL_VERSION
 from db.session import close_db, get_session_ctx, init_db
 from models.learning import ShadowBacktest
 from models.trade import Position
@@ -314,12 +315,14 @@ async def test_local_ai_tools_status_uses_client_when_dashboard_is_split(
                 ShadowBacktest(
                     model_name="ensemble",
                     execution_mode="paper",
+                    decision_id=9001,
                     symbol="BTC/USDT",
                     decision_action="long",
                     status="completed",
                     created_at=datetime(2026, 6, 28, 1, 0, tzinfo=UTC),
                     due_at=datetime(2026, 6, 28, 1, 30, tzinfo=UTC),
-                    horizon_minutes=30,
+                    horizon_minutes=15,
+                    label_version=SHADOW_LABEL_VERSION,
                     long_return_pct=0.2,
                     short_return_pct=-0.1,
                     best_action="long",
@@ -409,12 +412,14 @@ async def test_ml_signal_status_uses_current_epoch_count_when_dashboard_is_split
                 ShadowBacktest(
                     model_name="ensemble",
                     execution_mode="paper",
+                    decision_id=9002,
                     symbol="BTC/USDT",
                     decision_action="long",
                     status="completed",
                     created_at=datetime(2026, 6, 28, 1, 0, tzinfo=UTC),
                     due_at=datetime(2026, 6, 28, 1, 30, tzinfo=UTC),
-                    horizon_minutes=30,
+                    horizon_minutes=15,
+                    label_version=SHADOW_LABEL_VERSION,
                     long_return_pct=0.2,
                     short_return_pct=-0.1,
                     best_action="long",

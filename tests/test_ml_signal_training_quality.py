@@ -1001,8 +1001,19 @@ def test_train_from_frame_persists_and_loads_registry_artifact(
     assert registry.current_path.exists()
     assert status["available"] is True
     assert status["live_ml_ready"] is False
+    assert status["paper_model_eligible"] is status["strategy_blueprint"][
+        "paper_execution_eligible"
+    ]
+    assert status["paper_trading_permission"] is status["paper_model_eligible"]
     assert status["artifact_registry"]["available"] is True
     assert status["artifact_registry"]["sha256"] == metadata["artifact_sha256"]
+    metadata_status = service.status_metadata()
+    assert metadata_status["paper_model_eligible"] is metadata_status[
+        "strategy_blueprint"
+    ]["paper_execution_eligible"]
+    assert metadata_status["paper_trading_permission"] is metadata_status[
+        "paper_model_eligible"
+    ]
     governance = status["governance_report"]
     assert governance["artifact_quality_fingerprint"] == governance["quality_fingerprint"]
     assert governance["artifact_matches_quality"] is True
@@ -1352,6 +1363,7 @@ def test_incompatible_registered_artifact_keeps_manifest_evidence_in_status(
 
     assert status["available"] is False
     assert status["status"] == "artifact_incompatible"
+    assert status["model_bundle_available"] is False
     assert (
         "artifact_profit_supervision_version_mismatch" in status["model_load_diagnostic"]["details"]
     )

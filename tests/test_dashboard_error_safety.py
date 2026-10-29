@@ -3026,6 +3026,7 @@ async def test_collect_platform_runtime_status_does_not_resurrect_rejected_bundl
                         "service": "phase3_quant_api",
                         "available": False,
                         "model_bundle_available": False,
+                        "paper_trading_permission": True,
                         "child_endpoints": {
                             "profit_prediction": {
                                 "available": False,
@@ -3059,9 +3060,76 @@ async def test_collect_platform_runtime_status_does_not_resurrect_rejected_bundl
     tools = result["local_ai_tools"]
 
     assert tools["model_bundle_available"] is False
+    assert tools["paper_trading_permission"] is False
+    assert tools["permission_status"] == "shadow"
+    assert tools["paper_trading_blockers"] == ["model_bundle_unavailable"]
     assert tools["artifact_status"] == "unavailable"
     assert tools["child_endpoints"]["profit_prediction"]["available"] is False
-    assert tools["child_contract_status"] == "unavailable"
+    assert tools["child_contract_status"] == "artifact_unavailable"
+
+
+async def test_collect_platform_runtime_status_blocks_paper_permission_when_children_are_missing(
+    monkeypatch,
+) -> None:
+    fake_settings = SimpleNamespace(
+        get_fixed_ai_models=lambda include_empty=False: [],
+        local_ai_tools_api_base="http://local-ai.test",
+        local_ai_tools_api_key="hidden-tools-key",
+    )
+    monkeypatch.setattr(server_monitor_status, "settings", fake_settings)
+
+    class FakeAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def request(
+            self,
+            method: str,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: dict[str, Any] | None = None,
+        ) -> httpx.Response:
+            request = httpx.Request(method, url)
+            if url.endswith("/models/status"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "service": "phase3_quant_api",
+                        "available": True,
+                        "model_bundle_available": True,
+                        "paper_trading_permission": True,
+                        "live_trading_permission": True,
+                    },
+                    request=request,
+                )
+            if url.endswith("/health/live"):
+                return httpx.Response(
+                    200,
+                    json={"ok": True, "service": "phase3_quant_api"},
+                    request=request,
+                )
+            raise AssertionError(f"unexpected request: {url}")
+
+    monkeypatch.setattr(server_monitor_status.httpx, "AsyncClient", FakeAsyncClient)
+
+    result = await server_monitor_status.collect_platform_runtime_status()
+    tools = result["local_ai_tools"]
+
+    assert tools["model_bundle_available"] is True
+    assert tools["child_metadata_ready_count"] == 0
+    assert tools["paper_trading_permission"] is False
+    assert tools["live_trading_permission"] is False
+    assert tools["permission_status"] == "shadow"
+    assert tools["paper_trading_blockers"] == [
+        "phase3_quant_child_endpoints_not_ready"
+    ]
 
 
 async def test_collect_platform_runtime_status_uses_env_local_tools_key_when_settings_empty(

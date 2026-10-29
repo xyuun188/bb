@@ -660,6 +660,7 @@ def _install_split_service_command(
     model_tunnel_service: str,
     local_ai_tools_key_file: str = "",
     model_topology_profile: str | None = None,
+    preserve_runtime_env: bool = False,
 ) -> str:
     dashboard_unit = _render_dashboard_service(remote_app_dir, owner)
     selected_profile = str(
@@ -672,10 +673,14 @@ def _install_split_service_command(
         owner,
         profile=selected_profile,
     )
-    runtime_env_script = _runtime_env_update_script(
-        remote_app_dir=remote_app_dir,
-        local_ai_tools_key_file=local_ai_tools_key_file,
-        model_topology_profile=selected_profile,
+    runtime_env_script = (
+        _runtime_env_update_script(
+            remote_app_dir=remote_app_dir,
+            local_ai_tools_key_file=local_ai_tools_key_file,
+            model_topology_profile=selected_profile,
+        )
+        if not preserve_runtime_env
+        else ""
     )
     tunnel_checks = " ".join(
         f"{port}:{path}" for port, path in _model_tunnel_endpoint_pairs(selected_profile)
@@ -706,18 +711,24 @@ TimeoutStopSec=30
         if local_ai_tools_key_file
         else ""
     )
+    runtime_env_update = (
+        f"python3 - <<'PY'\n{runtime_env_script}\nPY\n"
+        if runtime_env_script
+        else "echo preserving-existing-runtime-env; "
+    )
     return (
-        cleanup_prefix + "set -e; "
+        cleanup_prefix
+        + "set -e; "
         "(systemctl enable --now redis-server.service >/dev/null 2>&1 || "
         " systemctl enable --now redis.service >/dev/null 2>&1 || true); "
-        f"python3 - <<'PY'\n{runtime_env_script}\nPY\n"
-        f"cat > /tmp/{dashboard_service} <<'UNIT'\n{dashboard_unit}\nUNIT\n"
-        f"install -m 0644 /tmp/{dashboard_service} /etc/systemd/system/{dashboard_service}; "
-        f"cat > /tmp/{model_tunnel_service} <<'UNIT'\n{model_tunnel_unit}\nUNIT\n"
-        f"install -m 0644 /tmp/{model_tunnel_service} /etc/systemd/system/{model_tunnel_service}; "
-        f"mkdir -p /etc/systemd/system/{trading_service}.d; "
-        f"cat > /etc/systemd/system/{trading_service}.d/20-split-dashboard.conf <<'DROPIN'\n{trading_dropin}\nDROPIN\n"
-        f"systemctl daemon-reload; systemctl enable {dashboard_service} {model_tunnel_service} >/dev/null\n"
+        + runtime_env_update
+        + f"cat > /tmp/{dashboard_service} <<'UNIT'\n{dashboard_unit}\nUNIT\n"
+        + f"install -m 0644 /tmp/{dashboard_service} /etc/systemd/system/{dashboard_service}; "
+        + f"cat > /tmp/{model_tunnel_service} <<'UNIT'\n{model_tunnel_unit}\nUNIT\n"
+        + f"install -m 0644 /tmp/{model_tunnel_service} /etc/systemd/system/{model_tunnel_service}; "
+        + f"mkdir -p /etc/systemd/system/{trading_service}.d; "
+        + f"cat > /etc/systemd/system/{trading_service}.d/20-split-dashboard.conf <<'DROPIN'\n{trading_dropin}\nDROPIN\n"
+        + f"systemctl daemon-reload; systemctl enable {dashboard_service} {model_tunnel_service} >/dev/null\n"
         + install_strategy_replay_timer(remote_app_dir, owner)
     )
 
@@ -1129,6 +1140,15 @@ def parse_args() -> argparse.Namespace:
             "do not upload files or restart any service."
         ),
     )
+    parser.add_argument(
+        "--preserve-runtime-env",
+        action="store_true",
+        help=(
+            "Deploy and restart split services while preserving the existing online "
+            "runtime model routes. Use only when the online runtime env is already "
+            "validated; the default still regenerates it from a fresh candidate manifest."
+        ),
+    )
     parser.add_argument("--skip-restart", action="store_true")
     parser.add_argument("--skip-secret-file-purge", action="store_true")
     parser.add_argument(
@@ -1149,6 +1169,10 @@ def main() -> None:
     args = parse_args()
     if args.keep_trading_stopped and args.resume_trading:
         raise SystemExit("--keep-trading-stopped and --resume-trading are mutually exclusive")
+    if args.preserve_runtime_env and not args.split_services:
+        raise SystemExit("--preserve-runtime-env requires --split-services")
+    if args.preserve_runtime_env and args.runtime_env_only:
+        raise SystemExit("--preserve-runtime-env cannot be used with --runtime-env-only")
     deployment_files = iter_upload_files(include_tests=args.include_tests)
     if not args.runtime_env_only:
         validate_deployment_source_dependencies(deployment_files)
@@ -1272,6 +1296,7 @@ def main() -> None:
                     model_tunnel_service=REMOTE_MODEL_TUNNEL_SERVICE_NAME,
                     local_ai_tools_key_file=remote_secret_path,
                     model_topology_profile=args.model_topology_profile,
+                    preserve_runtime_env=bool(args.preserve_runtime_env),
                 ),
                 timeout=120,
                 check=True,

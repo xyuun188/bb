@@ -35,8 +35,8 @@
     learning_only: '仅学习观察，不影响生产交易',
     ready: '收益证据已达到生产就绪标准',
     shadow_ready: '影子观察就绪',
-    paper_canary_ready: '模型处于 Paper Canary 生命周期；模拟盘正常交易，实盘仍未授权',
-    artifact_activation_not_production_authorized: '当前 Artifact 可参与模拟盘，尚未获得实盘权限',
+    paper_canary_ready: '模型处于 Paper Canary 生命周期；实际开仓仍由纸盘运行状态和逐笔门禁决定',
+    artifact_activation_not_production_authorized: '当前 Artifact 可提供纸盘候选信号，尚未获得实盘权限',
     average_net_return_after_all_cost_not_positive: '平均费后收益不为正',
     average_fee_after_return_not_positive: '平均费后收益不为正',
     empirical_return_lower_hinge_not_positive: '费后收益经验下界不为正',
@@ -168,11 +168,19 @@
     const diagnostic = ml.model_load_diagnostic || {};
     const code = diagnostic.code || ml.status || 'unavailable';
     if (transientModelState(ml)) return '状态刷新中';
-    if (ml.available !== true) return localizedReason(code);
+    if (ml.available !== true || ml.model_bundle_available !== true) {
+      return ml.available === true ? '模型产物未就绪，仅分析/采样' : localizedReason(code);
+    }
     if (ml.live_ml_ready === true) return '已生产就绪';
-    if (ml.paper_trading_permission === true) return '模拟盘可用，实盘未晋升';
+    if (paperModelCandidateReady(ml)) return '可提供纸盘候选信号；不代表开仓获准';
     if (code === 'degraded' || ml.readiness_state === 'degraded') return '模型可用，实盘证据未达标';
     return localizedReason(code);
+  }
+
+  function paperModelCandidateReady(ml) {
+    return ml.available === true
+      && ml.model_bundle_available === true
+      && ml.paper_model_eligible === true;
   }
 
   function transientModelState(ml) {
@@ -215,8 +223,10 @@
     setText('[data-metric="pending-samples"]', fmt(pending));
     setText('[data-detail="pending-samples"]', pending === null ? '接口未提供新增样本游标' : '相对最近已训练游标');
     setText('[data-metric="quarantined-samples"]', fmt(quarantined));
-    setText('[data-metric="model-influence"]', ml.paper_trading_permission === true ? '模拟盘允许' : '模拟盘不可用');
-    setText('[data-detail="model-influence"]', ml.live_ml_ready === true ? '实盘候选已就绪，逐笔生产门禁仍生效' : '实盘未授权；不阻断模拟盘分析和正常交易');
+    setText('[data-metric="model-influence"]', paperModelCandidateReady(ml) ? '可产出纸盘候选' : '无纸盘候选资格');
+    setText('[data-detail="model-influence"]', ml.live_ml_ready === true
+      ? '实盘候选已就绪，逐笔生产门禁仍生效'
+      : '候选资格不授权订单；纸盘运行和单笔开仓仍需独立门禁');
     const latestTraining = ml.latest_training || {};
     const latestAttemptAt = ml.latest_training_attempt_at;
     const latestAt = ml.latest_training_at || latestTraining.trained_at;
@@ -286,7 +296,7 @@
       ['下次检查', schedulerRows.map(item => item.next_check_at || item.next_run_at).find(Boolean) || '未提供'],
       ['模型注册数', modelSummary.model_count ?? '未提供'],
       ['贡献归因查询', contributionStatus.state === 'timeout' ? '已限时降级' : contributionStatus.state || '未提供'],
-      ['模拟盘权限', ml.paper_trading_permission === true ? '允许' : '未允许'],
+      ['本地 ML 模型资格', ml.paper_model_eligible === true ? '可提供纸盘候选' : '不可提供纸盘候选'],
       ['实盘权限', ml.live_trading_permission === true ? '允许' : '未晋级'],
       ['数据时间', ml.trained_at || ml.checked_at || '未提供'],
       ['24/72 小时观察', continuousText],
@@ -462,7 +472,8 @@
       <div class="evidence-grid">
         ${evidenceItem('Artifact 版本', ml.artifact_version || '未提供')}
         ${evidenceItem('激活阶段', lifecycleText[activation.activation_stage] || activation.activation_stage || ml.artifact_lifecycle || '未提供')}
-        ${evidenceItem('模拟盘交易权限', ml.paper_trading_permission === true ? '允许' : '不可用', ml.paper_trading_permission === true ? 'good' : 'warn')}
+        ${evidenceItem('模型纸盘候选资格', paperModelCandidateReady(ml) ? '可产生候选信号' : '未获候选资格', 'warn')}
+        ${evidenceItem('实际开仓权限', '未由模型状态授权；须逐笔通过收益、成本、仓位、账户与交易所门禁', 'warn')}
         ${evidenceItem('实盘候选权限', ml.live_trading_permission === true ? '允许逐笔检查' : '未晋升', ml.live_trading_permission === true ? 'good' : 'warn')}
         ${evidenceItem('训练 / 留出决策组', `${fmt(ml.train_decision_group_count)} / ${fmt(ml.test_decision_group_count)}`)}
         ${evidenceItem('Walk-forward', `${walkForward.status === 'complete' ? '已完成' : walkForward.status || '未提供'} · ${fmt(walkForward.fold_count ?? walkForward.folds?.length)} 折`)}
@@ -529,9 +540,11 @@
     }
     table.innerHTML = models.map((model) => {
       const blockers = Array.isArray(model.blocking_reasons) ? model.blocking_reasons : [];
-      const influence = model.live_ml_ready
-        ? '模拟盘正常参与；实盘逐笔门禁'
-        : model.trainable ? '模拟盘正常参与；实盘未授权' : '仅推理或评估';
+      const influence = model.artifact_available !== true
+        ? (model.runtime_available === true ? '未参与：模型产物未就绪' : '服务不可用')
+        : model.paper_model_eligible === true
+          ? '可提供纸盘候选；每笔开仓另行门禁'
+          : model.trainable ? '仅训练/评估；无纸盘候选资格' : '仅推理或评估';
       const localizedModel = modelText[model.model_id] || [];
       const route = model.execution_plane === 'cloud'
         ? '云端低频'

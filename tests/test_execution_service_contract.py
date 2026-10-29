@@ -29,6 +29,7 @@ from services.trade_execution_contract import (
 from services.trade_order_log_service import TradeOrderLogOutcome
 from services.trading_policies import PolicyGateResult
 from services.training_data_quality import annotate_training_payload
+from tests.feature_availability_fixtures import seal_synthetic_feature_availability
 from tests.legacy_paper_contract_fixtures import (
     build_legacy_normal_paper_v4_trade_contract,
 )
@@ -1249,6 +1250,13 @@ def test_legacy_paper_training_entry_is_blocked_but_history_remains_trainable() 
             },
         ),
     }
+    entry_features = {
+        "symbol": decision.symbol,
+        "current_price": entry_result.price,
+        "returns_1": 0.0,
+        "spread_pct": 0.02,
+    }
+    seal_synthetic_feature_availability(entry_features, decision_at=opened_at)
     sample = build_okx_history_training_sample(
         history,
         positions_by_id={
@@ -1261,6 +1269,9 @@ def test_legacy_paper_training_entry_is_blocked_but_history_remains_trainable() 
         orders_by_exchange_id=orders,
         decision_raw_by_order_id={
             entry_result.exchange_order_id: decision.raw_response
+        },
+        decision_feature_by_order_id={
+            entry_result.exchange_order_id: entry_features
         },
     )
     outcome = build_authoritative_trade_outcome(sample)

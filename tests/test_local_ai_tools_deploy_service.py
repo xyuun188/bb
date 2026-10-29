@@ -838,6 +838,8 @@ def test_generated_service_without_artifact_fails_closed_without_heuristic_retur
         assert payload["best_side"] == "hold"
         assert payload["live_ml_ready"] is False
         assert payload["production_permission"] is False
+        assert payload["prediction_quality"]["contract_complete"] is False
+        assert payload["prediction_quality"]["paper_eligible"] is False
         assert payload["prediction_quality"]["production_eligible"] is False
         assert payload["return_distribution_input_version"] == (
             module.RETURN_DISTRIBUTION_INPUT_VERSION
@@ -1154,6 +1156,21 @@ def test_shadow_model_metadata_is_idempotent_for_paper_permission(monkeypatch) -
                 "artifact_persisted": True,
                 "model_stage": "canary",
                 "artifact_lifecycle": "canary",
+                "artifact_activation_manifest": {
+                    "activation_stage": "canary",
+                    "paper_canary_authorized": True,
+                    "live_ml_ready": False,
+                    "readiness_state": "paper_canary_ready",
+                    "blocking_reasons": [],
+                    "paper_canary_report": {
+                        "authorized": True,
+                        "state": "ready",
+                        "execution_scope": "paper_only",
+                        "production_permission": False,
+                        "blocking_reasons": [],
+                        "eligible_sides": ["long", "short"],
+                    },
+                },
             }
         },
     )
@@ -1179,6 +1196,7 @@ def test_shadow_model_metadata_is_idempotent_for_paper_permission(monkeypatch) -
 
     for payload in (first, second):
         assert payload["paper_trading_permission"] is True
+        assert payload["paper_trading_blockers"] == []
         assert payload["production_permission"] is False
         assert payload["live_ml_ready"] is False
         assert payload["prediction_quality"]["contract_complete"] is True
@@ -3285,6 +3303,31 @@ def test_local_ai_training_reports_cost_identity_failure_separately(
     assert result["reason"] == "chronological_cost_training_identity_incomplete"
     assert result["shadow_sample_count"] == 2
     assert result["authoritative_cost_sample_count"] == 2
+
+
+def test_local_ai_training_reports_cost_holdout_failure_separately(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    trades = _training_trade_samples(count=3)
+    decision_at = datetime(2026, 7, 14, tzinfo=UTC)
+    for sample in trades:
+        sample["decision_timestamp"] = decision_at.isoformat()
+        sample["label_timestamp"] = (decision_at + timedelta(minutes=30)).isoformat()
+
+    result = module.train(
+        _training_request(
+            module,
+            shadow_samples=_training_shadow_samples(count=2),
+            trade_samples=trades,
+        )
+    )
+
+    assert result["trained"] is False
+    assert result["reason"] == "chronological_cost_training_holdout_unavailable"
+    assert result["message"] == "decision_group_holdout_unavailable"
+    assert result["shadow_sample_count"] == 2
+    assert result["authoritative_cost_sample_count"] == 3
 
 
 def test_local_ai_tools_generated_service_uses_profit_target_distribution(

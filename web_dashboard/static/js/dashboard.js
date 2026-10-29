@@ -5520,9 +5520,9 @@ const DASHBOARD_REASON_TEXT = Object.freeze({
     degraded: '证据未达标',
     learning_only: '仅学习观察',
     shadow_ready: '影子观察就绪',
-    paper_canary_ready: 'Paper Canary 生命周期；模拟盘正常交易，实盘仍未授权',
+    paper_canary_ready: 'Paper Canary 生命周期；纸盘运行和每笔开仓仍由独立门禁决定',
     partial_ready: '部分方向就绪',
-    artifact_activation_not_production_authorized: '当前 Artifact 可参与模拟盘，尚未获得实盘权限',
+    artifact_activation_not_production_authorized: '当前 Artifact 可提供纸盘候选信号，尚未获得实盘权限',
     shadow_market_opportunity_distribution_missing: '缺少影子市场机会收益分布',
     counterfactual_execution_cost_distribution_missing: '缺少反事实执行成本分布',
     authoritative_realized_return_distribution_missing: '缺少权威真实成交收益分布',
@@ -11775,7 +11775,8 @@ function mlLocalEvidenceHtml(status) {
         `<section class="ml-evidence-panel ${activation.live_ml_ready === true ? '' : 'warn'}">
             <div class="ml-evidence-head"><strong>晋升与激活证据</strong><span>${activation.live_ml_ready === true ? '已授权' : '未授权'}</span></div>
             ${mlEvidenceRow('激活阶段', evidenceValue(activation.activation_stage || status.artifact_lifecycle))}
-            ${mlEvidenceRow('模拟盘交易权限', status.paper_trading_permission === true ? '允许' : '不可用')}
+            ${mlEvidenceRow('本地 ML 模型资格', status.paper_model_eligible === true ? '可提供纸盘候选' : '不可提供纸盘候选')}
+            ${mlEvidenceRow('实际开仓权限', '由运行状态及逐笔门禁决定')}
             ${mlEvidenceRow('实盘候选权限', status.live_trading_permission === true ? '允许逐笔检查' : '未晋升')}
             ${mlEvidenceRow('Walk-forward', evidenceValue(walkForward.status))}
             ${mlEvidenceRow('滚动折数', mlSampleCountLabel(mlOptionalNumber(walkForward.folds?.length)))}
@@ -11830,22 +11831,39 @@ function renderMLSignalOverview() {
         latestPrediction?.best_side,
     );
     const ready = status.available === true;
+    const paperModelEligible = ready
+        && status.model_bundle_available === true
+        && status.paper_model_eligible === true;
     const statusCode = String(status.status || '').toLowerCase();
     const statusRefreshing = status.refresh_in_background === true
         || statusCode === 'status_timeout'
         || statusCode === 'status_stale'
         || statusCode === 'request_error';
     const unavailableReason = status.message || status.error || '本地 ML 模型尚未返回可用状态';
+    const paperBlockers = Array.isArray(status.paper_trading_blockers)
+        ? status.paper_trading_blockers
+        : Array.isArray(status.paper_model_blockers)
+            ? status.paper_model_blockers
+            : [];
+    const paperBlockerText = paperBlockers.length
+        ? paperBlockers.slice(0, 3).map(dashboardReasonText).filter(Boolean).join('；')
+        : '';
     const statusDisplay = statusRefreshing
         ? '状态刷新中'
-        : (ready ? (status.paper_trading_permission === true ? '模拟盘参与中' : '仅加载') : '不可用');
+        : (ready ? (paperModelEligible ? '可提供纸盘候选' : '仅分析/采样') : '不可用');
     const statusDetail = statusRefreshing
         ? (statusCode === 'status_timeout'
             ? '模型状态读取较慢，系统正在后台重试。'
             : statusCode === 'status_stale'
                 ? '模型服务在线，当前显示最近一次成功状态。'
             : '暂时无法取得模型状态，系统正在自动重试。')
-        : (ready ? (status.live_ml_ready === true ? '实盘候选已就绪' : '实盘未晋升') : unavailableReason);
+        : (ready
+            ? status.live_ml_ready === true
+                ? '实盘候选已就绪'
+                : paperModelEligible
+                    ? '本地 ML 模型具备纸盘候选资格；服务运行和每笔开仓仍由独立门禁决定'
+                    : `本地 ML 模型当前仅分析和采样${paperBlockerText ? `：${paperBlockerText}` : ''}`
+            : unavailableReason);
     const latestTraining = status.latest_training || {};
     const latestAttemptAt = status.latest_training_attempt_at;
     const successfulTrainingAt = status.latest_training_success_at || status.latest_training_at || latestTraining.trained_at;
@@ -11873,13 +11891,14 @@ function renderMLSignalOverview() {
     const readinessBlockers = Array.isArray(readiness.blocking_reasons) ? readiness.blocking_reasons : [];
     const readinessState = status.readiness_state || readiness.state || status.status || 'learning_only';
     const allowLivePositionInfluence = status.live_ml_ready === true;
-    const allowPaperTrading = status.paper_trading_permission === true;
     const influenceEnabled = allowLivePositionInfluence;
-    const controlledReadinessDegrade = ready && !allowLivePositionInfluence && ['degraded', 'learning_only'].includes(String(readinessState || '').toLowerCase());
+    const controlledReadinessDegrade = paperModelEligible
+        && !allowLivePositionInfluence
+        && ['degraded', 'learning_only'].includes(String(readinessState || '').toLowerCase());
     const readinessDisplayState = controlledReadinessDegrade
-        ? '模拟盘可用'
+        ? '可提供纸盘候选'
         : dashboardReasonText(readinessState);
-    const readinessTone = allowLivePositionInfluence ? 'good' : (ready ? 'warn' : 'bad');
+    const readinessTone = allowLivePositionInfluence ? 'good' : (paperModelEligible ? 'warn' : 'bad');
     const readinessReasonText = readinessBlockers.length
         ? readinessBlockers.slice(0, 4).map(dashboardReasonText).filter(Boolean).join('；')
         : Object.keys(readiness).length ? '当前没有就绪阻断项' : '就绪证据缺失';
@@ -11898,7 +11917,7 @@ function renderMLSignalOverview() {
         updatedEl.textContent = statusRefreshing
             ? statusDetail
             : ready
-            ? `市场标签 ${mlSampleCountLabel(samples.mlShadowMarket)} 条 · 反事实成本 ${mlSampleCountLabel(samples.mlShadowCost)} 条 · OKX 实际费后收益 ${mlSampleCountLabel(samples.mlActualReturn)} 条 · 模拟盘${allowPaperTrading ? '正常参与' : '不可用'} · 实盘${influenceEnabled ? '候选就绪' : '未授权'}`
+            ? `市场标签 ${mlSampleCountLabel(samples.mlShadowMarket)} 条 · 反事实成本 ${mlSampleCountLabel(samples.mlShadowCost)} 条 · OKX 实际费后收益 ${mlSampleCountLabel(samples.mlActualReturn)} 条 · 本地 ML ${paperModelEligible ? '可提供纸盘候选' : '仅分析/采样'} · 实盘${influenceEnabled ? '候选就绪' : '未授权'}`
             : `模型不可用 · ${unavailableReason}`;
     }
 
@@ -11918,14 +11937,14 @@ function renderMLSignalOverview() {
             </div>
             <div class="ml-flow-step">
                 <div class="ml-flow-index">4</div>
-                <div><strong>${allowPaperTrading ? '参与模拟盘正常决策' : '模型当前不可用'}</strong><span>${influenceEnabled ? '实盘候选已就绪，每笔订单仍执行生产门禁' : '晋升状态只阻断实盘，不阻断模拟盘采样和训练'}</span></div>
+                <div><strong>${paperModelEligible ? '本地 ML 可提供纸盘候选' : ready ? '仅分析与采样' : '模型当前不可用'}</strong><span>${influenceEnabled ? '实盘候选已就绪，每笔订单仍执行生产门禁' : paperModelEligible ? '这只是模型层资格；纸盘服务运行状态及本次开仓仍须通过独立门禁' : '本地 ML 不提供纸盘候选；不影响其它独立模型来源的评估'}</span></div>
             </div>
         </div>
         <div class="ml-overview-grid">
-            ${mlMetricCard('模型状态', statusDisplay, statusDetail, statusRefreshing ? 'warn' : (ready ? (allowPaperTrading ? 'good' : 'warn') : 'bad'))}
+            ${mlMetricCard('模型状态', statusDisplay, statusDetail, statusRefreshing ? 'warn' : (ready ? (paperModelEligible ? 'good' : 'warn') : 'bad'))}
             ${mlMetricCard('就绪判断', readinessDisplayState, readinessReasonText, readinessTone)}
-            ${mlMetricCard('模拟盘交易权限', allowPaperTrading ? '允许' : '不可用', allowPaperTrading ? '晋升、LCB、PF 不参与模拟盘授权' : '模型制品或运行链不可用', allowPaperTrading ? 'good' : 'bad')}
-            ${mlMetricCard('实盘候选权限', allowLivePositionInfluence ? '允许逐笔检查' : '未晋升', allowLivePositionInfluence ? '仍须 production_trade_gate 逐笔授权' : '不影响模拟盘分析、交易和训练', allowLivePositionInfluence ? 'good' : 'warn')}
+            ${mlMetricCard('本地 ML 模型资格', paperModelEligible ? '可提供候选信号' : '仅分析/采样', paperModelEligible ? '仅代表模型层具备候选资格；不代表纸盘服务运行或本次开仓获准' : (paperBlockerText || '当前模型未获纸盘候选资格'), paperModelEligible ? 'good' : 'warn')}
+            ${mlMetricCard('实盘候选权限', allowLivePositionInfluence ? '允许逐笔检查' : '未晋升', allowLivePositionInfluence ? '仍须 production_trade_gate 逐笔授权' : '不代表模拟盘已获开仓授权', allowLivePositionInfluence ? 'good' : 'warn')}
             ${mlMetricCard('影子市场机会样本', mlSampleCountLabel(samples.mlShadowMarket), '不代表实际成交或真实费后收益', Number.isFinite(samples.mlShadowMarket) ? 'good' : 'warn')}
             ${mlMetricCard('影子反事实成本样本', mlSampleCountLabel(samples.mlShadowCost), '监督盘口、费用、资金费与反事实滑点；只作反事实对照，不能覆盖真实盈亏', Number.isFinite(samples.mlShadowCost) ? 'good' : 'warn')}
             ${mlMetricCard('OKX 实际费后收益样本', mlSampleCountLabel(samples.mlActualReturn), '只统计可信已平仓生命周期', Number.isFinite(samples.mlActualReturn) ? 'good' : 'warn')}
@@ -11955,6 +11974,9 @@ function renderLocalAIToolsStatus() {
     const childEndpoints = status.child_endpoints || {};
     const available = status.available === true;
     const serviceAvailable = status.service_available !== false && (available || status.service_available === true);
+    const modelBundleAvailable = status.model_bundle_available === true;
+    const paperTradingPermission = modelBundleAvailable
+        && status.paper_trading_permission === true;
     const trainedAt = status.trained_at ? toBeijingTime(status.trained_at) : '-';
     const samples = mlSampleCounts();
     const childMetadataReadyFallback = Object.values(childEndpoints).filter(item => item && (item.metadata_ready || item.available)).length;
@@ -11985,9 +12007,15 @@ function renderLocalAIToolsStatus() {
     const cards = [
         {
             label: '服务状态',
-            value: serviceAvailable ? '可用' : '不可用',
-            subtitle: serviceAvailable ? (status.model_bundle_available === false ? '服务已连接，训练模型未就绪，子接口使用启发式/轻量模型' : '服务器量化工具已连接') : (status.error || status.message || '等待服务返回状态'),
-            tone: serviceAvailable ? 'good' : 'bad',
+            value: serviceAvailable
+                ? (modelBundleAvailable ? '模型已就绪' : '服务已连接')
+                : '不可用',
+            subtitle: serviceAvailable
+                ? (modelBundleAvailable
+                    ? (paperTradingPermission ? '量化模型产物已加载；实际交易还需纸盘运行与逐笔门禁通过' : '模型产物已验证，但尚未获得量化模型纸盘资格')
+                    : '服务在线，但训练模型产物未就绪；子接口不可用于模型交易')
+                : (status.error || status.message || '等待服务返回状态'),
+            tone: serviceAvailable ? (modelBundleAvailable ? 'good' : 'warn') : 'bad',
         },
         {
             label: '最近训练与数据版本',

@@ -38,7 +38,7 @@ def test_training_page_is_independent_from_main_dashboard() -> None:
     assert "数据不可用" in script
     assert "缺少来自不同决策组的市场机会与执行成本监督样本" in script
     assert "当前退出压力为零，继续持有" in script
-    assert "模拟盘交易权限" in script
+    assert "本地 ML 模型资格" in script
     assert "实盘候选权限" in script
     assert "training_task_manifest" in script
     assert "replay_weight_manifest" in script
@@ -61,9 +61,15 @@ def test_training_page_static_bundle_uses_valid_chinese_and_cache_version() -> N
     training = (static_dir / "training.html").read_text(encoding="utf-8")
     script = (static_dir / "js" / "training.js").read_text(encoding="utf-8")
 
-    assert "training.js?v=20260915-training-quality-v6" in training
+    assert "training.js?v=20261029-model-permission-v3" in training
     assert "当前 Artifact 与运行时收益监督合同不兼容" in script
-    assert "模拟盘可用，实盘未晋升" in script
+    assert "可提供纸盘候选信号；不代表开仓获准" in script
+    assert "模型纸盘候选资格" in script
+    assert "paperModelCandidateReady(ml)" in script
+    assert "ml.model_bundle_available === true" in script
+    assert "不代表开仓获准" in script
+    assert "模拟盘交易权限" not in script
+    assert "未参与：模型产物未就绪" in script
     assert "真实晋升阻断" in script
     assert "鏈煡" not in script
     assert "璇佹嵁" not in script

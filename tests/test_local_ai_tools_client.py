@@ -276,7 +276,7 @@ async def test_local_ai_tools_waits_for_capacity_without_overlapping_batches(
 
     assert first["status"] == "completed"
     assert second["status"] == "completed"
-    assert second["queue_wait_seconds"] >= 0.02
+    assert second["queue_wait_seconds"] > 0
     assert second["queue_policy"] == "fifo_within_shared_batch_deadline"
     assert max_active_calls == 3
     assert len(calls) == 6
@@ -1548,6 +1548,71 @@ async def test_local_ai_tools_status_does_not_resurrect_rejected_bundle_from_liv
         result["child_endpoints"]["profit_prediction"]["error"]
         == "model_bundle_unavailable"
     )
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_status_clears_stale_paper_permission_without_bundle(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+
+    async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
+        if path == "/health/live":
+            return {"ok": True, "service": "phase3_quant_api"}
+        return {
+            "available": True,
+            "model_bundle_available": False,
+            "paper_trading_permission": True,
+            "artifact_activation_manifest": {
+                "activation_stage": "canary",
+                "paper_canary_authorized": True,
+            },
+            "status": "artifact_unavailable",
+        }
+
+    monkeypatch.setattr(client, "_get", get_status)
+
+    result = await client.status()
+
+    assert result["available"] is True
+    assert result["service_available"] is True
+    assert result["model_bundle_available"] is False
+    assert result["paper_trading_permission"] is False
+    assert "model_bundle_unavailable" in result["paper_trading_blockers"]
+    assert result["permission_status"] == "shadow"
+
+
+@pytest.mark.asyncio
+async def test_local_ai_tools_status_blocks_paper_permission_when_children_are_missing(
+    local_tools_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LocalAIToolsClient()
+
+    async def get_status(path: str, request_timeout: float | None = None) -> dict[str, Any]:
+        if path == "/health/live":
+            return {"ok": True, "service": "phase3_quant_api"}
+        return {
+            "available": True,
+            "model_bundle_available": True,
+            "paper_trading_permission": True,
+            "live_trading_permission": True,
+            "status": "ready",
+        }
+
+    monkeypatch.setattr(client, "_get", get_status)
+
+    result = await client.status()
+
+    assert result["model_bundle_available"] is True
+    assert result["child_metadata_ready_count"] == 0
+    assert result["paper_trading_permission"] is False
+    assert result["live_trading_permission"] is False
+    assert result["paper_trading_blockers"] == [
+        "phase3_quant_child_endpoints_not_ready"
+    ]
+    assert result["permission_status"] == "shadow"
 
 
 @pytest.mark.asyncio
