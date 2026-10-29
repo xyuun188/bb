@@ -101,3 +101,31 @@ async def test_settlement_repairs_use_one_training_cadence(
         second = await host._maybe_train_local_ai_tools_process()
         assert second["reason"] == "not_due"
         assert host.training_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_training_attempt_advances_cursor_without_repeating(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "services.okx_training_gate.okx_training_refresh_gate", lambda: {"allowed": True}
+    )
+    host = CursorCoordinator(
+        age_hours=7,
+        previous_fingerprint="same",
+        current_fingerprint="repaired",
+    )
+
+    first = await host._maybe_train_local_ai_tools_process()
+    assert host.training_calls == 1
+
+    # A rejected functional training result still records the input cursor.
+    # The next scheduler tick must not rerun the same holdout until evidence
+    # actually changes.
+    host.state_row["last_result"] = first
+    host.state_row["last_finished_at"] = datetime.now(UTC).isoformat()
+
+    second = await host._maybe_train_local_ai_tools_process()
+
+    assert second["reason"] == "not_due"
+    assert host.training_calls == 1

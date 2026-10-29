@@ -814,6 +814,11 @@ class ModelTrainingCoordinatorMixin:
             training_state_trade_cursor = 0
             training_state_trained_at = None
             canonical_market_cursor = None
+            latest_attempt_at = None
+            latest_attempt_market_cursor = None
+            latest_attempt_shadow_cursor = None
+            latest_attempt_trade_cursor = None
+            latest_attempt_cursor_seen = False
             state_store = self._model_training_state()
             read_training_state = getattr(state_store, "read", None)
             if callable(read_training_state):
@@ -822,6 +827,7 @@ class ModelTrainingCoordinatorMixin:
                 for model_id in LOCAL_AI_TOOL_MODEL_IDS:
                     model_row = model_rows.get(model_id) or {}
                     successful_result = model_row.get("last_successful_result") or {}
+                    last_result = model_row.get("last_result") or {}
                     training_state_cursor = max(
                         training_state_cursor,
                         self._safe_int(
@@ -845,41 +851,87 @@ class ModelTrainingCoordinatorMixin:
                             0,
                         ),
                     )
-                    if model_row.get("sample_cursor"):
-                        succeeded_at = model_row.get("last_successful_training_at")
-                        if not succeeded_at:
-                            succeeded_at = next(
-                                (
-                                    event.get("at")
-                                    for event in reversed(model_row.get("history") or [])
-                                    if isinstance(event, dict)
-                                    and event.get("event") == "succeeded"
-                                    and event.get("at")
-                                ),
-                                None,
-                            )
-                        if succeeded_at and (
-                            training_state_trained_at is None
-                            or str(succeeded_at) > str(training_state_trained_at)
+                    succeeded_at = model_row.get("last_successful_training_at")
+                    if not succeeded_at:
+                        succeeded_at = next(
+                            (
+                                event.get("at")
+                                for event in reversed(model_row.get("history") or [])
+                                if isinstance(event, dict)
+                                and event.get("event") == "succeeded"
+                                and event.get("at")
+                            ),
+                            None,
+                        )
+                    if succeeded_at and (
+                        training_state_trained_at is None
+                        or str(succeeded_at) > str(training_state_trained_at)
+                    ):
+                        training_state_trained_at = succeeded_at
+
+                    # A failed functional attempt has still consumed the
+                    # current input cursor.  Prefer the newest completed
+                    # attempt for cadence state so the scheduler does not
+                    # rerun the same rejected holdout every timer interval.
+                    attempt_at = model_row.get("last_finished_at") or succeeded_at
+                    attempt_result = (
+                        last_result if isinstance(last_result, dict) else {}
+                    )
+                    if (
+                        not attempt_result.get("authoritative_trade_training_probe")
+                        and isinstance(successful_result, dict)
+                    ):
+                        attempt_result = successful_result
+                    if attempt_at and (
+                        latest_attempt_at is None
+                        or str(attempt_at) > str(latest_attempt_at)
+                    ):
+                        latest_attempt_at = attempt_at
+                        previous_trade_probe = (
+                            attempt_result.get("authoritative_trade_training_probe") or {}
+                        )
+                        if attempt_result.get("cursor_count_scope") == (
+                            "clean_market_groups_and_settlement_fact_fingerprint"
                         ):
-                            training_state_trained_at = succeeded_at
-                            previous_trade_probe = (
-                                successful_result.get("authoritative_trade_training_probe") or {}
+                            latest_attempt_market_cursor = self._safe_int(
+                                attempt_result.get("completed_market_decision_group_count"),
+                                0,
                             )
-                            if successful_result.get("cursor_count_scope") == (
-                                "clean_market_groups_and_settlement_fact_fingerprint"
-                            ):
-                                canonical_market_cursor = self._safe_int(
-                                    successful_result.get("completed_market_decision_group_count"), 0
-                                )
-            previous_completed_shadow_total = max(
-                previous_completed_shadow_total,
-                training_state_shadow_cursor,
-            )
-            previous_completed_trade_total = max(
-                previous_completed_trade_total,
-                training_state_trade_cursor,
-            )
+                            latest_attempt_cursor_seen = True
+                        latest_attempt_shadow_cursor = (
+                            self._safe_int(
+                                attempt_result.get("completed_shadow_sample_count"),
+                                0,
+                            )
+                            if attempt_result.get("completed_shadow_sample_count") is not None
+                            else None
+                        )
+                        latest_attempt_trade_cursor = (
+                            self._safe_int(
+                                attempt_result.get("completed_trade_sample_count"),
+                                0,
+                            )
+                            if attempt_result.get("completed_trade_sample_count") is not None
+                            else None
+                        )
+            if latest_attempt_at is not None:
+                if latest_attempt_shadow_cursor is not None:
+                    previous_completed_shadow_total = latest_attempt_shadow_cursor
+                    latest_attempt_cursor_seen = True
+                if latest_attempt_trade_cursor is not None:
+                    previous_completed_trade_total = latest_attempt_trade_cursor
+                    latest_attempt_cursor_seen = True
+                if market_cursor_only and latest_attempt_market_cursor is not None:
+                    canonical_market_cursor = latest_attempt_market_cursor
+            if not latest_attempt_cursor_seen:
+                previous_completed_shadow_total = max(
+                    previous_completed_shadow_total,
+                    training_state_shadow_cursor,
+                )
+                previous_completed_trade_total = max(
+                    previous_completed_trade_total,
+                    training_state_trade_cursor,
+                )
             if market_cursor_only:
                 completed_trade_total = previous_completed_trade_total
             new_shadow = max(completed_shadow_total - previous_completed_shadow_total, 0)
