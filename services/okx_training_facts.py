@@ -1597,7 +1597,15 @@ def build_okx_history_training_sample(
         "execution_actual_over_budget_loss_usdt": budget_facts["actual_over_budget_loss_usdt"],
         "strategy_entry_kind": "normal_strategy_trade",
         "historical_entry_contract_kind": (
-            "normal_paper_v14"
+            "normal_paper_training_v21"
+            if valid_normal_paper
+            and current_normal_paper
+            and normal_paper.get("selection_reason") == "paper_training_entry"
+            else "normal_paper_quality_observation_v21"
+            if valid_normal_paper
+            and current_normal_paper
+            and normal_paper.get("selection_reason") == "paper_quality_observation"
+            else "normal_paper_v21"
             if valid_normal_paper and current_normal_paper
             else "paper_training"
             if valid_paper_training
@@ -1629,11 +1637,13 @@ def build_okx_history_training_sample(
                 "version": normal_paper_evidence.get("version"),
                 "source_version": normal_paper_evidence.get("source_version"),
                 "contract_generation": (
-                    "current_quality_observation_v14"
+                    "current_bounded_training_v21"
                     if current_normal_paper
-                    and normal_paper.get("selection_reason")
-                    in {"paper_quality_observation", "paper_training_entry"}
-                    else "current_validated_v14"
+                    and normal_paper.get("selection_reason") == "paper_training_entry"
+                    else "current_quality_observation_v21"
+                    if current_normal_paper
+                    and normal_paper.get("selection_reason") == "paper_quality_observation"
+                    else "current_validated_v21"
                     if current_normal_paper
                     else "historical_normalized_current_protocol"
                     if historical_normal_paper

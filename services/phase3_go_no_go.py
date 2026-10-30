@@ -5,6 +5,10 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
+)
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 
@@ -157,6 +161,9 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         "paper_quality_observation_requires_positive_expected_net_return",
         "paper_quality_observation_allows_non_positive_return_lcb",
         "paper_quality_observation_is_shadow_only",
+        "paper_training_entry_is_bounded_paper_only",
+        "paper_training_entry_authorizes_normal_entry",
+        "paper_training_entry_requires_positive_size_aware_net_return",
         "paper_entry_requires_historical_fee_after_quality_permission",
         "paper_entry_requires_profit_factor",
         "paper_entry_requires_current_execution_cost",
@@ -175,6 +182,9 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         "paper_normal_entry_requires_positive_return_lcb",
         "paper_validated_entry_requires_positive_return_lcb",
         "paper_quality_observation_authorizes_normal_entry",
+        "paper_training_entry_is_shadow_only",
+        "paper_training_entry_allows_non_positive_fee_after_return",
+        "paper_training_entry_production_permission",
     )
     missing_policy = [
         key for key in required_true_trade_policy if trade_policy.get(key) is not True
@@ -182,6 +192,27 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
     missing_policy.extend(
         key for key in required_false_trade_policy if trade_policy.get(key) is not False
     )
+    required_numeric_trade_policy = {
+        "paper_training_entry_single_trade_risk_fraction": (
+            NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
+        ),
+        "paper_training_entry_portfolio_risk_fraction": (
+            NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION
+        ),
+    }
+    invalid_numeric_policy = [
+        key
+        for key, expected in required_numeric_trade_policy.items()
+        if (
+            _safe_float(trade_policy.get(key)) is None
+            or not math.isclose(
+                float(_safe_float(trade_policy.get(key))),
+                expected,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+        )
+    ]
     report_available = trade.get("report_available", True)
     if report_available is False:
         blockers.append(
@@ -198,12 +229,19 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
     # An unavailable audit cannot prove or disprove individual policy fields.
     # Keep the single availability blocker instead of misreporting a timeout as
     # a malformed contract payload.
-    if "trade_execution_contract" not in deferred_required and report_available is not False and missing_policy:
+    if (
+        "trade_execution_contract" not in deferred_required
+        and report_available is not False
+        and (missing_policy or invalid_numeric_policy)
+    ):
         blockers.append(
             _blocker(
                 "dynamic_return_contract_policy_incomplete",
                 "Execution audit does not prove all return/cost/provenance invariants.",
-                evidence={"missing": missing_policy},
+                evidence={
+                    "missing": missing_policy,
+                    "invalid_numeric": invalid_numeric_policy,
+                },
             )
         )
     violation_count = _safe_int(trade_summary.get("contract_violation_count"))

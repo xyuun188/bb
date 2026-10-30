@@ -38,8 +38,16 @@ def test_dashboard_policy_cannot_drift_from_execution_policy() -> None:
 
     assert projected["policy"] == canonical
     assert stale["policy"]["paper_quality_observation_allows_non_positive_return_lcb"] is False
-    assert canonical["paper_training_entry_is_shadow_only"] is True
-    assert canonical["paper_training_entry_authorizes_normal_entry"] is False
+    assert canonical["paper_training_entry_is_shadow_only"] is False
+    assert canonical["paper_training_entry_authorizes_normal_entry"] is True
+    assert canonical["paper_training_entry_is_bounded_paper_only"] is True
+    assert canonical["paper_training_entry_production_permission"] is False
+    assert canonical["paper_training_entry_single_trade_risk_fraction"] == pytest.approx(
+        0.0001
+    )
+    assert canonical["paper_training_entry_portfolio_risk_fraction"] == pytest.approx(
+        0.0003
+    )
 
 
 def test_removed_fixed_policy_and_global_fallback_tokens_cannot_return_to_production() -> None:
@@ -223,6 +231,14 @@ def _required_go_no_go_cards() -> list[dict[str, Any]]:
                     "paper_quality_observation_allows_non_positive_return_lcb": True,
                     "paper_quality_observation_is_shadow_only": True,
                     "paper_quality_observation_authorizes_normal_entry": False,
+                    "paper_training_entry_is_bounded_paper_only": True,
+                    "paper_training_entry_authorizes_normal_entry": True,
+                    "paper_training_entry_requires_positive_size_aware_net_return": True,
+                    "paper_training_entry_allows_non_positive_fee_after_return": False,
+                    "paper_training_entry_is_shadow_only": False,
+                    "paper_training_entry_production_permission": False,
+                    "paper_training_entry_single_trade_risk_fraction": 0.0001,
+                    "paper_training_entry_portfolio_risk_fraction": 0.0003,
                     "paper_entry_requires_profit_factor": True,
                     "paper_entry_requires_positive_expected_net_return": True,
                     "paper_entry_requires_current_execution_cost": True,

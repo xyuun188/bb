@@ -171,8 +171,8 @@ def classify_entry_funnel_reason(
         or final_code in {"MODEL_UNAVAILABLE", "MODEL_TIMEOUT", "MODEL_INVALID_OUTPUT"}
     )
 
-    # Selected training/quality observations are deliberately unauthorized
-    # shadow envelopes, not missing candidates.
+    # A bounded training contract is an executable paper entry. Keep legacy
+    # shadow classification only for old or explicitly unauthorized envelopes.
     if (
         paper_selection.get("selected") is True
         and (
@@ -180,7 +180,8 @@ def classify_entry_funnel_reason(
             or normal_paper_trade.get("paper_training_only") is True
         )
     ):
-        return "shadow_training"
+        if normal_paper_trade.get("authorized") is not True:
+            return "shadow_training"
     if (
         paper_selection.get("selected") is True
         and (

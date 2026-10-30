@@ -8,6 +8,8 @@ from services.normal_paper_trade import (
     HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS,
     NORMAL_PAPER_ORDER_IDENTITY_VERSION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_VERSION,
     _contract_fingerprint_payload,
     _fingerprint,
@@ -317,11 +319,16 @@ def test_current_positive_edge_with_denied_historical_quality_is_training_only()
     )
 
     assert selection["selection_reason"] == "paper_training_entry"
-    assert contract["authorized"] is False
+    assert contract["authorized"] is True
     assert contract["paper_training_only"] is True
-    assert "normal_paper_trade_quality_observation_shadow_only" in (
-        normal_paper_trade_contract_reasons(contract)
+    assert contract["production_permission"] is False
+    assert contract["single_trade_risk_fraction_cap"] == (
+        NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
     )
+    assert contract["portfolio_risk_fraction_cap"] == (
+        NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION
+    )
+    assert normal_paper_trade_contract_reasons(contract) == []
     assert normal_paper_trade_observation_contract_reasons(contract) == []
 
 
@@ -469,10 +476,10 @@ def test_current_positive_fee_after_mean_with_negative_downside_stays_training_o
         selection_reason=selection["selection_reason"],
         direction_support=selection["selected_support"],
     )
-    assert contract["authorized"] is False
+    assert contract["authorized"] is True
     assert contract["current_edge_validated"] is True
     assert contract["objective_net_return_pct"] == pytest.approx(-0.45)
-    assert normal_paper_trade_contract_reasons(contract)
+    assert normal_paper_trade_contract_reasons(contract) == []
     assert normal_paper_trade_observation_contract_reasons(contract) == []
 
 
@@ -498,9 +505,9 @@ def test_current_positive_signal_with_negative_downside_and_denied_history_is_sh
         selection_reason=selection["selection_reason"],
         direction_support=selection["selected_support"],
     )
-    assert contract["authorized"] is False
+    assert contract["authorized"] is True
     assert contract["objective_net_return_pct"] == pytest.approx(-0.45)
-    assert normal_paper_trade_contract_reasons(contract)
+    assert normal_paper_trade_contract_reasons(contract) == []
     assert normal_paper_trade_observation_contract_reasons(contract) == []
 
 
@@ -526,8 +533,8 @@ def test_current_positive_edge_does_not_override_denied_quality_permission() -> 
         selection_reason=selection["selection_reason"],
         direction_support=selection["selected_support"],
     )
-    assert contract["authorized"] is False
-    assert normal_paper_trade_contract_reasons(contract)
+    assert contract["authorized"] is True
+    assert normal_paper_trade_contract_reasons(contract) == []
     assert normal_paper_trade_observation_contract_reasons(contract) == []
 
 

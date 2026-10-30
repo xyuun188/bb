@@ -16,6 +16,9 @@ from services.entry_profit_risk_sizing import (
 from services.execution_cost_model import execution_cost_estimate
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
+    _contract_fingerprint_payload,
     build_normal_paper_trade_contract,
 )
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
@@ -196,6 +199,38 @@ def _quality_observation_decision(*, return_lcb_pct: float = -0.3) -> DecisionOu
     ] = return_lcb_pct
     decision.suggested_leverage = 20.0
     return decision
+
+
+def _use_bounded_training_entry(
+    decision: DecisionOutput,
+    *,
+    raw_return_pct: float = 0.9,
+) -> dict:
+    normal_trade = decision.raw_response["normal_paper_trade"]
+    normal_trade.update(
+        {
+            "selection_reason": "paper_training_entry",
+            "paper_quality_observation_only": False,
+            "paper_training_only": True,
+            "paper_quality_mode": "training",
+            "current_raw_expected_return_pct": raw_return_pct,
+            "paper_training_reasons": [
+                "historical_quality_gate_is_observation_only",
+                "current_directional_evidence_is_training_eligible",
+            ],
+            "authorized": True,
+            "single_trade_risk_fraction_cap": (
+                NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
+            ),
+            "portfolio_risk_fraction_cap": (
+                NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION
+            ),
+        }
+    )
+    normal_trade["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(normal_trade)
+    )
+    return normal_trade
 
 
 async def _balance(_mode: str, _decision: DecisionOutput | None) -> float:
@@ -648,28 +683,9 @@ async def test_normal_paper_rejects_when_native_tier_has_no_remaining_capacity()
 
 
 @pytest.mark.asyncio
-async def test_training_entry_cannot_authorize_normal_paper_sizing() -> None:
+async def test_bounded_training_entry_can_use_only_its_micro_risk_budget() -> None:
     decision = _quality_observation_decision(return_lcb_pct=-0.3)
-    normal_trade = decision.raw_response["normal_paper_trade"]
-    normal_trade["selection_reason"] = "paper_training_entry"
-    normal_trade["paper_quality_observation_only"] = False
-    normal_trade["paper_training_only"] = True
-    normal_trade["paper_quality_mode"] = "training"
-    normal_trade["current_raw_expected_return_pct"] = 0.9
-    normal_trade["paper_training_reasons"] = [
-        "historical_quality_gate_is_observation_only",
-        "current_directional_evidence_is_training_eligible",
-    ]
-    normal_trade["authorized"] = True
-    normal_trade["single_trade_risk_fraction_cap"] = (
-        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-    )
-    normal_trade["contract_fingerprint"] = ""
-    from services.normal_paper_trade import _contract_fingerprint_payload, _fingerprint
-
-    normal_trade["contract_fingerprint"] = _fingerprint(
-        _contract_fingerprint_payload(normal_trade)
-    )
+    _use_bounded_training_entry(decision)
     decision.raw_response["opportunity_score"]["return_distribution_contract"][
         "raw_expected_return_pct"
     ] = 0.9
@@ -679,16 +695,50 @@ async def test_training_entry_cannot_authorize_normal_paper_sizing() -> None:
 
     sizing = decision.raw_response["profit_risk_sizing"]
     dynamic = sizing["dynamic_leverage_decision"]
-    assert sizing["production_eligible"] is False
-    assert sizing["final_notional_usdt"] == 0.0
-    assert decision.raw_response["entry_permission"]["granted"] is False
+    assert sizing["production_eligible"] is True
+    assert sizing["final_notional_usdt"] > 0.0
     assert dynamic["policy_provenance"]["policy_scope"] == "paper"
     assert sizing["paper_training_entry_mode"] is True
     assert sizing["single_trade_risk_fraction_cap"] == pytest.approx(
-        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+        NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
     )
+    assert sizing["risk_budget_usdt"] <= 0.1
+    assert sizing["portfolio_risk_limit_applied"] is True
+    assert sizing["portfolio_risk_budget_usdt"] == pytest.approx(0.3)
+    assert sizing["production_permission"] is False
     assert dynamic["policy_provenance"]["effective_return_pct"] > 0.0
     assert sizing["final_leverage"] >= 1.0
+    assert RiskEngine().assess(decision, [], 1000.0).approved is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("portfolio_risk_limit_applied", False),
+        ("portfolio_risk_budget_usdt", 0.31),
+        ("current_training_portfolio_stressed_loss_usdt", None),
+    ],
+)
+async def test_training_risk_contract_tampering_fails_closed(
+    key: str,
+    value: object,
+) -> None:
+    decision = _quality_observation_decision(return_lcb_pct=-0.3)
+    _use_bounded_training_entry(decision)
+    decision.raw_response["opportunity_score"]["return_distribution_contract"][
+        "raw_expected_return_pct"
+    ] = 0.9
+    await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(
+        decision,
+        "paper",
+        [],
+    )
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    sizing[key] = value
+
+    assert RiskEngine().assess(decision, [], 1000.0).approved is False
 
 
 @pytest.mark.asyncio
@@ -730,25 +780,7 @@ async def test_normal_entry_refreshes_all_return_contracts_from_current_cost(gro
 @pytest.mark.asyncio
 async def test_paper_training_negative_fee_after_return_is_shadow_only() -> None:
     decision = _quality_observation_decision(return_lcb_pct=-0.3)
-    normal_trade = decision.raw_response["normal_paper_trade"]
-    normal_trade["selection_reason"] = "paper_training_entry"
-    normal_trade["paper_quality_observation_only"] = False
-    normal_trade["paper_training_only"] = True
-    normal_trade["paper_quality_mode"] = "training"
-    normal_trade["current_raw_expected_return_pct"] = 0.9
-    normal_trade["paper_training_reasons"] = [
-        "historical_quality_gate_is_observation_only",
-        "current_directional_evidence_is_training_eligible",
-    ]
-    normal_trade["authorized"] = True
-    normal_trade["single_trade_risk_fraction_cap"] = (
-        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-    )
-    from services.normal_paper_trade import _contract_fingerprint_payload, _fingerprint
-
-    normal_trade["contract_fingerprint"] = _fingerprint(
-        _contract_fingerprint_payload(normal_trade)
-    )
+    _use_bounded_training_entry(decision)
     decision.raw_response["opportunity_score"]["return_distribution_contract"][
         "raw_expected_return_pct"
     ] = -0.05
@@ -761,32 +793,14 @@ async def test_paper_training_negative_fee_after_return_is_shadow_only() -> None
     assert sizing["final_notional_usdt"] == 0.0
     assert sizing["paper_profitability_gate_applied"] is True
     assert sizing["paper_training_entry_mode"] is True
-    assert sizing["paper_training_shadow_only"] is True
-    assert "normal_paper_training_shadow_only" in sizing["reason"]
+    assert sizing["paper_training_shadow_only"] is False
+    assert "normal_paper_expected_net_not_positive_after_size_cost" in sizing["reason"]
 
 
 @pytest.mark.asyncio
 async def test_paper_training_reprices_against_distribution_slippage_floor_once() -> None:
     decision = _quality_observation_decision(return_lcb_pct=0.2)
-    normal_trade = decision.raw_response["normal_paper_trade"]
-    normal_trade["selection_reason"] = "paper_training_entry"
-    normal_trade["paper_quality_observation_only"] = False
-    normal_trade["paper_training_only"] = True
-    normal_trade["paper_quality_mode"] = "training"
-    normal_trade["current_raw_expected_return_pct"] = 0.9
-    normal_trade["paper_training_reasons"] = [
-        "historical_quality_gate_is_observation_only",
-        "current_directional_evidence_is_training_eligible",
-    ]
-    normal_trade["authorized"] = True
-    normal_trade["single_trade_risk_fraction_cap"] = (
-        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-    )
-    from services.normal_paper_trade import _contract_fingerprint_payload, _fingerprint
-
-    normal_trade["contract_fingerprint"] = _fingerprint(
-        _contract_fingerprint_payload(normal_trade)
-    )
+    _use_bounded_training_entry(decision)
     opportunity = decision.raw_response["opportunity_score"]
     opportunity["return_distribution_contract"].update(
         {
@@ -824,8 +838,8 @@ async def test_paper_training_reprices_against_distribution_slippage_floor_once(
         )
     )
 
-    assert sizing["production_eligible"] is False
-    assert sizing["paper_training_shadow_only"] is True
+    assert sizing["production_eligible"] is True
+    assert sizing["paper_training_shadow_only"] is False
     assert sizing["expected_net_return_pct"] > 0.0
     assert sizing["expected_net_return_pct"] == pytest.approx(
         expected_net_after_repricing
@@ -849,29 +863,7 @@ async def test_paper_training_uses_solved_return_for_execution_permission(
     entry_eligible: bool,
 ) -> None:
     decision = _quality_observation_decision(return_lcb_pct=-0.3)
-    normal_trade = decision.raw_response["normal_paper_trade"]
-    normal_trade.update(
-        {
-            "selection_reason": "paper_training_entry",
-            "paper_quality_observation_only": False,
-            "paper_training_only": True,
-            "paper_quality_mode": "training",
-            "current_raw_expected_return_pct": gross_return,
-            "paper_training_reasons": [
-                "historical_quality_gate_is_observation_only",
-                "current_directional_evidence_is_training_eligible",
-            ],
-            "authorized": True,
-            "single_trade_risk_fraction_cap": (
-                NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-            ),
-        }
-    )
-    from services.normal_paper_trade import _contract_fingerprint_payload, _fingerprint
-
-    normal_trade["contract_fingerprint"] = _fingerprint(
-        _contract_fingerprint_payload(normal_trade)
-    )
+    _use_bounded_training_entry(decision, raw_return_pct=gross_return)
     decision.feature_snapshot.update(_size_aware_book_snapshot(5_000.0))
     opportunity = decision.raw_response["opportunity_score"]
     original_cost = execution_cost_estimate(decision.feature_snapshot).to_dict()
@@ -896,20 +888,20 @@ async def test_paper_training_uses_solved_return_for_execution_permission(
     sizing = decision.raw_response["profit_risk_sizing"]
     solution = sizing["size_aware_profitability"]
     assert solution["production_eligible"] is entry_eligible
-    assert sizing["production_eligible"] is False
-    assert sizing["final_notional_usdt"] == 0.0
-    assert sizing["paper_training_shadow_only"] is True
+    assert sizing["production_eligible"] is entry_eligible
+    assert sizing["paper_training_shadow_only"] is False
     assert sizing["expected_net_return_pct"] == pytest.approx(
         gross_return - sizing["execution_cost"]["total_pct"]
     )
     if entry_eligible:
         assert sizing["expected_net_return_pct"] > 0.0
         assert solution["selected_notional_usdt"] >= sizing["minimum_order_notional_usdt"]
-        assert "normal_paper_training_shadow_only" in sizing["reason"]
+        assert sizing["final_notional_usdt"] >= sizing["minimum_order_notional_usdt"]
+        assert sizing["risk_budget_usdt"] <= 0.1
     else:
         assert sizing["expected_net_return_pct"] <= 0.0
         assert sizing["final_notional_usdt"] == 0.0
-        assert "normal_paper_training_shadow_only" in sizing["reason"]
+        assert "normal_paper_expected_net_not_positive_after_size_cost" in sizing["reason"]
 
 
 @pytest.mark.asyncio

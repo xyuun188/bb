@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import isclose
+from math import isclose, isfinite
 from typing import Any
 
 import structlog
@@ -16,6 +16,8 @@ from risk_manager.position_limits import PositionLimitChecker
 from risk_manager.stop_loss import StopLossResult
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_SIZING_VERSION,
+    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
     normal_paper_trade_contract_reasons,
 )
 
@@ -202,6 +204,53 @@ class RiskEngine:
                 equity * expected_single_cap + 1e-8
             ):
                 return "Normal paper trade exceeds its single-trade risk cap."
+            if normal_trade.get("selection_reason") == "paper_training_entry":
+                portfolio_cap = RiskEngine._safe_positive_float(
+                    normal_trade.get("portfolio_risk_fraction_cap")
+                )
+                portfolio_budget = RiskEngine._safe_positive_float(
+                    sizing.get("portfolio_risk_budget_usdt")
+                )
+                current_portfolio_risk_raw = sizing.get(
+                    "current_training_portfolio_stressed_loss_usdt"
+                )
+                try:
+                    current_portfolio_risk = float(current_portfolio_risk_raw)
+                except (TypeError, ValueError):
+                    current_portfolio_risk = float("nan")
+                if (
+                    sizing.get("portfolio_risk_limit_applied") is not True
+                    or not isclose(
+                        portfolio_cap,
+                        NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+                        rel_tol=1e-12,
+                        abs_tol=1e-12,
+                    )
+                    or not isclose(
+                        portfolio_budget,
+                        equity
+                        * NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+                        rel_tol=1e-8,
+                        abs_tol=1e-8,
+                    )
+                    or not isfinite(current_portfolio_risk)
+                    or current_portfolio_risk < 0.0
+                ):
+                    return "Normal paper training portfolio risk contract is invalid."
+                if (
+                    current_portfolio_risk + planned_loss
+                    > portfolio_budget + 1e-8
+                    or risk_budget
+                    > portfolio_budget - current_portfolio_risk + 1e-8
+                ):
+                    return "Normal paper training exceeds its portfolio risk cap."
+                if not isclose(
+                    expected_single_cap,
+                    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                ):
+                    return "Normal paper training single-trade cap is invalid."
             leverage_tier = sizing.get("leverage_tier_selection")
             leverage_tier = leverage_tier if isinstance(leverage_tier, dict) else {}
             tier_max = RiskEngine._safe_positive_float(leverage_tier.get("max_leverage"))

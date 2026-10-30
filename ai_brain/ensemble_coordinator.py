@@ -1013,7 +1013,7 @@ class EnsembleCoordinator:
                     "granted": True,
                     "scope": "paper_only",
                     "reason": normal_contract["selection_reason"],
-                    "training_only": False,
+                    "training_only": normal_contract.get("paper_training_only") is True,
                     "production_permission": False,
                 }
                 paper_raw["base_weighted_score_observation"] = round(

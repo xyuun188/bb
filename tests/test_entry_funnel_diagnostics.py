@@ -39,6 +39,25 @@ def test_funnel_distinguishes_selected_training_shadow_from_no_candidate() -> No
     ) == "shadow_training"
 
 
+def test_funnel_distinguishes_authorized_bounded_paper_training() -> None:
+    assert classify_entry_funnel_reason(
+        raw={
+            "paper_trade_selection": {
+                "selected": True,
+                "selection_reason": "paper_training_entry",
+            },
+            "normal_paper_trade": {
+                "authorized": True,
+                "paper_training_only": True,
+                "production_permission": False,
+            },
+        },
+        action="hold",
+        was_executed=False,
+        has_order=False,
+    ) == "no_candidate"
+
+
 def test_funnel_distinguishes_selected_quality_observation() -> None:
     assert classify_entry_funnel_reason(
         raw={

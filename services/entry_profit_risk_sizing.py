@@ -28,6 +28,8 @@ from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
+    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
     is_normal_paper_trade_decision,
     normal_paper_current_return_ready,
     normal_paper_trade_contract_reasons,
@@ -692,6 +694,31 @@ def build_portfolio_risk_snapshot(
         candidate_side=candidate_side,
         contract_specs=contract_specs,
     )
+
+
+def _paper_training_positions(
+    positions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    training_positions: list[dict[str, Any]] = []
+    for position in positions:
+        item = _safe_dict(position)
+        if str(item.get("execution_mode") or "paper").lower() != "paper":
+            continue
+        management = _safe_dict(item.get("current_management_contract"))
+        normal_lifecycle = _safe_dict(
+            item.get("normal_paper_lifecycle")
+            or management.get("normal_paper_lifecycle")
+        )
+        legacy_lifecycle = _safe_dict(
+            item.get("paper_training_lifecycle")
+            or management.get("paper_training_lifecycle")
+        )
+        if (
+            normal_lifecycle.get("selection_reason") == "paper_training_entry"
+            or legacy_lifecycle.get("loss_tolerant_for_training") is True
+        ):
+            training_positions.append(item)
+    return training_positions
 
 
 def _correlation_pressure(
@@ -1961,6 +1988,20 @@ class EntryProfitRiskSizingPolicy:
             ),
             0.0,
         )
+        training_portfolio_snapshot, training_portfolio_reasons = (
+            _portfolio_risk_snapshot(
+                _paper_training_positions(open_positions),
+                candidate_side=side,
+                contract_specs=contract_specs,
+            )
+        )
+        current_training_portfolio_risk = max(
+            _safe_float(
+                training_portfolio_snapshot.get("current_stressed_loss_usdt"),
+                0.0,
+            ),
+            0.0,
+        )
         direction_concentration = max(
             _safe_float(portfolio_snapshot.get("direction_concentration"), 0.0),
             0.0,
@@ -1991,17 +2032,38 @@ class EntryProfitRiskSizingPolicy:
             negative_lcb_stress_fraction,
             0.01,
         )
+        risk_cap_limit = (
+            NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
+            if training_mode
+            else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+        )
         single_trade_risk_fraction = min(
             max(
                 _safe_float(normal_trade.get("single_trade_risk_fraction_cap"), 0.0),
                 0.0,
             ),
-            NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+            risk_cap_limit,
         )
         single_trade_risk_budget = account_equity * single_trade_risk_fraction
-        # Paper observations retain the paper risk cap. An uncertain lower bound
-        # increases stress (and reduces notional); it is not a live permission.
-        risk_budget = single_trade_risk_budget
+        training_portfolio_cap = (
+            _safe_float(
+                normal_trade.get("portfolio_risk_fraction_cap"),
+                NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+            )
+            if training_mode
+            else 0.0
+        )
+        portfolio_risk_budget = account_equity * max(training_portfolio_cap, 0.0)
+        remaining_portfolio_risk_budget = max(
+            portfolio_risk_budget - current_training_portfolio_risk, 0.0
+        )
+        # Training entries use an independent portfolio ceiling. An uncertain
+        # lower bound increases stress and reduces notional; it never grants a
+        # live permission.
+        risk_budget = min(
+            single_trade_risk_budget,
+            remaining_portfolio_risk_budget,
+        ) if training_mode else single_trade_risk_budget
         risk_limited_notional = risk_budget / stress_fraction if stress_fraction > 0 else 0.0
         risk_and_liquidity_ceiling = min(side_depth, risk_limited_notional)
         minimum_order = okx_minimum_order_notional_usdt(
@@ -2234,7 +2296,7 @@ class EntryProfitRiskSizingPolicy:
             )
             raw["entry_permission"] = permission
         decision.raw_response = raw
-        training_shadow_only = training_mode
+        training_shadow_only = False
         negative_lcb_stress_fraction = max(
             negative_lcb_stress_fraction, -return_lcb / 100.0, 0.0
         )
@@ -2341,6 +2403,11 @@ class EntryProfitRiskSizingPolicy:
         )
         reasons: list[str] = []
         reasons.extend(contract_reasons)
+        if training_mode:
+            reasons.extend(
+                f"normal_paper_training_{reason}"
+                for reason in training_portfolio_reasons
+            )
         if not is_normal_paper_trade_decision(decision):
             reasons.append("normal_paper_trade_contract_incomplete")
         exchange_fact_provenance = _safe_dict(facts.get("policy_provenance"))
@@ -2394,8 +2461,6 @@ class EntryProfitRiskSizingPolicy:
             reasons.append(f"normal_paper_size_aware_{size_reason}")
         if not isfinite(expected_net) or expected_net <= 0.0:
             reasons.append("normal_paper_expected_net_not_positive_after_size_cost")
-        if training_shadow_only:
-            reasons.append("normal_paper_training_shadow_only")
         if training_mode and raw_signal_return <= 0.0:
             reasons.append("normal_paper_training_raw_return_not_positive")
         if not isfinite(return_lcb):
@@ -2471,6 +2536,19 @@ class EntryProfitRiskSizingPolicy:
                 leverage_tier_selection.get("policy_provenance")
             ).get("input_fingerprint"),
         }
+        if training_mode:
+            audit_inputs.update(
+                {
+                    "portfolio_risk_limit_applied": True,
+                    "training_portfolio_risk_budget_usdt": portfolio_risk_budget,
+                    "remaining_training_portfolio_risk_budget_usdt": (
+                        remaining_portfolio_risk_budget
+                    ),
+                    "current_training_portfolio_stressed_loss_usdt": (
+                        current_training_portfolio_risk
+                    ),
+                }
+            )
         provenance = {
             "source": "normal_paper_account_and_native_exchange_contract",
             "observation_window": "current_normal_paper_entry",
@@ -2543,8 +2621,9 @@ class EntryProfitRiskSizingPolicy:
             "final_leverage": round(final_leverage if eligible else 1.0, 8),
             "paper_quality_observation_mode": False,
             "paper_training_entry_mode": training_mode,
-            "paper_training_shadow_only": training_shadow_only,
-            "paper_quality_shadow_only": training_shadow_only,
+            "paper_training_shadow_only": False,
+            "paper_training_bounded_paper_only": training_mode,
+            "paper_quality_shadow_only": False,
             "paper_quality_non_positive_return_lcb": False,
             "paper_quality_observation_leverage_cap": None,
             "drawdown_pressure": round(drawdown_pressure, 8),
@@ -2591,6 +2670,19 @@ class EntryProfitRiskSizingPolicy:
             },
             "policy_provenance": provenance,
         }
+        if training_mode:
+            sizing.update(
+                {
+                    "portfolio_risk_limit_applied": True,
+                    "portfolio_risk_budget_usdt": round(portfolio_risk_budget, 8),
+                    "remaining_portfolio_risk_budget_usdt": round(
+                        remaining_portfolio_risk_budget, 8
+                    ),
+                    "current_training_portfolio_stressed_loss_usdt": round(
+                        current_training_portfolio_risk, 8
+                    ),
+                }
+            )
         sizing["policy_provenance"]["contract_fingerprint"] = _fingerprint(sizing)
         raw["profit_risk_sizing"] = sizing
         decision.raw_response = raw

@@ -18,6 +18,7 @@ from core.safe_output import safe_error_text
 from services.entry_direction_metrics import selected_entry_metrics
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
     normal_paper_current_return_ready,
     normal_paper_trade_contract_reasons,
 )
@@ -166,6 +167,9 @@ class EntryHighRiskReviewGatePolicy:
             sizing.get("single_trade_risk_fraction_cap"), -1.0
         )
         final_leverage = _safe_float(sizing.get("final_leverage"), -1.0)
+        training_mode = (
+            normal_trade.get("selection_reason") == "paper_training_entry"
+        )
         violations: list[str] = normal_paper_trade_contract_reasons(normal_trade)
         if str(model_mode or "").lower() != "paper":
             violations.append("execution_mode_not_paper")
@@ -190,7 +194,11 @@ class EntryHighRiskReviewGatePolicy:
             sizing.get("expected_net_return_pct"), sizing.get("return_lcb_pct")
         ):
             violations.append("sizing_current_return_contract_invalid")
-        advisory_risk_cap = NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+        advisory_risk_cap = (
+            NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
+            if training_mode
+            else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
+        )
         if not 0.0 < normal_risk_cap <= advisory_risk_cap:
             violations.append("normal_trade_risk_cap_exceeded")
         if not 0.0 < sizing_risk_cap <= advisory_risk_cap:
@@ -208,7 +216,7 @@ class EntryHighRiskReviewGatePolicy:
                 "paper_quality_observation_mode"
             )
             is True,
-            "paper_training_entry_mode": False,
+            "paper_training_entry_mode": training_mode,
             "single_trade_risk_fraction_cap": sizing_risk_cap,
             "final_leverage": final_leverage,
             "risk_fraction_limit": advisory_risk_cap,

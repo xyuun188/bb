@@ -25,6 +25,14 @@ def _cards() -> list[dict]:
                     "paper_quality_observation_allows_non_positive_return_lcb": True,
                     "paper_quality_observation_is_shadow_only": True,
                     "paper_quality_observation_authorizes_normal_entry": False,
+                    "paper_training_entry_is_bounded_paper_only": True,
+                    "paper_training_entry_authorizes_normal_entry": True,
+                    "paper_training_entry_requires_positive_size_aware_net_return": True,
+                    "paper_training_entry_allows_non_positive_fee_after_return": False,
+                    "paper_training_entry_is_shadow_only": False,
+                    "paper_training_entry_production_permission": False,
+                    "paper_training_entry_single_trade_risk_fraction": 0.0001,
+                    "paper_training_entry_portfolio_risk_fraction": 0.0003,
                     "paper_entry_requires_profit_factor": True,
                     "paper_entry_requires_positive_expected_net_return": True,
                     "paper_entry_requires_current_execution_cost": True,
@@ -86,6 +94,25 @@ def test_phase3_go_no_go_accepts_complete_dynamic_return_architecture() -> None:
     assert report["policy"]["optimization_target"] == PROFIT_TRAINING_TARGET
     assert report["policy"]["win_rate_is_diagnostic_only"] is True
     assert report["policy"]["expert_memory_strategy_learning_are_observation_only"] is True
+
+
+def test_phase3_go_no_go_rejects_drifted_training_risk_caps() -> None:
+    cards = deepcopy(_cards())
+    trade = next(card for card in cards if card["key"] == "trade_execution_contract")
+    trade["details"]["policy"]["paper_training_entry_single_trade_risk_fraction"] = (
+        0.005
+    )
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    blocker = next(
+        item
+        for item in report["blockers"]
+        if item["code"] == "dynamic_return_contract_policy_incomplete"
+    )
+    assert blocker["evidence"]["invalid_numeric"] == [
+        "paper_training_entry_single_trade_risk_fraction"
+    ]
 
 
 def test_phase3_go_no_go_fails_closed_when_required_audit_is_missing() -> None:

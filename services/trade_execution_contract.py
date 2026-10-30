@@ -18,6 +18,8 @@ from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
+    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
     historical_normalized_contract_reasons,
     normal_paper_trade_contract_reasons,
     normal_paper_trade_observation_contract_reasons,
@@ -526,13 +528,21 @@ def trade_execution_policy() -> dict[str, Any]:
         "paper_quality_observation_authorizes_normal_entry": False,
         "paper_quality_observation_max_loss_probability": 0.60,
         "paper_training_entry_requires_current_raw_return": True,
+        "paper_training_entry_requires_positive_size_aware_net_return": True,
         "paper_validated_entry_requires_positive_fee_after_return": True,
-        "paper_training_entry_allows_non_positive_fee_after_return": True,
-        # Training observations never authorize ordinary orders, regardless
-        # of the current predicted return. Shadow evaluation owns their labels.
-        "paper_training_entry_is_shadow_only": True,
-        "paper_training_entry_authorizes_normal_entry": False,
+        "paper_training_entry_allows_non_positive_fee_after_return": False,
+        # Training entries are bounded paper orders. They can collect a
+        # trusted settlement label but never grant production/live permission.
+        "paper_training_entry_is_shadow_only": False,
+        "paper_training_entry_authorizes_normal_entry": True,
+        "paper_training_entry_is_bounded_paper_only": True,
         "paper_training_entry_production_permission": False,
+        "paper_training_entry_single_trade_risk_fraction": (
+            NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
+        ),
+        "paper_training_entry_portfolio_risk_fraction": (
+            NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION
+        ),
         "paper_entry_requires_profit_factor": True,
         "paper_entry_requires_positive_expected_net_return": True,
         "paper_entry_requires_current_execution_cost": True,
@@ -1665,6 +1675,52 @@ def validate_normal_paper_entry_contract(
         or risk_budget > equity * settlement_single_cap + 1e-8
     ):
         reasons.append("normal_paper_single_trade_risk_cap_exceeded")
+    if normal_trade.get("selection_reason") == "paper_training_entry":
+        portfolio_cap = _safe_float(
+            normal_trade.get("portfolio_risk_fraction_cap"),
+            float("nan"),
+        )
+        portfolio_budget = _safe_float(
+            sizing.get("portfolio_risk_budget_usdt"),
+            float("nan"),
+        )
+        current_portfolio_risk = _safe_float(
+            sizing.get("current_training_portfolio_stressed_loss_usdt"),
+            float("nan"),
+        )
+        expected_portfolio_budget = (
+            equity * NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION
+        )
+        if (
+            sizing.get("portfolio_risk_limit_applied") is not True
+            or not isclose(
+                portfolio_cap,
+                NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            or not isclose(
+            portfolio_budget,
+            expected_portfolio_budget,
+            rel_tol=1e-8,
+            abs_tol=1e-8,
+            )
+            or not isfinite(current_portfolio_risk)
+            or current_portfolio_risk < 0.0
+            or not isclose(
+                single_cap,
+                NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+        ):
+            reasons.append("normal_paper_training_portfolio_budget_invalid")
+        if (
+            current_portfolio_risk + planned_loss > portfolio_budget + 1e-8
+            or risk_budget
+            > portfolio_budget - current_portfolio_risk + 1e-8
+        ):
+            reasons.append("normal_paper_training_portfolio_risk_cap_exceeded")
     if stress <= 0.0 or not persisted_product_isclose(
         planned_loss,
         final_notional,
