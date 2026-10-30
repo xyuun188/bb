@@ -32,10 +32,14 @@ def classify_analysis_status(raw: Any) -> str:
     payload = raw if isinstance(raw, dict) else {}
     quality = payload.get("analysis_quality_contract")
     quality = quality if isinstance(quality, dict) else {}
-    if payload.get("market_model_timeout") or (
-        analysis_quality_reason_code(quality) == ReasonCode.MODEL_TIMEOUT
-    ):
+    quality_reason = analysis_quality_reason_code(quality)
+    if payload.get("market_model_timeout") or quality_reason == ReasonCode.MODEL_TIMEOUT:
         return "retryable_failure"
+    if quality_reason in {
+        ReasonCode.MODEL_INVALID_OUTPUT,
+        ReasonCode.MODEL_UNAVAILABLE,
+    }:
+        return "model_failure"
     if analysis_quality_stage_status(quality) == "failed" or (
         not quality and payload.get("expert_failures")
     ):

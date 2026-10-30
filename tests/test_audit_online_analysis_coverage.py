@@ -187,6 +187,39 @@ def test_analysis_status_reads_timeout_from_canonical_contract() -> None:
     assert audit.classify_analysis_status(raw) == "retryable_failure"
 
 
+def test_analysis_status_counts_unavailable_model_when_observation_lifecycle_completed() -> None:
+    raw = {
+        "analysis_quality_contract": {
+            "analysis_complete": False,
+            "observation_complete": True,
+            "reason_code": "insufficient_evidence",
+            "status_counts": {
+                "completed": 0,
+                "timeout": 0,
+                "parse_failed": 0,
+                "empty": 0,
+                "unavailable": 4,
+                "skipped": 0,
+            },
+        }
+    }
+
+    assert audit.classify_analysis_status(raw) == "model_failure"
+
+
+def test_analysis_status_counts_invalid_model_output_before_observation_completion() -> None:
+    raw = {
+        "analysis_quality_contract": {
+            "analysis_complete": False,
+            "observation_complete": True,
+            "reason_code": "insufficient_evidence",
+            "status_counts": {"parse_failed": 1},
+        }
+    }
+
+    assert audit.classify_analysis_status(raw) == "model_failure"
+
+
 def test_analysis_status_keeps_direction_conflict_distinct_from_model_failure() -> None:
     raw = {
         "analysis_quality_contract": {

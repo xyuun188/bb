@@ -756,20 +756,31 @@ def build_batch_experts_user_prompt(
             for name in requested_experts
         }
         compact_order = ",".join(requested_experts)
-        compact_role_rules = (
-            "trend=direction; momentum=payoff; sentiment=timing; "
-            "position=exit; risk=safety. Use h only for neutral, conflicting, "
-            "missing, or unsupported evidence."
+        compact_role_labels = {
+            "trend_expert": "trend=direction",
+            "momentum_expert": "momentum=payoff",
+            "sentiment_expert": "sentiment=timing",
+            "position_expert": "position=exit",
+            "risk_expert": "risk=safety",
+        }
+        compact_role_rules = "; ".join(
+            compact_role_labels[name] for name in requested_experts
+        ) + ". Use h only for neutral, conflicting, missing, or unsupported evidence."
+        position_rule = (
+            " position_expert=hold without a position."
+            if "position_expert" in requested_experts
+            else ""
         )
         return (
-            "QWEN_TARGET_BATCH_V3\n"
+            "QWEN_TARGET_BATCH_V4\n"
             "Production Qwen ultra-compact mode. JSON only; no markdown/thinking/reasoning. "
-            f"Return exactly {{\"a\":[\"l|s|h|cl|cs\",...]}} in this order: {compact_order}. "
-            "Use one action code per item only; never include expert names, confidence, or explanations.\n"
+            f"Return exactly {{\"a\":[\"l|s|h|cl|cs\",...]}} with exactly "
+            f"{len(requested_experts)} action codes, one per requested expert in this order: "
+            f"{compact_order}. Do not include omitted experts.\n"
             f"Rules: {compact_role_rules}\n"
             f"Data: {json.dumps(compact_data, ensure_ascii=False, separators=(',', ':'))}\n"
             "Codes: l=long, s=short, h=hold, cl=close_long, cs=close_short. "
-            "No invented data; position_expert=hold without a position."
+            f"No invented data.{position_rule}"
         )
 
     strategy_mode = (

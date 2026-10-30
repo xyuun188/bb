@@ -426,7 +426,9 @@ def test_qwen_production_batch_prompt_uses_compact_wire_schema() -> None:
 
     assert '"a":["l|s|h|cl|cs",...]' in prompt
     assert "Production Qwen ultra-compact mode" in prompt
-    assert "QWEN_TARGET_BATCH_V3" in prompt
+    assert "QWEN_TARGET_BATCH_V4" in prompt
+    assert "with exactly 4 action codes" in prompt
+    assert "position_expert" not in prompt
     assert "position_size_pct" not in prompt
     assert len(prompt) < 4_000
 
@@ -827,11 +829,14 @@ async def test_qwen_batch_failure_exposes_bounded_response_contract(
 async def test_qwen_batch_vector_accepts_full_action_aliases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    captured_messages: list[list[Any]] = []
+
     class FakeChatOpenAI:
         def __init__(self, **_kwargs: Any) -> None:
             pass
 
-        async def ainvoke(self, _messages: list[Any]) -> SimpleNamespace:
+        async def ainvoke(self, messages: list[Any]) -> SimpleNamespace:
+            captured_messages.append(messages)
             return SimpleNamespace(
                 content='{"a":["long","short","hold","close_long"]}',
                 response_metadata={"finish_reason": "stop"},
@@ -862,6 +867,51 @@ async def test_qwen_batch_vector_accepts_full_action_aliases(
         "sentiment_expert",
         "risk_expert",
     )] == ["long", "short", "hold", "close_long"]
+    assert 'with one field: {"a":[...]}' in captured_messages[0][0].content
+    assert "expert-name keys" in captured_messages[0][0].content
+
+
+@pytest.mark.asyncio
+async def test_qwen_batch_mismatched_vector_reports_shape_without_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeChatOpenAI:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def ainvoke(self, _messages: list[Any]) -> SimpleNamespace:
+            return SimpleNamespace(
+                content='{"a":["h","h","h","h","h"]}',
+                response_metadata={"finish_reason": "stop"},
+                usage_metadata={"completion_tokens": 14},
+            )
+
+    monkeypatch.setattr("ai_brain.llm_agent.ChatOpenAI", FakeChatOpenAI)
+    agent = LLMAgent(
+        name="trend_expert",
+        api_config={
+            "api_base": LOCAL_QWEN_TEST_BASE,
+            "api_key": "test-key",
+            "model": "qwen3.8-27b",
+            "role": "trend_direction",
+        },
+    )
+    await agent.initialize()
+
+    with pytest.raises(LLMResponseParseError) as raised:
+        await agent.decide_batch_experts(
+            FeatureVector(symbol="BTC/USDT"),
+            {"execution_mode": "paper"},
+            ["trend_expert", "momentum_expert", "sentiment_expert", "risk_expert"],
+        )
+
+    error = str(raised.value)
+    assert "compact action vector invalid" in error
+    assert "keys=a" in error
+    assert "vector=list:5" in error
+    assert "valid=5/4" in error
+    assert "content_chars=27" in error
+    assert '"h","h"' not in error
 
 
 @pytest.mark.asyncio

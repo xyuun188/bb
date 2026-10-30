@@ -496,6 +496,35 @@ def _normalize_compact_batch_vector(
     return normalized
 
 
+def _batch_response_shape_summary(
+    value: Any,
+    expert_names: list[str] | tuple[str, ...],
+) -> str:
+    """Summarize response structure without logging model-generated content."""
+
+    if not isinstance(value, dict):
+        return (
+            f"root={type(value).__name__}; expected={len(expert_names)}"
+        )
+    vector = value.get("a", value.get("actions"))
+    vector_type = type(vector).__name__ if vector is not None else "missing"
+    vector_length = len(vector) if isinstance(vector, (list, tuple, str)) else None
+    known_keys = {"a", "actions", "experts"}
+    present_keys = sorted(known_keys.intersection(str(key) for key in value))
+    valid_action_count = None
+    if isinstance(vector, list):
+        valid_action_count = sum(
+            _normalize_compact_batch_value(item) is not None for item in vector
+        )
+    return (
+        "root=object; "
+        f"keys={','.join(present_keys) or 'none'}; "
+        f"vector={vector_type}:{vector_length if vector_length is not None else '?'}; "
+        f"valid={valid_action_count if valid_action_count is not None else '?'}/"
+        f"{len(expert_names)}"
+    )
+
+
 def _format_local_ai_tools(tools: dict[str, Any]) -> str:
     if not isinstance(tools, dict) or not tools or not tools.get("enabled"):
         return ""
@@ -1522,9 +1551,10 @@ class LLMAgent(AbstractAIModel):
 
         async def _invoke_batch(prompt: str, *, repair: bool = False) -> dict[str, Any]:
             system_prompt = (
-                "QWEN_TARGET_BATCH_SYSTEM_V2. Output one minified JSON object only. "
-                "No markdown, prose, or thinking. Use only the requested expert keys "
-                "and action codes l,s,h,cl,cs."
+                "QWEN_TARGET_BATCH_SYSTEM_V4. Return exactly one minified JSON object "
+                'with one field: {"a":[...]}. The array must contain exactly one '
+                "action code l,s,h,cl,cs per requested expert, in the user-specified "
+                "order. No expert-name keys, markdown, prose, explanations, or thinking."
                 if target_single_call
                 else BATCH_EXPERT_SYSTEM_PROMPT
             )
@@ -1594,6 +1624,12 @@ class LLMAgent(AbstractAIModel):
                 vector = _normalize_compact_batch_vector(parsed, expert_names)
                 if vector is not None:
                     return vector
+                if isinstance(parsed, dict) and ("a" in parsed or "actions" in parsed):
+                    raise LLMResponseParseError(
+                        "batch expert compact action vector invalid; "
+                        f"{_batch_response_shape_summary(parsed, expert_names)}; "
+                        f"{response_summary}"
+                    )
             experts = parsed.get("experts") if isinstance(parsed, dict) else None
             if not isinstance(experts, dict) and target_single_call and isinstance(parsed, dict):
                 # Accept compact Qwen output that omits only the outer wrapper.
@@ -1606,7 +1642,12 @@ class LLMAgent(AbstractAIModel):
                     experts = top_level
             if not isinstance(experts, dict):
                 kind = "repair" if repair else "batch"
-                suffix = f"; {response_summary}" if target_single_call else ""
+                suffix = (
+                    f"; {_batch_response_shape_summary(parsed, expert_names)}; "
+                    f"{response_summary}"
+                    if target_single_call
+                    else ""
+                )
                 raise LLMResponseParseError(
                     f"{kind} experts response missing experts object{suffix}"
                 )
@@ -1651,7 +1692,7 @@ class LLMAgent(AbstractAIModel):
         try:
             experts_payload = await _invoke_batch(user_prompt)
         except LLMResponseParseError as exc:
-            repair_error = safe_error_text(exc, limit=180)
+            repair_error = safe_error_text(exc, limit=420 if target_single_call else 180)
             experts_payload = {}
 
         missing_names = [
