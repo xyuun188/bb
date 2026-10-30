@@ -1,6 +1,6 @@
 # Profitability Remediation Execution Plan
 
-Updated: 2026-10-26, Asia/Shanghai.
+Updated: 2026-10-30, Asia/Shanghai.
 Status: ACTIVE. Profitability acceptance has NOT passed.
 Repository: `G:\数字量化\bb`; remote application: `/data/bb/app`.
 This file is the durable recovery checkpoint for the current Codex chat.
@@ -40,6 +40,48 @@ This file is the durable recovery checkpoint for the current Codex chat.
   that adjustment. Ruff, compileall, `git diff --check`, and the profit
   integrity architecture audit passed. The final full-suite run after the
   smoke adjustment also passed: `5111 passed, 1 skipped`.
+
+## Mature Cohort Closure (2026-10-30)
+
+- The sealed 30-minute decision cohort
+  `2026-10-29T03:15:00Z` through `2026-10-29T03:45:00Z` contains `64`
+  decision groups and was sealed with ordered-ID fingerprint
+  `d43261f4960d33a9db84a4a78cb379d16ae46985b1bbb6a1d519470c197b0313`.
+- Its single read-only mature audit ran after the fixed
+  `2026-10-29T07:46:00Z` maturity boundary and matched all `64` sealed
+  decisions. It found `256` rows with no duplicate group/horizon rows:
+  `71` native, complete rows, `184` historical/incomplete cost rows, and
+  `1` quarantined native market-fact row. No group had all four horizons
+  eligible, so the cohort is **G2 insufficient** and cannot enter G3.
+- The audit queried labels only for this sealed cohort, persisted no artifact,
+  changed no database or permission state, submitted no orders, and did not
+  evaluate an independent exam. Do not backfill it from later rows, run the
+  frozen Ridge/tree search on it, or reinterpret its 71 rows as profitability
+  evidence.
+- The remaining blocker is data generation, not an unhandled code path:
+  future governed paper observations must produce complete OKX-backed native
+  fee-after lifecycles in all required horizons. Until a materially new
+  cohort has enough all-four eligible groups, G3 remains closed, G4-G6 remain
+  unstarted/blocked, `live_ml_ready` remains `false`, and the paper service
+  stays stopped unless an operator explicitly starts the governed paper
+  collector.
+- A fresh online read-only resume preflight at
+  `2026-10-30T07:23:13Z` reports `can_resume_paper=true`, zero account/order
+  integrity issues, a ready Phase 3 artifact and all four quant child endpoint
+  metadata contracts ready. It confirms the paper service is stopped and
+  `live_routing_enabled=false`; no service was started by this audit.
+- The same preflight found the separately configured high-risk review
+  provider returning HTTP `401` because its authorization key is unavailable.
+  Specialist shadow evaluation currently has no authoritative inference
+  samples and records fallback as `specialist_inference_unavailable`. This is
+  an operations-secret/configuration dependency, not a code defect. Keep
+  high-risk decisions fail-closed; an authorized operator must restore the
+  provider secret through the deployment secret manager and verify a bounded
+  inference probe before relying on that reviewer. Do not put the key in Git,
+  this plan, or project memory, and do not silently route around the reviewer.
+- The bounded full-suite regression run passed `5111` tests with `1` skipped;
+  the cohort-audit focused suite passed `4`, Ruff/compileall/diff checks
+  passed. This confirms software integrity only, not profitability.
 
 ## Objective
 
@@ -105,8 +147,8 @@ or trade frequency to manufacture success.
 | --- | --- | --- | --- |
 | G0 Recovery and execution safety | PASSED | Active goal, this checkpoint, same-chat scheduled continuation | Saved automation inspected and app view verified on 2026-10-22 |
 | G1 Authoritative loss attribution | PASSED | Fixed-cutoff canonical lifecycle and complete official-bill audit; evidence below | Separate full round trips, partial updates and window cash flow; reconcile price PnL, signed fees and funding without double counting; expose unresolved links and costs |
-| G2 Data and label validity | PASSED for the final sealed cohort's eligible native subset; the later 987-decision cohort was insufficient; a post-repair cohort is pending | Eligibility, timing, cost and provenance report plus defect regressions | No duplicate decision/horizon rows; native point-in-time fee-after rows are isolated from historical/contradictory rows before research |
-| G3 Cost-aware candidate development | REJECTED for frozen live-rules-canary.v1; Ridge v2 remains unrun because its 987-decision G2 cohort was insufficient; a new post-repair window is preregistered | Bounded experiment ledger and purged chronological comparisons; no candidate approved | Candidate family/features/horizon/threshold/exits selected only within development folds; compare no-trade and transparent baselines on identical costs and exposure |
+| G2 Data and label validity | PASSED only for previously eligible native subsets; the 2026-10-29 sealed cohort is insufficient with 0 all-four eligible groups | Eligibility, timing, cost and provenance report plus defect regressions | No duplicate decision/horizon rows; native point-in-time fee-after rows are isolated from historical/contradictory rows before research |
+| G3 Cost-aware candidate development | REJECTED for prior frozen candidates; the latest 2026-10-29 cohort is closed without a run because G2 has 0 all-four eligible groups | Bounded experiment ledger and purged chronological comparisons; no candidate approved | Candidate family/features/horizon/threshold/exits selected only within development folds; compare no-trade and transparent baselines on identical costs and exposure |
 | G4 Frozen independent evaluation | NOT STARTED | No qualifying candidate to freeze; no untouched exam opened | Predefined sample coverage, time/dependence-aware lower bound above zero, positive net mean, PF above one, predefined drawdown/tail limits, and cost stress tests pass; no post-exam tuning |
 | G5 Governed paper execution | NOT STARTED | No G3/G4-approved policy or governed profitable paper round trip | Prior gates passed; frozen risk budget; no unlinked fills/unprotected exposure; observed fee-after results and forecast calibration meet preregistered criteria |
 | G6 Final acceptance and handoff | BLOCKED | Depends on G2-G5 evidence | G0-G5 all passed, exact deployed hashes match accepted version, independent subsequent window passes predefined criteria; remaining uncertainty disclosed |
