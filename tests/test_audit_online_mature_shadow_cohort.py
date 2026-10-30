@@ -46,6 +46,20 @@ def test_rendered_cohort_audit_keeps_all_cutoffs() -> None:
     assert "__EXPECTED_DECISION_COUNT__" not in rendered
 
 
+def test_zero_decision_seal_is_explicitly_insufficient() -> None:
+    rendered = audit._render_remote_script(
+        decision_since=datetime(2026, 10, 26, 23, 10, tzinfo=UTC),
+        decision_cutoff=datetime(2026, 10, 27, 5, 10, tzinfo=UTC),
+        maturity_cutoff=datetime(2026, 10, 27, 15, 11, tzinfo=UTC),
+        row_limit=1200,
+        expected_decision_count=0,
+    )
+
+    assert "EXPECTED_DECISION_COUNT = 0" in rendered
+    assert '"insufficient_decision_samples"' in rendered
+    assert '"decision_count_matches_seal"' in rendered
+
+
 def test_cli_supports_distinct_evidence_output_path() -> None:
     resolved = audit._resolve_evidence_path(
         "data/profitability_remediation/final.json",

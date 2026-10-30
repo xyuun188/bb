@@ -250,7 +250,8 @@ async def main():
         else:
             decision_rows = []
         decision_cohort_complete = (
-            len(decision_rows) == EXPECTED_DECISION_COUNT
+            EXPECTED_DECISION_COUNT > 0
+            and len(decision_rows) == EXPECTED_DECISION_COUNT
             and len(decision_rows) <= ROW_LIMIT
         )
         label_row_limit = ROW_LIMIT * len(HORIZONS)
@@ -378,7 +379,11 @@ async def main():
             "status": (
                 "ready_for_label_audit"
                 if decision_cohort_complete
-                else "sealed_decision_cohort_mismatch"
+                else (
+                    "insufficient_decision_samples"
+                    if EXPECTED_DECISION_COUNT == 0 and not decision_rows
+                    else "sealed_decision_cohort_mismatch"
+                )
             ),
             "checked_at": datetime.now(UTC).isoformat(),
             "window": {
@@ -393,6 +398,9 @@ async def main():
             },
             "input": {
                 "decision_snapshot_count": len(decision_rows),
+                "decision_count_matches_seal": (
+                    len(decision_rows) == EXPECTED_DECISION_COUNT
+                ),
                 "decision_candidate_count": len(decision_candidates),
                 "decision_candidate_in_window_count": len(
                     decision_candidates_in_window
@@ -569,8 +577,8 @@ def main() -> None:
         parser.error("--minutes must be between 1 and 10080")
     if not 1 <= row_limit <= 2500:
         parser.error("--limit must be between 1 and 2500")
-    if not 1 <= expected_decision_count <= row_limit:
-        parser.error("--expected-decision-count must be between 1 and --limit")
+    if not 0 <= expected_decision_count <= row_limit:
+        parser.error("--expected-decision-count must be between 0 and --limit")
     decision_cutoff = _parse_cutoff(args.cutoff)
     maturity_cutoff = _parse_cutoff(args.maturity_cutoff)
     if maturity_cutoff < decision_cutoff:
