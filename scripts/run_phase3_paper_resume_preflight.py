@@ -26,6 +26,7 @@ from core.safe_output import safe_error_text  # noqa: E402
 from services.phase3_paper_resume_preflight import (  # noqa: E402
     Phase3PaperResumePreflightService,
 )
+from services.secure_runtime_config import load_secure_settings_into_runtime  # noqa: E402
 
 DEFAULT_REPORT_DIR = "phase3_paper_resume_preflight_reports"
 
@@ -65,6 +66,10 @@ async def collect_phase3_paper_resume_preflight(
     model_server_timeout_seconds: int = 24,
     specialist_report_max_age_seconds: int = 7200,
 ) -> dict[str, Any]:
+    # The dashboard and trading process both overlay encrypted runtime secrets
+    # after their database connection is available. Keep this standalone
+    # preflight on the same configuration path before probing configured APIs.
+    await load_secure_settings_into_runtime()
     return await Phase3PaperResumePreflightService(
         okx_lookback_hours=okx_lookback_hours,
         okx_limit=okx_limit,

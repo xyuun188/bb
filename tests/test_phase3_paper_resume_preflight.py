@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from config.settings import settings
 from scripts import run_phase3_paper_resume_preflight as preflight_cli
 from services.phase3_paper_resume_preflight import (
     Phase3PaperResumePreflightService,
@@ -421,6 +422,42 @@ async def test_phase3_paper_resume_preflight_service_uses_injected_providers() -
     assert report["can_resume_paper"] is True
     assert provider_thread_ids
     assert main_thread_id not in provider_thread_ids
+
+
+@pytest.mark.asyncio
+async def test_preflight_cli_loads_secure_runtime_settings_before_collecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_key = settings.high_risk_review_api_key
+    observed: dict[str, Any] = {}
+    monkeypatch.setattr(settings, "high_risk_review_api_key", original_key)
+
+    async def load_secure_settings() -> dict[str, Any]:
+        monkeypatch.setattr(settings, "high_risk_review_api_key", "test-only-review-key")
+        observed["loaded"] = True
+        return {"loaded_keys": ["high_risk_review.api_key"], "skipped": [], "error": ""}
+
+    class FakePreflightService:
+        def __init__(self, **_kwargs: Any) -> None:
+            observed["key_available_during_collection"] = (
+                settings.high_risk_review_api_key == "test-only-review-key"
+            )
+
+        async def report(self) -> dict[str, Any]:
+            return {"status": "ready", "can_resume_paper": True}
+
+    monkeypatch.setattr(
+        preflight_cli,
+        "load_secure_settings_into_runtime",
+        load_secure_settings,
+    )
+    monkeypatch.setattr(preflight_cli, "Phase3PaperResumePreflightService", FakePreflightService)
+
+    report = await preflight_cli.collect_phase3_paper_resume_preflight()
+
+    assert observed == {"loaded": True, "key_available_during_collection": True}
+    assert report["can_resume_paper"] is True
+    assert "test-only-review-key" not in json.dumps(report)
 
 
 @pytest.mark.asyncio
