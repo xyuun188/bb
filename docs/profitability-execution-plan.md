@@ -5,6 +5,42 @@ Status: ACTIVE. Profitability acceptance has NOT passed.
 Repository: `G:\数字量化\bb`; remote application: `/data/bb/app`.
 This file is the durable recovery checkpoint for the current Codex chat.
 
+## Phase 3 Paper Bootstrap Recovery (2026-10-30)
+
+- Added an explicit `paper_bootstrap` training path for `local_ai_tools` only.
+  It still requires the normal chronological, purged, disjoint-decision-group
+  market holdout. When authoritative OKX execution-cost rows cannot form their
+  own chronological holdout, it persists no cost model and reports
+  `waiting_for_authoritative_cost_holdout`; it never invents fee or slippage
+  values. The artifact is paper-only and cannot set `live_ml_ready`.
+- Fixed bootstrap artifact registration, activation, loading, status and
+  prediction metadata so the lifecycle is recognized consistently. The deploy
+  smoke accepts `bootstrap` while continuing to require production eligibility
+  and permission to remain false.
+- Online training created artifact
+  `20261030T070539711913Z-7db02cfa` from `503` market samples and `3`
+  authoritative cost samples. It is registered as `bootstrap`, with
+  `paper_bootstrap_state=waiting_for_authoritative_cost_holdout`,
+  `artifact_persisted=true`, and `live_ml_ready=false`.
+- The dedicated `bb-phase3-quant-api.service` was deployed and restarted on
+  the model host. Endpoint smoke passed for profit, timeseries, sentiment and
+  exit contracts. A fresh read-only paper-resume preflight reports
+  `can_resume_paper=true`, all four child endpoint metadata contracts ready,
+  `paper_trading_permission=true`, and `live_trading_permission=false`.
+  `bb-paper-trading.service` was not started and no orders were submitted.
+- This clears the model-bundle cold-start blocker only. Cost-model holdout is
+  still unavailable, return-evidence promotion blockers remain, and negative
+  authoritative fee-after economics / G3-G6 profitability gates are not
+  cleared by bootstrap. Continue collecting genuine OKX cost-complete
+  lifecycles and independently evaluated profitability evidence; do not
+  promote this artifact to canary/live or reinterpret market-only rows as
+  realized returns.
+- Verification: full suite `5111 passed, 1 skipped` before the final deploy
+  smoke adjustment; the deploy/service focused suite passed `103` tests after
+  that adjustment. Ruff, compileall, `git diff --check`, and the profit
+  integrity architecture audit passed. The final full-suite run after the
+  smoke adjustment also passed: `5111 passed, 1 skipped`.
+
 ## Objective
 
 Complete authoritative loss attribution, validate data and signals, research

@@ -60,8 +60,18 @@ def _local_ai_base_arg(base_url: str) -> str:
     return f" --base-url {value}" if value else ""
 
 
-def _build_rebuild_commands(*, local_ai_tools_base_url: str = "") -> dict[str, Any]:
+def _build_rebuild_commands(
+    *,
+    local_ai_tools_base_url: str = "",
+    training_mode: str = "shadow",
+) -> dict[str, Any]:
     local_ai_base = _local_ai_base_arg(local_ai_tools_base_url)
+    paper_bootstrap = str(training_mode or "shadow").strip().lower() == "paper_bootstrap"
+    local_ai_preflight = (
+        "python scripts/train_local_ai_tools_models.py"
+        f"{local_ai_base}"
+        + (" --training-mode paper_bootstrap" if paper_bootstrap else "")
+    )
     commands = {
         "ml_signal": {
             "preflight_command": "python scripts/train_ml_signal_model.py",
@@ -71,16 +81,28 @@ def _build_rebuild_commands(*, local_ai_tools_base_url: str = "") -> dict[str, A
             ),
         },
         "local_ai_tools": {
-            "preflight_command": f"python scripts/train_local_ai_tools_models.py{local_ai_base}",
+            "preflight_command": local_ai_preflight,
             "confirmed_rebuild_command": (
                 "python scripts/train_local_ai_tools_models.py"
-                f"{local_ai_base} --persist-artifact --confirm-phase3-rebuild"
+                f"{local_ai_base}"
+                + (" --training-mode paper_bootstrap" if paper_bootstrap else "")
+                + " --persist-artifact --confirm-phase3-rebuild"
             ),
         },
     }
+    if not paper_bootstrap:
+        commands["local_ai_tools"]["paper_bootstrap_rebuild_command"] = (
+            "python scripts/train_local_ai_tools_models.py"
+            f"{local_ai_base} --training-mode paper_bootstrap "
+            "--persist-artifact --confirm-phase3-rebuild"
+        )
     for item in commands.values():
         item["preflight_argv"] = _command_list(item["preflight_command"])
         item["confirmed_rebuild_argv"] = _command_list(item["confirmed_rebuild_command"])
+        if "paper_bootstrap_rebuild_command" in item:
+            item["paper_bootstrap_rebuild_argv"] = _command_list(
+                item["paper_bootstrap_rebuild_command"]
+            )
     return commands
 
 
@@ -247,6 +269,7 @@ async def collect_phase3_rebuild_preflight(
     requested_persist_artifact: bool = False,
     confirm_phase3_rebuild: bool = False,
     local_ai_tools_base_url: str = "",
+    training_mode: str = "shadow",
 ) -> dict[str, Any]:
     started_at = datetime.now(UTC)
     collection_errors: dict[str, str] = {}
@@ -262,7 +285,7 @@ async def collect_phase3_rebuild_preflight(
         shadow_samples=payload["shadow_samples"],
     )
     promotion = build_phase3_promotion_recommendation(
-        training_mode="shadow",
+        training_mode=training_mode,
         quality_report=payload["quality_report"],
         governance_report=payload["governance_report"],
         paper_observation_report=paper_observation_report,
@@ -281,8 +304,8 @@ async def collect_phase3_rebuild_preflight(
         "quality_report": payload["quality_report"],
         "governance_report": payload["governance_report"],
         "return_objective_report": return_objective_report,
-        "training_mode": "shadow",
-        "model_stage": "shadow",
+        "training_mode": training_mode,
+        "model_stage": "bootstrap" if training_mode == "paper_bootstrap" else "shadow",
         "promotion_flow": "candidate_to_shadow_to_canary_to_active",
         "promotion_recommendation": promotion,
     }
@@ -324,9 +347,11 @@ async def collect_phase3_rebuild_preflight(
         runtime_probe=runtime_probe,
         requested_persist_artifact=requested_persist_artifact,
         confirm_phase3_rebuild=confirm_phase3_rebuild,
+        training_mode=training_mode,
     )
     commands = _build_rebuild_commands(
-        local_ai_tools_base_url=local_ai_tools_base_url or settings.local_ai_tools_api_base
+        local_ai_tools_base_url=local_ai_tools_base_url or settings.local_ai_tools_api_base,
+        training_mode=training_mode,
     )
     return {
         "status": readiness["status"],
@@ -337,6 +362,7 @@ async def collect_phase3_rebuild_preflight(
         "starts_trading_service": False,
         "requested_persist_artifact": bool(requested_persist_artifact),
         "confirm_phase3_rebuild": bool(confirm_phase3_rebuild),
+        "training_mode": training_mode,
         "readiness": readiness,
         "collection_errors": collection_errors,
         "training_summary": {
@@ -372,6 +398,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-ai-tools-base-url", default=settings.local_ai_tools_api_base)
     parser.add_argument("--persist-artifact", action="store_true")
     parser.add_argument("--confirm-phase3-rebuild", action="store_true")
+    parser.add_argument(
+        "--training-mode",
+        choices=("shadow", "paper_bootstrap"),
+        default="shadow",
+    )
     parser.add_argument("--json-indent", type=int, default=2)
     parser.add_argument(
         "--output-dir",
@@ -401,6 +432,7 @@ async def _main() -> int:
         requested_persist_artifact=bool(args.persist_artifact),
         confirm_phase3_rebuild=bool(args.confirm_phase3_rebuild),
         local_ai_tools_base_url=args.local_ai_tools_base_url,
+        training_mode=args.training_mode,
     )
     indent = None if int(args.json_indent or 0) <= 0 else int(args.json_indent)
     if not args.stdout_only:

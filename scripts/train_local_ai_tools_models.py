@@ -1244,9 +1244,12 @@ async def _main() -> None:
     parser.add_argument("--skip-quarantine", action="store_true")
     parser.add_argument(
         "--training-mode",
-        choices=("shadow", "formal", "walk_forward"),
+        choices=("shadow", "paper_bootstrap", "formal", "walk_forward"),
         default="shadow",
-        help="Phase-3 model-factory mode; default is shadow and never mutates live routing.",
+        help=(
+            "Phase-3 model-factory mode. paper_bootstrap persists a paper-only "
+            "gross-market artifact while chronological authoritative cost holdout warms up."
+        ),
     )
     parser.add_argument(
         "--persist-artifact",

@@ -56,9 +56,12 @@ class Phase3RebuildReadinessService:
         runtime_probe: dict[str, Any] | None = None,
         requested_persist_artifact: bool = False,
         confirm_phase3_rebuild: bool = False,
+        training_mode: str = "shadow",
     ) -> dict[str, Any]:
         started_at = datetime.now(UTC)
         local_tools = _safe_dict(local_ai_tools)
+        mode = _status(training_mode or "shadow")
+        paper_bootstrap = mode == "paper_bootstrap"
         governance_report = _safe_dict(governance)
         historical = _safe_dict(historical_trade_fact_audit)
         artifacts = _safe_dict(artifact_retirement_audit)
@@ -80,7 +83,10 @@ class Phase3RebuildReadinessService:
         else:
             passed.append("shadow_train_and_holdout_available")
         if trade_count <= 0:
-            blockers.append("authoritative_trade_distribution_unavailable")
+            if paper_bootstrap:
+                warnings.append("paper_bootstrap_waiting_for_authoritative_trade_history")
+            else:
+                blockers.append("authoritative_trade_distribution_unavailable")
         else:
             passed.append("authoritative_trade_distribution_available")
 
@@ -99,10 +105,16 @@ class Phase3RebuildReadinessService:
 
         historical_status = _status(historical.get("status"))
         if historical_status in {"", "unavailable", "error"}:
-            blockers.append("historical_trade_fact_audit_unavailable")
+            if paper_bootstrap:
+                warnings.append("paper_bootstrap_historical_trade_audit_incomplete")
+            else:
+                blockers.append("historical_trade_fact_audit_unavailable")
         elif historical_status != "clean":
             if _safe_int(historical.get("trainable_closed_positions")) <= 0:
-                blockers.append("no_clean_closed_trade_facts")
+                if paper_bootstrap:
+                    warnings.append("paper_bootstrap_waiting_for_clean_closed_trade_facts")
+                else:
+                    blockers.append("no_clean_closed_trade_facts")
             warnings.append("historical_trade_facts_require_quarantine")
         else:
             passed.append("historical_trade_facts_clean")
@@ -132,6 +144,8 @@ class Phase3RebuildReadinessService:
             local_tools.get("promotion_flow")
             or PHASE3_REQUIRED_PROMOTION_FLOW
         )
+        if mode not in {"shadow", "paper_bootstrap"}:
+            blockers.append("training_mode_invalid")
         if promotion_flow != PHASE3_REQUIRED_PROMOTION_FLOW:
             blockers.append("promotion_flow_not_phase3")
         else:
@@ -165,9 +179,15 @@ class Phase3RebuildReadinessService:
                 "can_persist_artifact": can_persist,
                 "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
                 "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
-                "target_stage": "shadow",
+                "target_stage": "bootstrap" if paper_bootstrap else "shadow",
+                "training_mode": mode,
             },
         }
+        if paper_bootstrap:
+            target_states["ml_signal"]["can_persist_artifact"] = False
+            target_states["ml_signal"]["persistence_blocker"] = (
+                "paper_bootstrap_applies_to_local_ai_tools_only"
+            )
 
         for target in target_states.values():
             if target["can_persist_artifact"]:
@@ -187,6 +207,7 @@ class Phase3RebuildReadinessService:
             "confirm_phase3_rebuild": bool(confirm_phase3_rebuild),
             "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
             "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
+            "training_mode": mode,
             "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
             "blockers": list(dict.fromkeys(blockers)),
             "warnings": list(dict.fromkeys(warnings)),
@@ -195,7 +216,11 @@ class Phase3RebuildReadinessService:
                 "shadow_sample_count": shadow_count,
                 "trade_sample_count": trade_count,
                 "effective_weight_ratio": round(effective_weight_ratio, 4),
-                "distribution_requirement": "non_empty_train_holdout_and_authoritative_trade",
+                "distribution_requirement": (
+                    "non_empty_market_train_and_holdout"
+                    if paper_bootstrap
+                    else "non_empty_train_holdout_and_authoritative_trade"
+                ),
             },
             "source_status": {
                 "governance_status": governance_status or "unknown",
@@ -209,7 +234,11 @@ class Phase3RebuildReadinessService:
                 "run_preflight_until_blockers_clear"
                 if blockers
                 else (
-                    "run_confirmed_phase3_rebuild_when_operator_is_ready"
+                    "run_confirmed_paper_bootstrap_rebuild_when_operator_is_ready"
+                    if paper_bootstrap and not requested_persist_artifact
+                    else "confirmed_paper_bootstrap_rebuild_may_persist_gross_only_artifact"
+                    if paper_bootstrap
+                    else "run_confirmed_phase3_rebuild_when_operator_is_ready"
                     if not requested_persist_artifact
                     else "confirmed_rebuild_may_persist_shadow_artifacts"
                 )

@@ -80,14 +80,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--persist-artifact", action="store_true")
     parser.add_argument("--confirm-phase3-rebuild", action="store_true")
+    parser.add_argument(
+        "--training-mode",
+        choices=("shadow", "paper_bootstrap"),
+        default="shadow",
+    )
     parser.add_argument("--timeout", type=int, default=7200)
     args = parser.parse_args()
     if args.persist_artifact and not args.confirm_phase3_rebuild:
         parser.error("--persist-artifact requires --confirm-phase3-rebuild")
+    if args.training_mode == "paper_bootstrap" and args.target != "local_ai_tools":
+        parser.error("--training-mode paper_bootstrap requires --target local_ai_tools")
     return args
 
 
-def _target_argv(target: str, *, persist_artifact: bool) -> tuple[str, list[str]]:
+def _target_argv(
+    target: str,
+    *,
+    persist_artifact: bool,
+    training_mode: str = "shadow",
+) -> tuple[str, list[str]]:
+    if training_mode == "paper_bootstrap" and target != "local_ai_tools":
+        raise ValueError("paper_bootstrap training is only valid for local_ai_tools")
     if target == "ml_signal":
         script_path = (
             "scripts/run_local_ml_auto_train.py"
@@ -97,7 +111,7 @@ def _target_argv(target: str, *, persist_artifact: bool) -> tuple[str, list[str]
         argv = [script_path, "--force"] if persist_artifact else [script_path]
     else:
         script_path = "scripts/train_local_ai_tools_models.py"
-        argv = [script_path, "--training-mode", "shadow"]
+        argv = [script_path, "--training-mode", training_mode]
     if persist_artifact and target != "ml_signal":
         argv.extend(("--persist-artifact", "--confirm-phase3-rebuild"))
     return script_path, argv
@@ -198,6 +212,10 @@ compact_payload = {{
         "message",
         "shadow_sample_count",
         "authoritative_cost_sample_count",
+        "training_cost_policy",
+        "paper_bootstrap",
+        "paper_bootstrap_state",
+        "artifact_activation_stage",
     )
     if key in full_payload
 }}
@@ -294,6 +312,7 @@ def main() -> None:
             script_path, argv = _target_argv(
                 target,
                 persist_artifact=bool(args.persist_artifact),
+                training_mode=args.training_mode,
             )
             try:
                 output = run_remote_text(

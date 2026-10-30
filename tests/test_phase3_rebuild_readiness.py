@@ -74,6 +74,42 @@ def test_phase3_rebuild_readiness_allows_confirmed_shadow_artifact_write_only() 
     assert report["next_action"] == "confirmed_rebuild_may_persist_shadow_artifacts"
 
 
+def test_phase3_rebuild_readiness_allows_only_confirmed_paper_bootstrap_without_trade_history() -> None:
+    report = Phase3RebuildReadinessService().report(
+        local_ai_tools={
+            "training_shadow_sample_count": 500,
+            "training_trade_sample_count": 0,
+            "quality_report": {
+                "totals": {
+                    "total": 500,
+                    "excluded": 0,
+                    "effective_weight_ratio": 0.91,
+                }
+            },
+            "promotion_flow": "candidate_to_shadow_to_canary_to_active",
+        },
+        governance={"status": "clean", "contamination_risk": "low"},
+        historical_trade_fact_audit={
+            "status": "dirty",
+            "trainable_closed_positions": 0,
+            "training_policy": "current_training_epoch_only",
+        },
+        artifact_retirement_audit={"status": "ready", "retired_or_untrusted_count": 0},
+        runtime_probe={"status": "ok"},
+        requested_persist_artifact=True,
+        confirm_phase3_rebuild=True,
+        training_mode="paper_bootstrap",
+    )
+
+    assert report["can_persist_artifact"] is True
+    assert report["training_mode"] == "paper_bootstrap"
+    assert report["target_artifacts"]["local_ai_tools"]["target_stage"] == "bootstrap"
+    assert report["target_artifacts"]["local_ai_tools"]["can_persist_artifact"] is True
+    assert report["target_artifacts"]["ml_signal"]["can_persist_artifact"] is False
+    assert "no_clean_closed_trade_facts" not in report["blockers"]
+    assert "paper_bootstrap_waiting_for_clean_closed_trade_facts" in report["warnings"]
+
+
 def test_phase3_rebuild_readiness_requires_double_confirmation_for_write() -> None:
     report = Phase3RebuildReadinessService().report(
         local_ai_tools={

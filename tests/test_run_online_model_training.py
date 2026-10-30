@@ -28,6 +28,28 @@ def test_local_ai_tools_online_training_has_no_stage_authorization_input() -> No
     assert "--model-stage" not in argv
 
 
+def test_online_paper_bootstrap_is_explicit_and_local_ai_tools_only() -> None:
+    script_path, argv = _target_argv(
+        "local_ai_tools",
+        persist_artifact=True,
+        training_mode="paper_bootstrap",
+    )
+
+    assert argv == [
+        script_path,
+        "--training-mode",
+        "paper_bootstrap",
+        "--persist-artifact",
+        "--confirm-phase3-rebuild",
+    ]
+    with pytest.raises(ValueError, match="only valid for local_ai_tools"):
+        _target_argv(
+            "ml_signal",
+            persist_artifact=True,
+            training_mode="paper_bootstrap",
+        )
+
+
 def test_persisted_ml_training_uses_full_candidate_lifecycle() -> None:
     script_path, argv = _target_argv("ml_signal", persist_artifact=True)
 

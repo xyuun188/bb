@@ -68,6 +68,11 @@ PHASE3_DOWNLOAD_REPORT_PATH = (
 PHASE3_ARTIFACT_POLICY_ID = "phase3_clean_training_artifact_v1"
 CURRENT_TRAINING_EPOCH_POLICY = "current_epoch_plus_approved_historical_rebuild"
 PHASE3_REQUIRED_PROMOTION_FLOW = "candidate_to_shadow_to_canary_to_active"
+PAPER_BOOTSTRAP_TRAINING_MODE = "paper_bootstrap"
+PAPER_BOOTSTRAP_ARTIFACT_STAGE = "bootstrap"
+PAPER_BOOTSTRAP_COST_POLICY = (
+    "gross_market_opportunity_only_with_downstream_current_paper_cost_repricing"
+)
 # No frozen independent exam has passed for the active profitability plan.
 INDEPENDENT_EXAM_PROMOTION_ENABLED = False
 TRAIN_REQUEST_TIMEOUT_SECONDS = min(
@@ -267,6 +272,8 @@ _STATUS_METADATA_KEYS = (
     "training_policy",
     "trade_sample_cursor_policy",
     "training_mode",
+    "paper_bootstrap",
+    "paper_bootstrap_state",
     "model_stage",
     "artifact_persisted",
     "preflight_only",
@@ -1347,6 +1354,37 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(blockers))
 
 
+def _paper_bootstrap_contract_blockers(metadata: dict[str, Any]) -> list[str]:
+    """Validate the narrow paper-only artifact contract without cost labels."""
+
+    blockers: list[str] = []
+    if metadata.get("training_mode") != PAPER_BOOTSTRAP_TRAINING_MODE:
+        blockers.append("paper_bootstrap_training_mode_missing")
+    if metadata.get("paper_bootstrap") is not True:
+        blockers.append("paper_bootstrap_marker_missing")
+    if metadata.get("paper_bootstrap_state") != "waiting_for_authoritative_cost_holdout":
+        blockers.append("paper_bootstrap_cost_holdout_state_invalid")
+    if metadata.get("training_cost_policy") != PAPER_BOOTSTRAP_COST_POLICY:
+        blockers.append("paper_bootstrap_cost_policy_mismatch")
+    if metadata.get("live_ml_ready") is True:
+        blockers.append("paper_bootstrap_live_permission_forbidden")
+    cost_holdout = metadata.get("execution_cost_holdout_report")
+    cost_holdout = cost_holdout if isinstance(cost_holdout, dict) else {}
+    if (
+        cost_holdout.get("status") != "waiting_for_authoritative_cost_holdout"
+        or int(cost_holdout.get("sample_count") or 0) != 0
+        or cost_holdout.get("chronological") is not False
+        or cost_holdout.get("decision_group_disjoint") is not False
+        or not cost_holdout.get("blockers")
+    ):
+        blockers.append("paper_bootstrap_cost_holdout_report_invalid")
+    activation = metadata.get("artifact_activation_manifest")
+    activation = activation if isinstance(activation, dict) else {}
+    if activation.get("activation_stage") != PAPER_BOOTSTRAP_ARTIFACT_STAGE:
+        blockers.append("paper_bootstrap_activation_stage_invalid")
+    return list(dict.fromkeys(blockers))
+
+
 def feature_row(features: dict[str, Any], *, horizon_minutes: int | None = None) -> dict[str, float]:
     price = f(features, "current_price", f(features, "close", 0.0))
     atr = f(features, "atr_14")
@@ -1637,6 +1675,11 @@ def _resolve_artifact_pointer(
     if metadata_hash != manifest.get("metadata_sha256") or sha256_file(metadata_path) != metadata_hash:
         raise ValueError("Local AI artifact metadata hash verification failed.")
     metadata = read_json_object(metadata_path)
+    training_cost_policy = (
+        PAPER_BOOTSTRAP_COST_POLICY
+        if metadata.get("paper_bootstrap") is True
+        else "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
+    )
     contract_expectations = {
         "objective_name": RETURN_OBJECTIVE_NAME,
         "objective_version": RETURN_OBJECTIVE_VERSION,
@@ -1645,9 +1688,7 @@ def _resolve_artifact_pointer(
         "cost_model_version": COST_MODEL_VERSION,
         "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
         "time_split_policy": "independent_chronological_disjoint_decision_groups",
-        "training_cost_policy": (
-            "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
-        ),
+        "training_cost_policy": training_cost_policy,
     }
     for field, expected in contract_expectations.items():
         if metadata.get(field) != manifest.get(field):
@@ -1768,6 +1809,21 @@ def _resolve_artifact_pointer(
                 or recommendation.get("canary_ready") is not True
             ):
                 raise ValueError("Canary local AI activation contract is incomplete.")
+        if stage == PAPER_BOOTSTRAP_ARTIFACT_STAGE:
+            bootstrap_blockers = _paper_bootstrap_contract_blockers(metadata)
+            if bootstrap_blockers:
+                raise IncompatibleArtifactContractError(
+                    "Paper bootstrap activation contract is incomplete: "
+                    + ",".join(bootstrap_blockers)
+                )
+            if (
+                activation.get("execution_scope") != "paper_only"
+                or activation.get("paper_execution_permission") is not True
+                or activation.get("production_permission") is not False
+                or activation.get("live_ml_ready") is not False
+                or activation.get("bootstrap_authorized") is not True
+            ):
+                raise ValueError("Paper bootstrap activation permission is incomplete.")
         if stage == "active":
             recommendation = activation.get("promotion_recommendation") or {}
             if (
@@ -1790,7 +1846,7 @@ def _resolve_artifact_pointer(
                 or activation.get("production_permission") is not True
             ):
                 raise ValueError("Active local AI activation permission is incomplete.")
-        if stage not in {"shadow", "canary", "active"}:
+        if stage not in {"shadow", "bootstrap", "canary", "active"}:
             raise ValueError("Local AI activation stage is invalid.")
     elif role == "challenger":
         rejection_path = (
@@ -1885,7 +1941,13 @@ def persist_candidate_bundle(
         "artifact_registry_version": ARTIFACT_REGISTRY_VERSION,
         "artifact_model_id": ARTIFACT_MODEL_ID,
         "artifact_version": version,
-        "artifact_lifecycle": "candidate",
+        "artifact_lifecycle": (
+            PAPER_BOOTSTRAP_ARTIFACT_STAGE
+            if metadata.get("paper_bootstrap") is True
+            else "candidate"
+        ),
+        # The registry role remains candidate until activation; the runtime
+        # stage is derived from the activation manifest after promotion.
         "model_stage": "candidate",
         "live_ml_ready": False,
     }
@@ -1954,7 +2016,7 @@ def _governed_candidate_activation_stage(
 
 
 def _local_artifact_stage_rank(stage: str) -> int:
-    return {"shadow": 0, "canary": 1, "active": 2}.get(
+    return {"shadow": 0, "bootstrap": 0, "canary": 1, "active": 2}.get(
         str(stage or "").lower(),
         -1,
     )
@@ -2039,6 +2101,20 @@ def _compare_candidate_to_current(
     current_stage = str(
         (current.get("activation_manifest") or {}).get("activation_stage") or ""
     ).lower()
+    if current_stage == PAPER_BOOTSTRAP_ARTIFACT_STAGE and candidate_stage == "shadow":
+        return {
+            **report,
+            "reason": "paper_bootstrap_retained_until_governed_upgrade",
+            "blocking_reasons": ["candidate_lifecycle_regression"],
+            "champion_version": current.get("version"),
+        }
+    if current_stage == "shadow" and candidate_stage == PAPER_BOOTSTRAP_ARTIFACT_STAGE:
+        return {
+            **report,
+            "accepted": True,
+            "reason": "explicit_paper_bootstrap_initialization",
+            "champion_version": current.get("version"),
+        }
     candidate_rank = _local_artifact_stage_rank(candidate_stage)
     champion_rank = _local_artifact_stage_rank(current_stage)
     if candidate_rank < champion_rank:
@@ -2105,8 +2181,15 @@ def _local_activation_manifest(
     *,
     transition_from_stage: str | None = None,
 ) -> tuple[dict[str, Any], Path]:
-    if activation_stage not in {"shadow", "canary", "active"}:
+    if activation_stage not in {"shadow", "bootstrap", "canary", "active"}:
         raise ValueError("Local AI artifact activation stage is invalid.")
+    if activation_stage == PAPER_BOOTSTRAP_ARTIFACT_STAGE:
+        bootstrap_blockers = _paper_bootstrap_contract_blockers(artifact["metadata"])
+        if bootstrap_blockers:
+            raise ValueError(
+                "Paper bootstrap activation contract is incomplete: "
+                + ",".join(bootstrap_blockers)
+            )
     evidence_blockers = _production_return_evidence_blockers(artifact["metadata"])
     promotion_recommendation = return_evidence.get("promotion_recommendation") or {}
     production_authorized = activation_stage == "active"
@@ -2130,9 +2213,12 @@ def _local_activation_manifest(
             if activation_stage == "active"
             else "paper_only"
         ),
-        # Shadow is observation-only and must never advertise order capability.
+        # Shadow is observation-only. Bootstrap is paper-only, but its cost
+        # contract is explicitly runtime-derived until historical holdout data
+        # is available.
         "paper_execution_permission": activation_stage != "shadow",
         "observation_only": activation_stage == "shadow",
+        "bootstrap_authorized": activation_stage == "bootstrap",
         "production_permission": production_authorized,
         "canary_authorized": activation_stage == "canary",
         "promotion_recommendation": promotion_recommendation,
@@ -2156,12 +2242,12 @@ def activate_candidate_shadow(
     )
     if candidate is None:
         raise ValueError("Local AI candidate artifact is not registered.")
-    if activation_stage != "shadow":
-        raise ValueError("Local AI candidate must first activate as shadow.")
+    if activation_stage not in {"shadow", "bootstrap"}:
+        raise ValueError("Local AI candidate must first activate as shadow or bootstrap.")
     activation, activation_path = _local_activation_manifest(
         candidate,
         return_evidence,
-        "shadow",
+        activation_stage,
     )
     write_json_atomic(activation_path, activation)
     current, _incompatible_reason = _replaceable_current_artifact(
@@ -2214,6 +2300,7 @@ def transition_current_artifact(
     current_stage = str(current_activation.get("activation_stage") or "")
     allowed_targets = {
         "shadow": {"canary"},
+        "bootstrap": {"canary"},
         "canary": {"active"},
     }
     if activation_stage not in allowed_targets.get(current_stage, set()):
@@ -2422,12 +2509,15 @@ def _load_bundle_unlocked() -> dict[str, Any] | None:
                 for key in (
                     "long_return_model",
                     "short_return_model",
-                    "long_cost_model",
-                    "short_cost_model",
                 )
             )
         ):
             raise ValueError("local quant artifact separated supervision rejected")
+        bootstrap_blockers = _paper_bootstrap_contract_blockers(metadata)
+        if bootstrap_blockers and not all(
+            key in candidate for key in ("long_cost_model", "short_cost_model")
+        ):
+            raise ValueError("local quant artifact cost supervision is missing")
         activation = current.get("activation_manifest") or {}
         runtime_metadata = {
             **metadata,
@@ -2698,7 +2788,13 @@ def _model_artifact_status() -> dict[str, Any]:
     activation_status = activation_status if isinstance(activation_status, dict) else {}
     model_bundle_available = current is not None and bool(raw_metadata)
     activation_stage = str((activation or {}).get("activation_stage") or "unregistered")
-    paper_lifecycle_valid = activation_stage in {"candidate", "shadow", "canary", "active"}
+    paper_lifecycle_valid = activation_stage in {
+        "candidate",
+        "shadow",
+        "bootstrap",
+        "canary",
+        "active",
+    }
     def candidate_summary(resolved: dict[str, Any] | None) -> dict[str, Any]:
         metadata = resolved.get("metadata") if isinstance(resolved, dict) else {}
         metadata = metadata if isinstance(metadata, dict) else {}
@@ -2866,8 +2962,49 @@ def execution_cost_distribution_contract(
         "uncertainty_pct": distribution.get("std"),
         "distribution_member_count": distribution.get("sample_count"),
         "distribution_ready": distribution.get("distribution_ready") is True,
-        "source_authority": "okx_fills_fees_funding_model",
+        "source_authority": distribution.get(
+            "source_authority",
+            "okx_fills_fees_funding_model",
+        ),
+        "bootstrap_cost_policy": distribution.get("bootstrap_cost_policy"),
+        "reason": distribution.get("reason"),
     }
+
+
+def _unavailable_execution_cost_distribution(
+    *,
+    reason: str = "authoritative_cost_holdout_unavailable",
+) -> dict[str, Any]:
+    """Describe the absent historical cost model without inventing a value."""
+
+    return {
+        "expected": None,
+        "median": None,
+        "lower_bound": None,
+        "upper_bound": None,
+        "std": None,
+        "sample_count": 0,
+        "distribution_ready": False,
+        "source_authority": "historical_cost_model_unavailable",
+        "cost_model_version": COST_MODEL_VERSION,
+        "reason": str(reason),
+    }
+
+
+def _cost_distribution_for_inference(
+    bundle: dict[str, Any],
+    *,
+    side: str,
+    x: list[list[float]],
+) -> dict[str, Any]:
+    model_key = f"{side}_cost_model"
+    model = bundle.get(model_key)
+    if model is not None:
+        return regression_prediction_distribution(model, x)
+    metadata = bundle.get("metadata") or {}
+    if metadata.get("artifact_lifecycle") == PAPER_BOOTSTRAP_ARTIFACT_STAGE:
+        return _unavailable_execution_cost_distribution()
+    return _unavailable_execution_cost_distribution(reason="artifact_cost_model_unavailable")
 
 
 def model_return_distribution_input(
@@ -4287,6 +4424,8 @@ def with_model_metadata(
             "label_name",
             "label_version",
             "training_cost_policy",
+            "paper_bootstrap",
+            "paper_bootstrap_state",
             "artifact_persisted",
             "artifact_lifecycle",
             "model_stage",
@@ -4309,6 +4448,15 @@ def with_model_metadata(
             activation_stage == "active"
             and metadata.get("live_ml_ready") is True
             and not _production_return_evidence_blockers(metadata)
+        )
+        paper_bootstrap_contract = bool(
+            activation_stage == PAPER_BOOTSTRAP_ARTIFACT_STAGE
+            and metadata.get("training_mode") == PAPER_BOOTSTRAP_TRAINING_MODE
+            and metadata.get("paper_bootstrap") is True
+            and metadata.get("paper_bootstrap_state")
+            == "waiting_for_authoritative_cost_holdout"
+            and metadata.get("live_ml_ready") is not True
+            and metadata.get("training_cost_policy") == PAPER_BOOTSTRAP_COST_POLICY
         )
         distribution_inputs_ready = True
         for side in ("long", "short"):
@@ -4363,8 +4511,15 @@ def with_model_metadata(
             and payload.get("objective_version") == RETURN_OBJECTIVE_VERSION
             and payload.get("label_name") == RETURN_LABEL_NAME
             and payload.get("label_version") == RETURN_LABEL_VERSION
-            and payload.get("training_cost_policy")
-            == "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
+            and (
+                payload.get("training_cost_policy")
+                == "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
+                or (
+                    paper_bootstrap_contract
+                    and payload.get("training_cost_policy")
+                    == PAPER_BOOTSTRAP_COST_POLICY
+                )
+            )
             and payload.get("profit_supervision_version")
             == PROFIT_SUPERVISION_VERSION
             and payload.get("return_semantics")
@@ -5251,6 +5406,20 @@ def _with_post_training_inference_warmup(payload: dict[str, Any]) -> dict[str, A
 def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
     rows = _market_training_rows(req.shadow_samples or [])
     cost_rows = _authoritative_cost_training_rows(req.trade_samples or [])
+    bootstrap_mode = (
+        str(req.training_mode or "").strip().lower() == PAPER_BOOTSTRAP_TRAINING_MODE
+    )
+    if str(req.training_mode or "shadow").strip().lower() not in {
+        "shadow",
+        "formal",
+        "walk_forward",
+        PAPER_BOOTSTRAP_TRAINING_MODE,
+    }:
+        return {
+            "trained": False,
+            "reason": "training_mode_invalid",
+            "training_mode": str(req.training_mode or ""),
+        }
     if len(rows) <= 1:
         return {
             "trained": False,
@@ -5259,7 +5428,7 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
             "authoritative_cost_sample_count": len(cost_rows),
             "message": "Need fixed-horizon market labels from separate decision groups.",
         }
-    if len(cost_rows) <= 1:
+    if len(cost_rows) <= 1 and not bootstrap_mode:
         return {
             "trained": False,
             "reason": "authoritative_execution_cost_distribution_unavailable",
@@ -5281,20 +5450,38 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
             "shadow_sample_count": len(rows),
             "message": str(exc),
         }
+    cost_split_failure = ""
     try:
         cost_split = _purged_chronological_holdout(cost_rows)
     except ValueError as exc:
-        reason = (
-            "chronological_cost_training_holdout_unavailable"
-            if str(exc) == "decision_group_holdout_unavailable"
-            else "chronological_cost_training_identity_incomplete"
-        )
+        if not bootstrap_mode:
+            reason = (
+                "chronological_cost_training_holdout_unavailable"
+                if str(exc) == "decision_group_holdout_unavailable"
+                else "chronological_cost_training_identity_incomplete"
+            )
+            return {
+                "trained": False,
+                "reason": reason,
+                "shadow_sample_count": len(rows),
+                "authoritative_cost_sample_count": len(cost_rows),
+                "message": str(exc),
+            }
+        cost_split = None
+        cost_split_failure = str(exc)
+    if bootstrap_mode and cost_split is not None:
         return {
             "trained": False,
-            "reason": reason,
+            "reason": "paper_bootstrap_unnecessary",
+            "message": (
+                "An authoritative chronological cost holdout is available; "
+                "run standard training to fit and evaluate the cost model."
+            ),
             "shadow_sample_count": len(rows),
             "authoritative_cost_sample_count": len(cost_rows),
-            "message": str(exc),
+            "artifact_persisted": False,
+            "preflight_only": True,
+            "training_mode": PAPER_BOOTSTRAP_TRAINING_MODE,
         }
     rows = market_split["rows"]
     train_rows = market_split["train_rows"]
@@ -5302,12 +5489,20 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
     train_groups = market_split["train_groups"]
     holdout_groups = market_split["holdout_groups"]
     purged_holdout_group_count = market_split["purged_group_count"]
-    cost_rows = cost_split["rows"]
-    cost_train_rows = cost_split["train_rows"]
-    cost_holdout_rows = cost_split["holdout_rows"]
-    cost_train_groups = cost_split["train_groups"]
-    cost_holdout_groups = cost_split["holdout_groups"]
-    purged_cost_holdout_group_count = cost_split["purged_group_count"]
+    if cost_split is None:
+        cost_rows = list(cost_rows)
+        cost_train_rows = []
+        cost_holdout_rows = []
+        cost_train_groups = set()
+        cost_holdout_groups = set()
+        purged_cost_holdout_group_count = 0
+    else:
+        cost_rows = cost_split["rows"]
+        cost_train_rows = cost_split["train_rows"]
+        cost_holdout_rows = cost_split["holdout_rows"]
+        cost_train_groups = cost_split["train_groups"]
+        cost_holdout_groups = cost_split["holdout_groups"]
+        purged_cost_holdout_group_count = cost_split["purged_group_count"]
 
     long_tail_boundary = empirical_lower_hinge(
         [row["long_return"] for row in train_rows if row["long_return"] < 0]
@@ -5360,34 +5555,60 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
         )
         return model
 
-    long_cost_model = fit_cost_model("long")
-    short_cost_model = fit_cost_model("short")
-    _training_gc()
-    cost_models = {"long": long_cost_model, "short": short_cost_model}
-    cost_holdout_errors: dict[str, list[float]] = {"long": [], "short": []}
-    for row in cost_holdout_rows:
-        side = str(row["side"])
-        prediction = float(cost_models[side].predict([row["x"]])[0])
-        cost_holdout_errors[side].append(
-            abs(prediction - float(row["execution_cost"]))
-        )
-    execution_cost_holdout_report = {
-        "source_authority": "okx_fills_fees_funding",
-        "chronological": True,
-        "decision_group_disjoint": not bool(
-            cost_train_groups & cost_holdout_groups
-        ),
-        "sample_count": len(cost_holdout_rows),
-        "sides": {
-            side: {
-                "sample_count": len(errors),
-                "mae_pct": float(np.mean(errors)) if errors else None,
-                "training_sample_count": cost_side_training_counts[side],
-                "fallback": cost_side_fallbacks[side],
-            }
-            for side, errors in cost_holdout_errors.items()
-        },
-    }
+    if bootstrap_mode:
+        long_cost_model = None
+        short_cost_model = None
+        execution_cost_holdout_report = {
+            "source_authority": "okx_fills_fees_funding",
+            "chronological": False,
+            "decision_group_disjoint": False,
+            "sample_count": 0,
+            "authoritative_sample_count": len(cost_rows),
+            "status": "waiting_for_authoritative_cost_holdout",
+            "blockers": [
+                (
+                    "chronological_cost_training_identity_incomplete"
+                    if cost_split_failure
+                    and cost_split_failure
+                    != "decision_group_holdout_unavailable"
+                    else "chronological_cost_training_holdout_unavailable"
+                )
+            ],
+            "fallback_policy": PAPER_BOOTSTRAP_COST_POLICY,
+            "sides": {
+                "long": {"sample_count": 0},
+                "short": {"sample_count": 0},
+            },
+        }
+    else:
+        long_cost_model = fit_cost_model("long")
+        short_cost_model = fit_cost_model("short")
+        _training_gc()
+        cost_models = {"long": long_cost_model, "short": short_cost_model}
+        cost_holdout_errors: dict[str, list[float]] = {"long": [], "short": []}
+        for row in cost_holdout_rows:
+            side = str(row["side"])
+            prediction = float(cost_models[side].predict([row["x"]])[0])
+            cost_holdout_errors[side].append(
+                abs(prediction - float(row["execution_cost"]))
+            )
+        execution_cost_holdout_report = {
+            "source_authority": "okx_fills_fees_funding",
+            "chronological": True,
+            "decision_group_disjoint": not bool(
+                cost_train_groups & cost_holdout_groups
+            ),
+            "sample_count": len(cost_holdout_rows),
+            "sides": {
+                side: {
+                    "sample_count": len(errors),
+                    "mae_pct": float(np.mean(errors)) if errors else None,
+                    "training_sample_count": cost_side_training_counts[side],
+                    "fallback": cost_side_fallbacks[side],
+                }
+                for side, errors in cost_holdout_errors.items()
+            },
+        }
 
     horizon_models: dict[int, dict[str, Any]] = {}
     for horizon in sorted({int(r["horizon"]) for r in train_rows}):
@@ -5674,7 +5895,15 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
         "primary_prediction_horizon_runtime_policy": "runtime_primary_horizon_5m_when_available",
         "profile_count": len(profiles),
         "training_cost_policy": (
-            "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
+            PAPER_BOOTSTRAP_COST_POLICY
+            if bootstrap_mode
+            else "shadow_market_opportunity_plus_authoritative_okx_execution_cost"
+        ),
+        "paper_bootstrap": bool(bootstrap_mode),
+        "paper_bootstrap_state": (
+            "waiting_for_authoritative_cost_holdout"
+            if bootstrap_mode
+            else None
         ),
         "execution_cost_holdout_report": execution_cost_holdout_report,
         "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
@@ -5718,7 +5947,9 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
         "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "trade_sample_cursor_policy": CURRENT_TRAINING_EPOCH_POLICY,
         "training_mode": str(req.training_mode or "shadow"),
-        "model_stage": "candidate",
+        "model_stage": (
+            PAPER_BOOTSTRAP_ARTIFACT_STAGE if bootstrap_mode else "candidate"
+        ),
         "promotion_flow": PHASE3_REQUIRED_PROMOTION_FLOW,
         "artifact_persisted": bool(req.persist_artifact and req.confirm_phase3_rebuild),
         "preflight_only": not bool(req.persist_artifact and req.confirm_phase3_rebuild),
@@ -5726,8 +5957,16 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
         "confirm_phase3_rebuild": bool(req.confirm_phase3_rebuild),
         "promotion_recommendation": req.promotion_recommendation or {},
         "artifact_activation_manifest": {
-            "status": "not_activated",
-            "activation_stage": "candidate",
+            "status": (
+                "pending_paper_bootstrap_activation"
+                if bootstrap_mode
+                else "not_activated"
+            ),
+            "activation_stage": (
+                PAPER_BOOTSTRAP_ARTIFACT_STAGE
+                if bootstrap_mode
+                else "candidate"
+            ),
             "live_ml_ready": False,
         },
         "live_promotion_manifest": {
@@ -5736,13 +5975,24 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
             "live_ml_ready": False,
         },
         "training_objective": (
-            "Predict fixed-horizon market opportunity only from shadow market paths; "
-            "predict execution cost and calibrate realized net return only from "
-            "authoritative OKX lifecycles."
+            (
+                "Predict fixed-horizon gross market opportunity from clean shadow "
+                "market paths. Paper decisions reprice through the current account "
+                "execution-cost contract; no historical cost model is emitted."
+                if bootstrap_mode
+                else
+                "Predict fixed-horizon market opportunity from clean shadow market "
+                "paths; fit execution cost only from chronological authoritative "
+                "OKX lifecycles."
+            )
         ),
         "models": {
             "profit": "ExtraTreesRegressor long/short gross market opportunity",
-            "execution_cost": "ExtraTreesRegressor authoritative OKX long/short execution cost",
+            "execution_cost": (
+                "not fitted; waiting for chronological authoritative OKX cost holdout"
+                if bootstrap_mode
+                else "ExtraTreesRegressor authoritative OKX long/short execution cost"
+            ),
             "loss_filter": "ExtraTreesClassifier fixed-horizon market tail probability",
             "timeseries": "Per-horizon long/short ExtraTreesRegressor return distributions",
             "deep_timeseries": (
@@ -5815,9 +6065,13 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
         "promotion_recommendation": req.promotion_recommendation or {},
         "training_mode": str(req.training_mode or "shadow"),
     })
-    activation_stage = _governed_candidate_activation_stage(
-        req.promotion_recommendation or {},
-        return_evidence_blockers,
+    activation_stage = (
+        PAPER_BOOTSTRAP_ARTIFACT_STAGE
+        if bootstrap_mode and cost_split is None
+        else _governed_candidate_activation_stage(
+            req.promotion_recommendation or {},
+            return_evidence_blockers,
+        )
     )
     champion_comparison = _compare_candidate_to_current(
         metadata,
@@ -5862,7 +6116,10 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
             **metadata,
         })
     activation_evidence["champion_comparison"] = champion_comparison
-    current = activate_candidate_shadow(activation_evidence)
+    current = activate_candidate_shadow(
+        activation_evidence,
+        activation_stage=activation_stage,
+    )
     if activation_stage in {"canary", "active"}:
         current = transition_current_artifact(
             activation_evidence,
@@ -6259,11 +6516,11 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
             horizon_minutes = int(feature_row(features)["horizon_minutes"])
             long_distribution = regression_prediction_distribution(bundle["long_return_model"], x)
             short_distribution = regression_prediction_distribution(bundle["short_return_model"], x)
-            long_cost_distribution = regression_prediction_distribution(
-                bundle["long_cost_model"], x
+            long_cost_distribution = _cost_distribution_for_inference(
+                bundle, side="long", x=x
             )
-            short_cost_distribution = regression_prediction_distribution(
-                bundle["short_cost_model"], x
+            short_cost_distribution = _cost_distribution_for_inference(
+                bundle, side="short", x=x
             )
             long_expected = float(long_distribution["expected"])
             short_expected = float(short_distribution["expected"])
@@ -6372,7 +6629,12 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                     "short": execution_cost_distribution_contract(
                         short_cost_distribution
                     ),
-                    "source_authority": "okx_fills_fees_funding_model",
+                    "source_authority": (
+                        "okx_fills_fees_funding_model"
+                        if long_cost_distribution.get("distribution_ready") is True
+                        and short_cost_distribution.get("distribution_ready") is True
+                        else "historical_cost_model_unavailable"
+                    ),
                 },
                 "actual_trade_calibration": {
                     "long": long_profile,
@@ -6404,7 +6666,17 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                     "long": long_profile,
                     "short": short_profile,
                 },
-                "note": "Shadow models predict gross market opportunity and counterfactual cost separately; only OKX lifecycles calibrate realized return and slippage.",
+                "note": (
+                    "Paper bootstrap predicts gross market opportunity only; paper "
+                    "decisions use the current account execution-cost contract. "
+                    "Historical cost modeling and live promotion remain unavailable."
+                    if metadata.get("artifact_lifecycle")
+                    == PAPER_BOOTSTRAP_ARTIFACT_STAGE
+                    else
+                    "Shadow models predict gross market opportunity and counterfactual "
+                    "cost separately; only OKX lifecycles calibrate realized return "
+                    "and slippage."
+                ),
             }, kind="profit", features=features, fallback_reason="profit_specialist_pending_phase3_clean_rebuild")
         except Exception as exc:
             fallback_error = safe_error(exc)
@@ -6470,13 +6742,11 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 x = [model_x(features, horizon_minutes=int(horizon))]
                 long_distribution = regression_prediction_distribution(item["long_model"], x)
                 short_distribution = regression_prediction_distribution(item["short_model"], x)
-                long_cost_distribution = regression_prediction_distribution(
-                    bundle["long_cost_model"],
-                    x,
+                long_cost_distribution = _cost_distribution_for_inference(
+                    bundle, side="long", x=x
                 )
-                short_cost_distribution = regression_prediction_distribution(
-                    bundle["short_cost_model"],
-                    x,
+                short_cost_distribution = _cost_distribution_for_inference(
+                    bundle, side="short", x=x
                 )
                 long_return = float(long_distribution["expected"])
                 short_return = float(short_distribution["expected"])
@@ -6545,7 +6815,12 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                         "short": execution_cost_distribution_contract(
                             short_cost_distribution
                         ),
-                        "source_authority": "okx_fills_fees_funding_model",
+                        "source_authority": (
+                            "okx_fills_fees_funding_model"
+                            if long_cost_distribution.get("distribution_ready") is True
+                            and short_cost_distribution.get("distribution_ready") is True
+                            else "historical_cost_model_unavailable"
+                        ),
                     },
                     "actual_trade_calibration": actual_calibration,
                     "best_side": best_side,

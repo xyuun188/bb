@@ -3330,6 +3330,107 @@ def test_local_ai_training_reports_cost_holdout_failure_separately(
     assert result["authoritative_cost_sample_count"] == 3
 
 
+def test_local_ai_paper_bootstrap_persists_gross_only_paper_artifact(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    stored: dict[str, object] = {}
+
+    class DistributionTree:
+        def __init__(self, value: float) -> None:
+            self.value = value
+
+        def predict(self, rows: list[list[float]]) -> list[float]:
+            return [self.value] * len(rows)
+
+    class DistributionModel:
+        def __init__(self) -> None:
+            self.named_steps = {"model": self, "imputer": self}
+            self.estimators_ = [DistributionTree(0.01), DistributionTree(0.03)]
+
+        def fit(self, *_args: object, **_kwargs: object) -> DistributionModel:
+            return self
+
+        def predict(self, rows: list[list[float]]) -> list[float]:
+            return [0.02] * len(rows)
+
+        def transform(self, rows: list[list[float]]) -> list[list[float]]:
+            return rows
+
+    module._make_regressor = lambda _sample_count: DistributionModel()
+
+    def dump_bundle(bundle: dict[str, object], path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"bootstrap-bundle")
+        stored["bundle"] = bundle
+        return path
+
+    module.dump_trusted_joblib_bundle = dump_bundle
+    module.load_trusted_joblib_bundle = lambda _path: stored["bundle"]
+
+    result = module.train(
+        module.TrainRequest(
+            shadow_samples=_training_shadow_samples(count=20),
+            trade_samples=[],
+            training_mode="paper_bootstrap",
+            persist_artifact=True,
+            confirm_phase3_rebuild=True,
+        )
+    )
+
+    assert result["trained"] is True
+    assert result["artifact_persisted"] is True
+    assert result["training_mode"] == "paper_bootstrap"
+    assert result["paper_bootstrap"] is True
+    assert result["paper_bootstrap_state"] == "waiting_for_authoritative_cost_holdout"
+    assert result["training_cost_policy"] == (
+        "gross_market_opportunity_only_with_downstream_current_paper_cost_repricing"
+    )
+    assert result["execution_cost_holdout_report"]["sample_count"] == 0
+    assert result["execution_cost_holdout_report"]["chronological"] is False
+    assert result["models"]["execution_cost"].startswith("not fitted;")
+    assert result["artifact_activation_stage"] == "bootstrap"
+    assert result["live_ml_ready"] is False
+    current = module._resolve_artifact_pointer(
+        module.CURRENT_POINTER_PATH,
+        role="current",
+    )
+    assert current["activation_manifest"]["activation_stage"] == "bootstrap"
+    assert current["activation_manifest"]["paper_execution_permission"] is True
+    assert current["activation_manifest"]["production_permission"] is False
+    features = dict(_training_shadow_samples(count=1)[0]["features"])
+    prediction = module.profit_predict(
+        module.FeatureRequest.model_construct(
+            symbol="BTC/USDT",
+            features=features,
+        )
+    )
+    assert prediction["paper_trading_permission"] is True
+    assert prediction["live_ml_ready"] is False
+    assert prediction["prediction_quality"]["paper_eligible"] is True
+    cost_distribution = prediction["counterfactual_execution_cost_distribution"]
+    assert cost_distribution["source_authority"] == "historical_cost_model_unavailable"
+    assert cost_distribution["long"]["distribution_ready"] is False
+    assert cost_distribution["long"]["expected_pct"] is None
+
+
+def test_local_ai_paper_bootstrap_rejects_available_cost_holdout(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    result = module.train(
+        module.TrainRequest(
+            shadow_samples=_training_shadow_samples(count=20),
+            trade_samples=_training_trade_samples(count=20),
+            training_mode="paper_bootstrap",
+        )
+    )
+
+    assert result["trained"] is False
+    assert result["reason"] == "paper_bootstrap_unnecessary"
+    assert result["artifact_persisted"] is False
+
+
 def test_local_ai_tools_generated_service_uses_profit_target_distribution(
     tmp_path: Path,
 ) -> None:
@@ -3663,7 +3764,10 @@ def test_phase3_quant_api_remote_smoke_checks_governed_activation_contract() -> 
     assert "health.get('service') == 'phase3_quant_api'" in command
     assert "health.get('root') == '/data/BB'" in command
     assert "live_mutation" not in command
-    assert "lifecycle in {'unregistered', 'shadow', 'canary', 'active'}" in command
+    assert (
+        "lifecycle in {'unregistered', 'bootstrap', 'shadow', 'canary', 'active'}"
+        in command
+    )
     assert "health.get('live_ml_ready') is live" in command
     assert "profit.get('trained') is has_artifact" in command
     assert "profit.get('shadow_payload', {}).get('tool') == 'profit_prediction'" in command
