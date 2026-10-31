@@ -8155,6 +8155,47 @@ class TradingService(ModelTrainingCoordinatorMixin):
         )
         coverage_due_symbols = list(selection.get("coverage_due_symbols") or [])
         coverage_overdue_symbols = list(selection.get("coverage_overdue_symbols") or [])
+        coverage_due_never_analyzed_symbols = list(
+            selection.get("coverage_due_never_analyzed_symbols") or []
+        )
+        # Private execution capability is not a market-analysis requirement.
+        # A symbol can be intentionally excluded from the observation queue
+        # after OKX marks its paper/live instrument unavailable.  Do not leave
+        # that stale selection snapshot as an overdue coverage blocker.
+        try:
+            model_mode = self._get_model_execution_mode(ENSEMBLE_TRADER_NAME)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            model_mode = "paper"
+        execution_unavailable_keys = {
+            self._normalize_position_symbol(symbol)
+            for symbol in self._entry_unavailable_cache_for_mode(model_mode)
+            if self._normalize_position_symbol(symbol)
+        }
+
+        def coverage_symbols_excluding_execution_unavailable(values: Any) -> list[str]:
+            return [
+                str(symbol)
+                for symbol in values or []
+                if self._normalize_position_symbol(symbol)
+                not in execution_unavailable_keys
+            ]
+
+        execution_unavailable_due_symbols = [
+            str(symbol)
+            for symbol in coverage_due_symbols
+            if self._normalize_position_symbol(symbol) in execution_unavailable_keys
+        ]
+        coverage_due_symbols = coverage_symbols_excluding_execution_unavailable(
+            coverage_due_symbols
+        )
+        coverage_overdue_symbols = coverage_symbols_excluding_execution_unavailable(
+            coverage_overdue_symbols
+        )
+        coverage_due_never_analyzed_symbols = (
+            coverage_symbols_excluding_execution_unavailable(
+                coverage_due_never_analyzed_symbols
+            )
+        )
         selection_evidence_available = bool(selection.get("generated_at"))
         snapshot["monitoring_active"] = bool(monitoring_active)
         snapshot["candidate_coverage_evidence_available"] = selection_evidence_available
@@ -8165,12 +8206,18 @@ class TradingService(ModelTrainingCoordinatorMixin):
         snapshot["coverage_due_symbols"] = coverage_due_symbols[:50]
         snapshot["coverage_overdue_count"] = len(coverage_overdue_symbols)
         snapshot["coverage_overdue_symbols"] = coverage_overdue_symbols[:50]
-        snapshot["coverage_due_never_analyzed_count"] = int(
-            selection.get("coverage_due_never_analyzed_count") or 0
+        snapshot["coverage_due_never_analyzed_count"] = len(
+            coverage_due_never_analyzed_symbols
         )
-        snapshot["coverage_due_never_analyzed_symbols"] = list(
-            selection.get("coverage_due_never_analyzed_symbols") or []
-        )[:50]
+        snapshot["coverage_due_never_analyzed_symbols"] = (
+            coverage_due_never_analyzed_symbols[:50]
+        )
+        snapshot["coverage_due_execution_unavailable_count"] = len(
+            execution_unavailable_due_symbols
+        )
+        snapshot["coverage_due_execution_unavailable_symbols"] = (
+            execution_unavailable_due_symbols[:50]
+        )
         snapshot["coverage_due_resolved_count"] = int(
             selection.get("coverage_due_resolved_count") or 0
         )

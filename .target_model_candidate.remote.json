@@ -16,7 +16,7 @@
     "engine": "transformers",
     "engine_version": "5.8.1",
     "transformers_version": "5.8.1",
-    "probe_sha256": "84fe28c87d07fc1bdb149bfc064a6ce7884b06392b8bd0b70d7cfa5a01102a19"
+    "probe_sha256": "068f245fa3878a29d4e4aa2dab4ea3a38c284e9f91622fb02c4d2a609e506808"
   },
   "context_length": 4096,
   "config_sha256": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
@@ -114,10 +114,10 @@
     }
   ],
   "gpu_memory_peak_gib": 23.74707,
-  "inference_p95_ms": 1263.834,
+  "inference_p95_ms": 1193.236,
   "max_concurrency": 1,
-  "storage_available_gib": 35.37456512451172,
+  "storage_available_gib": 35.55484390258789,
   "storage_required_free_gib": 20.0,
-  "validated_at": "2026-10-19T04:12:45.001486+00:00",
+  "validated_at": "2026-10-30T19:52:50.901856+00:00",
   "validator_version": "bb-model-validator.v1"
 }

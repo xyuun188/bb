@@ -7796,6 +7796,51 @@ def test_successful_market_analysis_resolves_due_candidate_before_coverage_snaps
     assert snapshot["coverage_window_met"] is False
 
 
+def test_execution_unavailable_due_symbols_do_not_block_market_coverage() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service._get_model_execution_mode = lambda _name: "paper"
+    service._unavailable_entry_symbols_by_mode = {
+        "paper": {
+            "PONS/USDT": {
+                "available": False,
+                "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            },
+            "BAT/USDT": {
+                "available": False,
+                "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            },
+        },
+        "live": {},
+    }
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+    service._last_market_analysis_selection_diagnostics = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "candidate_count": 3,
+        "coverage_target_seconds": 30 * 60,
+        "coverage_due_symbols": ["PONS/USDT", "BAT/USDT"],
+        "coverage_overdue_symbols": ["PONS/USDT", "BAT/USDT"],
+        "coverage_due_never_analyzed_symbols": [],
+    }
+
+    snapshot = service._market_defer_snapshot(monitoring_active=True)
+
+    assert snapshot["coverage_overdue_count"] == 0
+    assert snapshot["coverage_overdue_symbols"] == []
+    assert snapshot["coverage_due_count"] == 0
+    assert snapshot["coverage_due_execution_unavailable_count"] == 2
+    assert snapshot["coverage_due_execution_unavailable_symbols"] == [
+        "PONS/USDT",
+        "BAT/USDT",
+    ]
+    assert snapshot["coverage_window_met"] is True
+
+
 @pytest.mark.asyncio
 async def test_market_entry_pipeline_handoff_keeps_symbol_claim_without_blocking_round() -> None:
     service = TradingService.__new__(TradingService)
