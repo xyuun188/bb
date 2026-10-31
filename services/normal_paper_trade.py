@@ -928,6 +928,12 @@ def ensure_normal_paper_trade_contract(
     if not normal_paper_trade_contract_reasons(existing):
         return existing
 
+    # A current contract may have failed after current execution-cost
+    # reconciliation. Preserve that exact evidence and its denial; rebuilding
+    # it from pre-reconciliation support could silently restore authorization.
+    if existing.get("version") == NORMAL_PAPER_TRADE_VERSION:
+        return existing
+
     # A recognized historical envelope may settle an old fill, but it must not
     # survive into the authorization path for a new submission.
     raw.pop("normal_paper_trade", None)
@@ -942,7 +948,6 @@ def ensure_normal_paper_trade_contract(
         str(selection.get("selection_reason") or "").strip()
         not in NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS
     ):
-        raw.pop("normal_paper_trade", None)
         decision.raw_response = raw
         return {}
     support = _dict(raw.get("independent_direction_support"))

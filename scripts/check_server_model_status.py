@@ -1,8 +1,8 @@
 """Read-only status check for the single Qwen3.8-27B model host.
 
-Retired 14B entries below are reported as deprecated service names and must
-remain inactive; they are never started or used as routing fallbacks.
-The optional legacy audit profile is intentionally removed from the CLI.
+The legacy service names below are an absence check only. They must be missing
+or inactive and are never started or used as routing fallbacks.
+The legacy audit profile is intentionally removed from the CLI.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def _target_status_command() -> str:
             f"curl -fsS --max-time 8 http://127.0.0.1:{port}/v1/models || true",
             f"echo '--- phase3 quant API port {PHASE3_QUANT_API_PORT} ---'",
             f"curl -fsS --max-time 8 http://127.0.0.1:{PHASE3_QUANT_API_PORT}/health || true",
-            "echo '--- retired 14B services must be inactive or missing ---'",
+            "echo '--- legacy service absence check (must be inactive or missing) ---'",
             *[f"printf '{name} '; systemctl is-active {name} || true" for name in RETIRED_MODEL_SERVICES],
             "echo '--- disk/gpu ---'",
             "df -h /data || true",

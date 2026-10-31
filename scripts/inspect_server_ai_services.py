@@ -36,7 +36,7 @@ def _target_command() -> str:
         [
             "echo '--- target_single_model service ---'",
             f"systemctl cat {TARGET_SERVICE} --no-pager || true",
-            "echo '--- retired services ---'",
+            "echo '--- legacy service absence check ---'",
             *[f"echo '### {service}'; systemctl cat {service} --no-pager || true" for service in RETIRED_MODEL_SERVICES],
             "echo '--- phase3 scripts/manifests ---'",
             "ls -lah /data/BB/scripts /data/BB/manifests 2>/dev/null || true",

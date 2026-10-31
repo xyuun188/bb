@@ -575,7 +575,9 @@ def test_unauthorized_shadow_observation_cannot_be_reused_as_entry_permission() 
         direction_support=_quality_observation_support("long", objective_net=-0.3),
     )
     contract["authorized"] = False
-    contract["contract_fingerprint"] = _fingerprint(_contract_fingerprint_payload(contract))
+    contract["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(contract)
+    )
 
     assert normal_paper_trade_observation_contract_reasons(contract) == []
     assert "normal_paper_trade_not_authorized" in normal_paper_trade_contract_reasons(contract)
@@ -748,6 +750,34 @@ def test_existing_signed_contract_can_be_attached_to_paper_decision() -> None:
     )
 
     assert ensure_normal_paper_trade_contract(decision, "paper") == contract
+
+
+def test_invalid_current_contract_is_retained_as_auditable_evidence() -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="short",
+        selection_reason="strategy_edge_selected",
+        direction_support=_support("short", expected_net=0.2),
+    )
+    contract["authorized"] = False
+    contract["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(contract)
+    )
+    decision = _decision(
+        {
+            "normal_paper_trade": contract,
+            "paper_trade_selection": {},
+        },
+        action=Action.SHORT,
+    )
+
+    retained = ensure_normal_paper_trade_contract(decision, "paper")
+
+    assert retained == contract
+    assert decision.raw_response["normal_paper_trade"] == contract
+    assert "normal_paper_trade_not_authorized" in (
+        normal_paper_trade_contract_reasons(retained)
+    )
 
 
 def test_legacy_v4_contract_is_removed_before_new_entry_authorization() -> None:
