@@ -20,7 +20,7 @@ from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
     normal_paper_current_return_ready,
-    normal_paper_trade_contract_reasons,
+    normal_paper_entry_contract_reasons,
 )
 from services.trading_policies import PolicyGateResult
 
@@ -170,7 +170,7 @@ class EntryHighRiskReviewGatePolicy:
         training_mode = (
             normal_trade.get("selection_reason") == "paper_training_entry"
         )
-        violations: list[str] = normal_paper_trade_contract_reasons(normal_trade)
+        violations: list[str] = normal_paper_entry_contract_reasons(normal_trade)
         if str(model_mode or "").lower() != "paper":
             violations.append("execution_mode_not_paper")
         if not (

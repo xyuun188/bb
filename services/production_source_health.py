@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
-from services.normal_paper_trade import normal_paper_trade_contract_reasons
+from services.normal_paper_trade import normal_paper_entry_contract_reasons
 
 _NORMAL_PAPER_PRIMARY_QUALITY_GATE_REASONS = {
     "direction_support_expected_net_not_positive",
@@ -71,7 +71,7 @@ def _source_count(raw: dict[str, Any]) -> int:
 
 def _is_normal_paper_candidate(raw: dict[str, Any]) -> bool:
     contract = _safe_dict(raw.get("normal_paper_trade"))
-    return bool(contract) and not normal_paper_trade_contract_reasons(contract)
+    return bool(contract) and not normal_paper_entry_contract_reasons(contract)
 
 
 def _paper_trade_gate_reasons(raw: dict[str, Any]) -> list[str]:

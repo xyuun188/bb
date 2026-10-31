@@ -24,6 +24,7 @@ from services.entry_profit_risk_sizing import (
 from services.live_ml_profit_contract import apply_live_ml_profit_contract
 from services.normal_paper_trade import (
     ensure_normal_paper_trade_contract,
+    normal_paper_entry_contract_reasons,
     normal_paper_trade_contract_reasons,
 )
 from services.pipeline_context import EntryPipelineContext, ExitPipelineContext
@@ -530,7 +531,7 @@ class EntryPolicy:
         if str(model_mode or "").lower() == "paper":
             raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
             contract = raw.get("normal_paper_trade")
-            contract_reasons = normal_paper_trade_contract_reasons(contract)
+            contract_reasons = normal_paper_entry_contract_reasons(contract)
             sizing = raw.get("profit_risk_sizing")
             sizing = sizing if isinstance(sizing, dict) else {}
             if sizing.get("contract_lifecycle") != "normal_paper_trade":

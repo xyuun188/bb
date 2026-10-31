@@ -21,7 +21,7 @@ from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
     NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
     historical_normalized_contract_reasons,
-    normal_paper_trade_contract_reasons,
+    normal_paper_entry_contract_reasons,
     normal_paper_trade_observation_contract_reasons,
     normalize_normal_paper_contract,
 )
@@ -518,8 +518,8 @@ def trade_execution_policy() -> dict[str, Any]:
         "optimization_target": PROFIT_TRAINING_TARGET,
         "paper_entry_requires_model_promotion": False,
         "paper_entry_requires_historical_fee_after_quality_permission": True,
-        "paper_normal_entry_requires_positive_return_lcb": False,
-        "paper_validated_entry_requires_positive_return_lcb": False,
+        "paper_normal_entry_requires_positive_return_lcb": True,
+        "paper_validated_entry_requires_positive_return_lcb": True,
         "paper_downside_return_is_sizing_stress": True,
         "paper_quality_observation_requires_positive_expected_net_return": True,
         "paper_quality_observation_requires_positive_return_lcb": False,
@@ -529,10 +529,11 @@ def trade_execution_policy() -> dict[str, Any]:
         "paper_quality_observation_max_loss_probability": 0.60,
         "paper_training_entry_requires_current_raw_return": True,
         "paper_training_entry_requires_positive_size_aware_net_return": True,
+        "paper_training_entry_requires_positive_return_lcb": True,
         "paper_validated_entry_requires_positive_fee_after_return": True,
         "paper_training_entry_allows_non_positive_fee_after_return": False,
-        # Training entries are bounded paper orders. They can collect a
-        # trusted settlement label but never grant production/live permission.
+        # Training entries remain bounded paper-only orders, but a non-positive
+        # return lower bound is now observation-only and cannot open a position.
         "paper_training_entry_is_shadow_only": False,
         "paper_training_entry_authorizes_normal_entry": True,
         "paper_training_entry_is_bounded_paper_only": True,
@@ -1552,7 +1553,7 @@ def validate_normal_paper_entry_contract(
         if historical_normal_trade
         else normal_paper_trade_observation_contract_reasons(normal_trade)
         if confirmed_observation_settlement
-        else normal_paper_trade_contract_reasons(normal_trade)
+        else normal_paper_entry_contract_reasons(normal_trade)
     )
     if historical_normal_trade and not allow_historical_settlement:
         reasons.append("normal_paper_historical_contract_not_authorized_for_new_entry")

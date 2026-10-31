@@ -11,7 +11,7 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-10-30.normal-paper-strategy-trade.v21"
+NORMAL_PAPER_TRADE_VERSION = "2026-10-31.normal-paper-strategy-trade.v22"
 NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-10-30.normal-paper-dynamic-risk.v11"
 HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS = frozenset(
     {
@@ -27,6 +27,7 @@ NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
 HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS = frozenset(
     {
+        "2026-10-30.normal-paper-strategy-trade.v21",
         "2026-10-21.normal-paper-strategy-trade.v20",
         "2026-10-21.normal-paper-strategy-trade.v19",
         "2026-10-20.normal-paper-strategy-trade.v18",
@@ -84,6 +85,25 @@ def normal_paper_current_return_ready(expected_net: Any, downside_return: Any) -
     expected = _float(expected_net, None)
     downside = _float(downside_return, None)
     return expected is not None and expected > 0.0 and downside is not None
+
+
+def normal_paper_entry_return_ready(expected_net: Any, downside_return: Any) -> bool:
+    """Require positive mean and positive downside bound before a new order.
+
+    ``normal_paper_current_return_ready`` remains intentionally permissive for
+    sizing and observation records.  New order authorization is stricter:
+    a positive mean with a non-positive lower bound is retained as evidence,
+    but cannot create another position.
+    """
+
+    expected = _float(expected_net, None)
+    downside = _float(downside_return, None)
+    return (
+        expected is not None
+        and expected > 0.0
+        and downside is not None
+        and downside > 0.0
+    )
 
 
 def _quality_permissions_ready(value: Any) -> bool:
@@ -321,7 +341,7 @@ def attach_normal_paper_order_identity(
         return {}
     raw = dict(_dict(decision.raw_response))
     contract = _dict(raw.get("normal_paper_trade"))
-    if normal_paper_trade_contract_reasons(contract):
+    if normal_paper_entry_contract_reasons(contract):
         return {}
     client_order_id = normal_paper_client_order_id(decision_id)
     if not client_order_id:
@@ -370,7 +390,12 @@ def normal_paper_order_identity_reasons(
         reasons.append("normal_paper_order_identity_entry_type_invalid")
     if identity.get("production_permission") is not False:
         reasons.append("normal_paper_order_identity_production_permission_invalid")
-    if normal_paper_settlement_contract_reasons(normal_contract):
+    identity_contract_reasons = (
+        normal_paper_entry_contract_reasons(normal_contract)
+        if normal_contract.get("version") == NORMAL_PAPER_TRADE_VERSION
+        else normal_paper_settlement_contract_reasons(normal_contract)
+    )
+    if identity_contract_reasons:
         reasons.append("normal_paper_order_identity_trade_contract_invalid")
     if identity.get("normal_trade_contract_fingerprint") != normal_contract.get(
         "contract_fingerprint"
@@ -897,6 +922,9 @@ def reconcile_normal_paper_trade_contract(
         "current": {
             "expected_net_return_pct": round(expected_net, 8),
             "return_lcb_pct": round(return_lcb, 8),
+            "new_entry_return_ready": normal_paper_entry_return_ready(
+                expected_net, return_lcb
+            ),
             "gross_expected_return_pct": (
                 round(gross_expected, 8) if gross_expected is not None else None
             ),
@@ -976,7 +1004,7 @@ def build_normal_paper_position_lifecycle(decision: Any) -> dict[str, Any]:
 
     raw = _dict(getattr(decision, "raw_response", None))
     contract = _dict(raw.get("normal_paper_trade"))
-    if normal_paper_trade_contract_reasons(contract):
+    if normal_paper_entry_contract_reasons(contract):
         return {}
     return {
         "version": NORMAL_PAPER_TRADE_VERSION,
@@ -1135,13 +1163,26 @@ def _normal_strategy_trade_contract_reasons(
 
 
 def normal_paper_trade_contract_reasons(value: Any) -> list[str]:
-    """Validate the only contract allowed to authorize a new paper entry."""
+    """Validate the current paper contract and its sizing invariants."""
 
     return _normal_strategy_trade_contract_reasons(
         value,
         require_new_entry_permission=True,
         require_quality_permission=True,
     )
+
+
+def normal_paper_entry_contract_reasons(value: Any) -> list[str]:
+    """Validate the stricter contract required immediately before submission."""
+
+    contract = _dict(value)
+    reasons = normal_paper_trade_contract_reasons(contract)
+    if not normal_paper_entry_return_ready(
+        contract.get("expected_net_return_pct"),
+        contract.get("objective_net_return_pct"),
+    ):
+        reasons.append("normal_paper_trade_return_lcb_not_positive")
+    return list(dict.fromkeys(reasons))
 
 
 def normal_paper_trade_observation_contract_reasons(value: Any) -> list[str]:

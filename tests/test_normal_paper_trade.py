@@ -17,6 +17,7 @@ from services.normal_paper_trade import (
     build_normal_paper_trade_contract,
     ensure_normal_paper_trade_contract,
     normal_paper_decision_id_from_client_order_id,
+    normal_paper_entry_contract_reasons,
     normal_paper_order_identity_reasons,
     normal_paper_settlement_contract_reasons,
     normal_paper_trade_contract_reasons,
@@ -160,7 +161,7 @@ def test_reconcile_normal_trade_keeps_positive_current_execution_edge_authorized
         contract,
         {
             "expected_net_return_pct": 0.08,
-            "return_lcb_pct": -0.22,
+            "return_lcb_pct": 0.02,
             "execution_cost": {"total_pct": 0.19},
             "return_distribution_contract": {
                 "gross_market_distribution": {"raw_expected_return_pct": 0.27}
@@ -173,6 +174,21 @@ def test_reconcile_normal_trade_keeps_positive_current_execution_edge_authorized
     assert reconciled["expected_net_return_pct"] == pytest.approx(0.08)
     assert reconciled["current_raw_expected_return_pct"] == pytest.approx(0.27)
     assert normal_paper_trade_contract_reasons(reconciled) == []
+    assert normal_paper_entry_contract_reasons(reconciled) == []
+
+
+def test_negative_return_lcb_remains_sizing_evidence_but_cannot_submit_entry() -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="short",
+        selection_reason="strategy_edge_selected",
+        direction_support=_support("short", expected_net=0.2, objective_net=-0.22),
+    )
+
+    assert normal_paper_trade_contract_reasons(contract) == []
+    assert "normal_paper_trade_return_lcb_not_positive" in (
+        normal_paper_entry_contract_reasons(contract)
+    )
 
 
 def test_reconcile_cannot_restore_entry_after_historical_quality_permission_is_denied() -> None:

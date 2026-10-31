@@ -165,7 +165,7 @@ from services.model_training_coordinator import (
 from services.model_training_state import (
     ModelTrainingStateStore,
 )
-from services.normal_paper_trade import normal_paper_trade_contract_reasons
+from services.normal_paper_trade import normal_paper_entry_contract_reasons
 from services.okx_balance_snapshot import (
     balance_snapshot_recovery_reason,
     balance_snapshot_verified,
@@ -7966,7 +7966,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         contract_authorized = bool(
             contract.get("authorized") is True
             and permission.get("granted") is True
-            and not normal_paper_trade_contract_reasons(contract)
+            and not normal_paper_entry_contract_reasons(contract)
         )
         if contract_authorized:
             # The ranker's analysis-only label is a coverage/provenance marker.
@@ -7978,7 +7978,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             symbol not in unavailable_by_mode
             and selection.get("selected") is True
             and permission.get("granted") is True
-            and not normal_paper_trade_contract_reasons(contract)
+            and not normal_paper_entry_contract_reasons(contract)
         )
 
     def _entry_gate_reason_with_market_boundary(
