@@ -837,6 +837,62 @@ def test_missing_cost_or_provenance_fails_closed() -> None:
     assert reasons["dynamic_risk_budget_provenance_incomplete"] == 1
 
 
+def test_historical_training_settlement_uses_persisted_budget_caps() -> None:
+    raw = _entry_raw()
+    raw["normal_paper_trade"] = {
+        "version": "2026-10-30.normal-paper-strategy-trade.v21",
+        "authorized": True,
+        "trade_mode": "paper",
+        "execution_scope": "paper_only",
+        "entry_type": "normal_strategy_trade",
+        "trade_kind": "normal_strategy_trade",
+        "production_permission": False,
+        "selection_reason": "paper_training_entry",
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "single_trade_risk_fraction_cap": 0.0001,
+        "portfolio_risk_fraction_cap": 0.0003,
+    }
+    raw["profit_risk_sizing"].update(
+        {
+            "contract_version": NORMAL_PAPER_TRADE_SIZING_VERSION,
+            "contract_lifecycle": "normal_paper_trade",
+            "execution_scope": "paper_only",
+            "production_permission": False,
+            "production_eligible": True,
+            "account_equity_usdt": 1000.0,
+            "risk_budget_usdt": 0.1,
+            "planned_stressed_loss_usdt": 0.1,
+            "stressed_loss_fraction": 0.01,
+            "target_notional_usdt": 10.0,
+            "final_notional_usdt": 10.0,
+            "fill_notional_ceiling_usdt": 10.0,
+            "minimum_order_notional_usdt": 1.0,
+            "portfolio_risk_limit_applied": True,
+            "portfolio_risk_budget_usdt": 0.3,
+            "current_training_portfolio_stressed_loss_usdt": 0.0,
+        }
+    )
+
+    report = summarize_trade_execution_contract(
+        [_decision(401, "long", raw)],
+        orders=[_filled_order(401, quantity=0.1)],
+    )
+
+    assert (
+        report["violation_reason_counts"].get(
+            "normal_paper_training_portfolio_budget_invalid"
+        )
+        is None
+    )
+    assert (
+        report["violation_reason_counts"].get(
+            "normal_paper_training_portfolio_risk_cap_exceeded"
+        )
+        is None
+    )
+
+
 def test_obsolete_policy_payload_is_rejected_even_when_nested() -> None:
     raw = _entry_raw()
     raw["diagnostics"] = {"profit_first_trade_plan": {"decision_lane": "old"}}

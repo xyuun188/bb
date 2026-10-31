@@ -1579,6 +1579,15 @@ def validate_normal_paper_entry_contract(
         if historical_normal_trade
         else single_cap
     )
+    # Historical normalization intentionally projects current semantics for
+    # analysis/training. Execution settlement must instead use the immutable
+    # caps persisted in the source envelope, including the training portfolio
+    # cap and the training single-trade cap.
+    settlement_portfolio_cap = (
+        _safe_float(source_normal_trade.get("portfolio_risk_fraction_cap"), float("nan"))
+        if historical_normal_trade
+        else _safe_float(normal_trade.get("portfolio_risk_fraction_cap"), float("nan"))
+    )
     bounded_fill_drift = _bounded_confirmed_fill_drift(
         observation={
             "current_execution_cost_pct": execution_cost.get("total_pct"),
@@ -1677,9 +1686,9 @@ def validate_normal_paper_entry_contract(
     ):
         reasons.append("normal_paper_single_trade_risk_cap_exceeded")
     if normal_trade.get("selection_reason") == "paper_training_entry":
-        portfolio_cap = _safe_float(
-            normal_trade.get("portfolio_risk_fraction_cap"),
-            float("nan"),
+        portfolio_cap = settlement_portfolio_cap
+        training_single_cap = (
+            settlement_single_cap if historical_normal_trade else single_cap
         )
         portfolio_budget = _safe_float(
             sizing.get("portfolio_risk_budget_usdt"),
@@ -1709,7 +1718,7 @@ def validate_normal_paper_entry_contract(
             or not isfinite(current_portfolio_risk)
             or current_portfolio_risk < 0.0
             or not isclose(
-                single_cap,
+                training_single_cap,
                 NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
                 rel_tol=1e-12,
                 abs_tol=1e-12,
