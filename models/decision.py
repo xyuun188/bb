@@ -80,6 +80,7 @@ _PROFIT_RISK_SIZING_SNAPSHOT_KEYS = {
     "contract_lifecycle",
     "contract_version",
     "current_portfolio_stressed_loss_usdt",
+    "current_training_portfolio_stressed_loss_usdt",
     "decision_authority",
     "dynamic_leverage_decision",
     "entry_instrument_availability",
@@ -102,12 +103,14 @@ _PROFIT_RISK_SIZING_SNAPSHOT_KEYS = {
     "planned_stressed_loss_usdt",
     "policy_provenance",
     "portfolio_risk_budget_usdt",
+    "portfolio_risk_limit_applied",
     "portfolio_risk_snapshot",
     "position_size_pct",
     "production_eligible",
     "production_permission",
     "reason",
     "remaining_portfolio_risk_budget_usdt",
+    "remaining_training_portfolio_risk_budget_usdt",
     "return_lcb_pct",
     "risk_budget_usdt",
     "selected_contract_spec",
@@ -240,4 +243,4 @@ def _sync_model_health_snapshot(_mapper, _connection, target: AIDecision) -> Non
     target.model_health_has_local_ai_tools = _model_health_snapshot_present(raw, "local_ai_tools")
     target.model_health_snapshot_version = 1
     target.decision_learning_snapshot = _compact_decision_learning_snapshot(raw)
-    target.decision_learning_snapshot_version = 6
+    target.decision_learning_snapshot_version = 7

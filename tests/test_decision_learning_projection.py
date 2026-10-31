@@ -7,7 +7,9 @@ from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from services.decision_learning_projection import (
     backfill_downside_return_projection,
+    backfill_execution_risk_projection,
     restore_downside_return,
+    restore_execution_risk_projection,
 )
 
 
@@ -26,6 +28,46 @@ def test_restore_downside_preserves_original_contract_and_zero() -> None:
 @pytest.mark.parametrize("value", [None, True, "missing", float("nan"), float("inf")])
 def test_restore_downside_never_fabricates_missing_evidence(value) -> None:
     assert restore_downside_return({"profit_risk_sizing": {}}, value) is None
+
+
+def test_restore_execution_risk_projection_copies_only_missing_fields() -> None:
+    snapshot = {
+        "normal_paper_trade": {"selection_reason": "paper_training_entry"},
+        "profit_risk_sizing": {
+            "portfolio_risk_limit_applied": True,
+        },
+    }
+    raw_sizing = {
+        "portfolio_risk_limit_applied": False,
+        "current_training_portfolio_stressed_loss_usdt": 0.8,
+        "remaining_training_portfolio_risk_budget_usdt": 0.4,
+    }
+
+    repaired = restore_execution_risk_projection(snapshot, raw_sizing)
+
+    assert repaired["profit_risk_sizing"] == {
+        "portfolio_risk_limit_applied": True,
+        "current_training_portfolio_stressed_loss_usdt": 0.8,
+        "remaining_training_portfolio_risk_budget_usdt": 0.4,
+    }
+
+
+def test_restore_execution_risk_projection_reads_nested_audit_inputs() -> None:
+    repaired = restore_execution_risk_projection(
+        {
+            "normal_paper_trade": {"selection_reason": "paper_training_entry"},
+            "profit_risk_sizing": {},
+        },
+        {
+            "portfolio_risk_limit_applied": True,
+            "current_training_portfolio_stressed_loss_usdt": 0.8,
+            "audit_inputs": {
+                "remaining_training_portfolio_risk_budget_usdt": 0.4,
+            },
+        },
+    )
+
+    assert repaired["profit_risk_sizing"]["remaining_training_portfolio_risk_budget_usdt"] == 0.4
 
 
 @pytest.mark.asyncio
@@ -93,3 +135,63 @@ async def test_backfill_uses_bounded_batches_and_is_idempotent(monkeypatch) -> N
         assert row.raw_llm_response["profit_risk_sizing"]["return_lcb_pct"] == -0.4
         assert row.decision_learning_snapshot["profit_risk_sizing"]["return_lcb_pct"] == -0.4
         assert row.decision_learning_snapshot_version == 6
+
+
+@pytest.mark.asyncio
+async def test_execution_risk_backfill_preserves_prior_downside_projection() -> None:
+    from datetime import UTC, datetime
+
+    from sqlalchemy import update
+
+    from db.session import get_session_ctx
+
+    now = datetime.now(UTC)
+    raw_sizing = {
+        "current_training_portfolio_stressed_loss_usdt": 0.8,
+        "portfolio_risk_limit_applied": True,
+        "remaining_training_portfolio_risk_budget_usdt": 0.4,
+        "return_lcb_pct": -0.2,
+    }
+    async with get_session_ctx() as session:
+        decision = AIDecision(
+            model_name="projection_test",
+            symbol="BTC/USDT",
+            action="short",
+            confidence=0.7,
+            reasoning="projection",
+            created_at=now,
+            raw_llm_response={
+                "normal_paper_trade": {"selection_reason": "paper_training_entry"},
+                "profit_risk_sizing": raw_sizing,
+            },
+        )
+        session.add(decision)
+        await session.flush()
+        decision_id = decision.id
+    async with get_session_ctx() as session:
+        await session.execute(
+            update(AIDecision)
+            .where(AIDecision.id == decision_id)
+            .values(
+                decision_learning_snapshot={
+                    "normal_paper_trade": {"selection_reason": "paper_training_entry"},
+                    "profit_risk_sizing": {},
+                },
+                decision_learning_snapshot_version=5,
+            )
+        )
+
+    result = await backfill_execution_risk_projection(
+        apply=True,
+        since=now,
+        batch_size=1,
+    )
+
+    assert result["status"] == "complete"
+    assert result["applied"] >= 1
+    async with get_read_session_ctx() as session:
+        row = (
+            await session.execute(select(AIDecision).where(AIDecision.id == decision_id))
+        ).scalar_one()
+        assert row.decision_learning_snapshot["profit_risk_sizing"] == raw_sizing
+        assert row.decision_learning_snapshot_version == 7

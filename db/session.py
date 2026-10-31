@@ -1440,6 +1440,7 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                             'contract_lifecycle',
                             'contract_version',
                             'current_portfolio_stressed_loss_usdt',
+                            'current_training_portfolio_stressed_loss_usdt',
                             'decision_authority',
                             'dynamic_leverage_decision',
                             'entry_instrument_availability',
@@ -1462,12 +1463,14 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                             'planned_stressed_loss_usdt',
                             'policy_provenance',
                             'portfolio_risk_budget_usdt',
+                            'portfolio_risk_limit_applied',
                             'portfolio_risk_snapshot',
                             'position_size_pct',
                             'production_eligible',
                             'production_permission',
                             'reason',
                             'remaining_portfolio_risk_budget_usdt',
+                            'remaining_training_portfolio_risk_budget_usdt',
                             'return_lcb_pct',
                             'risk_budget_usdt',
                             'selected_contract_spec',
@@ -1562,7 +1565,7 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                         ),
                         '{}'::JSONB
                     );
-                    NEW.decision_learning_snapshot_version := 6;
+                    NEW.decision_learning_snapshot_version := 7;
                     RETURN NEW;
                 END;
                 $$

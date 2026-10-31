@@ -22,6 +22,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--decision-id", action="append", type=int, default=[])
     parser.add_argument("--backfill-downside-return", action="store_true")
+    parser.add_argument("--backfill-execution-risk", action="store_true")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--max-rows", type=int, default=10_000)
     parser.add_argument("--before-id", type=int)
@@ -31,10 +32,17 @@ def main() -> None:
         help="Print the execution-critical fields instead of the full raw payload.",
     )
     args = parser.parse_args()
-    if not args.decision_id and not args.backfill_downside_return:
-        parser.error("provide --decision-id or --backfill-downside-return")
-    if args.apply and not args.backfill_downside_return:
-        parser.error("--apply requires --backfill-downside-return")
+    if not args.decision_id and not (
+        args.backfill_downside_return or args.backfill_execution_risk
+    ):
+        parser.error(
+            "provide --decision-id, --backfill-downside-return, or "
+            "--backfill-execution-risk"
+        )
+    if args.apply and not (args.backfill_downside_return or args.backfill_execution_risk):
+        parser.error("--apply requires a backfill operation")
+    if args.backfill_downside_return and args.backfill_execution_risk:
+        parser.error("choose one backfill operation")
     script = f"""
 import asyncio, json
 from pathlib import Path
@@ -45,9 +53,17 @@ drop_privileges_to_runtime_user_if_needed(project_root=root)
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 async def main():
-    if {bool(args.backfill_downside_return)!r}:
-        from services.decision_learning_projection import backfill_downside_return_projection
-        result = await backfill_downside_return_projection(
+    if {bool(args.backfill_downside_return)!r} or {bool(args.backfill_execution_risk)!r}:
+        from services.decision_learning_projection import (
+            backfill_downside_return_projection,
+            backfill_execution_risk_projection,
+        )
+        backfill = (
+            backfill_downside_return_projection
+            if {bool(args.backfill_downside_return)!r}
+            else backfill_execution_risk_projection
+        )
+        result = await backfill(
             apply={bool(args.apply)!r},
             max_rows={max(1, min(args.max_rows, 100_000))!r},
             before_id={args.before_id!r},

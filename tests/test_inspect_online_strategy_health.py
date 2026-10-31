@@ -89,6 +89,21 @@ def test_entry_summary_keeps_recent_fills_and_reconciliation_gate() -> None:
     assert summary["recent_entry_flow"] == flow
 
 
+def test_entry_summary_exposes_contract_coverage_completeness() -> None:
+    contract = {
+        "summary": {"contract_violation_count": 51},
+        "coverage": {"complete": True, "truncated": False},
+        "coverage_complete": True,
+    }
+
+    summary = inspect_online_strategy_health._summarize_entry_report(
+        {"trade_execution_contract": contract}
+    )
+
+    assert summary["contract_coverage"] == contract["coverage"]
+    assert summary["contract_coverage_complete"] is True
+
+
 def test_remote_command_keeps_paths_scoped_and_quotes_output() -> None:
     result_path = inspect_online_strategy_health._remote_result_path(120, "abc123")
     command = inspect_online_strategy_health._build_remote_command(

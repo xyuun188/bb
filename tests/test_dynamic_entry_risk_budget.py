@@ -705,6 +705,7 @@ async def test_bounded_training_entry_can_use_only_its_micro_risk_budget() -> No
     assert sizing["risk_budget_usdt"] <= 0.1
     assert sizing["portfolio_risk_limit_applied"] is True
     assert sizing["portfolio_risk_budget_usdt"] == pytest.approx(0.3)
+    assert sizing["remaining_training_portfolio_risk_budget_usdt"] == pytest.approx(0.3)
     assert sizing["production_permission"] is False
     assert dynamic["policy_provenance"]["effective_return_pct"] > 0.0
     assert sizing["final_leverage"] >= 1.0

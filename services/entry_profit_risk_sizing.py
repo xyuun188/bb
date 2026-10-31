@@ -2678,6 +2678,9 @@ class EntryProfitRiskSizingPolicy:
                     "remaining_portfolio_risk_budget_usdt": round(
                         remaining_portfolio_risk_budget, 8
                     ),
+                    "remaining_training_portfolio_risk_budget_usdt": round(
+                        remaining_portfolio_risk_budget, 8
+                    ),
                     "current_training_portfolio_stressed_loss_usdt": round(
                         current_training_portfolio_risk, 8
                     ),

@@ -717,7 +717,7 @@ async def test_postgres_model_health_snapshot_schema_uses_trigger_without_histor
     assert "bb_compact_ai_decision_learning_value" in retention_trigger
     assert "bb_project_profit_risk_sizing_snapshot" in retention_trigger
     assert "item.key = 'normal_paper_trade'" in retention_trigger
-    assert "decision_learning_snapshot_version := 6" in retention_trigger
+    assert "decision_learning_snapshot_version := 7" in retention_trigger
 
 
 @pytest.mark.asyncio

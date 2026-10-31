@@ -6957,9 +6957,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
             for symbol in market_symbols
             if self._normalize_position_symbol(symbol) in verified_symbols
         ]
-        deferred_symbols = self._market_defer_tracker().ordered_symbols(
-            exclude_reasons={"shortlist_capacity"},
-        )
+        # Shortlist-capacity deferrals are eligible coverage work, not failed
+        # retries. Keep them in the bounded priority half so an oversized
+        # candidate pool cannot leave the same symbols overdue indefinitely;
+        # the other half remains a rotating universe slice.
+        deferred_symbols = self._market_defer_tracker().ordered_symbols()
         deferred_keys = {
             self._normalize_position_symbol(symbol)
             for symbol in deferred_symbols

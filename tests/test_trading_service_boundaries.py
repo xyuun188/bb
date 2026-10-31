@@ -7141,6 +7141,38 @@ def test_auto_scan_feature_budget_prioritizes_deferred_candidate_queue(
     )
 
 
+def test_auto_scan_feature_budget_retries_shortlist_capacity_for_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._auto_scan_feature_cursor = 0
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+    service.market_analysis_defer_tracker.defer("S7/USDT", "shortlist_capacity")
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER", 2)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MIN", 4)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MAX", 20)
+
+    selected = service._budget_auto_scan_feature_symbols(
+        [f"S{i}/USDT" for i in range(10)],
+        [],
+        configured_limit=2,
+    )
+
+    assert selected[0] == "S7/USDT"
+    assert (
+        service._last_auto_feature_fetch_budget_diagnostics[
+            "deferred_candidate_symbol_count"
+        ]
+        == 1
+    )
+
+
 def test_auto_scan_feature_budget_moves_repeated_failures_behind_waiting_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

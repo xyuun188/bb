@@ -415,6 +415,8 @@ async def main():
                 "summary": contract.get("summary", {}),
                 "violation_reason_counts": contract.get("violation_reason_counts", {}),
                 "violations": contract.get("violations", []),
+                "coverage": contract.get("coverage", {}),
+                "coverage_complete": contract.get("coverage_complete"),
                 "policy": contract.get("policy", {}),
             },
             "selected_decision": await _read_selected_decision() if DECISION_ID > 0 else None,
@@ -524,6 +526,8 @@ async def main():
                 # incident impossible to investigate from the dashboard or
                 # a copied audit report.
                 "violations": contract.get("violations", []),
+                "coverage": contract.get("coverage", {}),
+                "coverage_complete": contract.get("coverage_complete"),
                 "policy": contract.get("policy", {}),
             },
         }
@@ -632,6 +636,8 @@ def _summarize_report(report: dict) -> dict:
         "optimization_target": PROFIT_TRAINING_TARGET,
         "contract_summary": contract.get("summary") or {},
         "contract_violations": contract.get("violation_reason_counts") or {},
+        "contract_coverage": contract.get("coverage") or {},
+        "contract_coverage_complete": contract.get("coverage_complete"),
         "contract_policy": contract.get("policy") or {},
         "recent_entry_flow": report.get("recent_entry_flow") or {},
         "ml_readiness_state": ml_status.get("readiness_state") or ml_status.get("state"),
@@ -1037,6 +1043,8 @@ def _summarize_entry_report(report: dict) -> dict:
         "contract_summary": contract.get("summary") or {},
         "contract_violations": contract.get("violation_reason_counts") or {},
         "contract_violation_rows": contract.get("violations") or [],
+        "contract_coverage": contract.get("coverage") or {},
+        "contract_coverage_complete": contract.get("coverage_complete"),
         "contract_policy": contract.get("policy") or {},
         "recent_entry_flow": report.get("recent_entry_flow") or {},
         "selected_decision": _summarize_selected_decision(

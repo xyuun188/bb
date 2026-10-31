@@ -275,6 +275,22 @@ def test_learning_snapshot_preserves_exact_fingerprinted_normal_paper_contract()
     ) == []
 
 
+def test_learning_snapshot_preserves_training_risk_audit_fields() -> None:
+    raw = {
+        "normal_paper_trade": {"selection_reason": "paper_training_entry"},
+        "profit_risk_sizing": {
+            "portfolio_risk_limit_applied": True,
+            "portfolio_risk_budget_usdt": 1.2,
+            "remaining_training_portfolio_risk_budget_usdt": 0.4,
+            "current_training_portfolio_stressed_loss_usdt": 0.8,
+        },
+    }
+
+    compact = _compact_decision_learning_snapshot(raw)
+
+    assert compact["profit_risk_sizing"] == raw["profit_risk_sizing"]
+
+
 def test_negative_net_direction_cannot_authorize_a_paper_order() -> None:
     selection = select_normal_paper_trade_side(
         {"short": _support("short", expected_net=-0.05)}
