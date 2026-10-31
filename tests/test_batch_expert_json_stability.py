@@ -794,11 +794,15 @@ async def test_paper_batch_parser_preserves_complete_model_plan(
 async def test_qwen_batch_failure_exposes_bounded_response_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    calls = 0
+
     class FakeChatOpenAI:
         def __init__(self, **_kwargs: Any) -> None:
             pass
 
         async def ainvoke(self, _messages: list[Any]) -> SimpleNamespace:
+            nonlocal calls
+            calls += 1
             return SimpleNamespace(
                 content='{"a":["l","s"]}',
                 response_metadata={"finish_reason": "length"},
@@ -823,6 +827,59 @@ async def test_qwen_batch_failure_exposes_bounded_response_contract(
             {"execution_mode": "paper"},
             ["trend_expert", "momentum_expert", "sentiment_expert", "risk_expert"],
         )
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_qwen_batch_incomplete_response_uses_one_compact_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[Any]] = []
+
+    class FakeChatOpenAI:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def ainvoke(self, messages: list[Any]) -> SimpleNamespace:
+            calls.append(messages)
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    content='{"a":["h","h"]}',
+                    response_metadata={"finish_reason": "stop"},
+                    usage_metadata={"completion_tokens": 12},
+                )
+            return SimpleNamespace(
+                content='{"a":["h","h","h","h"]}',
+                response_metadata={"finish_reason": "stop"},
+                usage_metadata={"completion_tokens": 12},
+            )
+
+    monkeypatch.setattr("ai_brain.llm_agent.ChatOpenAI", FakeChatOpenAI)
+    agent = LLMAgent(
+        name="trend_expert",
+        api_config={
+            "api_base": LOCAL_QWEN_TEST_BASE,
+            "api_key": "test-key",
+            "model": "qwen3.8-27b",
+            "role": "trend_direction",
+        },
+    )
+    await agent.initialize()
+
+    decisions = await agent.decide_batch_experts(
+        FeatureVector(symbol="BTC/USDT"),
+        {"execution_mode": "paper"},
+        ["trend_expert", "momentum_expert", "sentiment_expert", "risk_expert"],
+    )
+
+    assert set(decisions) == {
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    }
+    assert len(calls) == 2
+    assert "QWEN_TARGET_BATCH_REPAIR_V1" in calls[1][1].content
 
 
 @pytest.mark.asyncio

@@ -466,12 +466,13 @@ class ModelRegistry:
         ensure_llm_call_budget(context)
 
         # A Qwen3.8-27B group is served by one single-worker carrier.  Enforce
-        # the one-request contract at the registry boundary as well as in the
-        # deployment environment, so an omitted/stale .env cannot re-enable a
-        # repair or consultation call that queues behind the hot-path request.
+        # the bounded two-request contract at the registry boundary as well as
+        # in the deployment environment. The second request is reserved for a
+        # compact schema repair when the carrier stops after an incomplete
+        # JSON object; it cannot become an open-ended consultation loop.
         if any(_is_target_qwen_provider(model) for model in active_models):
             budget = ensure_llm_call_budget(context)
-            budget["max_calls"] = 1
+            budget["max_calls"] = 2
 
         analysis_budget = _analysis_budget_snapshot(context)
         if analysis_budget is not None:

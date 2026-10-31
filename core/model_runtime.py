@@ -10,7 +10,11 @@ HIGH_RISK_REVIEW_TOKEN_FLOOR = 160
 HIGH_RISK_REVIEW_TOKEN_CAP = 600
 TARGET_QWEN_MODEL_ID = "qwen3.8-27b"
 TARGET_QWEN_MAX_COMPLETION_TOKENS = 96
-TARGET_QWEN_BATCH_MAX_COMPLETION_TOKENS = 32
+# Four compact action codes normally fit in a few tokens, but the target
+# carrier may still emit a short wrapper or a hidden boundary token before
+# stopping. Keep enough room for one complete JSON object without reopening
+# the old verbose expert-plan path.
+TARGET_QWEN_BATCH_MAX_COMPLETION_TOKENS = 64
 COMPLETION_TOKEN_CAPS = {
     "expert": 360,
     "fast_expert": 700,

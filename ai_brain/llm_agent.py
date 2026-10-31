@@ -1584,7 +1584,7 @@ class LLMAgent(AbstractAIModel):
                         max(
                             min(
                                 int(settings.ai_target_qwen_max_completion_tokens or 96),
-                                32,
+                                64,
                             ),
                             8,
                         )
@@ -1701,25 +1701,25 @@ class LLMAgent(AbstractAIModel):
             if _normalize_compact_batch_value(experts_payload.get(name)) is None
         ]
         if missing_names:
-            # Production analysis already has a hard per-round call budget.
-            # A second repair request to the single-concurrency Qwen carrier
-            # can turn one malformed JSON response into a 30+ second stall;
-            # fail closed and let the deterministic risk gate hold instead.
-            if target_single_call:
-                raise LLMResponseParseError(
-                    "Qwen3.8-27B batch response incomplete; production repair call disabled; "
-                    f"{repair_error or 'provider response metadata unavailable'}"
-                )
             repair_prompt = build_batch_experts_user_prompt(
                 feature_contexts,
                 {**context, "batch_repair_retry": True},
                 missing_names,
             )
-            repair_prompt += (
-                "\nRepair retry: previous batch output was incomplete or truncated. "
-                "Return ONLY the missing required experts listed above. "
-                "Use short Chinese reasoning and complete valid JSON."
-            )
+            if target_single_call:
+                repair_prompt += (
+                    "\nQWEN_TARGET_BATCH_REPAIR_V1: the previous response was incomplete. "
+                    "Return ONLY one minified JSON object with exactly one field "
+                    '{"a":["l|s|h|cl|cs",...]}. '
+                    f"Return exactly {len(missing_names)} action codes in this order: "
+                    f"{','.join(missing_names)}. No prose, markdown, expert names, or thinking."
+                )
+            else:
+                repair_prompt += (
+                    "\nRepair retry: previous batch output was incomplete or truncated. "
+                    "Return ONLY the missing required experts listed above. "
+                    "Use short Chinese reasoning and complete valid JSON."
+                )
             try:
                 repaired_payload = await _invoke_batch(repair_prompt, repair=True)
             except LLMResponseParseError as exc:
@@ -1748,8 +1748,10 @@ class LLMAgent(AbstractAIModel):
         ]
         if missing_after_repair:
             missing_text = ", ".join(missing_after_repair)
+            detail = f"; initial_error={repair_error}" if repair_error else ""
             raise LLMResponseParseError(
-                f"batch experts response incomplete after repair; missing experts: {missing_text}"
+                "batch experts response incomplete after repair; "
+                f"missing experts: {missing_text}{detail}"
             )
 
         decisions: dict[str, DecisionOutput] = {}

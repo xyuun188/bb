@@ -99,6 +99,19 @@ SKIP_FILES = {
     ".env.local",
     ".env.production",
     "PROJECT_MEMORY.md",
+    # Repository/operator metadata and model-host manifests are not runtime
+    # inputs for /data/bb/app. Keeping them online only creates stale copies
+    # that are mistaken for deployable application state.
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README.md",
+    ".gitignore",
+    "pyproject.toml",
+    "uv.lock",
+    "requirements-dev.txt",
+    "requirements-scraping.txt",
+    "requirements-target-inference.txt",
+    ".target_model_candidate.remote.json",
 }
 SKIP_SUFFIXES = {
     ".pyc",
@@ -115,7 +128,7 @@ SKIP_SUFFIXES = {
     ".7z",
     ".rar",
 }
-SKIP_PATH_PREFIXES = ("docs/superpowers/plans/",)
+SKIP_PATH_PREFIXES = ("docs/",)
 SKIP_NAME_PARTS = (
     "\u670d\u52a1\u5668\u4fe1\u606f",  # server info
     "\u670d\u52a1\u5668\u8d44\u6599",  # server data
@@ -1217,11 +1230,11 @@ def main() -> None:
         sftp = ssh.open_sftp()
         try:
             uploaded = upload_files(sftp, files, args.remote_app_dir, dry_run=False)
-            managed_roots = (
-                (*REMOTE_MANAGED_SOURCE_ROOTS, "tests")
-                if args.include_tests
-                else REMOTE_MANAGED_SOURCE_ROOTS
-            )
+            # Tests are optional deployment inputs, never production runtime
+            # sources. Always include the tree in stale-source pruning so a
+            # previous --include-tests upload cannot leave an obsolete online
+            # copy behind forever.
+            managed_roots = (*REMOTE_MANAGED_SOURCE_ROOTS, "tests")
             removed = (
                 []
                 if args.only
