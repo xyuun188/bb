@@ -1,8 +1,39 @@
 from __future__ import annotations
 
+import json
+import sys
 from datetime import UTC, datetime, timedelta
 
 from scripts import audit_online_analysis_coverage as audit
+
+
+def test_main_uses_full_remote_output_limit_for_long_reports(monkeypatch) -> None:
+    now = datetime(2026, 10, 31, 0, 0, tzinfo=UTC)
+    report = _report(now)
+    calls = {}
+
+    class SSH:
+        def close(self) -> None:
+            pass
+
+    ssh = SSH()
+    monkeypatch.setattr(audit, "connect_remote_ssh", lambda *_args, **_kwargs: ssh)
+
+    def run_remote_text(_ssh, _command, **kwargs):
+        calls.update(kwargs)
+        return json.dumps(report)
+
+    monkeypatch.setattr(audit, "run_remote_text", run_remote_text)
+    monkeypatch.setattr(audit, "safe_print", lambda _value: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["audit_online_analysis_coverage.py", "--allow-not-ready"],
+    )
+
+    audit.main()
+
+    assert calls["max_output_chars"] == audit.MAX_REMOTE_OUTPUT_TEXT_LIMIT
 
 
 def _report(now: datetime) -> dict:
