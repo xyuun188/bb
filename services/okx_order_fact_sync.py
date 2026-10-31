@@ -4748,12 +4748,18 @@ def _database_timeout_stage(exc: BaseException) -> str | None:
         for attribute in ("sqlstate", "pgcode"):
             value = getattr(current, attribute, None)
             if value:
-                sqlstates.add(str(value))
+                sqlstates.add(str(value).lower())
         next_exc = getattr(current, "orig", None) or current.__cause__ or current.__context__
         current = (
             next_exc if isinstance(next_exc, BaseException) and next_exc is not current else None
         )
     message = " | ".join(messages)
+    if (
+        "40p01" in sqlstates
+        or "deadlock detected" in message
+        or "deadlockdetectederror" in message
+    ):
+        return "database_deadlock"
     if "55p03" in sqlstates or "lock timeout" in message or "lock_not_available" in message:
         return "database_lock_timeout"
     if (

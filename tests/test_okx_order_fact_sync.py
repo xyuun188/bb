@@ -1004,6 +1004,17 @@ def test_database_timeout_stage_classifies_postgres_lock_and_statement_timeouts(
     assert _database_timeout_stage(RuntimeError("unrelated failure")) is None
 
 
+def test_database_timeout_stage_classifies_postgres_deadlocks() -> None:
+    assert _database_timeout_stage(RuntimeError("deadlock detected")) == "database_deadlock"
+
+    class _PostgresDeadlock(Exception):
+        sqlstate = "40P01"
+
+    assert _database_timeout_stage(_PostgresDeadlock("transaction aborted")) == (
+        "database_deadlock"
+    )
+
+
 @pytest.mark.asyncio
 async def test_non_postgres_sync_uses_same_hard_deadline(
     monkeypatch: pytest.MonkeyPatch,

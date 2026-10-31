@@ -12,10 +12,10 @@ from types import SimpleNamespace
 from typing import Any
 
 import structlog
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 
 from ai_brain.base_model import Action, DecisionOutput
-from config.settings import ENSEMBLE_TRADER_NAME
+from config.settings import ENSEMBLE_TRADER_NAME, settings
 from core.safe_output import safe_error_text
 from core.symbols import (
     okx_inst_id_from_payload,
@@ -24,7 +24,7 @@ from core.symbols import (
 )
 from core.trading_mode import mode_manager
 from db.repositories.trade_repo import TradeRepository
-from db.session import get_read_session_ctx, get_session_ctx
+from db.session import get_engine, get_read_session_ctx, get_session_ctx
 from executor.base_executor import OrderStatus
 from models.account import OkxAccountBill
 from models.decision import AIDecision
@@ -83,6 +83,9 @@ AUTHORITATIVE_POSITION_PRICE_REUSE_SECONDS = 300.0
 LOCAL_POSITION_PERSISTENCE_GRACE_SECONDS = 60.0
 CURRENT_ENTRY_ORDER_MATCH_WINDOW_SECONDS = 10 * 60.0
 CURRENT_ENTRY_ORDER_PRICE_TOLERANCE_RATIO = 0.005
+# Shared with services.okx_order_fact_sync.  Both paths update the same paper
+# order rows from authoritative OKX facts and must not interleave transactions.
+OKX_ORDER_FACT_SYNC_ADVISORY_LOCK_BASE = 0x42424F5244455200
 
 
 def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
@@ -2889,6 +2892,41 @@ class OkxSyncService:
         return refreshed
 
     async def reconcile_exchange_positions(self) -> list[dict]:
+        """Run one paper-position reconciliation under the shared writer lock."""
+
+        if str(getattr(settings, "database_url", "") or "").startswith("postgresql"):
+            engine = await get_engine()
+            lock_key = OKX_ORDER_FACT_SYNC_ADVISORY_LOCK_BASE
+            async with engine.connect() as lock_connection:
+                acquired = bool(
+                    (
+                        await lock_connection.execute(
+                            text("SELECT pg_try_advisory_lock(:lock_key)"),
+                            {"lock_key": lock_key},
+                        )
+                    ).scalar()
+                )
+                if not acquired:
+                    logger.info(
+                        "exchange position reconciliation deferred; order fact writer is active",
+                        lock_key=lock_key,
+                    )
+                    return []
+                await lock_connection.commit()
+                try:
+                    return await self._reconcile_exchange_positions_unlocked()
+                finally:
+                    try:
+                        await lock_connection.execute(
+                            text("SELECT pg_advisory_unlock(:lock_key)"),
+                            {"lock_key": lock_key},
+                        )
+                    except BaseException:
+                        await lock_connection.invalidate()
+                        raise
+        return await self._reconcile_exchange_positions_unlocked()
+
+    async def _reconcile_exchange_positions_unlocked(self) -> list[dict]:
         """Reconcile local paper positions with actual OKX demo positions.
 
         OKX attached TP/SL orders can close positions without going through the

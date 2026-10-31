@@ -10171,6 +10171,48 @@ async def test_sync_service_reconcile_exchange_positions_uses_injected_paper_okx
 
 
 @pytest.mark.asyncio
+async def test_sync_service_reconcile_exchange_positions_defers_when_order_fact_writer_is_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ScalarResult:
+        def scalar(self) -> bool:
+            return False
+
+    class _LockConnection:
+        async def execute(self, _statement: Any, _params: dict[str, Any]) -> _ScalarResult:
+            return _ScalarResult()
+
+        async def commit(self) -> None:
+            raise AssertionError("busy lock must not commit")
+
+        async def invalidate(self) -> None:
+            raise AssertionError("busy lock must not invalidate")
+
+    class _LockContext:
+        async def __aenter__(self) -> _LockConnection:
+            return _LockConnection()
+
+        async def __aexit__(self, _exc_type, _exc, _tb) -> None:
+            return None
+
+    class _Engine:
+        def connect(self) -> _LockContext:
+            return _LockContext()
+
+    async def fake_get_engine():
+        return _Engine()
+
+    monkeypatch.setattr(sync_module.settings, "database_url", "postgresql+asyncpg://test")
+    monkeypatch.setattr(sync_module, "get_engine", fake_get_engine)
+    service = OkxSyncService()
+    service._reconcile_exchange_positions_unlocked = lambda: pytest.fail(
+        "reconciliation must defer while the order fact writer owns the lock"
+    )
+
+    assert await service.reconcile_exchange_positions() == []
+
+
+@pytest.mark.asyncio
 async def test_sync_service_reuses_recent_authoritative_snapshot_after_position_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
