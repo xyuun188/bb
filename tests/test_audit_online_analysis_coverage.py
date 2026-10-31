@@ -75,6 +75,8 @@ def _report(now: datetime) -> dict:
             "candidate_coverage_target_seconds": 30 * 60,
             "coverage_due_count": 0,
             "coverage_due_symbols": [],
+            "coverage_overdue_count": 0,
+            "coverage_overdue_symbols": [],
         },
         "market": {
             "decision_count": 12,
@@ -165,12 +167,30 @@ def test_assessment_rejects_unresolved_due_market_candidates() -> None:
     report["coverage"]["coverage_window_met"] = False
     report["coverage"]["coverage_due_count"] = 1
     report["coverage"]["coverage_due_symbols"] = ["ETH/USDT"]
+    report["coverage"]["coverage_overdue_count"] = 1
+    report["coverage"]["coverage_overdue_symbols"] = ["ETH/USDT"]
 
     assessment = audit.assess_coverage_report(report, now=now)
 
     assert assessment["ready"] is False
     assert "market_coverage_window_not_met" in assessment["blockers"]
     assert "market_candidate_coverage_has_unresolved_due_symbols" in assessment["blockers"]
+
+
+def test_assessment_ignores_never_analyzed_discovery_candidates() -> None:
+    now = datetime(2026, 7, 25, 16, 0, tzinfo=UTC)
+    report = _report(now)
+    report["coverage"]["coverage_due_count"] = 1
+    report["coverage"]["coverage_due_symbols"] = ["NEW/USDT"]
+    report["coverage"]["coverage_due_never_analyzed_count"] = 1
+    report["coverage"]["coverage_due_never_analyzed_symbols"] = ["NEW/USDT"]
+    report["coverage"]["coverage_overdue_count"] = 0
+    report["coverage"]["coverage_overdue_symbols"] = []
+
+    assessment = audit.assess_coverage_report(report, now=now)
+
+    assert assessment["ready"] is True
+    assert assessment["blockers"] == []
 
 
 def test_assessment_rejects_duplicate_market_analysis_inside_cooldown() -> None:

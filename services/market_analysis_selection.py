@@ -422,6 +422,12 @@ class MarketAnalysisSelectionPolicy:
         cooldown_excluded = list(cooldown_excluded or [])
         selected_keys = {str(row["symbol_key"]) for row in selected_rows}
         coverage_due_rows = [row for row in rows if bool(row["coverage_due"])]
+        coverage_overdue_rows = [
+            row for row in coverage_due_rows if not bool(row["never_analyzed"])
+        ]
+        coverage_never_analyzed_rows = [
+            row for row in coverage_due_rows if bool(row["never_analyzed"])
+        ]
         coverage_due_unselected = [
             row for row in coverage_due_rows if str(row["symbol_key"]) not in selected_keys
         ]
@@ -515,6 +521,17 @@ class MarketAnalysisSelectionPolicy:
             ),
             "coverage_due_candidate_count": sum(bool(row["coverage_due"]) for row in rows),
             "coverage_due_symbols": [str(row["symbol"]) for row in coverage_due_rows],
+            # ``coverage_due`` includes never-analyzed discovery rows so the
+            # selector can prioritize them.  Only previously observed rows
+            # can be overdue against the 30-minute coverage contract.
+            "coverage_overdue_candidate_count": len(coverage_overdue_rows),
+            "coverage_overdue_symbols": [
+                str(row["symbol"]) for row in coverage_overdue_rows
+            ],
+            "coverage_due_never_analyzed_count": len(coverage_never_analyzed_rows),
+            "coverage_due_never_analyzed_symbols": [
+                str(row["symbol"]) for row in coverage_never_analyzed_rows
+            ],
             "coverage_due_unselected_count": len(coverage_due_unselected),
             "coverage_due_unselected_symbols": [
                 str(row["symbol"]) for row in coverage_due_unselected

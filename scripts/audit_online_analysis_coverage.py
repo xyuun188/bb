@@ -536,7 +536,14 @@ def assess_coverage_report(
             observed_at - selection_generated_at
         ).total_seconds() > max(float(candidate_selection_stale_seconds), 1.0):
             blockers.append("market_candidate_coverage_evidence_stale")
-        if int(coverage.get("coverage_due_count") or 0) > 0:
+        # ``coverage_due`` also contains never-analyzed discovery candidates.
+        # They are not overdue until they have a completed observation and
+        # then exceed the coverage target.  Older payloads lack the explicit
+        # field, so retain the strict legacy fallback for compatibility.
+        overdue_count = coverage.get("coverage_overdue_count")
+        if overdue_count is None:
+            overdue_count = coverage.get("coverage_due_count")
+        if int(overdue_count or 0) > 0:
             blockers.append("market_candidate_coverage_has_unresolved_due_symbols")
         candidate_target_seconds = float(
             coverage.get("candidate_coverage_target_seconds") or float("inf")

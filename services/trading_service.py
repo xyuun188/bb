@@ -8154,6 +8154,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             getattr(self, "_last_market_analysis_selection_diagnostics", {})
         )
         coverage_due_symbols = list(selection.get("coverage_due_symbols") or [])
+        coverage_overdue_symbols = list(selection.get("coverage_overdue_symbols") or [])
         selection_evidence_available = bool(selection.get("generated_at"))
         snapshot["monitoring_active"] = bool(monitoring_active)
         snapshot["candidate_coverage_evidence_available"] = selection_evidence_available
@@ -8162,6 +8163,14 @@ class TradingService(ModelTrainingCoordinatorMixin):
         snapshot["candidate_coverage_target_seconds"] = selection.get("coverage_target_seconds")
         snapshot["coverage_due_count"] = len(coverage_due_symbols)
         snapshot["coverage_due_symbols"] = coverage_due_symbols[:50]
+        snapshot["coverage_overdue_count"] = len(coverage_overdue_symbols)
+        snapshot["coverage_overdue_symbols"] = coverage_overdue_symbols[:50]
+        snapshot["coverage_due_never_analyzed_count"] = int(
+            selection.get("coverage_due_never_analyzed_count") or 0
+        )
+        snapshot["coverage_due_never_analyzed_symbols"] = list(
+            selection.get("coverage_due_never_analyzed_symbols") or []
+        )[:50]
         snapshot["coverage_due_resolved_count"] = int(
             selection.get("coverage_due_resolved_count") or 0
         )
@@ -8172,7 +8181,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
             monitoring_active and selection_evidence_available
         )
         snapshot["coverage_window_met"] = (
-            bool(snapshot.get("pending_coverage_window_met") and not coverage_due_symbols)
+            bool(
+                snapshot.get("pending_coverage_window_met")
+                and not coverage_overdue_symbols
+            )
             if snapshot["coverage_window_evaluable"]
             else None
         )
@@ -8522,6 +8534,23 @@ class TradingService(ModelTrainingCoordinatorMixin):
         was_due = any(self._normalize_position_symbol(value) == key for value in due_before)
         diagnostics["coverage_due_symbols"] = without_symbol(due_before)
         diagnostics["coverage_due_candidate_count"] = len(diagnostics["coverage_due_symbols"])
+        overdue_before = list(diagnostics.get("coverage_overdue_symbols") or [])
+        was_overdue = any(
+            self._normalize_position_symbol(value) == key for value in overdue_before
+        )
+        diagnostics["coverage_overdue_symbols"] = without_symbol(overdue_before)
+        diagnostics["coverage_overdue_candidate_count"] = len(
+            diagnostics["coverage_overdue_symbols"]
+        )
+        never_analyzed_before = list(
+            diagnostics.get("coverage_due_never_analyzed_symbols") or []
+        )
+        diagnostics["coverage_due_never_analyzed_symbols"] = without_symbol(
+            never_analyzed_before
+        )
+        diagnostics["coverage_due_never_analyzed_count"] = len(
+            diagnostics["coverage_due_never_analyzed_symbols"]
+        )
         diagnostics["coverage_due_unselected_symbols"] = without_symbol(
             diagnostics.get("coverage_due_unselected_symbols")
         )
@@ -8548,7 +8577,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 int(diagnostics.get("never_analyzed_candidate_count") or 0) - 1,
                 0,
             )
-        if was_due:
+        if was_due or was_overdue:
             resolved = list(diagnostics.get("coverage_due_resolved_symbols") or [])
             if not any(self._normalize_position_symbol(value) == key for value in resolved):
                 resolved.append(str(symbol))
