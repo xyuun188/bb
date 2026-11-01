@@ -1624,6 +1624,45 @@ async def test_market_candidate_prewarm_runs_in_background_queue() -> None:
 
 
 @pytest.mark.asyncio
+async def test_market_indicator_prewarm_inserts_priority_ahead_of_backlog_only() -> None:
+    service = TradingService.__new__(TradingService)
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    service._normalize_position_symbol = lambda value: str(value or "").upper()
+    service._market_indicator_prewarm_queue = ["BACKLOG/USDT"]
+    service._market_indicator_prewarm_task = None
+    service._market_indicator_prewarm_last_diagnostics = {}
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def prewarm(symbols: list[str], *, timeout_seconds: float) -> dict[str, Any]:
+        started.set()
+        await release.wait()
+        return {
+            "status": "ok",
+            "requested_count": len(symbols),
+            "available_count": len(symbols),
+            "unavailable_symbols": [],
+        }
+
+    service.data_service = SimpleNamespace(prewarm_indicator_snapshots=prewarm)
+    service._queue_market_candidate_indicator_prewarm(
+        ["ORDINARY/USDT", "OVERDUE/USDT"],
+        priority_symbols=["OVERDUE/USDT"],
+    )
+
+    assert service._market_indicator_prewarm_queue == [
+        "OVERDUE/USDT",
+        "BACKLOG/USDT",
+        "ORDINARY/USDT",
+    ]
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    release.set()
+    await service._market_indicator_prewarm_task
+
+
+@pytest.mark.asyncio
 async def test_market_candidate_prewarm_backoff_normalizes_unavailable_symbols() -> None:
     service = TradingService.__new__(TradingService)
     service.entry_symbol_universe = SimpleNamespace(
@@ -1681,6 +1720,69 @@ def test_complete_market_indicator_snapshot_does_not_need_background_prewarm() -
     prewarm_symbols = TradingService._market_indicator_prewarm_symbols(features)
 
     assert prewarm_symbols == ["ETH/USDT", "SOL/USDT"]
+
+
+def test_market_indicator_prewarm_prioritizes_overdue_coverage() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda value: str(value or "").upper()
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    policy = trading_service.MarketAnalysisSelectionPolicy(
+        normalize_symbol=service._normalize_position_symbol,
+        advantage_scorer=lambda feature: float(feature.score),
+        params=trading_service.MARKET_ANALYSIS_SELECTION_PARAMS,
+    )
+    now = datetime.now(UTC)
+    policy.history_loaded = True
+    policy.remember(
+        "OVERDUE/USDT",
+        SimpleNamespace(current_price=100.0, score=1.0),
+        observed_at=now - timedelta(minutes=45),
+    )
+    service.market_analysis_selector = policy
+
+    ordered = service._prioritize_market_indicator_prewarm_symbols(
+        ["FRESH/USDT", "OVERDUE/USDT", "OTHER/USDT"],
+        feature_vectors={
+            "FRESH/USDT": SimpleNamespace(indicator_snapshot_available=False, score=1.0),
+            "OVERDUE/USDT": SimpleNamespace(indicator_snapshot_available=False, score=1.0),
+            "OTHER/USDT": SimpleNamespace(indicator_snapshot_available=False, score=1.0),
+        },
+    )
+
+    assert ordered == ["OVERDUE/USDT", "FRESH/USDT", "OTHER/USDT"]
+
+
+def test_unselected_market_candidates_separate_hydration_from_capacity() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda value: str(value or "").upper()
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+
+    diagnostics = service._defer_unselected_market_candidates(
+        {
+            "READY/USDT": SimpleNamespace(indicator_snapshot_available=True),
+            "PENDING/USDT": SimpleNamespace(indicator_snapshot_available=False),
+            "SELECTED/USDT": SimpleNamespace(indicator_snapshot_available=False),
+        },
+        selected_keys={"SELECTED/USDT"},
+        cooldown_excluded_keys=set(),
+    )
+
+    assert diagnostics == {
+        "indicator_hydration_unavailable": ["PENDING/USDT"],
+        "shortlist_capacity": ["READY/USDT"],
+    }
+    assert (
+        service.market_analysis_defer_tracker.candidates["PENDING/USDT"].reason
+        == "indicator_hydration_unavailable"
+    )
+    assert service.market_analysis_defer_tracker.candidates["READY/USDT"].reason == (
+        "shortlist_capacity"
+    )
 
 
 @pytest.mark.asyncio

@@ -6494,6 +6494,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
     def _queue_market_candidate_indicator_prewarm(
         self,
         symbols: list[str],
+        *,
+        priority_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
         """Queue shortlist indicator work outside the latency-sensitive market round."""
 
@@ -6515,7 +6517,24 @@ class TradingService(ModelTrainingCoordinatorMixin):
             else:
                 ready_requested.append(symbol)
         existing = list(getattr(self, "_market_indicator_prewarm_queue", []) or [])
-        queued = self.entry_symbol_universe.dedupe_symbols([*existing, *ready_requested])[
+        priority_keys = {
+            normalize_symbol(symbol)
+            for symbol in priority_symbols or []
+            if normalize_symbol(symbol)
+        }
+        priority_requested = [
+            symbol
+            for symbol in ready_requested
+            if normalize_symbol(symbol) in priority_keys
+        ]
+        ordinary_requested = [
+            symbol
+            for symbol in ready_requested
+            if normalize_symbol(symbol) not in priority_keys
+        ]
+        queued = self.entry_symbol_universe.dedupe_symbols(
+            [*priority_requested, *existing, *ordinary_requested]
+        )[
             :MARKET_BACKGROUND_PREWARM_QUEUE_LIMIT
         ]
         self._market_indicator_prewarm_queue = queued
@@ -6550,6 +6569,74 @@ class TradingService(ModelTrainingCoordinatorMixin):
             if not bool(getattr(feature, "indicator_snapshot_available", False))
             or bool(getattr(feature, "indicator_snapshot_stale", False))
         ]
+
+    def _prioritize_market_indicator_prewarm_symbols(
+        self,
+        symbols: list[str],
+        *,
+        feature_vectors: dict[str, Any],
+    ) -> list[str]:
+        """Put overdue coverage ahead of ordinary indicator hydration work."""
+
+        requested = self.entry_symbol_universe.dedupe_symbols(symbols)
+        if len(requested) <= 1:
+            return requested
+        by_key = {
+            self._normalize_position_symbol(symbol): symbol
+            for symbol in requested
+            if self._normalize_position_symbol(symbol)
+        }
+        selection_policy = self._market_analysis_selector_policy()
+        due_symbols = selection_policy.coverage_priority_symbols(
+            feature_vectors,
+            now=datetime.now(UTC),
+        )
+        ordered_keys: list[str] = []
+        for symbol in due_symbols:
+            key = self._normalize_position_symbol(symbol)
+            if key and key in by_key and key not in ordered_keys:
+                ordered_keys.append(key)
+        tracker = getattr(self, "market_analysis_defer_tracker", None)
+        if tracker is not None:
+            for symbol in tracker.ordered_symbols():
+                key = self._normalize_position_symbol(symbol)
+                if key and key in by_key and key not in ordered_keys:
+                    ordered_keys.append(key)
+        prioritized = [by_key[key] for key in ordered_keys]
+        ordered_key_set = set(ordered_keys)
+        prioritized.extend(
+            symbol
+            for symbol in requested
+            if self._normalize_position_symbol(symbol) not in ordered_key_set
+        )
+        return prioritized
+
+    def _defer_unselected_market_candidates(
+        self,
+        selectable_market_vectors: dict[str, Any],
+        *,
+        selected_keys: set[str],
+        cooldown_excluded_keys: set[str],
+    ) -> dict[str, list[str]]:
+        """Keep indicator hydration failures distinct from shortlist capacity."""
+
+        unready_symbols: list[str] = []
+        capacity_symbols: list[str] = []
+        for symbol, feature in selectable_market_vectors.items():
+            key = self._normalize_position_symbol(symbol)
+            if not key or key in selected_keys or key in cooldown_excluded_keys:
+                continue
+            if not MarketAnalysisSelectionPolicy._analysis_snapshot_ready(feature):
+                unready_symbols.append(symbol)
+            else:
+                capacity_symbols.append(symbol)
+        tracker = self._market_defer_tracker()
+        tracker.defer_many(unready_symbols, "indicator_hydration_unavailable")
+        tracker.defer_many(capacity_symbols, "shortlist_capacity")
+        return {
+            "indicator_hydration_unavailable": unready_symbols,
+            "shortlist_capacity": capacity_symbols,
+        }
 
     async def _market_indicator_prewarm_worker(self) -> None:
         """Drain rolling prewarm work with bounded pacing and failure backoff."""
@@ -11226,9 +11313,19 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     market_feature_vectors_after_rank = dict(market_feature_vectors)
             if run_market_analysis and market_feature_vectors:
                 self._set_loop_stage("indicator_prewarm_queue")
-                prewarm_symbols = self._market_indicator_prewarm_symbols(market_feature_vectors)
+                coverage_priority_symbols = (
+                    self._market_analysis_selector_policy().coverage_priority_symbols(
+                        market_feature_vectors,
+                        now=datetime.now(UTC),
+                    )
+                )
+                prewarm_symbols = self._prioritize_market_indicator_prewarm_symbols(
+                    self._market_indicator_prewarm_symbols(market_feature_vectors),
+                    feature_vectors=market_feature_vectors,
+                )
                 market_indicator_prewarm = self._queue_market_candidate_indicator_prewarm(
-                    prewarm_symbols
+                    prewarm_symbols,
+                    priority_symbols=coverage_priority_symbols,
                 )
                 market_indicator_prewarm["already_ready_count"] = len(market_feature_vectors) - len(
                     prewarm_symbols
@@ -11346,9 +11443,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     ),
                 }
             if run_market_analysis and market_feature_vectors:
-                selectable_market_symbols = list(market_feature_vectors)
                 self._set_loop_stage("candidate_selection")
                 await self._ensure_market_analysis_selection_history()
+                selectable_market_vectors = dict(market_feature_vectors)
                 market_feature_vectors = self._select_market_analysis_candidates(
                     market_feature_vectors,
                     market_symbol_budget,
@@ -11368,16 +11465,22 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     if self._normalize_position_symbol(symbol)
                 }
                 if selection_diagnostics.get("cooldown_history_ready", True) is not False:
-                    self._market_defer_tracker().defer_many(
-                        [
-                            symbol
-                            for symbol in selectable_market_symbols
-                            if (
-                                self._normalize_position_symbol(symbol) not in selected_market_keys
-                                and self._normalize_position_symbol(symbol) not in cooldown_excluded_keys
-                            )
-                        ],
-                        "shortlist_capacity",
+                    defer_diagnostics = self._defer_unselected_market_candidates(
+                        selectable_market_vectors,
+                        selected_keys=selected_market_keys,
+                        cooldown_excluded_keys=cooldown_excluded_keys,
+                    )
+                    selection_diagnostics["indicator_hydration_deferred_symbols"] = (
+                        defer_diagnostics["indicator_hydration_unavailable"]
+                    )[:50]
+                    selection_diagnostics["indicator_hydration_deferred_count"] = len(
+                        defer_diagnostics["indicator_hydration_unavailable"]
+                    )
+                    selection_diagnostics["shortlist_capacity_deferred_symbols"] = (
+                        defer_diagnostics["shortlist_capacity"]
+                    )[:50]
+                    selection_diagnostics["shortlist_capacity_deferred_count"] = len(
+                        defer_diagnostics["shortlist_capacity"]
                     )
                 # A normal cooldown is not a failed/deferred task.  Keeping
                 # it in the retry queue would make the next feature-fetch

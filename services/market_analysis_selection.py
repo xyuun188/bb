@@ -101,6 +101,29 @@ class MarketAnalysisSelectionPolicy:
         minimum = max(int(getattr(self.params, "candidate_pool_minimum", 0) or 0), final)
         return min(total, max(final * multiplier, minimum))
 
+    def coverage_priority_symbols(
+        self,
+        candidates: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """Order indicator work by overdue coverage, independent of readiness."""
+
+        selected_at = _as_utc(now) or datetime.now(UTC)
+        rows = [
+            self._candidate_row(symbol, feature, rank=index + 1, now=selected_at)
+            for index, (symbol, feature) in enumerate((candidates or {}).items())
+        ]
+        due_rows = [row for row in rows if bool(row["coverage_due"])]
+        due_rows.sort(
+            key=lambda row: (
+                not bool(row["never_analyzed"]),
+                _safe_float(row["recent_age_seconds"], float("inf")),
+            ),
+            reverse=True,
+        )
+        return [str(row["symbol"]) for row in due_rows]
+
     def select(
         self,
         candidates: dict[str, Any],

@@ -333,3 +333,24 @@ def test_coverage_backlog_reserves_two_slots_for_final_limit_three() -> None:
 
     assert result.diagnostics["coverage_selected_symbols"] == ["SOL/USDT", "XRP/USDT"]
     assert result.diagnostics["coverage_due_unselected_symbols"] == []
+
+
+def test_coverage_priority_orders_overdue_candidates_before_discovery() -> None:
+    now = datetime(2026, 7, 21, 1, 0, tzinfo=UTC)
+    policy = _policy(coverage_target_seconds=30 * 60)
+    recent = _feature("BTC/USDT", 10.0)
+    overdue = _feature("SOL/USDT", 2.0)
+    never_analyzed = _feature("XRP/USDT", 1.0)
+    policy.remember("BTC/USDT", recent, observed_at=now - timedelta(minutes=2))
+    policy.remember("SOL/USDT", overdue, observed_at=now - timedelta(minutes=45))
+
+    priority = policy.coverage_priority_symbols(
+        {
+            "BTC/USDT": recent,
+            "XRP/USDT": never_analyzed,
+            "SOL/USDT": overdue,
+        },
+        now=now,
+    )
+
+    assert priority == ["SOL/USDT", "XRP/USDT"]
