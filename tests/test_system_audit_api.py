@@ -230,8 +230,8 @@ def _trade_contract_details_ok() -> dict[str, Any]:
         "policy": {
             "paper_entry_requires_model_promotion": False,
             "paper_entry_requires_historical_fee_after_quality_permission": True,
-            "paper_normal_entry_requires_positive_return_lcb": False,
-            "paper_validated_entry_requires_positive_return_lcb": False,
+            "paper_normal_entry_requires_positive_return_lcb": True,
+            "paper_validated_entry_requires_positive_return_lcb": True,
             "paper_downside_return_is_sizing_stress": True,
             "paper_quality_observation_requires_positive_expected_net_return": True,
             "paper_quality_observation_requires_positive_return_lcb": False,
