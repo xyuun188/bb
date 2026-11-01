@@ -7791,6 +7791,40 @@ def test_market_deferred_rotation_starts_from_skipped_symbol() -> None:
     assert "risk gates" in rotation["reason"]
 
 
+def test_market_deferred_rotation_keeps_overdue_coverage_ahead_of_queue() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+    service.market_analysis_defer_tracker.defer_many(
+        ["LINK/USDT", "IRYS/USDT", "SPK/USDT", "UP/USDT"],
+        "scheduled",
+    )
+    analysis_budget = {
+        "market_analysis_selection": {
+            "coverage_overdue_symbols": ["SPK/USDT", "UP/USDT"],
+        }
+    }
+
+    rotated = service._rotate_market_feature_vectors_for_deferred_coverage(
+        {
+            "LINK/USDT": "link",
+            "IRYS/USDT": "irys",
+            "SPK/USDT": "spk",
+            "UP/USDT": "up",
+        },
+        analysis_budget_context=analysis_budget,
+    )
+
+    assert list(rotated) == ["SPK/USDT", "UP/USDT", "LINK/USDT", "IRYS/USDT"]
+    rotation = analysis_budget["market_deferred_rotation"]
+    assert rotation["coverage_overdue_symbols"] == ["SPK/USDT", "UP/USDT"]
+
+
 def test_market_deferred_rotation_keeps_order_when_no_match() -> None:
     service = TradingService.__new__(TradingService)
     service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(

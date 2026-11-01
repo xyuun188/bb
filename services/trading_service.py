@@ -9978,6 +9978,73 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 }
             return dict(items)
 
+        selection_diagnostics = (
+            analysis_budget_context.get("market_analysis_selection")
+            if isinstance(analysis_budget_context, dict)
+            else None
+        )
+        selection_diagnostics = (
+            selection_diagnostics if isinstance(selection_diagnostics, dict) else {}
+        )
+        overdue_symbols = list(selection_diagnostics.get("coverage_overdue_symbols") or [])
+        item_by_key = {
+            self._normalize_position_symbol(symbol): (symbol, feature)
+            for symbol, feature in items
+            if self._normalize_position_symbol(symbol)
+        }
+        overdue_items: list[tuple[str, Any]] = []
+        overdue_keys: set[str] = set()
+        for symbol in overdue_symbols:
+            key = self._normalize_position_symbol(symbol)
+            if not key or key in overdue_keys or key not in item_by_key:
+                continue
+            overdue_keys.add(key)
+            overdue_items.append(item_by_key[key])
+        if overdue_items:
+            remaining_items = [
+                item
+                for item in items
+                if self._normalize_position_symbol(item[0]) not in overdue_keys
+            ]
+            remaining_index = {
+                self._normalize_position_symbol(symbol): index
+                for index, (symbol, _feature) in enumerate(remaining_items)
+                if self._normalize_position_symbol(symbol)
+            }
+            remaining_start_key = next(
+                (
+                    self._normalize_position_symbol(symbol)
+                    for symbol in deferred
+                    if self._normalize_position_symbol(symbol) in remaining_index
+                ),
+                None,
+            )
+            if remaining_start_key is not None and remaining_index[remaining_start_key] > 0:
+                start_index = remaining_index[remaining_start_key]
+                remaining_items = (
+                    remaining_items[start_index:] + remaining_items[:start_index]
+                )
+            rotated_items = overdue_items + remaining_items
+            if isinstance(analysis_budget_context, dict):
+                analysis_budget_context["market_deferred_rotation"] = {
+                    "read_only": True,
+                    "is_entry_gate": False,
+                    "applied": True,
+                    "start_symbol": rotated_items[0][0],
+                    "start_index": 0,
+                    "ranked_symbol_count": len(items),
+                    "deferred_symbol_count": len(deferred),
+                    "deferred_symbols": deferred[:20],
+                    "coverage_overdue_symbols": [symbol for symbol, _ in overdue_items],
+                    "reason": (
+                        "truly overdue coverage symbols lead the current shortlist before "
+                        "ordinary deferred candidates; remaining deferred symbols retain queue "
+                        "rotation so one slow symbol cannot starve other work. Entry thresholds, "
+                        "sizing, leverage, ML readiness, and risk gates remain unchanged"
+                    ),
+                }
+            return dict(rotated_items)
+
         normalized_index = {
             self._normalize_position_symbol(symbol): index
             for index, (symbol, _fv) in enumerate(items)

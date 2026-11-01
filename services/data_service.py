@@ -97,6 +97,10 @@ INDICATOR_CACHED_READ_CONCURRENCY = max(
     min(4, int(settings.database_pool_size or 1)),
 )
 INDICATOR_CACHED_READ_TASK_LIMIT = 8
+# ``block_on_remote=False`` is used by the live ranking path.  Cached indicator
+# construction may continue in the background, but it must not consume the
+# round's scheduling budget while waiting for local I/O or CPU work.
+NONBLOCKING_INDICATOR_CACHE_BUILD_TIMEOUT_SECONDS = 0.05
 INDICATOR_COMPUTE_CONCURRENCY = 1
 # K-line persistence is maintenance traffic, but a two-writer gate makes the
 # four-timeframe coverage wave fall behind the one-minute freshness budget.
@@ -3211,19 +3215,18 @@ class DataService:
                     return result
 
                 cached_build_task = asyncio.create_task(build_cached_features())
-                local_build_timeout = max(
-                    min(
-                        float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS) * 0.8,
-                        float(FEATURE_SNAPSHOT_TIMEOUT_SECONDS) - 0.1,
-                    ),
-                    0.1,
-                )
+                local_build_timeout = NONBLOCKING_INDICATOR_CACHE_BUILD_TIMEOUT_SECONDS
                 done, pending = await asyncio.wait(
                     {cached_build_task},
                     timeout=local_build_timeout,
                 )
                 if pending:
                     cached_build_task.add_done_callback(_consume_task_result)
+                    if allow_background_refresh:
+                        # The live nonblocking path must hand ownership to the
+                        # remote refresh immediately; do not wait for the
+                        # cached-read task to discover the same cache miss.
+                        self._schedule_indicator_snapshot_refresh(normalized)
                     return self._unavailable_indicator_snapshot(
                         "indicator_cached_build_in_progress",
                         refresh_in_background=True,
