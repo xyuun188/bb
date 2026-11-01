@@ -57,6 +57,10 @@ def test_optional_derivatives_routes_use_a_separate_gate() -> None:
         == okx_rest_client_module.PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY
         == 4
     )
+    assert (
+        client._public_market_optional_gate()._normal_limit
+        == okx_rest_client_module.PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY - 1
+    )
 
 
 @pytest.mark.asyncio

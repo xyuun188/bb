@@ -8222,6 +8222,43 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self.market_analysis_defer_tracker = tracker
         return tracker
 
+    def _market_scan_pool_symbols(
+        self,
+        available: list[dict[str, Any]],
+        *,
+        pool_limit: int,
+    ) -> list[str]:
+        """Keep deferred candidates in the discovery pool before applying caps.
+
+        OKX sorts the available universe by activity. A deferred low-activity
+        symbol can therefore disappear before the rotating feature-fetch
+        budget ever gets a chance to prioritize it. Reserve the head of the
+        bounded discovery pool for retryable candidates, then fill the
+        remaining slots with the normal activity-ranked universe.
+        """
+
+        limit = max(int(pool_limit or 0), 1)
+        rows = [row for row in available if isinstance(row, dict)]
+        by_key = {
+            self._normalize_position_symbol(row.get("symbol")): str(row.get("symbol"))
+            for row in rows
+            if self._normalize_position_symbol(row.get("symbol"))
+        }
+        deferred_symbols = self._market_defer_tracker().ordered_symbols()
+        deferred_available = [
+            by_key[key]
+            for symbol in deferred_symbols
+            if (key := self._normalize_position_symbol(symbol)) in by_key
+        ]
+        ranked_symbols = [
+            str(row.get("symbol"))
+            for row in rows
+            if str(row.get("symbol") or "").strip()
+        ]
+        return self.entry_symbol_universe.dedupe_symbols(
+            [*deferred_available, *ranked_symbols]
+        )[:limit]
+
     def _market_defer_snapshot(
         self,
         *,
@@ -10763,7 +10800,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
                             30,
                         ),
                     )
-                    scan_symbols = [s["symbol"] for s in available[:pool_limit]]
+                    scan_symbols = self._market_scan_pool_symbols(
+                        available,
+                        pool_limit=pool_limit,
+                    )
                 except Exception:
                     limit = max(1, int(settings.auto_scan_symbol_limit))
                     pool_limit = limit

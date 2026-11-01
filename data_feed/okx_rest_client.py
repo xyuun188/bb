@@ -477,7 +477,16 @@ class OKXRestClient:
     def _public_market_optional_gate(self) -> _PriorityRequestGate:
         gate = self._public_market_optional_request_gate
         if not isinstance(gate, _PriorityRequestGate):
-            gate = _PriorityRequestGate(PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY)
+            # Background indicator/coverage refreshes are normal traffic. Keep
+            # one lane free so a priority candidate prewarm can start without
+            # waiting for an entire maintenance wave to drain.
+            gate = _PriorityRequestGate(
+                PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY,
+                normal_limit=max(
+                    1,
+                    PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY - 1,
+                ),
+            )
             self._public_market_optional_request_gate = gate
         return gate
 

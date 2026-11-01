@@ -7183,6 +7183,58 @@ def test_runtime_market_fetch_limit_falls_back_to_configured_limit(
     }) == 16
 
 
+def test_market_scan_pool_keeps_deferred_symbols_before_activity_ranked_rows() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = (
+        lambda symbol: str(symbol or "").replace(":USDT", "").upper()
+    )
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+    service.market_analysis_defer_tracker.defer("LOW/USDT", "shortlist_capacity")
+
+    available = [
+        {"symbol": "BTC/USDT:USDT"},
+        {"symbol": "ETH/USDT:USDT"},
+        {"symbol": "LOW/USDT:USDT"},
+    ]
+
+    assert service._market_scan_pool_symbols(available, pool_limit=2) == [
+        "LOW/USDT:USDT",
+        "BTC/USDT:USDT",
+    ]
+
+
+def test_market_scan_pool_caps_deferred_candidates_without_dropping_head_order() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "").upper()
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+    service.market_analysis_defer_tracker.defer_many(
+        ["D1/USDT", "D2/USDT", "D3/USDT"],
+        "shortlist_capacity",
+    )
+
+    available = [
+        {"symbol": "D1/USDT"},
+        {"symbol": "D2/USDT"},
+        {"symbol": "D3/USDT"},
+        {"symbol": "BTC/USDT"},
+    ]
+
+    assert service._market_scan_pool_symbols(available, pool_limit=2) == [
+        "D1/USDT",
+        "D2/USDT",
+    ]
+
+
 def test_auto_scan_feature_budget_reserves_rotation_when_verified_pool_fills_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
