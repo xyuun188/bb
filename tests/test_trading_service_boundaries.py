@@ -1935,6 +1935,16 @@ async def test_final_market_candidate_refresh_defers_market_data_quality_failure
     assert result.market_data_observation_reasons == ["short_cycle_features_missing"]
 
 
+def test_coverage_priority_prewarm_keeps_due_pending_symbols_in_order() -> None:
+    selected = TradingService._market_coverage_priority_prewarm_symbols(
+        ["READY/USDT", "OVERDUE/USDT", "OVERDUE/USDT", "SECOND/USDT"],
+        ["SECOND/USDT", "OVERDUE/USDT", "OTHER/USDT"],
+        limit=2,
+    )
+
+    assert selected == ["OVERDUE/USDT", "SECOND/USDT"]
+
+
 @pytest.mark.asyncio
 async def test_final_market_candidate_defers_when_indicators_remain_unavailable() -> None:
     service = TradingService.__new__(TradingService)

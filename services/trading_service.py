@@ -340,6 +340,10 @@ MARKET_BACKGROUND_PREWARM_QUEUE_LIMIT = 64
 MARKET_BACKGROUND_PREWARM_INTER_BATCH_SECONDS = 0.75
 MARKET_BACKGROUND_PREWARM_FAILURE_BACKOFF_BASE_SECONDS = 30.0
 MARKET_BACKGROUND_PREWARM_FAILURE_BACKOFF_MAX_SECONDS = 300.0
+# Coverage due symbols must not wait behind the rotating background queue.
+# This is a scheduling retry only; the entry contract still requires complete
+# execution facts and positive return evidence later in the round.
+MARKET_COVERAGE_PRIORITY_PREWARM_MAX_SYMBOLS = 3
 MARKET_SYMBOL_ANALYSIS_MIN_SECONDS = 20.0
 MARKET_SYMBOL_SCHEDULER_OVERHEAD_SECONDS = 1.0
 # Keep the outer watchdog bounded independently from a long user-facing
@@ -6570,6 +6574,26 @@ class TradingService(ModelTrainingCoordinatorMixin):
             or bool(getattr(feature, "indicator_snapshot_stale", False))
         ]
 
+    @staticmethod
+    def _market_coverage_priority_prewarm_symbols(
+        coverage_priority_symbols: list[str],
+        prewarm_symbols: list[str],
+        *,
+        limit: int = MARKET_COVERAGE_PRIORITY_PREWARM_MAX_SYMBOLS,
+    ) -> list[str]:
+        """Return only due symbols that still need indicator hydration."""
+
+        pending = {str(symbol) for symbol in prewarm_symbols}
+        selected: list[str] = []
+        for symbol in coverage_priority_symbols:
+            normalized = str(symbol)
+            if normalized not in pending or normalized in selected:
+                continue
+            selected.append(normalized)
+            if len(selected) >= max(int(limit), 0):
+                break
+        return selected
+
     def _prioritize_market_indicator_prewarm_symbols(
         self,
         symbols: list[str],
@@ -11363,6 +11387,27 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     self._market_indicator_prewarm_symbols(market_feature_vectors),
                     feature_vectors=market_feature_vectors,
                 )
+                coverage_priority_prewarm_symbols = (
+                    self._market_coverage_priority_prewarm_symbols(
+                        coverage_priority_symbols,
+                        prewarm_symbols,
+                    )
+                )
+                coverage_priority_retry = (
+                    await self._prewarm_market_candidate_indicators(
+                        coverage_priority_prewarm_symbols,
+                        background=False,
+                    )
+                    if coverage_priority_prewarm_symbols
+                    else {
+                        "status": "skipped",
+                        "requested_count": 0,
+                        "available_count": 0,
+                        "unavailable_symbols": [],
+                        "is_entry_permission": False,
+                        "changes_trading_thresholds": False,
+                    }
+                )
                 market_indicator_prewarm = self._queue_market_candidate_indicator_prewarm(
                     prewarm_symbols,
                     priority_symbols=coverage_priority_symbols,
@@ -11370,6 +11415,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 market_indicator_prewarm["already_ready_count"] = len(market_feature_vectors) - len(
                     prewarm_symbols
                 )
+                market_indicator_prewarm["coverage_priority_retry"] = coverage_priority_retry
             else:
                 market_indicator_prewarm = {
                     "status": "skipped",
