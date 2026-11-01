@@ -222,6 +222,40 @@ async def test_indicator_ohlcv_latency_logs_queue_diagnostic(
 
 
 @pytest.mark.asyncio
+async def test_background_public_market_queue_wait_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+
+    class SaturatedGate:
+        async def acquire(self, *, priority: bool) -> None:
+            assert priority is False
+            await asyncio.sleep(10.0)
+
+        def release(self, *, priority: bool) -> None:
+            raise AssertionError("a timed-out waiter must not release a slot")
+
+    class Exchange:
+        async def fetch_order_book(self, _symbol: str, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("the provider must not be called after queue timeout")
+
+    monkeypatch.setattr(client, "_public_market_gate", lambda: SaturatedGate())
+    monkeypatch.setattr(
+        client,
+        "_get_exchange",
+        lambda: asyncio.sleep(0, result=Exchange()),
+    )
+    monkeypatch.setattr(client, "_ensure_rest_url", lambda: None)
+
+    with pytest.raises(TimeoutError):
+        await client._ccxt_call(
+            "fetch_order_book",
+            "BTC/USDT:USDT",
+            limit=5,
+        )
+
+
+@pytest.mark.asyncio
 async def test_request_gate_returns_slot_when_granted_waiter_is_cancelled() -> None:
     gate = _PriorityRequestGate(1, normal_limit=1)
     await gate.acquire(priority=False)

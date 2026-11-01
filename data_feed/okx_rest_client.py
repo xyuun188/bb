@@ -105,6 +105,11 @@ PUBLIC_MARKET_NATIVE_CONSISTENCY_CONCURRENCY = 4
 # a dead exchange connection must not occupy a shared request slot for a full
 # minute and starve executable quotes.
 PUBLIC_MARKET_REQUEST_TIMEOUT_SECONDS = 8.0
+# Background market enrichment is allowed to wait briefly for a shared public
+# lane. If the lane is saturated, fail that optional refresh closed and let
+# the caller use its bounded cache/retry path instead of accumulating a
+# multi-second queue that can also delay executable fact requests.
+PUBLIC_MARKET_BACKGROUND_QUEUE_WAIT_SECONDS = 1.0
 PUBLIC_MARKET_NATIVE_CONSISTENCY_TIMEOUT_RETRY_DELAY_SECONDS = 0.05
 PUBLIC_MARKET_SLOW_WAIT_LOG_MS = 250.0
 PUBLIC_MARKET_SLOW_PROVIDER_LOG_MS = 750.0
@@ -538,7 +543,19 @@ class OKXRestClient:
             request_cancelled = False
             try:
                 if gate is not None:
-                    await gate.acquire(priority=is_priority)
+                    background_queue_wait = (
+                        not is_priority
+                        and request_gate is None
+                        and is_public_method
+                        and method_name != "fetch_native_consistency_ohlcv"
+                    )
+                    if background_queue_wait:
+                        await asyncio.wait_for(
+                            gate.acquire(priority=False),
+                            timeout=PUBLIC_MARKET_BACKGROUND_QUEUE_WAIT_SECONDS,
+                        )
+                    else:
+                        await gate.acquire(priority=is_priority)
                     acquired = True
                 gate_acquired_at = time.monotonic()
                 call = method(*args, **kwargs)
