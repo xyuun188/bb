@@ -879,6 +879,7 @@ async def test_qwen_batch_incomplete_response_uses_one_compact_repair(
         "risk_expert",
     }
     assert len(calls) == 2
+    assert "QWEN_TARGET_BATCH_V4" in calls[1][1].content
     assert "QWEN_TARGET_BATCH_REPAIR_V1" in calls[1][1].content
 
 

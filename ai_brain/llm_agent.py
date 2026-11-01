@@ -1701,9 +1701,17 @@ class LLMAgent(AbstractAIModel):
             if _normalize_compact_batch_value(experts_payload.get(name)) is None
         ]
         if missing_names:
+            repair_context = dict(context)
+            if target_single_call:
+                # Keep the repair on the same compact wire contract as the
+                # initial Qwen request.  Without this marker the prompt
+                # builder falls back to the verbose generic batch schema,
+                # which can reproduce the truncation that triggered repair.
+                repair_context["_compact_qwen_batch"] = True
+            repair_context["batch_repair_retry"] = True
             repair_prompt = build_batch_experts_user_prompt(
                 feature_contexts,
-                {**context, "batch_repair_retry": True},
+                repair_context,
                 missing_names,
             )
             if target_single_call:
