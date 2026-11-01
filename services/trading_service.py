@@ -6570,9 +6570,28 @@ class TradingService(ModelTrainingCoordinatorMixin):
         return [
             symbol
             for symbol, feature in (feature_vectors or {}).items()
-            if not bool(getattr(feature, "indicator_snapshot_available", False))
-            or bool(getattr(feature, "indicator_snapshot_stale", False))
+            if TradingService._market_indicator_snapshot_needs_prewarm(feature)
         ]
+
+    @staticmethod
+    def _market_indicator_snapshot_needs_prewarm(feature: Any) -> bool:
+        """Treat fallback/partial indicator markers as hydration work."""
+
+        if not bool(getattr(feature, "indicator_snapshot_available", False)):
+            return True
+        if bool(getattr(feature, "indicator_snapshot_stale", False)):
+            return True
+        quality = str(
+            getattr(feature, "indicator_snapshot_quality", "") or ""
+        ).strip().lower()
+        reason = str(
+            getattr(feature, "indicator_snapshot_reason", "") or ""
+        ).strip().lower()
+        if quality and quality != "full":
+            return True
+        if reason and reason != "recent_complete_klines":
+            return True
+        return False
 
     @staticmethod
     def _market_coverage_priority_prewarm_symbols(

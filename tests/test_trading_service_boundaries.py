@@ -1722,6 +1722,24 @@ def test_complete_market_indicator_snapshot_does_not_need_background_prewarm() -
     assert prewarm_symbols == ["ETH/USDT", "SOL/USDT"]
 
 
+def test_fallback_market_anchor_requires_indicator_prewarm() -> None:
+    features = {
+        "TIA/USDT": SimpleNamespace(
+            indicator_snapshot_available=True,
+            indicator_snapshot_stale=False,
+            indicator_snapshot_quality="fallback_market_anchor",
+        ),
+        "BTC/USDT": SimpleNamespace(
+            indicator_snapshot_available=True,
+            indicator_snapshot_stale=False,
+            indicator_snapshot_quality="full",
+            indicator_snapshot_reason="recent_complete_klines",
+        ),
+    }
+
+    assert TradingService._market_indicator_prewarm_symbols(features) == ["TIA/USDT"]
+
+
 def test_market_indicator_prewarm_prioritizes_overdue_coverage() -> None:
     service = TradingService.__new__(TradingService)
     service._normalize_position_symbol = lambda value: str(value or "").upper()
