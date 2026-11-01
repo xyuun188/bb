@@ -1963,6 +1963,26 @@ def test_coverage_priority_prewarm_keeps_due_pending_symbols_in_order() -> None:
     assert selected == ["OVERDUE/USDT", "SECOND/USDT"]
 
 
+def test_market_analysis_order_puts_coverage_symbols_first() -> None:
+    ordered = TradingService._order_market_analysis_candidates_for_coverage(
+        {
+            "ADVANTAGE/USDT": object(),
+            "SATS/USDT": object(),
+            "OTHER/USDT": object(),
+            "NEIRO/USDT": object(),
+        },
+        ["NEIRO/USDT", "SATS/USDT"],
+        ["SATS/USDT"],
+    )
+
+    assert list(ordered) == [
+        "SATS/USDT",
+        "ADVANTAGE/USDT",
+        "OTHER/USDT",
+        "NEIRO/USDT",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_final_market_candidate_defers_when_indicators_remain_unavailable() -> None:
     service = TradingService.__new__(TradingService)

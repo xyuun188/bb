@@ -8723,7 +8723,37 @@ class TradingService(ModelTrainingCoordinatorMixin):
             cooldown_underfilled=diagnostics.get("cooldown_underfilled"),
             recent_material_change_count=diagnostics.get("recent_material_change_count"),
         )
-        return result.selected
+        return self._order_market_analysis_candidates_for_coverage(
+            result.selected,
+            diagnostics.get("coverage_selected_symbols") or [],
+            diagnostics.get("coverage_overdue_symbols") or [],
+        )
+
+    @staticmethod
+    def _order_market_analysis_candidates_for_coverage(
+        selected: dict[str, Any],
+        coverage_symbols: list[str],
+        overdue_symbols: list[str],
+    ) -> dict[str, Any]:
+        """Start truly overdue coverage AI work before advantage candidates."""
+
+        if not selected or not coverage_symbols or not overdue_symbols:
+            return dict(selected)
+        selected_keys = set(selected)
+        overdue_keys = set(overdue_symbols)
+        coverage_first = [
+            symbol
+            for symbol in coverage_symbols
+            if symbol in selected_keys and symbol in overdue_keys
+        ]
+        coverage_keys = set(coverage_first)
+        return {
+            symbol: selected[symbol]
+            for symbol in [
+                *coverage_first,
+                *(symbol for symbol in selected if symbol not in coverage_keys),
+            ]
+        }
 
     def _remember_market_analysis_observation(self, symbol: str, feature: Any) -> None:
         self._market_analysis_selector_policy().remember(symbol, feature)
