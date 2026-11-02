@@ -684,7 +684,7 @@ async def test_normal_paper_rejects_when_native_tier_has_no_remaining_capacity()
 
 @pytest.mark.asyncio
 async def test_bounded_training_entry_can_use_only_its_micro_risk_budget() -> None:
-    decision = _quality_observation_decision(return_lcb_pct=-0.3)
+    decision = _quality_observation_decision(return_lcb_pct=0.3)
     _use_bounded_training_entry(decision)
     decision.raw_response["opportunity_score"]["return_distribution_contract"][
         "raw_expected_return_pct"
@@ -725,7 +725,7 @@ async def test_training_risk_contract_tampering_fails_closed(
     key: str,
     value: object,
 ) -> None:
-    decision = _quality_observation_decision(return_lcb_pct=-0.3)
+    decision = _quality_observation_decision(return_lcb_pct=0.3)
     _use_bounded_training_entry(decision)
     decision.raw_response["opportunity_score"]["return_distribution_contract"][
         "raw_expected_return_pct"
@@ -863,7 +863,7 @@ async def test_paper_training_uses_solved_return_for_execution_permission(
     gross_return: float,
     entry_eligible: bool,
 ) -> None:
-    decision = _quality_observation_decision(return_lcb_pct=-0.3)
+    decision = _quality_observation_decision(return_lcb_pct=0.3)
     _use_bounded_training_entry(decision, raw_return_pct=gross_return)
     decision.feature_snapshot.update(_size_aware_book_snapshot(5_000.0))
     opportunity = decision.raw_response["opportunity_score"]
@@ -874,7 +874,7 @@ async def test_paper_training_uses_solved_return_for_execution_permission(
     opportunity["return_distribution_contract"].update(
         {
             "raw_expected_return_pct": original_net,
-            "objective_expected_return_pct": -0.5,
+            "objective_expected_return_pct": 0.25,
             "transformations": {
                 "live_execution_cost_pct": original_cost["total_pct"],
                 "live_slippage_pct": original_cost["slippage_pct"],
@@ -1055,7 +1055,7 @@ async def test_negative_lcb_quality_observation_is_shadow_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_normal_paper_negative_downside_is_bounded_by_full_risk_budget() -> None:
+async def test_normal_paper_negative_downside_is_stressed_but_blocks_entry() -> None:
     decision = _decision()
     raw = decision.raw_response
     raw["normal_paper_trade"] = build_normal_paper_trade_contract(
@@ -1083,12 +1083,13 @@ async def test_normal_paper_negative_downside_is_bounded_by_full_risk_budget() -
         decision, "paper", []
     )
     sizing = raw["profit_risk_sizing"]
-    assert sizing["production_eligible"] is True
+    assert sizing["production_eligible"] is False
     assert sizing["return_lcb_pct"] < 0.0
     assert sizing["stressed_loss_fraction"] >= abs(sizing["return_lcb_pct"]) / 100.0
     assert 0.0 < sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
     assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
-    assert decision.suggested_leverage > 1.0
+    assert sizing["final_notional_usdt"] == 0.0
+    assert decision.suggested_leverage == 1.0
     assert sizing["production_permission"] is False
 
 

@@ -4773,6 +4773,71 @@ async def test_entry_execution_policy_blocks_unverified_market_analysis_before_p
 
 
 @pytest.mark.asyncio
+async def test_market_entry_pipeline_stops_observation_candidate_before_risk_preparation() -> None:
+    service = TradingService.__new__(TradingService)
+    decision = _decision(Action.LONG)
+    recorded: dict[str, Any] = {}
+    prepare_called = False
+
+    service._market_analysis_only_entry_reason = (
+        lambda _decision, **_kwargs: "observation-only candidate"
+    )
+    service._finalize_unsubmitted_entry_contract = lambda *_args: decision.raw_response
+
+    async def record_skip(**kwargs: Any) -> None:
+        recorded.update(kwargs)
+
+    async def prepare_entry(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal prepare_called
+        prepare_called = True
+
+    service.market_auto_entry_processor = SimpleNamespace(record_skip=record_skip)
+    service._prepare_entry_for_hard_risk = prepare_entry
+
+    await service._run_market_entry_pipeline(
+        symbol=decision.symbol,
+        model_name=decision.model_name,
+        decision=decision,
+        decision_db_id=123,
+        model_mode="paper",
+        feature_vector=SimpleNamespace(symbol=decision.symbol),
+        results={},
+        open_positions=[],
+        staged_entry_counts={},
+        strategy_mode_context=None,
+        market_regime_context=None,
+        new_pair_pause_reason=None,
+    )
+
+    assert prepare_called is False
+    assert recorded["skip_kind"] == "market_analysis_only"
+    assert recorded["reason"] == "observation-only candidate"
+
+
+@pytest.mark.asyncio
+async def test_pre_order_facts_fail_closed_for_observation_candidate_before_executor_call() -> None:
+    service = TradingService.__new__(TradingService)
+    executor_calls: list[str] = []
+
+    service._market_analysis_only_entry_reason = (
+        lambda _decision, **_kwargs: "observation-only candidate"
+    )
+
+    async def executor_provider(mode: str) -> Any:
+        executor_calls.append(mode)
+        raise AssertionError("analysis-only candidates must not refresh execution facts")
+
+    service._get_okx_executor_for_mode = executor_provider
+
+    facts = await service.pre_order_execution_facts("paper", _decision(Action.LONG))
+
+    assert executor_calls == []
+    assert facts["production_eligible"] is False
+    assert facts["reason"] == "market_analysis_only"
+    assert facts["reasons"] == ["market_analysis_only"]
+
+
+@pytest.mark.asyncio
 async def test_entry_execution_policy_blocks_paper_observation_contract_in_live_mode() -> None:
     service = TradingService.__new__(TradingService)
     service._market_analysis_only_symbols = {"BTC/USDT"}

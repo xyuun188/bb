@@ -89,7 +89,7 @@ class MarketAutoEntryProcessor:
         opportunity_reason = self.gate_reason(decision)
         if opportunity_reason:
             reason = self._entry_gate_skip_reason(opportunity_reason)
-            await self._record_skip(
+            await self.record_skip(
                 symbol=symbol,
                 model_name=model_name,
                 decision=decision,
@@ -108,7 +108,7 @@ class MarketAutoEntryProcessor:
         )
         if not immediate_plan.should_execute:
             reason = immediate_plan.reason
-            await self._record_skip(
+            await self.record_skip(
                 symbol=symbol,
                 model_name=model_name,
                 decision=decision,
@@ -132,7 +132,7 @@ class MarketAutoEntryProcessor:
         )
         if capacity_reason:
             reason = f"开仓信号执行前容量复核未通过：{capacity_reason}"
-            await self._record_skip(
+            await self.record_skip(
                 symbol=symbol,
                 model_name=model_name,
                 decision=decision,
@@ -400,7 +400,7 @@ class MarketAutoEntryProcessor:
             return reason
         return f"入场候选暂未满足执行条件：{reason}"
 
-    async def _record_skip(
+    async def record_skip(
         self,
         *,
         symbol: str,

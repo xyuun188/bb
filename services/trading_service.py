@@ -4459,6 +4459,25 @@ class TradingService(ModelTrainingCoordinatorMixin):
     ) -> dict[str, Any]:
         """Load immediate native market and account cost facts before submit."""
 
+        market_analysis_reason = self._market_analysis_only_entry_reason(
+            decision,
+            model_mode=model_mode,
+        )
+        if market_analysis_reason:
+            logger.info(
+                "market analysis-only entry stopped before pre-order refresh",
+                mode=model_mode,
+                symbol=decision.symbol,
+                reason=market_analysis_reason,
+            )
+            return {
+                "production_eligible": False,
+                "available": False,
+                "reason": "market_analysis_only",
+                "reasons": ["market_analysis_only"],
+                "block_reasons": ["market_analysis_only"],
+            }
+
         executor = await self._get_okx_executor_for_mode(model_mode)
         side = "long" if decision.action == Action.LONG else "short"
         facts = await executor.pre_order_execution_facts(decision.symbol, side)
@@ -8054,7 +8073,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
     ) -> str | None:
         """Return the hard boundary for observation-only market candidates."""
 
-        if not decision.is_entry:
+        if not getattr(decision, "is_entry", False):
             return None
         symbol = self._normalize_position_symbol(getattr(decision, "symbol", ""))
         raw = self._safe_dict(decision.raw_response)
@@ -10330,6 +10349,28 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """Finish risk preparation and execution outside the market analysis clock."""
 
         try:
+            market_analysis_reason = self._market_analysis_only_entry_reason(
+                decision,
+                model_mode=model_mode,
+            )
+            if market_analysis_reason:
+                self._finalize_unsubmitted_entry_contract(
+                    decision,
+                    model_mode,
+                    market_analysis_reason,
+                )
+                await self.market_auto_entry_processor.record_skip(
+                    symbol=symbol,
+                    model_name=model_name,
+                    decision=decision,
+                    decision_db_id=decision_db_id,
+                    results=results,
+                    model_mode=model_mode,
+                    reason=market_analysis_reason,
+                    skip_kind="market_analysis_only",
+                )
+                return
+
             await self._prepare_entry_for_hard_risk(
                 decision,
                 model_mode,
