@@ -369,6 +369,7 @@ class DataService:
         self._kline_coverage_index = 0
         self._derivatives_cache: dict[str, dict[str, Any]] = {}
         self._derivatives_refresh_tasks: dict[str, asyncio.Task] = {}
+        self._derivatives_priority_refresh_tasks: dict[str, asyncio.Task] = {}
         self._derivatives_failed_at: dict[str, datetime] = {}
         self._last_sentiment_update: datetime | None = None
         self._sentiment_update_interval = 300  # seconds
@@ -3473,6 +3474,13 @@ class DataService:
             self._derivatives_refresh_tasks = tasks
         return tasks
 
+    def _derivatives_priority_refresh_task_map(self) -> dict[str, asyncio.Task]:
+        tasks = getattr(self, "_derivatives_priority_refresh_tasks", None)
+        if not isinstance(tasks, dict):
+            tasks = {}
+            self._derivatives_priority_refresh_tasks = tasks
+        return tasks
+
     def _is_fresh_indicator_cache(self, cached: Any) -> bool:
         if not isinstance(cached, dict):
             return False
@@ -4355,9 +4363,14 @@ class DataService:
                     return data
 
         tasks = self._derivatives_refresh_task_map()
-        existing_task = tasks.get(normalized)
+        priority_tasks = self._derivatives_priority_refresh_task_map()
+        existing_task = priority_tasks.get(normalized)
+        task_map = priority_tasks
+        if existing_task is None or existing_task.done():
+            existing_task = tasks.get(normalized)
+            task_map = tasks
         if existing_task and not existing_task.done():
-            if block_on_remote:
+            if block_on_remote and task_map is priority_tasks:
                 try:
                     result = await asyncio.wait_for(
                         asyncio.shield(existing_task),
@@ -4371,8 +4384,8 @@ class DataService:
                     # warming the route cache.  Let this required caller run
                     # one explicit funding-aware refresh instead of accepting
                     # that partial result as an analysis snapshot.
-                    if tasks.get(normalized) is existing_task:
-                        tasks.pop(normalized, None)
+                    if task_map.get(normalized) is existing_task:
+                        task_map.pop(normalized, None)
                 except TimeoutError:
                     if cached_data:
                         cached_data["derivatives_snapshot_stale"] = True
@@ -4381,7 +4394,8 @@ class DataService:
                     cached_data["derivatives_refresh_in_background"] = True
                     cached_data["derivatives_refresh_timeout"] = True
                     return cached_data
-            return {"derivatives_refresh_in_background": True}
+            elif not block_on_remote:
+                return {"derivatives_refresh_in_background": True}
         if not block_on_remote:
             if allow_background_refresh:
                 self._schedule_derivatives_background_refresh(normalized)
@@ -4394,31 +4408,31 @@ class DataService:
 
         async def refresh() -> dict[str, Any]:
             refresh_fn = self._refresh_derivatives_snapshot
-            try:
-                return await refresh_fn(
-                    normalized,
-                    required_only=required_only,
-                    require_funding=require_funding,
-                )
-            except TypeError as exc:
-                # Keep older test doubles and integrations source-compatible
-                # while the real implementation adopts the explicit contract.
-                error_text = safe_error_text(exc)
-                if "require_funding" in error_text:
-                    try:
-                        return await refresh_fn(
-                            normalized,
-                            required_only=required_only,
-                        )
-                    except TypeError as nested_exc:
-                        if "required_only" not in safe_error_text(nested_exc):
-                            raise
-                        return await refresh_fn(normalized)
-                if "required_only" not in error_text:
-                    raise
-                return await refresh_fn(normalized)
+            refresh_kwargs: dict[str, Any] = {
+                "required_only": required_only,
+                "require_funding": require_funding,
+                "priority": True,
+            }
+            for _attempt in range(3):
+                try:
+                    return await refresh_fn(normalized, **refresh_kwargs)
+                except TypeError as exc:
+                    error_text = safe_error_text(exc)
+                    unsupported = next(
+                        (
+                            key
+                            for key in ("require_funding", "priority", "required_only")
+                            if key in error_text
+                        ),
+                        None,
+                    )
+                    if unsupported is None:
+                        raise
+                    refresh_kwargs.pop(unsupported)
+            return await refresh_fn(normalized)
 
         task = asyncio.create_task(refresh())
+        tasks = priority_tasks
         tasks[normalized] = task
 
         def cleanup(finished: asyncio.Task[dict[str, Any]]) -> None:
@@ -4518,6 +4532,10 @@ class DataService:
             return
         normalized = self._normalize_symbols([symbol])[0]
         tasks = self._derivatives_refresh_task_map()
+        priority_tasks = self._derivatives_priority_refresh_task_map()
+        priority_task = priority_tasks.get(normalized)
+        if priority_task and not priority_task.done():
+            return
         existing_task = tasks.get(normalized)
         if existing_task and not existing_task.done():
             return
@@ -4558,10 +4576,12 @@ class DataService:
         *,
         required_only: bool = False,
         require_funding: bool = False,
+        priority: bool = False,
     ) -> dict[str, Any]:
         normalized = self._normalize_symbols([symbol])[0]
         contract_spec: dict[str, Any] | None = None
         tasks = self._derivatives_refresh_task_map()
+        priority_tasks = self._derivatives_priority_refresh_task_map()
         failed_cache = getattr(self, "_derivatives_failed_at", None)
         if not isinstance(failed_cache, dict):
             failed_cache = {}
@@ -4570,7 +4590,8 @@ class DataService:
             (self._derivatives_cache.get(normalized) or {}).get("data") or {}
         )
         current_task = asyncio.current_task()
-        existing_task = tasks.get(normalized)
+        task_map = priority_tasks if priority else tasks
+        existing_task = task_map.get(normalized)
         if existing_task and existing_task is not current_task and not existing_task.done():
             result = await existing_task
             return dict(result or {})
@@ -4613,7 +4634,7 @@ class DataService:
                 "contract_spec": contract_spec,
                 "required_only": required_only,
                 "require_funding": require_funding,
-                "priority": bool(require_funding),
+                "priority": bool(priority or required_only or require_funding),
                 "native_market_facts": self._cached_native_derivatives_facts(
                     normalized,
                     contract_spec,

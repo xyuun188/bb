@@ -54,6 +54,7 @@ def _service() -> DataService:
     service._kline_coverage_index = 0
     service._derivatives_cache = {}
     service._derivatives_refresh_tasks = {}
+    service._derivatives_priority_refresh_tasks = {}
     service._ticker_persisted_at = {}
     service._ticker_persist_inflight = set()
     service._ticker_persist_semaphore = asyncio.Semaphore(
@@ -2600,7 +2601,7 @@ async def test_derivatives_refresh_timeout_keeps_shared_task_alive(
     assert result["derivatives_refresh_in_background"] is True
     assert result["derivatives_refresh_timeout"] is True
     await asyncio.wait_for(started.wait(), timeout=0.2)
-    task = service._derivatives_refresh_tasks["ETH/USDT"]
+    task = service._derivatives_priority_refresh_tasks["ETH/USDT"]
     assert not task.cancelled()
 
     release.set()
@@ -2608,7 +2609,79 @@ async def test_derivatives_refresh_timeout_keeps_shared_task_alive(
     assert completed["funding_rate"] == pytest.approx(0.002)
     assert not cancelled.is_set()
     await asyncio.sleep(0)
-    assert "ETH/USDT" not in service._derivatives_refresh_tasks
+    assert "ETH/USDT" not in service._derivatives_priority_refresh_tasks
+
+
+@pytest.mark.asyncio
+async def test_blocking_derivatives_refresh_prioritizes_required_routes() -> None:
+    service = _service()
+    service._derivatives_failed_at = {}
+    service._derivatives_refresh_tasks = {}
+    calls: list[tuple[bool, bool, bool]] = []
+    service._get_instrument_spec = (  # type: ignore[method-assign]
+        lambda _symbol, **_kwargs: asyncio.sleep(
+            0,
+            result={"instId": "ETH-USDT-SWAP"},
+        )
+    )
+
+    class FakeRestClient:
+        async def fetch_derivatives_snapshot(
+            self,
+            _symbol: str,
+            *,
+            contract_spec: dict,
+            required_only: bool = False,
+            require_funding: bool = False,
+            priority: bool = False,
+            native_market_facts: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            calls.append((required_only, require_funding, priority))
+            return {"orderbook_bid_depth": 10.0}
+
+    service.rest_client = FakeRestClient()
+
+    await service._get_derivatives_snapshot("ETH/USDT", block_on_remote=True)
+
+    assert calls == [(False, False, True)]
+
+
+@pytest.mark.asyncio
+async def test_priority_derivatives_refresh_does_not_wait_for_background_refresh() -> None:
+    service = _service()
+    background_started = asyncio.Event()
+    release_background = asyncio.Event()
+    calls: list[bool] = []
+
+    async def refresh(
+        _symbol: str,
+        *,
+        required_only: bool = False,
+        require_funding: bool = False,
+        priority: bool = False,
+    ) -> dict[str, Any]:
+        calls.append(priority)
+        if priority:
+            return {"refresh_lane": "priority"}
+        background_started.set()
+        await release_background.wait()
+        return {"refresh_lane": "background"}
+
+    service._refresh_derivatives_snapshot = refresh  # type: ignore[method-assign]
+    service._schedule_derivatives_background_refresh("ETH/USDT")
+    await asyncio.wait_for(background_started.wait(), timeout=0.2)
+
+    result = await asyncio.wait_for(
+        service._get_derivatives_snapshot("ETH/USDT", block_on_remote=True),
+        timeout=0.2,
+    )
+
+    assert calls == [False, True]
+    assert result["refresh_lane"] == "priority"
+    background_task = service._derivatives_refresh_tasks["ETH/USDT"]
+    assert not background_task.done()
+    release_background.set()
+    await asyncio.wait_for(background_task, timeout=0.2)
 
 
 @pytest.mark.asyncio
@@ -2616,13 +2689,24 @@ async def test_derivatives_refresh_records_success_without_missing_cache_state()
     service = _service()
     service._derivatives_failed_at = {}
     service._derivatives_refresh_tasks = {}
+    priorities: list[bool] = []
     service._get_instrument_spec = (  # type: ignore[method-assign]
         lambda _symbol, **_kwargs: asyncio.sleep(0, result={"instId": "PROS-USDT-SWAP"})
     )
 
     class FakeRestClient:
-        async def fetch_derivatives_snapshot(self, _symbol: str, *, contract_spec: dict) -> dict[str, Any]:
+        async def fetch_derivatives_snapshot(
+            self,
+            _symbol: str,
+            *,
+            contract_spec: dict,
+            required_only: bool = False,
+            require_funding: bool = False,
+            priority: bool = False,
+            native_market_facts: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
             assert contract_spec["instId"] == "PROS-USDT-SWAP"
+            priorities.append(priority)
             return {"funding_rate": 0.001, "orderbook_bid_depth": 10.0}
 
     service.rest_client = FakeRestClient()
@@ -2630,6 +2714,7 @@ async def test_derivatives_refresh_records_success_without_missing_cache_state()
     result = await service._refresh_derivatives_snapshot("PROS/USDT")
 
     assert result["funding_rate"] == pytest.approx(0.001)
+    assert priorities == [False]
     assert "PROS/USDT" not in service._derivatives_failed_at
     assert service._derivatives_cache["PROS/USDT"]["data"] == result
 
@@ -2642,7 +2727,7 @@ async def test_market_derivatives_refresh_requests_required_routes_only() -> Non
     service._get_instrument_spec = (  # type: ignore[method-assign]
         lambda _symbol, **_kwargs: asyncio.sleep(0, result={"instId": "ETH-USDT-SWAP"})
     )
-    calls: list[bool] = []
+    calls: list[tuple[bool, bool]] = []
 
     class FakeRestClient:
         async def fetch_derivatives_snapshot(
@@ -2651,9 +2736,10 @@ async def test_market_derivatives_refresh_requests_required_routes_only() -> Non
             *,
             contract_spec: dict,
             required_only: bool = False,
+            priority: bool = False,
         ) -> dict[str, Any]:
             assert contract_spec["instId"] == "ETH-USDT-SWAP"
-            calls.append(required_only)
+            calls.append((required_only, priority))
             return {
                 "orderbook_data_available": True,
                 "orderbook_bid_depth": 10.0,
@@ -2671,7 +2757,7 @@ async def test_market_derivatives_refresh_requests_required_routes_only() -> Non
         allow_background_refresh=False,
     )
 
-    assert calls == [True]
+    assert calls == [(True, True)]
     assert result["derivatives_required_data_available"] is True
 
 
