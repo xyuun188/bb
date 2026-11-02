@@ -896,7 +896,7 @@ def reconcile_normal_paper_trade_contract(
         and contract["current_edge_validated"]
         and current_raw is not None
         and current_raw > 0.0
-        and normal_paper_current_return_ready(expected_net, return_lcb)
+        and normal_paper_entry_return_ready(expected_net, return_lcb)
         and current_loss_probability is not None
         and current_loss_probability <= (
             NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
@@ -906,7 +906,7 @@ def reconcile_normal_paper_trade_contract(
         selection_reason == "strategy_edge_selected"
         and _quality_permissions_ready(quality_permissions)
         and contract["current_edge_validated"]
-        and normal_paper_current_return_ready(expected_net, return_lcb)
+        and normal_paper_entry_return_ready(expected_net, return_lcb)
     )
     entry_eligible = training_entry_eligible or validated_entry_eligible
     contract["reconciliation"] = {

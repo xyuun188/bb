@@ -177,6 +177,52 @@ def test_reconcile_normal_trade_keeps_positive_current_execution_edge_authorized
     assert normal_paper_entry_contract_reasons(reconciled) == []
 
 
+@pytest.mark.parametrize(
+    "selection_reason",
+    ["strategy_edge_selected", "paper_training_entry"],
+)
+def test_reconcile_does_not_authorize_non_positive_current_return_lcb(
+    selection_reason: str,
+) -> None:
+    support = _support("long", expected_net=0.2, objective_net=0.1)
+    if selection_reason == "paper_training_entry":
+        support["quant_quality_permissions"]["local_ml"][
+            "paper_execution_permission"
+        ] = False
+        selection = select_normal_paper_trade_side({"long": support})
+        assert selection["selection_reason"] == "paper_training_entry"
+        support = selection["selected_support"]
+
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason=selection_reason,
+        direction_support=support,
+    )
+    assert contract
+
+    reconciled = reconcile_normal_paper_trade_contract(
+        contract,
+        {
+            "expected_net_return_pct": 0.08,
+            "return_lcb_pct": -0.22,
+            "execution_cost": {"total_pct": 0.19},
+            "return_distribution_contract": {
+                "gross_market_distribution": {"raw_expected_return_pct": 0.27}
+            },
+        },
+    )
+
+    assert reconciled["authorized"] is False
+    assert reconciled["reconciliation"]["status"] == (
+        "blocked_current_execution_return"
+    )
+    assert reconciled["reconciliation"]["current"]["new_entry_return_ready"] is False
+    assert "normal_paper_trade_return_lcb_not_positive" in (
+        normal_paper_entry_contract_reasons(reconciled)
+    )
+
+
 def test_negative_return_lcb_remains_sizing_evidence_but_cannot_submit_entry() -> None:
     contract = build_normal_paper_trade_contract(
         symbol="BTC/USDT",
