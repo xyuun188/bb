@@ -4691,6 +4691,25 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """Apply current exchange/account safety before the return policy."""
 
         if decision.is_entry:
+            # This is the last shared entry boundary before ExecutionService
+            # requests an exchange executor.  Candidate filters cover the
+            # normal market path, but manual/recovery/review callers can enter
+            # here directly; observation-only provenance must therefore be
+            # enforced again at this boundary.
+            market_analysis_reason = self._market_analysis_only_entry_reason(
+                decision,
+                model_mode=model_mode,
+            )
+            if market_analysis_reason:
+                return PolicyGateResult.block(
+                    "market_analysis_only",
+                    market_analysis_reason,
+                    {
+                        "stage_status": "blocked",
+                        "skip_kind": "market_analysis_only",
+                        "execution_blocker": "market_analysis_only",
+                    },
+                )
             # Market analysis can take longer than one position-sync interval.
             # Refresh the authoritative snapshot immediately before the final
             # entry policy so a position opened by another round cannot be
@@ -8027,7 +8046,12 @@ class TradingService(ModelTrainingCoordinatorMixin):
             suspicious_symbol_policy=EntrySuspiciousSymbolPolicy(self._normalize_position_symbol),
         ).safety_reason(decision)
 
-    def _market_analysis_only_entry_reason(self, decision: DecisionOutput) -> str | None:
+    def _market_analysis_only_entry_reason(
+        self,
+        decision: DecisionOutput,
+        *,
+        model_mode: str | None = None,
+    ) -> str | None:
         """Return the hard boundary for observation-only market candidates."""
 
         if not decision.is_entry:
@@ -8044,7 +8068,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             for item in (getattr(self, "_market_analysis_only_symbols", set()) or set())
         }:
             return None
-        if self._market_analysis_only_can_promote(decision):
+        if self._market_analysis_only_can_promote(decision, model_mode=model_mode):
             raw["market_analysis_only"] = True
             raw["market_analysis_only_contract"] = {
                 "selected_for_market_analysis": True,
@@ -8056,18 +8080,35 @@ class TradingService(ModelTrainingCoordinatorMixin):
             decision.raw_response = raw
             return None
         raw["market_analysis_only"] = True
-        raw["market_analysis_only_contract"] = {
+        funnel = self._safe_dict(raw.get("market_candidate_funnel"))
+        marker = (
+            self._market_analysis_only_marker(funnel, symbol)
+            if funnel
+            else None
+        )
+        blocked_contract = {
             "selected_for_market_analysis": True,
             "entry_permission": False,
-            "reason": "ranker_analysis_only_fill",
+            "reason": (marker or {}).get("reason") or "ranker_analysis_only_fill",
         }
+        candidate_state = (marker or {}).get("state")
+        if candidate_state:
+            blocked_contract["execution_candidate_state"] = candidate_state
+        if funnel.get("round_id"):
+            blocked_contract["round_id"] = funnel["round_id"]
+        raw["market_analysis_only_contract"] = blocked_contract
         decision.raw_response = raw
         return (
             "该币种仅用于扩大市场观察覆盖，未通过交易候选质量层；"
             "分析结果不能进入开仓执行链路。"
         )
 
-    def _market_analysis_only_can_promote(self, decision: DecisionOutput) -> bool:
+    def _market_analysis_only_can_promote(
+        self,
+        decision: DecisionOutput,
+        *,
+        model_mode: str | None = None,
+    ) -> bool:
         """Allow only a complete, already-authorized paper contract through.
 
         The shortlist may mark a symbol as observation-only for provenance. That
@@ -8081,11 +8122,16 @@ class TradingService(ModelTrainingCoordinatorMixin):
         selection = self._safe_dict(raw.get("paper_trade_selection"))
         permission = self._safe_dict(raw.get("entry_permission"))
         contract = self._safe_dict(raw.get("normal_paper_trade"))
-        try:
-            mode = self._get_model_execution_mode(getattr(decision, "model_name", ""))
-        except (AttributeError, KeyError, TypeError, ValueError):
-            mode = "paper"
-        selected_mode = "live" if str(mode).lower() == "live" else "paper"
+        mode = model_mode
+        if mode is None:
+            try:
+                mode = self._get_model_execution_mode(getattr(decision, "model_name", ""))
+            except (AttributeError, KeyError, TypeError, ValueError):
+                return False
+        normalized_mode = str(mode).lower()
+        if normalized_mode != "paper":
+            return False
+        selected_mode = normalized_mode
         # Keep this round's selection based on the cache snapshot that existed
         # when the round began. The capability refresh runs concurrently and
         # may finish during the hand-off below, but its result must only affect
@@ -8093,16 +8139,34 @@ class TradingService(ModelTrainingCoordinatorMixin):
         # shortlist halfway through its diagnostics.
         unavailable_by_mode = dict(self._entry_unavailable_cache_for_mode(selected_mode))
         symbol = self._normalize_position_symbol(getattr(decision, "symbol", ""))
+        funnel = self._safe_dict(raw.get("market_candidate_funnel"))
+        marker = (
+            self._market_analysis_only_marker(funnel, symbol)
+            if funnel
+            else None
+        )
+        marker_state = str((marker or {}).get("state") or "").strip()
+        if marker_state in {
+            "analysis_only_execution_unverified",
+            "execution_unavailable",
+        }:
+            return False
+        verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
+        verified_symbols = (
+            verified_by_mode.get(selected_mode, set())
+            if isinstance(verified_by_mode, dict)
+            else set()
+        )
+        if symbol not in verified_symbols:
+            return False
         contract_authorized = bool(
             contract.get("authorized") is True
             and permission.get("granted") is True
             and not normal_paper_entry_contract_reasons(contract)
         )
         if contract_authorized:
-            # The ranker's analysis-only label is a coverage/provenance marker.
-            # It must not veto a decision that already carries the complete
-            # normal-paper authorization contract; otherwise one decision is
-            # simultaneously authorized and permanently non-executable.
+            # A complete paper contract is necessary but cannot substitute for
+            # a positive execution-capability fact from this round or cache.
             return bool(symbol not in unavailable_by_mode)
         return bool(
             symbol not in unavailable_by_mode
@@ -8114,13 +8178,18 @@ class TradingService(ModelTrainingCoordinatorMixin):
     def _entry_gate_reason_with_market_boundary(
         self,
         decision: DecisionOutput,
+        *,
+        model_mode: str | None = None,
     ) -> str | None:
         """Apply the normal entry gate plus the observation-only boundary."""
 
         normal_reason = self.entry_policy.gate_reason(decision)
         if normal_reason:
             return normal_reason
-        return self._market_analysis_only_entry_reason(decision)
+        return self._market_analysis_only_entry_reason(
+            decision,
+            model_mode=model_mode,
+        )
 
     async def _today_side_performance(self, mode: str) -> dict[str, dict[str, float]]:
         """Delegate today's long/short realized-PnL feedback to a dedicated service."""
@@ -9779,12 +9848,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
             return None
         candidates: list[dict[str, Any]] = []
         selected_symbols = funnel.get("analysis_only_selected_symbols")
-        if isinstance(selected_symbols, (list, tuple, set)):
-            if any(self._normalize_position_symbol(item) == normalized for item in selected_symbols):
-                return {
-                    "reason": "ranker_analysis_only_fill",
-                    "state": "analysis_only_selection",
-                }
+        selected_for_analysis = isinstance(selected_symbols, (list, tuple, set)) and any(
+            self._normalize_position_symbol(item) == normalized for item in selected_symbols
+        )
         availability = self._safe_dict(funnel.get("execution_availability"))
         for key in ("analysis_only_execution_unverified", "unavailable"):
             rows = availability.get(key)
@@ -9800,24 +9866,53 @@ class TradingService(ModelTrainingCoordinatorMixin):
                         enriched.setdefault("analysis_only", True)
                         enriched.setdefault("execution_candidate_state", "execution_unavailable")
                     candidates.append(enriched)
+        ranked_candidates: list[dict[str, Any]] = []
         for key in ("ranked_symbol_sample", "rank_top_symbols", "symbols"):
             rows = funnel.get(key)
             if isinstance(rows, list):
-                candidates.extend(item for item in rows if isinstance(item, dict))
-        for item in candidates:
-            if self._normalize_position_symbol(item.get("symbol")) != normalized:
-                continue
+                ranked_candidates.extend(item for item in rows if isinstance(item, dict))
+        candidates.extend(ranked_candidates)
+
+        matching = [
+            item
+            for item in candidates
+            if self._normalize_position_symbol(item.get("symbol")) == normalized
+        ]
+        for item in matching:
             state = str(item.get("execution_candidate_state") or "").strip()
-            if (
-                item.get("analysis_only") is True
-                or state in {"analysis_only_execution_unverified", "execution_unavailable"}
-            ):
+            if state in {"analysis_only_execution_unverified", "execution_unavailable"}:
                 return {
                     "reason": item.get("reason")
                     or item.get("non_selected_reason")
                     or "ranker_analysis_only_fill",
-                    "state": state or item.get("selection_tier") or "analysis_only",
+                    "state": state,
                 }
+
+        for item in matching:
+            state = str(item.get("execution_candidate_state") or "").strip()
+            is_analysis_selection = bool(
+                selected_for_analysis
+                or item.get("analysis_only") is True
+                or item.get("selection_tier") == "analysis_only_fill"
+                or item.get("non_selected_reason") == "selected_for_market_analysis_only"
+            )
+            if is_analysis_selection:
+                return {
+                    "reason": item.get("reason")
+                    or item.get("non_selected_reason")
+                    or "ranker_analysis_only_fill",
+                    "state": (
+                        "execution_verified"
+                        if state == "execution_verified"
+                        else "analysis_only_selection"
+                    ),
+                }
+
+        if selected_for_analysis:
+            return {
+                "reason": "ranker_analysis_only_fill",
+                "state": "analysis_only_selection",
+            }
         return None
 
     @staticmethod

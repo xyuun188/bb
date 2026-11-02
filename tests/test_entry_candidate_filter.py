@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_candidate_filter import EntryCandidateFilterPolicy
 from services.entry_candidate_queue import EntryCandidate
@@ -174,9 +176,20 @@ def test_market_analysis_only_candidate_is_blocked_before_execution() -> None:
     }
 
 
-def test_market_analysis_only_candidate_with_full_paper_contract_is_promoted() -> None:
+@pytest.mark.parametrize(
+    ("model_mode", "expected_reason"),
+    [("paper", None), ("live", "blocked"), ("shadow", "blocked")],
+)
+def test_market_analysis_only_candidate_promotion_uses_execution_mode(
+    model_mode: str,
+    expected_reason: str | None,
+) -> None:
     service = object.__new__(TradingService)
     service._market_analysis_only_symbols = {"BTC/USDT"}
+    service._verified_entry_symbols_by_mode = {
+        "paper": {"BTC/USDT"},
+        "live": {"BTC/USDT"},
+    }
 
     class EntryPolicy:
         @staticmethod
@@ -217,6 +230,11 @@ def test_market_analysis_only_candidate_with_full_paper_contract_is_promoted() -
     decision.raw_response = {
         "paper_trade_selection": {"selected": True},
         "entry_permission": {"granted": True},
+        "market_analysis_only_contract": {
+            "selected_for_market_analysis": True,
+            "entry_permission": False,
+            "execution_candidate_state": "execution_verified",
+        },
         "normal_paper_trade": build_normal_paper_trade_contract(
             symbol="BTC/USDT",
             side="long",
@@ -225,14 +243,122 @@ def test_market_analysis_only_candidate_with_full_paper_contract_is_promoted() -
         ),
     }
 
-    assert service._entry_gate_reason_with_market_boundary(decision) is None
-    assert decision.raw_response["market_analysis_only_contract"] == {
-        "selected_for_market_analysis": True,
-        "entry_permission": True,
-        "promoted_for_execution": True,
-        "reason": "full_paper_entry_contract_passed",
-        "original_reason": "ranker_analysis_only_fill",
+    reason = service._entry_gate_reason_with_market_boundary(
+        decision,
+        model_mode=model_mode,
+    )
+
+    if expected_reason is None:
+        assert reason is None
+        assert decision.raw_response["market_analysis_only_contract"] == {
+            "selected_for_market_analysis": True,
+            "entry_permission": True,
+            "promoted_for_execution": True,
+            "reason": "full_paper_entry_contract_passed",
+            "original_reason": "ranker_analysis_only_fill",
+        }
+    else:
+        assert reason is not None
+        assert decision.raw_response["market_analysis_only_contract"][
+            "entry_permission"
+        ] is False
+
+
+@pytest.mark.parametrize(
+    "funnel_state",
+    [None, "analysis_only_execution_unverified", "execution_verified"],
+)
+def test_unverified_market_candidate_with_full_paper_contract_is_not_promoted(
+    funnel_state: str | None,
+) -> None:
+    service = object.__new__(TradingService)
+    service._market_analysis_only_symbols = {"BTC/USDT"}
+    service._verified_entry_symbols_by_mode = {"paper": set(), "live": set()}
+
+    class EntryPolicy:
+        @staticmethod
+        def gate_reason(_decision: DecisionOutput) -> str | None:
+            return None
+
+    service.entry_policy = EntryPolicy()
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    decision = _decision("BTC/USDT")
+    support = {
+        "eligible": True,
+        "selected_side": "long",
+        "prediction_horizon_minutes": 30.0,
+        "expected_net_return_pct": 0.3,
+        "objective_net_return_pct": 0.15,
+        "loss_probability": 0.35,
+        "quant_evidence_families": ["local_ml"],
+        "quant_quality_permissions": {
+            "local_ml": {
+                "paper_execution_permission": True,
+                "paper_execution_reason": "authoritative_quality_above_break_even",
+                "paper_execution_evidence_source": "test_authoritative_trade",
+                "paper_execution_evidence": {
+                    "sample_count": 20,
+                    "average_return": 0.2,
+                    "return_lcb": 0.1,
+                    "profit_factor": 1.5,
+                    "profit_factor_above_break_even": True,
+                },
+                "break_even_contract": {
+                    "average_return_above_zero": True,
+                    "return_lcb_above_zero": True,
+                    "profit_factor_above_one": True,
+                },
+            }
+        },
+        "strong_expert_opposition": False,
     }
+    decision.raw_response = {
+        "paper_trade_selection": {"selected": True},
+        "entry_permission": {"granted": True},
+        "market_analysis_only_contract": {
+            "selected_for_market_analysis": True,
+            "entry_permission": False,
+            "reason": "model_claimed_execution_verified",
+            "execution_candidate_state": "execution_verified",
+        },
+        "normal_paper_trade": build_normal_paper_trade_contract(
+            symbol="BTC/USDT",
+            side="long",
+            selection_reason="strategy_edge_selected",
+            direction_support=support,
+        ),
+    }
+    if funnel_state:
+        availability = {"unavailable": []}
+        if funnel_state == "analysis_only_execution_unverified":
+            availability["analysis_only_execution_unverified"] = [
+                {
+                    "symbol": "BTC/USDT",
+                    "reason": "okx_private_entry_instrument_probe_deferred",
+                }
+            ]
+        decision.raw_response["market_candidate_funnel"] = {
+            "execution_availability": availability,
+            "ranked_symbol_sample": [
+                {
+                    "symbol": "BTC/USDT",
+                    "analysis_only": True,
+                    "selection_tier": "analysis_only_fill",
+                    "execution_candidate_state": funnel_state,
+                }
+            ],
+        }
+
+    reason = service._entry_gate_reason_with_market_boundary(decision)
+
+    assert reason is not None
+    assert decision.raw_response["market_analysis_only_contract"].get(
+        "execution_candidate_state"
+    ) == funnel_state
+    assert decision.raw_response["market_analysis_only_contract"]["entry_permission"] is False
+    assert not decision.raw_response["market_analysis_only_contract"].get(
+        "promoted_for_execution", False
+    )
 
 
 def test_market_analysis_only_training_contract_is_not_promoted() -> None:
@@ -313,6 +439,7 @@ def test_known_unavailable_market_candidate_cannot_be_promoted() -> None:
 
     service.entry_policy = EntryPolicy()
     service._get_model_execution_mode = lambda _model_name: "paper"
+    service._verified_entry_symbols_by_mode = {"paper": set(), "live": set()}
     decision = _decision("BTC/USDT")
     support = {
         "eligible": True,

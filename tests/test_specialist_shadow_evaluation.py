@@ -5,15 +5,22 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import event
 
 from config.settings import settings
-from db.session import close_db, get_session_ctx, init_db
+from db.session import close_db, get_engine, get_session_ctx, init_db
 from models.learning import ShadowBacktest
 from scripts import run_specialist_shadow_evaluation as runner
+from services import specialist_shadow_evaluation as specialist_evaluation
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.specialist_shadow_evaluation import (
+    SpecialistShadowEvaluationAccumulator,
     SpecialistShadowEvaluationService,
+    _empty_metric,
+    _mean_lcb,
+    _mean_lcb_from_moments,
     _regime_stability_report,
+    _remember_shadow_event,
     _rolling_distribution_report,
     _walk_forward_report,
     summarize_specialist_shadow_evaluation,
@@ -276,6 +283,53 @@ def test_specialist_shadow_evaluation_reports_timesfm_challenger_metrics() -> No
     assert report["summary"]["promotion_ready_count"] == 2
     assert report["authoritative_eligible_count"] == 34
     assert report["promotion_gate"]["requires_at_least_one_promotion_ready_model"] is True
+
+
+def test_shadow_return_lcb_running_moments_match_batch_calculation() -> None:
+    values = [0.31, -0.08, 0.12, -0.22, 0.07, 0.19]
+    metric = _empty_metric("time_series_prediction", "timesfm")
+    for value in values:
+        _remember_shadow_event(metric, {"net_return_after_all_cost_pct": value})
+
+    lcb = _mean_lcb_from_moments(
+        metric["shadow_return_count"],
+        metric["shadow_return_mean_pct"],
+        metric["shadow_return_m2_pct"],
+    )
+
+    assert lcb == pytest.approx(_mean_lcb(values))
+    assert metric["shadow_event_count"] == len(values)
+    assert len(metric["shadow_event_samples"]) == len(values)
+
+
+def test_specialist_shadow_report_supports_incremental_row_accumulation() -> None:
+    rows = [
+        _row(index=index, realized=0.2 + index / 100)
+        for index in range(1, 35)
+    ]
+    authoritative_samples = [
+        _authoritative_sample(index, pnl_ratio_pct=-0.01 if index == 17 else 0.25)
+        for index in range(1, 35)
+    ]
+    expected = summarize_specialist_shadow_evaluation(
+        rows,
+        authoritative_trade_samples=authoritative_samples,
+    )
+    accumulator = SpecialistShadowEvaluationAccumulator()
+    for row in rows:
+        accumulator.add_shadow_row(row)
+    actual = summarize_specialist_shadow_evaluation(
+        (),
+        authoritative_trade_samples=authoritative_samples,
+        accumulator=accumulator,
+    )
+
+    for report in (expected, actual):
+        report.pop("generated_at")
+        for model in report["models"]:
+            for shadow_event in model["shadow_events"]:
+                shadow_event["execution_cost"]["policy_provenance"].pop("generated_at")
+    assert actual == expected
 
 
 def test_specialist_shadow_evaluation_blocks_undefined_authoritative_profit_factor() -> None:
@@ -568,3 +622,79 @@ async def test_specialist_report_mode_filter_uses_only_selected_execution_mode(
     assert paper["query_policy"]["training_feature_snapshot_column"] is True
     assert paper["query_policy"]["keyset_pagination"] is True
     assert paper["query_policy"]["row_batch_size"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_specialist_report_uses_composite_index_range_for_keyset_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(specialist_evaluation, "SHADOW_QUERY_BATCH_SIZE", 1)
+    original_summarize = specialist_evaluation.summarize_specialist_shadow_evaluation
+    summary_calls = 0
+
+    def assert_streamed_summary(rows, **kwargs):
+        nonlocal summary_calls
+        summary_calls += 1
+        assert list(rows) == []
+        assert isinstance(kwargs.get("accumulator"), SpecialistShadowEvaluationAccumulator)
+        return original_summarize((), **kwargs)
+
+    monkeypatch.setattr(
+        specialist_evaluation,
+        "summarize_specialist_shadow_evaluation",
+        assert_streamed_summary,
+    )
+    now = datetime.now(UTC)
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                ShadowBacktest(
+                    model_name="ensemble_trader",
+                    execution_mode="paper",
+                    symbol=f"BTC/USDT-{index}",
+                    status="completed",
+                    due_at=now,
+                    long_return_pct=0.2,
+                    short_return_pct=-0.2,
+                    created_at=now - timedelta(minutes=index),
+                )
+                for index in range(2)
+            ]
+        )
+
+    statements: list[str] = []
+    engine = await get_engine()
+
+    def capture_statement(
+        _conn: object,
+        _cursor: object,
+        statement: str,
+        _params: object,
+        _context: object,
+        _many: bool,
+    ) -> None:
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture_statement)
+    try:
+        report = await SpecialistShadowEvaluationService().report(hours=24, mode="paper")
+    finally:
+        event.remove(
+            engine.sync_engine,
+            "before_cursor_execute",
+            capture_statement,
+        )
+        await close_db()
+
+    select_statements = [
+        statement
+        for statement in statements
+        if "FROM shadow_backtests" in statement
+    ]
+    assert report["completed_count"] == 2
+    assert summary_calls == 1
+    assert report["query_policy"]["query_count"] == 3
+    assert len(select_statements) == 3
+    assert "(shadow_backtests.created_at, shadow_backtests.id) < (?, ?)" in select_statements[1]

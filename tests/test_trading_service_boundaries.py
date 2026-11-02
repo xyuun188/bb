@@ -4741,6 +4741,81 @@ async def test_entry_execution_policy_allows_degraded_okx_sync_with_fresh_snapsh
 
 
 @pytest.mark.asyncio
+async def test_entry_execution_policy_blocks_unverified_market_analysis_before_pipeline() -> None:
+    service = TradingService.__new__(TradingService)
+    service._market_analysis_only_symbols = {"BTC/USDT"}
+    service._verified_entry_symbols_by_mode = {"paper": set(), "live": set()}
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    service._market_analysis_only_can_promote = lambda _decision, **_kwargs: False
+
+    class EntryPolicy:
+        @staticmethod
+        def gate_reason(_decision: DecisionOutput) -> str | None:
+            return None
+
+    service.entry_policy = EntryPolicy()
+    service.entry_execution_pipeline = SimpleNamespace(
+        evaluate=lambda *_args, **_kwargs: pytest.fail(
+            "observation-only entry must stop before the execution pipeline"
+        )
+    )
+
+    result = await service.evaluate_entry_execution_policy(
+        _decision(Action.LONG),
+        "ensemble_trader",
+        "paper",
+        [],
+    )
+
+    assert result.passed is False
+    assert result.blocker == "market_analysis_only"
+    assert result.data["skip_kind"] == "market_analysis_only"
+
+
+@pytest.mark.asyncio
+async def test_entry_execution_policy_blocks_paper_observation_contract_in_live_mode() -> None:
+    service = TradingService.__new__(TradingService)
+    service._market_analysis_only_symbols = {"BTC/USDT"}
+    service._verified_entry_symbols_by_mode = {
+        "paper": {"BTC/USDT"},
+        "live": {"BTC/USDT"},
+    }
+
+    class EntryPolicy:
+        @staticmethod
+        def gate_reason(_decision: DecisionOutput) -> str | None:
+            return None
+
+    service.entry_policy = EntryPolicy()
+    service.entry_execution_pipeline = SimpleNamespace(
+        evaluate=lambda *_args, **_kwargs: pytest.fail(
+            "paper-only observation promotion must stop before live execution"
+        )
+    )
+    decision = _decision(Action.LONG)
+    decision.raw_response = {
+        "market_analysis_only_contract": {
+            "selected_for_market_analysis": True,
+            "entry_permission": False,
+            "execution_candidate_state": "execution_verified",
+        },
+        "entry_permission": {"granted": True},
+        "normal_paper_trade": {"authorized": True},
+    }
+
+    result = await service.evaluate_entry_execution_policy(
+        decision,
+        "ensemble_trader",
+        "live",
+        [],
+    )
+
+    assert result.passed is False
+    assert result.blocker == "market_analysis_only"
+    assert decision.raw_response["market_analysis_only_contract"]["entry_permission"] is False
+
+
+@pytest.mark.asyncio
 async def test_entry_execution_policy_refreshes_positions_and_blocks_same_symbol() -> None:
     service = TradingService.__new__(TradingService)
     service.okx_sync_service = SimpleNamespace()
@@ -7753,6 +7828,64 @@ def test_market_analysis_only_boundary_persists_round_marker_on_decision() -> No
         "reason": "okx_private_entry_instrument_probe_deferred",
         "execution_candidate_state": "analysis_only_execution_unverified",
         "round_id": "round-1",
+    }
+
+
+def test_market_analysis_only_marker_prefers_execution_state_over_generic_selection() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    marker = service._market_analysis_only_marker(
+        {
+            "analysis_only_selected_symbols": ["BTC/USDT"],
+            "execution_availability": {
+                "analysis_only_execution_unverified": [
+                    {
+                        "symbol": "BTC/USDT",
+                        "reason": "okx_private_entry_instrument_probe_deferred",
+                    }
+                ],
+                "unavailable": [],
+            },
+        },
+        "BTC/USDT",
+    )
+
+    assert marker == {
+        "reason": "okx_private_entry_instrument_probe_deferred",
+        "state": "analysis_only_execution_unverified",
+    }
+
+
+def test_verified_ranker_observation_marker_retains_execution_verification() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = TradingService._normalize_position_symbol.__get__(
+        service,
+        TradingService,
+    )
+    service._safe_dict = TradingService._safe_dict.__get__(service, TradingService)
+    marker = service._market_analysis_only_marker(
+        {
+            "analysis_only_selected_symbols": ["BTC/USDT"],
+            "execution_availability": {"unavailable": []},
+            "ranked_symbol_sample": [
+                {
+                    "symbol": "BTC/USDT",
+                    "selection_tier": "analysis_only_fill",
+                    "analysis_only": True,
+                    "execution_candidate_state": "execution_verified",
+                }
+            ],
+        },
+        "BTC/USDT",
+    )
+
+    assert marker == {
+        "reason": "ranker_analysis_only_fill",
+        "state": "execution_verified",
     }
 
 

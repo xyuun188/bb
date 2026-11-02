@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from math import sqrt
 from types import SimpleNamespace
@@ -443,7 +443,11 @@ def _empty_metric(tool_name: str, model_name: str) -> dict[str, Any]:
         "blockers": [],
         "legacy_mixed_shadow_count": 0,
         "legacy_quarantined_count": 0,
-        "shadow_events": [],
+        "shadow_event_count": 0,
+        "shadow_event_samples": [],
+        "shadow_return_count": 0,
+        "shadow_return_mean_pct": 0.0,
+        "shadow_return_m2_pct": 0.0,
         "authoritative_events": [],
         "authoritative_evidence": [],
         "authoritative_attempt_count": 0,
@@ -519,6 +523,33 @@ def _canonical_net_return(event: dict[str, Any]) -> float | None:
     """
 
     return _safe_float(event.get("net_return_after_all_cost_pct"), None)
+
+
+def _remember_shadow_event(metric: dict[str, Any], event: dict[str, Any]) -> None:
+    metric["shadow_event_count"] += 1
+    samples = metric["shadow_event_samples"]
+    if len(samples) < MAX_WORST_SAMPLE_COUNT:
+        samples.append(event)
+
+    value = _canonical_net_return(event)
+    if value is None:
+        return
+    count = int(metric["shadow_return_count"]) + 1
+    mean = float(metric["shadow_return_mean_pct"])
+    delta = value - mean
+    mean += delta / count
+    metric["shadow_return_count"] = count
+    metric["shadow_return_mean_pct"] = mean
+    metric["shadow_return_m2_pct"] += delta * (value - mean)
+
+
+def _mean_lcb_from_moments(count: int, mean: float, m2: float) -> float | None:
+    if count <= 0:
+        return None
+    if count == 1:
+        return mean
+    variance = max(m2, 0.0) / (count - 1)
+    return mean - sqrt(variance / count)
 
 
 def _walk_forward_report(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -703,13 +734,12 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
         for event in authoritative_events
         if (value := _canonical_net_return(event)) is not None
     ]
-    shadow_returns = [
-        float(value)
-        for event in list(metric.get("shadow_events") or [])
-        if (value := _canonical_net_return(event)) is not None
-    ]
     authoritative_return_lcb = _mean_lcb(authoritative_returns)
-    shadow_return_lcb = _mean_lcb(shadow_returns)
+    shadow_return_lcb = _mean_lcb_from_moments(
+        int(metric.get("shadow_return_count") or 0),
+        float(metric.get("shadow_return_mean_pct") or 0.0),
+        float(metric.get("shadow_return_m2_pct") or 0.0),
+    )
     blockers = []
     if not authoritative_returns:
         blockers.append("authoritative_return_distribution_missing")
@@ -751,11 +781,10 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
             for symbol, count in metric["tail_loss_symbols"].most_common(10)
         ],
         "worst_samples": list(metric.get("worst_samples") or [])[:MAX_WORST_SAMPLE_COUNT],
-        "shadow_event_count": len(metric.get("shadow_events") or []),
-        "shadow_events": list(metric.get("shadow_events") or [])[:MAX_WORST_SAMPLE_COUNT],
-        "shadow_events_truncated": (
-            len(metric.get("shadow_events") or []) > MAX_WORST_SAMPLE_COUNT
-        ),
+        "shadow_event_count": int(metric.get("shadow_event_count") or 0),
+        "shadow_events": list(metric.get("shadow_event_samples") or []),
+        "shadow_events_truncated": int(metric.get("shadow_event_count") or 0)
+        > len(metric.get("shadow_event_samples") or []),
         "authoritative_attempt_count": int(metric.get("authoritative_attempt_count") or 0),
         "authoritative_actual_inference_count": int(
             metric.get("authoritative_actual_inference_count") or 0
@@ -831,30 +860,27 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def summarize_specialist_shadow_evaluation(
-    rows: Sequence[Any],
-    *,
-    authoritative_trade_samples: Sequence[Any] | None = None,
-) -> dict[str, Any]:
-    metrics: dict[tuple[str, str], dict[str, Any]] = {}
-    completed_count = 0
-    eligible_count = 0
-    skipped_reasons: Counter[str] = Counter()
+class SpecialistShadowEvaluationAccumulator:
+    def __init__(self) -> None:
+        self.metrics: dict[tuple[str, str], dict[str, Any]] = {}
+        self.completed_count = 0
+        self.eligible_count = 0
+        self.skipped_reasons: Counter[str] = Counter()
 
-    for row in rows:
+    def add_shadow_row(self, row: Any) -> None:
         if _safe_str(_row_get(row, "status")).lower() != "completed":
-            skipped_reasons["not_completed"] += 1
-            continue
+            self.skipped_reasons["not_completed"] += 1
+            return
         long_return = _safe_float(_row_get(row, "long_return_pct"), None)
         short_return = _safe_float(_row_get(row, "short_return_pct"), None)
         if long_return is None or short_return is None:
-            skipped_reasons["missing_realized_returns"] += 1
-            continue
-        completed_count += 1
+            self.skipped_reasons["missing_realized_returns"] += 1
+            return
+        self.completed_count += 1
         local_shadow = _local_shadow(row)
         if not local_shadow:
-            skipped_reasons["missing_local_ai_tools_shadow"] += 1
-            continue
+            self.skipped_reasons["missing_local_ai_tools_shadow"] += 1
+            return
         actual_side = _actual_best_side(row)
         symbol = _safe_str(_row_get(row, "symbol")) or _safe_str(_features(row).get("symbol"))
         has_eligible_specialist = False
@@ -863,13 +889,13 @@ def summarize_specialist_shadow_evaluation(
             if not isinstance(tool, dict):
                 continue
             if tool_name == "profit_prediction" and _baseline_only_shadow(tool):
-                skipped_reasons[f"{tool_name}_baseline_only_shadow"] += 1
+                self.skipped_reasons[f"{tool_name}_baseline_only_shadow"] += 1
                 continue
             candidates = _tool_shadow_candidates(tool_name, tool)
             if tool_name == "profit_prediction" and not any(
                 bool(candidate.get("actual_inference")) for candidate in candidates
             ):
-                skipped_reasons[f"{tool_name}_non_specialist_shadow"] += 1
+                self.skipped_reasons[f"{tool_name}_non_specialist_shadow"] += 1
                 continue
             if not candidates:
                 continue
@@ -877,13 +903,14 @@ def summarize_specialist_shadow_evaluation(
             for candidate in candidates:
                 model_name = _safe_str(candidate.get("model")) or _tool_model_name(tool_name, tool)
                 key = (tool_name, model_name)
-                metric = metrics.setdefault(key, _empty_metric(tool_name, model_name))
+                metric = self.metrics.setdefault(key, _empty_metric(tool_name, model_name))
                 metric["sample_count"] += 1
                 if symbol:
                     metric["symbols"][symbol] += 1
                 if not candidate.get("actual_inference"):
                     _record_fallback(metric, candidate, source="shadow")
-                    metric["shadow_events"].append(
+                    _remember_shadow_event(
+                        metric,
                         {
                             "evidence_source": "shadow_counterfactual",
                             "shadow_backtest_id": _row_get(row, "id"),
@@ -895,7 +922,7 @@ def summarize_specialist_shadow_evaluation(
                             "created_at": _iso_row_datetime(row, "created_at"),
                             "label_timestamp": _iso_row_datetime(row, "due_at"),
                             "market_regime": _market_regime(row),
-                        }
+                        },
                     )
                     continue
                 legacy_mixed_shadow = bool(candidate.get("legacy_mixed_shadow"))
@@ -915,7 +942,7 @@ def summarize_specialist_shadow_evaluation(
                         gross_return_pct=float(gross_return),
                     )
                     if cost_complete_return is None:
-                        skipped_reasons["shadow_execution_cost_incomplete"] += 1
+                        self.skipped_reasons["shadow_execution_cost_incomplete"] += 1
                         continue
                     actual_return, execution_cost = cost_complete_return
                     metric["direction_count"] += 1
@@ -952,7 +979,8 @@ def summarize_specialist_shadow_evaluation(
                             legacy_mixed_shadow=legacy_mixed_shadow,
                         ),
                     )
-                    metric["shadow_events"].append(
+                    _remember_shadow_event(
+                        metric,
                         {
                             "evidence_source": "shadow_counterfactual_after_cost",
                             "shadow_backtest_id": _row_get(row, "id"),
@@ -966,7 +994,7 @@ def summarize_specialist_shadow_evaluation(
                             "created_at": _iso_row_datetime(row, "created_at"),
                             "label_timestamp": _iso_row_datetime(row, "due_at"),
                             "market_regime": _market_regime(row),
-                        }
+                        },
                     )
                 expected = _safe_float(candidate.get("expected_return_pct"), None)
                 if expected is not None:
@@ -977,7 +1005,22 @@ def summarize_specialist_shadow_evaluation(
                     metric["signal_score_sum"] += signal_score
                     metric["signal_score_count"] += 1
         if has_eligible_specialist:
-            eligible_count += 1
+            self.eligible_count += 1
+
+
+def summarize_specialist_shadow_evaluation(
+    rows: Iterable[Any],
+    *,
+    authoritative_trade_samples: Sequence[Any] | None = None,
+    accumulator: SpecialistShadowEvaluationAccumulator | None = None,
+) -> dict[str, Any]:
+    state = accumulator or SpecialistShadowEvaluationAccumulator()
+    for row in rows:
+        state.add_shadow_row(row)
+    metrics = state.metrics
+    completed_count = state.completed_count
+    eligible_count = state.eligible_count
+    skipped_reasons = state.skipped_reasons
 
     authoritative_input_count = 0
     authoritative_eligible_count = 0
@@ -1144,7 +1187,7 @@ class SpecialistShadowEvaluationService:
         authoritative_trade_samples: Sequence[Any] | None = None,
         mode: str | None = None,
     ) -> dict[str, Any]:
-        from sqlalchemy import and_, desc, or_, select
+        from sqlalchemy import desc, select, tuple_
 
         from db.session import get_read_session_ctx
         from models.learning import ShadowBacktest
@@ -1165,6 +1208,7 @@ class SpecialistShadowEvaluationService:
         if selected_mode is not None:
             filters.append(ShadowBacktest.execution_mode == selected_mode)
         session_factory = self._session_context_factory or get_read_session_ctx
+        accumulator = SpecialistShadowEvaluationAccumulator()
         async with session_factory() as session:
             # The compact training snapshot is maintained by the database
             # trigger/ORM event and avoids materializing the large runtime JSON
@@ -1186,10 +1230,8 @@ class SpecialistShadowEvaluationService:
                 ShadowBacktest.created_at,
                 ShadowBacktest.updated_at,
             )
-            # A single wide seven-day query can exceed PostgreSQL's statement
-            # timeout even though each page is small. Keyset pagination keeps
-            # the report complete while bounding every database round trip.
-            rows: list[Any] = []
+            # Process each page before fetching the next so memory stays bounded
+            # by one query batch rather than the full evaluation window.
             cursor_created_at: Any | None = None
             cursor_id: int | None = None
             query_count = 0
@@ -1197,13 +1239,8 @@ class SpecialistShadowEvaluationService:
                 page_filters = list(filters)
                 if cursor_created_at is not None and cursor_id is not None:
                     page_filters.append(
-                        or_(
-                            ShadowBacktest.created_at < cursor_created_at,
-                            and_(
-                                ShadowBacktest.created_at == cursor_created_at,
-                                ShadowBacktest.id < cursor_id,
-                            ),
-                        )
+                        tuple_(ShadowBacktest.created_at, ShadowBacktest.id)
+                        < tuple_(cursor_created_at, cursor_id)
                     )
                 result = await session.execute(
                     projection.where(*page_filters)
@@ -1214,18 +1251,24 @@ class SpecialistShadowEvaluationService:
                     .limit(SHADOW_QUERY_BATCH_SIZE)
                 )
                 query_count += 1
-                page = [SimpleNamespace(**dict(row)) for row in result.mappings()]
-                if not page:
+                page_size = 0
+                last_row: Any | None = None
+                for mapping in result.mappings():
+                    row = SimpleNamespace(**dict(mapping))
+                    accumulator.add_shadow_row(row)
+                    page_size += 1
+                    last_row = row
+                if page_size == 0:
                     break
-                rows.extend(page)
-                if len(page) < SHADOW_QUERY_BATCH_SIZE:
+                if page_size < SHADOW_QUERY_BATCH_SIZE:
                     break
-                last = page[-1]
-                cursor_created_at = last.created_at
-                cursor_id = int(last.id)
+                assert last_row is not None
+                cursor_created_at = last_row.created_at
+                cursor_id = int(last_row.id)
             report = summarize_specialist_shadow_evaluation(
-                rows,
+                (),
                 authoritative_trade_samples=authoritative_trade_samples,
+                accumulator=accumulator,
             )
         report["window_hours"] = capped_hours
         report["execution_mode"] = selected_mode or "all"
