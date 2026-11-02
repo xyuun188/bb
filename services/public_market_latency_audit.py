@@ -91,6 +91,14 @@ def summarize_public_market_latency_logs(
             "provider_duration_ms": [],
             "outcomes": Counter(),
             "priorities": Counter(),
+            "by_outcome": defaultdict(
+                lambda: {
+                    "queue_wait_ms": [],
+                    "provider_duration_ms": [],
+                    "priorities": Counter(),
+                    "error_types": Counter(),
+                }
+            ),
         }
     )
     files = []
@@ -128,14 +136,22 @@ def summarize_public_market_latency_logs(
                 continue
             matching_events += 1
             item = accumulators[method[:80]]
+            outcome = payload.get("outcome")
+            outcome_key = outcome[:32] if isinstance(outcome, str) else "unknown"
+            outcome_item = item["by_outcome"][outcome_key]
+            priority = str(payload.get("priority"))[:16]
+            error_type = payload.get("error_type")
             for field in ("queue_wait_ms", "provider_duration_ms"):
                 number = _finite_number(payload.get(field))
                 if number is not None:
                     item[field].append(number)
-            outcome = payload.get("outcome")
+                    outcome_item[field].append(number)
             if isinstance(outcome, str):
                 item["outcomes"][outcome[:32]] += 1
-            item["priorities"][str(payload.get("priority"))[:16]] += 1
+            item["priorities"][priority] += 1
+            outcome_item["priorities"][priority] += 1
+            if isinstance(error_type, str) and error_type:
+                outcome_item["error_types"][error_type[:80]] += 1
 
     routes = {}
     for method, item in sorted(accumulators.items()):
@@ -144,6 +160,17 @@ def summarize_public_market_latency_logs(
             "provider_duration_ms": _metric(item["provider_duration_ms"]),
             "outcomes": dict(item["outcomes"]),
             "priorities": dict(item["priorities"]),
+            "by_outcome": {
+                outcome: {
+                    "queue_wait_ms": _metric(outcome_item["queue_wait_ms"]),
+                    "provider_duration_ms": _metric(
+                        outcome_item["provider_duration_ms"]
+                    ),
+                    "priorities": dict(outcome_item["priorities"]),
+                    "error_types": dict(outcome_item["error_types"]),
+                }
+                for outcome, outcome_item in sorted(item["by_outcome"].items())
+            },
         }
     return {
         "window": {

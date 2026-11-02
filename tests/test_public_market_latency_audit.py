@@ -19,6 +19,7 @@ def _event(
     provider: float = 0.0,
     outcome: str = "ok",
     priority: bool = False,
+    error_type: str | None = None,
 ) -> bytes:
     return json.dumps(
         {
@@ -28,6 +29,7 @@ def _event(
             "queue_wait_ms": queue,
             "provider_duration_ms": provider,
             "outcome": outcome,
+            "error_type": error_type,
             "priority": priority,
             "sensitive_payload": "must_not_be_returned",
         }
@@ -97,6 +99,46 @@ def test_parses_structlog_event_nested_in_journald_message() -> None:
 
     assert report["matching_latency_event_count"] == 1
     assert report["routes"]["publicGetMarketIndexTickers"]["queue_wait_ms"]["max"] == 700.0
+
+
+def test_separates_queue_and_provider_latency_by_outcome() -> None:
+    since = datetime(2026, 10, 25, 1, 0, tzinfo=UTC)
+    until = since + timedelta(minutes=10)
+    report = summarize_public_market_latency_logs(
+        [
+            (
+                "trading.log",
+                b"\n".join(
+                    (
+                        _event(
+                            "2026-10-25T01:05:00+00:00",
+                            queue=1000.0,
+                            provider=0.0,
+                            outcome="error",
+                            error_type="TimeoutError",
+                        ),
+                        _event(
+                            "2026-10-25T01:06:00+00:00",
+                            queue=100.0,
+                            provider=800.0,
+                            outcome="ok",
+                            priority=True,
+                        ),
+                    )
+                ),
+            )
+        ],
+        since=since,
+        until=until,
+    )
+
+    route = report["routes"]["publicGetMarketIndexTickers"]
+    assert route["by_outcome"]["error"]["queue_wait_ms"]["p50"] == 1000.0
+    assert route["by_outcome"]["error"]["provider_duration_ms"]["p50"] == 0.0
+    assert route["by_outcome"]["error"]["error_types"] == {"TimeoutError": 1}
+    assert route["by_outcome"]["ok"]["queue_wait_ms"]["p50"] == 100.0
+    assert route["by_outcome"]["ok"]["provider_duration_ms"]["p50"] == 800.0
+    assert route["by_outcome"]["ok"]["priorities"] == {"True": 1}
 
 
 def test_bounds_log_count_and_rejects_naive_or_reversed_windows() -> None:

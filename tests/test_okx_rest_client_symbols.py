@@ -1651,6 +1651,43 @@ async def test_required_funding_snapshot_uses_priority_market_lane(monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_priority_derivatives_snapshot_propagates_priority_to_required_routes(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    priorities: dict[str, list[bool]] = {"orderbook": [], "reference_prices": []}
+
+    async def orderbook(
+        _symbol: str,
+        *,
+        contract_spec=None,
+        priority: bool = False,
+    ) -> dict[str, Any]:
+        priorities["orderbook"].append(priority)
+        return {"orderbook_data_available": False}
+
+    async def reference_prices(
+        _symbol: str,
+        *,
+        contract_spec=None,
+        priority: bool = False,
+    ) -> dict[str, Any]:
+        priorities["reference_prices"].append(priority)
+        return {"reference_prices_data_available": False}
+
+    monkeypatch.setattr(client, "fetch_order_book_metrics", orderbook)
+    monkeypatch.setattr(client, "fetch_reference_prices", reference_prices)
+
+    await client.fetch_derivatives_snapshot(
+        "BTC/USDT",
+        required_only=True,
+        priority=True,
+    )
+
+    assert priorities == {"orderbook": [True], "reference_prices": [True]}
+
+
+@pytest.mark.asyncio
 async def test_derivatives_snapshot_returns_completed_routes_before_deadline(
     monkeypatch,
 ) -> None:

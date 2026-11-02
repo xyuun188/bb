@@ -7580,3 +7580,68 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   evidence. After the fixed maturity cutoff
   `2026-10-27T15:11:00Z` (`23:11 Asia/Shanghai`), run the single bounded G2
   audit once, record insufficiency, and register a materially new window.
+
+### Paper Entry And Market-Fact Follow-Up (2026-11-02 20:29 Asia/Shanghai)
+
+- Local verification passed: `58` OKX REST client tests, `141` DataService
+  market-fact/availability tests, `73` normal-paper-trade tests, Ruff, compile
+  and `git diff --check`. The entry reconciliation now requires a positive
+  current return lower bound for both training-only and validated new entries;
+  sizing/observation compatibility remains unchanged. The added REST
+  regression confirms a priority derivatives snapshot forwards priority to
+  both required order-book and reference-price routes.
+- A bounded online entry recovery read through
+  `2026-11-02T12:19:27Z` found the paper service active and unpaused, with no
+  recent executed-entry evidence. In the preceding three hours there were
+  `411` market decisions (`344` hold, `57` short, `10` long); among the latest
+  `80`, the funnel classified `55` as no candidate, `14` as insufficient
+  evidence, and `11` as shadow/training only. Quant permission was false for
+  every inspected source: the available fee-after-return lower bounds were
+  non-positive, and sentiment had no qualifying evidence. The deployed model
+  remained `learning_only`/`degraded`, with influence disabled. This is a
+  genuine quality-evidence gate, not a reason to bypass execution safety or
+  claim that waiting will create profitability.
+- Market facts remain an operational issue: `16/80` recent availability
+  snapshots were not clean, mostly from missing/ambiguous funding receipts,
+  plus missing/ambiguous index-price facts. The 30-minute latency audit
+  contained a truncated log tail and is indicative only. The bounded latency
+  audit now groups outcomes, provider time and queue wait; its helper and
+  regression test synchronized with `source-integrity-ok:2`, without restart.
+  A complete post-restart three-minute window (`223` events, no truncated
+  tail) classified all errors as `TimeoutError` with zero provider duration:
+  39/95 optional OHLCV requests, 17/31 order-book requests, 6/21 index-ticker
+  requests, 7/15 ticker requests, and 3/16 mark-price requests. Error queue
+  wait medians ranged from `1,165.8ms` to `1,416.9ms`, while successful
+  requests had nonzero provider duration. This supports requests timing out
+  before the SDK call, likely from bounded queue/caller waits; it does not
+  establish an OKX provider outage. OHLCV uses a separate optional lane, while
+  book/ticker/reference calls share the public-market gate. No order-book
+  diagnostic event in this sample was priority-tagged, so the sample does not
+  test whether priority traffic bypasses contention. Several shadow
+  settlements were quarantined for incomplete funding intervals or missing
+  native market facts. Do not raise concurrency or relax fact validation from
+  this window alone; next trace queue producers and caller deadlines, and
+  measure a priority refresh under bounded load.
+- Three recent non-executed direction candidates also reported
+  `okx_private_entry_instrument_unavailable` or
+  `okx_entry_live_execution_environment_incompatible`. These are
+  paper/demo execution capability blockers, not permission to submit against
+  a mismatched live contract. Inspect the exact compatibility facts for each
+  candidate before considering any repair.
+- The read-only paper-resume preflight was intentionally blocked because
+  `bb-paper-trading.service` was already active; it did not indicate a service
+  health failure and must not be used to stop the running process. Local
+  `f2ea8e30` was synchronized with `source-integrity-ok:1` (the online source
+  already matched) and only `bb-paper-trading.service` was restarted at
+  `2026-11-02T12:28:37Z`. It returned `active/running`, `NRestarts=0`;
+  Dashboard and model-tunnel services were not restarted. The positive-LCB
+  repair therefore is loaded, but the observed non-positive evidence still
+  correctly prevents entries.
+- Current state: paper only, live routing disabled, zero verified open OKX
+  positions, and no basis to promise profitable trading. Do not wait passively
+  or relax gates. Next work is to investigate the market-request timeouts,
+  incomplete funding/index receipts, and demo execution compatibility; then
+  verify on a fresh bounded window that the operational errors decline while
+  preserving the economic gates. A new profitability cohort must be
+  preregistered and sealed before its outcomes are read; older evidence must
+  not be repurposed to authorize entry.
