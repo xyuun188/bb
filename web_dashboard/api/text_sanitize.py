@@ -8,11 +8,13 @@ as visible mojibake, so source files and dashboard output stay readable.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Any
 
 _CONTROL_TEXT_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
+@lru_cache(maxsize=256)
 def _u(escaped: str) -> str:
     """Decode an ASCII Unicode-escape literal into the original damaged text."""
 
