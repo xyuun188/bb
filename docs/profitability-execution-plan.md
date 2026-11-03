@@ -7686,3 +7686,45 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   preserving the economic gates. A new profitability cohort must be
   preregistered and sealed before its outcomes are read; older evidence must
   not be repurposed to authorize entry.
+
+### Execution-Market Negative Cache And Current Gate (2026-11-03)
+
+- Fixed the immediate pre-order path for a definitive missing execution
+  market: `okx_pre_order_execution_market_unavailable` now enters the existing
+  six-hour candidate negative cache only when its blocker is exactly
+  `execution_market_unavailable`. Transient or mixed probe failures remain
+  uncached; the entry stays blocked. Explicit OKX `51001` handling and all
+  profitability, risk, and live-routing gates are unchanged.
+- Regression coverage verifies the exact six-hour cache, rejects transient or
+  mixed blocker results, and preserves the existing 51001 and environment
+  compatibility policies. Local checks passed: 13 focused cache/boundary tests,
+  74 OKX receipt-clock/client tests, Ruff, and `git diff --check`.
+- The existing funding-failure telemetry change was also revalidated in the
+  same 74-test OKX run. It reports timeout versus exception type while keeping
+  missing funding evidence unavailable.
+- Read-only online Phase 3 Go/No-Go at `2026-11-03T12:14:46Z` remains
+  `no_go`; the hard blocker is `local_ml_not_live_ready`. The issue ledger
+  reports 17 fixed, 9 observing, and 1 unresolved out of 27. The unresolved
+  production-source audit reports zero qualifying production-source decisions
+  over about 24 hours and 53 decisions stopped at the quality gate;
+  this is not a missing code path that can be fixed by authorizing orders.
+- A separate recent entry-flow inspection found zero executed entries in its
+  sampled decisions and zero open positions. Paper-resume preflight at
+  `2026-11-03T12:16:41Z` passed OKX sync/integrity, account truth, model
+  runtime, all four quant child endpoints, dashboard, tunnels, and specialist
+  shadow freshness. Its only blocker was that `bb-paper-trading.service` was
+  already active, which is a precondition of that start-only preflight.
+- This release fixes repeated selection of a known unavailable demo market;
+  it does not create a profitable candidate. Keep the service paper-only and
+  live routing disabled. Do not mark the profitability/source issue closed
+  until fresh authoritative fee-after return evidence passes the existing
+  promotion gates.
+- Deployment completed with `source-integrity-ok:519` and
+  `runtime-imports-ok`; model tunnels, OKX network, and Dashboard passed.
+  Post-deploy, paper trading, Dashboard, and model tunnels were all
+  `active/running` with `NRestarts=0`; the paper journal had no error-level
+  entries in the following five minutes.
+- Post-deploy Go/No-Go at `2026-11-03T12:27:57Z` remained `no_go` with the
+  same `local_ml_not_live_ready` blocker and unchanged issue ledger
+  (`17 fixed`, `9 observing`, `1 unresolved`). This confirms deployment
+  integrity, not profitability or entry authorization.

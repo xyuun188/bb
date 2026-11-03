@@ -20,6 +20,14 @@ def entry_instrument_definitively_unavailable(facts: Mapping[str, Any] | None) -
     """Only an explicit OKX capability rejection warrants the long retry window."""
 
     payload = facts if isinstance(facts, Mapping) else {}
+    if payload.get("reason") == "okx_pre_order_execution_market_unavailable":
+        compatibility = payload.get("environment_compatibility")
+        compatibility = compatibility if isinstance(compatibility, Mapping) else {}
+        blockers = compatibility.get("blockers")
+        if isinstance(blockers, (list, tuple, set, frozenset)) and set(blockers) == {
+            "execution_market_unavailable"
+        }:
+            return True
     return (
         str(payload.get("error_code") or "") == "51001"
         or str(payload.get("reason") or "") == "okx_private_entry_instrument_unavailable"

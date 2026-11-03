@@ -116,6 +116,34 @@ def test_missing_execution_fact_fails_closed() -> None:
         ({"reason": "okx_private_entry_instrument_unavailable"}, True, 21600),
         (
             {
+                "reason": "okx_pre_order_execution_market_unavailable",
+                "environment_compatibility": {
+                    "blockers": ["execution_market_unavailable"],
+                },
+            },
+            True,
+            21600,
+        ),
+        (
+            {
+                "reason": "okx_pre_order_execution_market_unavailable",
+                "environment_compatibility": {
+                    "blockers": ["execution_market_unavailable", "timeout"],
+                },
+            },
+            False,
+            None,
+        ),
+        (
+            {
+                "reason": "okx_pre_order_execution_market_unavailable",
+                "environment_compatibility": {"blockers": "execution_market_unavailable"},
+            },
+            False,
+            None,
+        ),
+        (
+            {
                 "reason": "okx_private_entry_instrument_temporarily_unverified",
                 "error_code": "50001",
             },

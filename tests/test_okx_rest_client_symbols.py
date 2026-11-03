@@ -124,6 +124,7 @@ def test_latency_diagnostics_cover_quote_and_native_path_routes() -> None:
         "fetch_order_book",
         "fetch_ohlcv",
         "fetch_ticker",
+        "fetch_funding_rate",
         "fetch_native_consistency_ohlcv",
         "publicGetMarketIndexTickers",
         "publicGetMarketTicker",
@@ -170,6 +171,45 @@ async def test_public_market_latency_logs_bounded_queue_diagnostic(
     assert events[0]["queue_wait_ms"] >= 250.0
     assert events[0]["provider_duration_ms"] >= 0.0
     assert events[0]["outcome"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_funding_timeout_logs_market_latency_and_remains_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+    events: list[dict[str, Any]] = []
+
+    class Gate:
+        async def acquire(self, *, priority: bool) -> None:
+            assert priority is False
+
+        def release(self, *, priority: bool) -> None:
+            assert priority is False
+
+    class Exchange:
+        async def fetch_funding_rate(self, _symbol: str) -> dict[str, Any]:
+            raise TimeoutError("bounded request timed out")
+
+    monkeypatch.setattr(client, "_public_market_gate", lambda: Gate())
+    monkeypatch.setattr(client, "_get_exchange", lambda: asyncio.sleep(0, result=Exchange()))
+    monkeypatch.setattr(client, "_ensure_rest_url", lambda: None)
+    monkeypatch.setattr(
+        okx_rest_client_module.logger,
+        "info",
+        lambda _event, **kwargs: events.append(kwargs),
+    )
+
+    result = await client.fetch_funding_rate("BTC/USDT")
+
+    assert result["funding_data_available"] is False
+    assert result["funding_timeout"] is True
+    assert result["funding_error_type"] == "TimeoutError"
+    assert len(events) == 1
+    assert events[0]["method"] == "fetch_funding_rate"
+    assert events[0]["priority"] is False
+    assert events[0]["outcome"] == "error"
+    assert events[0]["error_type"] == "TimeoutError"
 
 
 @pytest.mark.asyncio

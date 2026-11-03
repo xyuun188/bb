@@ -118,6 +118,7 @@ PUBLIC_MARKET_DIAGNOSTIC_METHODS = frozenset(
         "fetch_order_book",
         "fetch_ohlcv",
         "fetch_ticker",
+        "fetch_funding_rate",
         "fetch_native_consistency_ohlcv",
         "publicGetMarketIndexTickers",
         "publicGetMarketTicker",
@@ -1074,6 +1075,8 @@ class OKXRestClient:
                 "funding_interval_minutes": None,
                 "funding_time": None,
                 "next_funding_time": None,
+                "funding_timeout": isinstance(exc, TimeoutError),
+                "funding_error_type": type(exc).__name__,
             }
 
         info = data.get("info") or {}

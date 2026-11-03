@@ -14330,6 +14330,80 @@ async def test_pre_order_environment_incompatibility_is_temporarily_cached() -> 
 
 
 @pytest.mark.asyncio
+async def test_pre_order_missing_execution_market_uses_long_negative_cache() -> None:
+    service = TradingService.__new__(TradingService)
+    service._entry_unavailable_cache_persist_enabled = False
+    service._unavailable_entry_symbols_by_mode = {"paper": {}, "live": {}}
+
+    class MissingExecutionMarketExecutor:
+        async def pre_order_execution_facts(self, _symbol: str, _side: str) -> dict[str, Any]:
+            return {
+                "production_eligible": False,
+                "reason": "okx_pre_order_execution_market_unavailable",
+                "symbol": "CRWV/USDT",
+                "inst_id": "CRWV-USDT-SWAP",
+                "feature_snapshot": {},
+                "environment_compatibility": {
+                    "checked": True,
+                    "compatible": False,
+                    "blockers": ["execution_market_unavailable"],
+                },
+            }
+
+    async def get_executor(_mode: str) -> MissingExecutionMarketExecutor:
+        return MissingExecutionMarketExecutor()
+
+    service._get_okx_executor_for_mode = get_executor  # type: ignore[method-assign]
+    decision = _decision(Action.LONG)
+    decision.symbol = "CRWV/USDT"
+
+    result = await service.pre_order_execution_facts("paper", decision)
+
+    assert result["production_eligible"] is False
+    cached = service._unavailable_entry_symbols_by_mode["paper"]["CRWV/USDT"]
+    assert cached["reason"] == "okx_pre_order_execution_market_unavailable"
+    assert cached["analysis_only"] is True
+    assert cached["execution_verified"] is False
+    assert datetime.fromisoformat(cached["expires_at"]) - datetime.now(UTC) > timedelta(
+        hours=5, minutes=59
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_order_transient_market_probe_failure_is_not_cached() -> None:
+    service = TradingService.__new__(TradingService)
+    service._entry_unavailable_cache_persist_enabled = False
+    service._unavailable_entry_symbols_by_mode = {"paper": {}, "live": {}}
+
+    class TransientMarketProbeExecutor:
+        async def pre_order_execution_facts(self, _symbol: str, _side: str) -> dict[str, Any]:
+            return {
+                "production_eligible": False,
+                "reason": "okx_pre_order_execution_market_unavailable",
+                "symbol": "CRWV/USDT",
+                "inst_id": "CRWV-USDT-SWAP",
+                "feature_snapshot": {},
+                "environment_compatibility": {
+                    "checked": True,
+                    "compatible": False,
+                    "blockers": ["execution_market_unavailable", "request_timeout"],
+                },
+            }
+
+    async def get_executor(_mode: str) -> TransientMarketProbeExecutor:
+        return TransientMarketProbeExecutor()
+
+    service._get_okx_executor_for_mode = get_executor  # type: ignore[method-assign]
+    decision = _decision(Action.LONG)
+    decision.symbol = "CRWV/USDT"
+
+    result = await service.pre_order_execution_facts("paper", decision)
+
+    assert result["production_eligible"] is False
+    assert service._unavailable_entry_symbols_by_mode["paper"] == {}
+
+
+@pytest.mark.asyncio
 async def test_pre_order_facts_reuse_recent_balance_after_empty_okx_snapshot() -> None:
     service = TradingService.__new__(TradingService)
     service._okx_balance_snapshot_cache = {

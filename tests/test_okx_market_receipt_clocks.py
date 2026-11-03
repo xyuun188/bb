@@ -118,6 +118,26 @@ async def test_failed_funding_request_has_no_received_clock(monkeypatch, receipt
 
     assert result["funding_data_available"] is False
     assert result.get("funding_rate_received_at") is None
+    assert result["funding_timeout"] is False
+    assert result["funding_error_type"] == "ConnectionError"
+
+
+@pytest.mark.asyncio
+async def test_funding_timeout_is_reported_without_a_receipt_clock(
+    monkeypatch, receipt_clock,
+) -> None:
+    client = OKXRestClient()
+
+    async def fetch(*args, **kwargs):
+        raise TimeoutError("bounded request timed out")
+
+    monkeypatch.setattr(client, "_ccxt_call", fetch)
+    result = await client.fetch_funding_rate("BTC/USDT")
+
+    assert result["funding_data_available"] is False
+    assert result["funding_timeout"] is True
+    assert result["funding_error_type"] == "TimeoutError"
+    assert result.get("funding_rate_received_at") is None
 
 
 @pytest.mark.asyncio
