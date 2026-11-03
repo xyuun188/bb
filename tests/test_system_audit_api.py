@@ -778,10 +778,66 @@ async def test_system_audit_shared_slot_wait_obeys_collection_deadline() -> None
     assert time.perf_counter() - started < 0.2
 
 
-def test_system_audit_schedules_position_capacity_before_slow_database_cards() -> None:
-    assert system_audit.DB_AUDIT_KEYS.index("position_capacity_release") < (
-        system_audit.DB_AUDIT_KEYS.index("model_training")
+def test_system_audit_orders_database_diagnostics_before_required_training() -> None:
+    assert system_audit.EARLY_DB_AUDIT_KEYS == ("production_source_health",)
+    assert system_audit.REQUIRED_AUDIT_KEYS == (
+        "position_capacity_release",
+        "model_training",
     )
+    assert (
+        system_audit.REQUIRED_AUDIT_MAX_CONCURRENCY
+        == system_audit.SYSTEM_AUDIT_DB_MAX_CONCURRENCY
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_system_audit_runs_priority_database_cards_without_overlap() -> None:
+    events: list[str] = []
+    active = 0
+    max_active = 0
+
+    def factory(key: str) -> AuditFactory:
+        async def run() -> dict[str, Any]:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            events.append(f"start:{key}")
+            try:
+                await asyncio.sleep(0.005)
+                return {"key": key, "status": "ok"}
+            finally:
+                events.append(f"finish:{key}")
+                active -= 1
+
+        return run
+
+    specs = [
+        ("model_training", factory("model_training")),
+        ("trade_loop", factory("trade_loop")),
+        ("production_source_health", factory("production_source_health")),
+        ("position_capacity_release", factory("position_capacity_release")),
+    ]
+    timings: dict[str, float] = {}
+    results = await system_audit._run_system_audit_sections(
+        specs,
+        timings=timings,
+        deadline=time.perf_counter() + 1,
+    )
+
+    assert events == [
+        "start:production_source_health",
+        "finish:production_source_health",
+        "start:position_capacity_release",
+        "finish:position_capacity_release",
+        "start:model_training",
+        "finish:model_training",
+        "start:trade_loop",
+        "finish:trade_loop",
+    ]
+    assert max_active == 1
+    assert set(results) == {key for key, _ in specs}
+    assert set(timings) == set(results)
 
 
 @pytest.mark.asyncio

@@ -122,19 +122,19 @@ SYSTEM_AUDIT_GLOBAL_MAX_CONCURRENCY = 2
 # share the trading service's database pool and PostgreSQL resources. Keep the
 # audit wave small enough that a long snapshot cannot starve its peers.
 SYSTEM_AUDIT_DB_MAX_CONCURRENCY = 1
-# Keep one audit snapshot bounded while allowing the two slow read-only
-# integrity scans to finish without starving the required contract card.
+# Keep one audit snapshot bounded while allowing the required read-only
+# integrity scans to finish without starving production-source diagnostics.
 # This work runs in the background; the API serves the last completed snapshot
 # while a new one is being assembled.
-SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 120.0
+SYSTEM_AUDIT_COLLECTION_BUDGET_SECONDS = 180.0
 # These two cards directly feed the phase-3 go/no-go decision. They must be
 # collected before the diagnostic backlog so queue contention cannot turn a
 # healthy required check into ``required_audits_deferred``.
-REQUIRED_AUDIT_MAX_CONCURRENCY = 2
+REQUIRED_AUDIT_MAX_CONCURRENCY = 1
 REQUIRED_AUDIT_SNAPSHOT_MAX_AGE_SECONDS = 10 * 60
 # Audits are diagnostic work and must not retain a large object graph for ten
 # minutes while the trading process is live.
-SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 150.0
+SYSTEM_AUDIT_SUBPROCESS_TIMEOUT_SECONDS = 210.0
 SYSTEM_AUDIT_MIN_REFRESH_INTERVAL_SECONDS = 900.0
 SYSTEM_AUDIT_RUNNER_RESULT_PREFIX = "BB_SYSTEM_AUDIT_RESULT_JSON="
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -230,8 +230,11 @@ PRIORITY_AUDIT_KEYS = (
     "trade_execution_contract",
 )
 REQUIRED_AUDIT_KEYS = (
-    "model_training",
     "position_capacity_release",
+    "model_training",
+)
+EARLY_DB_AUDIT_KEYS = (
+    "production_source_health",
 )
 DB_AUDIT_KEYS = (
     # This card feeds the entry/risk nodes. Run it before slow historical
@@ -6978,6 +6981,104 @@ async def collect_system_audit_status(
         )
 
 
+async def _run_system_audit_sections(
+    audit_specs: list[tuple[str, Any]],
+    *,
+    timings: dict[str, float],
+    deadline: float,
+) -> dict[str, dict[str, Any] | Exception]:
+    specs_by_key = dict(audit_specs)
+    early_db_specs = [
+        (key, specs_by_key[key]) for key in EARLY_DB_AUDIT_KEYS if key in specs_by_key
+    ]
+    required_specs = [
+        (key, specs_by_key[key]) for key in REQUIRED_AUDIT_KEYS if key in specs_by_key
+    ]
+    priority_specs = [
+        (key, factory)
+        for key, factory in audit_specs
+        if key in PRIORITY_AUDIT_KEYS and key not in REQUIRED_AUDIT_KEYS
+    ]
+    heavy_specs = [
+        (key, factory)
+        for key, factory in audit_specs
+        if key in HEAVY_AUDIT_KEYS
+        and key not in PRIORITY_AUDIT_KEYS
+        and key not in REQUIRED_AUDIT_KEYS
+    ]
+    db_specs = [
+        (key, factory)
+        for key, factory in audit_specs
+        if key in DB_AUDIT_KEYS
+        and key not in EARLY_DB_AUDIT_KEYS
+        and key not in PRIORITY_AUDIT_KEYS
+        and key not in HEAVY_AUDIT_KEYS
+        and key not in REQUIRED_AUDIT_KEYS
+    ]
+    regular_specs = [
+        (key, factory)
+        for key, factory in audit_specs
+        if key not in EARLY_DB_AUDIT_KEYS
+        and key not in PRIORITY_AUDIT_KEYS
+        and key not in HEAVY_AUDIT_KEYS
+        and key not in DB_AUDIT_KEYS
+        and key not in REQUIRED_AUDIT_KEYS
+    ]
+    shared_semaphore = asyncio.Semaphore(SYSTEM_AUDIT_GLOBAL_MAX_CONCURRENCY)
+    early_db_result = await _run_audit_specs(
+        early_db_specs,
+        max_concurrency=SYSTEM_AUDIT_DB_MAX_CONCURRENCY,
+        shared_semaphore=shared_semaphore,
+        timings=timings,
+        deadline=deadline,
+    )
+    required_result = await _run_audit_specs(
+        required_specs,
+        max_concurrency=REQUIRED_AUDIT_MAX_CONCURRENCY,
+        shared_semaphore=shared_semaphore,
+        timings=timings,
+        deadline=deadline,
+    )
+    priority_result, db_result, regular_result, heavy_result = await asyncio.gather(
+        _run_audit_specs(
+            priority_specs,
+            max_concurrency=SYSTEM_AUDIT_PRIORITY_MAX_CONCURRENCY,
+            shared_semaphore=shared_semaphore,
+            timings=timings,
+            deadline=deadline,
+        ),
+        _run_audit_specs(
+            db_specs,
+            max_concurrency=SYSTEM_AUDIT_DB_MAX_CONCURRENCY,
+            shared_semaphore=shared_semaphore,
+            timings=timings,
+            deadline=deadline,
+        ),
+        _run_audit_specs(
+            regular_specs,
+            max_concurrency=SYSTEM_AUDIT_MAX_CONCURRENCY,
+            shared_semaphore=shared_semaphore,
+            timings=timings,
+            deadline=deadline,
+        ),
+        _run_audit_specs(
+            heavy_specs,
+            max_concurrency=SYSTEM_AUDIT_MAX_CONCURRENCY,
+            shared_semaphore=shared_semaphore,
+            timings=timings,
+            deadline=deadline,
+        ),
+    )
+    result_by_key: dict[str, dict[str, Any] | Exception] = {}
+    result_by_key.update(early_db_result)
+    result_by_key.update(required_result)
+    result_by_key.update(priority_result)
+    result_by_key.update(db_result)
+    result_by_key.update(regular_result)
+    result_by_key.update(heavy_result)
+    return result_by_key
+
+
 async def _collect_system_audit_status_unlocked(
     *,
     record_history: bool = True,
@@ -7040,87 +7141,12 @@ async def _collect_system_audit_status_unlocked(
         ("visible_text_encoding", lambda: asyncio.to_thread(_source_visible_text_audit)),
         ("runtime_text_integrity", _runtime_text_integrity_audit),
     ]
-    required_specs = [
-        (key, factory)
-        for key, factory in audit_specs
-        if key in REQUIRED_AUDIT_KEYS
-    ]
-    priority_specs = [
-        (key, factory)
-        for key, factory in audit_specs
-        if key in PRIORITY_AUDIT_KEYS and key not in REQUIRED_AUDIT_KEYS
-    ]
-    heavy_specs = [
-        (key, factory)
-        for key, factory in audit_specs
-        if key in HEAVY_AUDIT_KEYS
-        and key not in PRIORITY_AUDIT_KEYS
-        and key not in REQUIRED_AUDIT_KEYS
-    ]
-    db_specs = [
-        (key, factory)
-        for key, factory in audit_specs
-        if key in DB_AUDIT_KEYS
-        and key not in PRIORITY_AUDIT_KEYS
-        and key not in HEAVY_AUDIT_KEYS
-        and key not in REQUIRED_AUDIT_KEYS
-    ]
-    regular_specs = [
-        (key, factory)
-        for key, factory in audit_specs
-        if key not in PRIORITY_AUDIT_KEYS
-        and key not in HEAVY_AUDIT_KEYS
-        and key not in DB_AUDIT_KEYS
-        and key not in REQUIRED_AUDIT_KEYS
-    ]
     section_timings: dict[str, float] = {}
-    result_by_key: dict[str, dict[str, Any] | Exception] = {}
-    # Required cards run first. The remaining groups are read-only and can run
-    # together behind the same bounded gate without delaying the go/no-go
-    # inputs. This avoids presenting queue contention as a missing audit.
-    shared_semaphore = asyncio.Semaphore(SYSTEM_AUDIT_GLOBAL_MAX_CONCURRENCY)
-    required_result = await _run_audit_specs(
-        required_specs,
-        max_concurrency=REQUIRED_AUDIT_MAX_CONCURRENCY,
-        shared_semaphore=shared_semaphore,
+    result_by_key = await _run_system_audit_sections(
+        audit_specs,
         timings=section_timings,
         deadline=collection_deadline,
     )
-    priority_result, db_result, regular_result, heavy_result = await asyncio.gather(
-        _run_audit_specs(
-            priority_specs,
-            max_concurrency=SYSTEM_AUDIT_PRIORITY_MAX_CONCURRENCY,
-            shared_semaphore=shared_semaphore,
-            timings=section_timings,
-            deadline=collection_deadline,
-        ),
-        _run_audit_specs(
-            db_specs,
-            max_concurrency=SYSTEM_AUDIT_DB_MAX_CONCURRENCY,
-            shared_semaphore=shared_semaphore,
-            timings=section_timings,
-            deadline=collection_deadline,
-        ),
-        _run_audit_specs(
-            regular_specs,
-            max_concurrency=SYSTEM_AUDIT_MAX_CONCURRENCY,
-            shared_semaphore=shared_semaphore,
-            timings=section_timings,
-            deadline=collection_deadline,
-        ),
-        _run_audit_specs(
-            heavy_specs,
-            max_concurrency=SYSTEM_AUDIT_MAX_CONCURRENCY,
-            shared_semaphore=shared_semaphore,
-            timings=section_timings,
-            deadline=collection_deadline,
-        ),
-    )
-    result_by_key.update(required_result)
-    result_by_key.update(priority_result)
-    result_by_key.update(db_result)
-    result_by_key.update(regular_result)
-    result_by_key.update(heavy_result)
     cards: list[dict[str, Any]] = []
     grouped_exception_cards: dict[str, dict[str, Any]] = {}
     for section_key, _factory in audit_specs:
@@ -7187,6 +7213,7 @@ async def _collect_system_audit_status_unlocked(
                     "regular": SYSTEM_AUDIT_MAX_CONCURRENCY,
                     "heavy": SYSTEM_AUDIT_MAX_CONCURRENCY,
                     "global": SYSTEM_AUDIT_GLOBAL_MAX_CONCURRENCY,
+                    "source_health": SYSTEM_AUDIT_DB_MAX_CONCURRENCY,
                 },
             },
             "safety_note": "根因雷达当前只读巡检；补历史仓位、重启服务、批量训练等动作必须人工确认。",
