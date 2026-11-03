@@ -98,6 +98,7 @@ async def repair_missing_okx_lifecycle_fragments(
         position for position in all_positions
         if position.settlement_status not in POSITION_SETTLEMENT_SUPERSEDED
     ]
+    positions_by_lifecycle_identity = _index_positions_by_lifecycle_identity(positions)
     order_result = await session.execute(
         select(Order).where(
             Order.execution_mode == selected_mode,
@@ -193,7 +194,15 @@ async def repair_missing_okx_lifecycle_fragments(
         samples.extend(identity_samples)
         lifecycle_key, lifecycle_positions = _select_lifecycle_positions(
             lifecycle,
-            positions,
+            positions_by_lifecycle_identity.get(
+                (
+                    lifecycle[1]["pos_id"],
+                    lifecycle[1]["inst_id"],
+                    lifecycle[1]["symbol"],
+                    lifecycle[1]["side"],
+                ),
+                [],
+            ),
             orders_by_id=orders_by_id,
         )
         if lifecycle_key is None or not lifecycle_positions:
@@ -267,6 +276,11 @@ async def repair_missing_okx_lifecycle_fragments(
             )
             positions.append(position)
             all_positions.append(position)
+            position_identity = _position_lifecycle_identity(position)
+            if position_identity is not None:
+                positions_by_lifecycle_identity.setdefault(position_identity, []).append(
+                    position
+                )
             globally_linked_close_ids.update(full_lifecycle_plan.close_order_ids)
             created += 1
             samples.append(
@@ -364,6 +378,11 @@ async def repair_missing_okx_lifecycle_fragments(
             await session.flush()
             positions.append(position)
             all_positions.append(position)
+            position_identity = _position_lifecycle_identity(position)
+            if position_identity is not None:
+                positions_by_lifecycle_identity.setdefault(position_identity, []).append(
+                    position
+                )
             globally_linked_close_ids.add(exchange_order_id)
             created += 1
             if history_record is not None:
@@ -790,6 +809,31 @@ def _select_lifecycle_positions(
         return None, []
     chosen_score, entry_ids, group = scored[0]
     return (*_base_key[:4], entry_ids), group
+
+
+def _position_lifecycle_identity(
+    position: Position,
+) -> tuple[str, str, str, str] | None:
+    pos_id = _text(getattr(position, "okx_pos_id", None))
+    inst_id = _text(getattr(position, "okx_inst_id", None)).upper()
+    symbol = normalize_trading_symbol(getattr(position, "symbol", ""))
+    side = str(getattr(position, "side", "") or "").lower()
+    if not pos_id or not inst_id or not symbol or side not in {"long", "short"}:
+        return None
+    return pos_id, inst_id, symbol, side
+
+
+def _index_positions_by_lifecycle_identity(
+    positions: Iterable[Position],
+) -> dict[tuple[str, str, str, str], list[Position]]:
+    indexed: dict[tuple[str, str, str, str], list[Position]] = {}
+    for position in positions:
+        if bool(getattr(position, "is_open", False)):
+            continue
+        identity = _position_lifecycle_identity(position)
+        if identity is not None:
+            indexed.setdefault(identity, []).append(position)
+    return indexed
 
 
 def _plan_missing_fragments(

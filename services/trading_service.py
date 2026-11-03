@@ -1165,6 +1165,13 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self._okx_position_settlement_sync_last_error: str | None = None
         self._okx_position_settlement_sync_success_count = 0
         self._okx_position_settlement_sync_failure_count = 0
+        self._okx_lifecycle_fragment_repair_task: asyncio.Task | None = None
+        self._okx_lifecycle_fragment_repair_last_started_at: datetime | None = None
+        self._okx_lifecycle_fragment_repair_last_finished_at: datetime | None = None
+        self._okx_lifecycle_fragment_repair_last_row: dict[str, Any] | None = None
+        self._okx_lifecycle_fragment_repair_last_error: str | None = None
+        self._okx_lifecycle_fragment_repair_success_count = 0
+        self._okx_lifecycle_fragment_repair_failure_count = 0
         self._okx_authoritative_sync_started_at: datetime | None = None
         self._okx_authoritative_sync_last_success_at: datetime | None = None
         self._okx_authoritative_sync_last_failure_at: datetime | None = None
@@ -1668,6 +1675,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
 
         return 10.0
 
+    def okx_lifecycle_fragment_repair_interval_seconds(self) -> float:
+        """Return the cadence for bounded repair of historical OKX lifecycles."""
+
+        return 300.0
+
     def _okx_authoritative_sync_status_payload(
         self,
         now: datetime | None = None,
@@ -1762,6 +1774,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "order_fact_sync": self._okx_order_fact_sync_status_payload(now),
             "settlement_fact_sync": self._okx_settlement_fact_sync_status_payload(now),
             "position_settlement_sync": self._okx_position_settlement_sync_status_payload(now),
+            "okx_lifecycle_fragment_repair": (
+                self._okx_lifecycle_fragment_repair_status_payload(now)
+            ),
             "source": "okx_private_api_current_positions",
         }
 
@@ -1902,6 +1917,68 @@ class TradingService(ModelTrainingCoordinatorMixin):
             ),
             "retry_interval_seconds": round(
                 self.okx_position_settlement_sync_interval_seconds(),
+                3,
+            ),
+        }
+
+    def _okx_lifecycle_fragment_repair_status_payload(
+        self,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Return diagnostics for the separately scheduled lifecycle repair."""
+
+        now = now or datetime.now(UTC)
+        task = getattr(self, "_okx_lifecycle_fragment_repair_task", None)
+        started_at = getattr(
+            self,
+            "_okx_lifecycle_fragment_repair_last_started_at",
+            None,
+        )
+        finished_at = getattr(
+            self,
+            "_okx_lifecycle_fragment_repair_last_finished_at",
+            None,
+        )
+        last_row = getattr(self, "_okx_lifecycle_fragment_repair_last_row", None)
+        if task is not None and not task.done():
+            status = "running"
+        elif isinstance(last_row, dict):
+            status = str(last_row.get("status") or "ok").lower() or "ok"
+        elif getattr(self, "_okx_lifecycle_fragment_repair_last_error", None):
+            status = "degraded"
+        else:
+            status = "pending"
+        age_seconds = (
+            max((now - finished_at).total_seconds(), 0.0)
+            if isinstance(finished_at, datetime)
+            else None
+        )
+        return {
+            "status": status,
+            "task_running": bool(task is not None and not task.done()),
+            "last_started_at": (
+                started_at.isoformat() if isinstance(started_at, datetime) else None
+            ),
+            "last_finished_at": (
+                finished_at.isoformat() if isinstance(finished_at, datetime) else None
+            ),
+            "last_finished_age_seconds": (
+                round(age_seconds, 3) if age_seconds is not None else None
+            ),
+            "last_error": getattr(
+                self,
+                "_okx_lifecycle_fragment_repair_last_error",
+                None,
+            ),
+            "last_row": last_row,
+            "success_count": int(
+                getattr(self, "_okx_lifecycle_fragment_repair_success_count", 0) or 0
+            ),
+            "failure_count": int(
+                getattr(self, "_okx_lifecycle_fragment_repair_failure_count", 0) or 0
+            ),
+            "interval_seconds": round(
+                self.okx_lifecycle_fragment_repair_interval_seconds(),
                 3,
             ),
         }
@@ -2664,7 +2741,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     mode=mode,
                     retry_seconds=self.okx_position_settlement_sync_interval_seconds(),
                     limit=10,
-                ).sync_once()
+                ).sync_once(include_lifecycle_fragment_repair=False)
                 self._okx_position_settlement_sync_last_row = row
                 self._okx_position_settlement_sync_last_error = None
                 self._okx_position_settlement_sync_success_count = (
@@ -2696,6 +2773,66 @@ class TradingService(ModelTrainingCoordinatorMixin):
             finally:
                 self._okx_position_settlement_sync_last_finished_at = datetime.now(UTC)
             await asyncio.sleep(self.okx_position_settlement_sync_interval_seconds())
+
+    async def _okx_lifecycle_fragment_repair_loop(self) -> None:
+        """Repair missing local fragments without delaying settlement retries."""
+
+        interval = self.okx_lifecycle_fragment_repair_interval_seconds()
+        while self._running:
+            factory = getattr(self, "okx_position_settlement_sync_factory", None)
+            if factory is None:
+                await asyncio.sleep(interval)
+                continue
+            started_at = datetime.now(UTC)
+            self._okx_lifecycle_fragment_repair_last_started_at = started_at
+            try:
+                mode = "live" if mode_manager.mode.value == "live" else "paper"
+                row = await factory(
+                    mode=mode,
+                ).repair_missing_lifecycle_fragments_once()
+                self._okx_lifecycle_fragment_repair_last_row = row
+                self._okx_lifecycle_fragment_repair_last_error = None
+                self._okx_lifecycle_fragment_repair_success_count = (
+                    int(
+                        getattr(
+                            self,
+                            "_okx_lifecycle_fragment_repair_success_count",
+                            0,
+                        )
+                        or 0
+                    )
+                    + 1
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error = safe_error_text(exc, limit=220)
+                self._okx_lifecycle_fragment_repair_last_error = error
+                self._okx_lifecycle_fragment_repair_last_row = {
+                    "status": "degraded",
+                    "mode": mode_manager.mode.value,
+                    "error": error,
+                    "created_count": 0,
+                    "samples": [],
+                }
+                self._okx_lifecycle_fragment_repair_failure_count = (
+                    int(
+                        getattr(
+                            self,
+                            "_okx_lifecycle_fragment_repair_failure_count",
+                            0,
+                        )
+                        or 0
+                    )
+                    + 1
+                )
+                logger.warning(
+                    "OKX lifecycle fragment repair failed",
+                    error=error,
+                )
+            finally:
+                self._okx_lifecycle_fragment_repair_last_finished_at = datetime.now(UTC)
+            await asyncio.sleep(interval)
 
     async def _run_shadow_backtest_update(self, *, limit: int) -> int:
         self._shadow_backtest_update_last_started_at = datetime.now(UTC)
@@ -12887,6 +13024,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self._okx_position_settlement_sync_task = asyncio.create_task(
             self._okx_position_settlement_sync_loop()
         )
+        self._okx_lifecycle_fragment_repair_task = asyncio.create_task(
+            self._okx_lifecycle_fragment_repair_loop()
+        )
         self._trading_control_command_task = asyncio.create_task(
             self._trading_control_command_loop()
         )
@@ -12898,6 +13038,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 self._okx_authoritative_sync_task,
                 self._okx_settlement_fact_sync_task,
                 self._okx_position_settlement_sync_task,
+                self._okx_lifecycle_fragment_repair_task,
                 self._trading_control_command_task,
             )
         except asyncio.CancelledError:
@@ -12935,6 +13076,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             getattr(self, "_okx_order_fact_sync_task", None),
             getattr(self, "_okx_settlement_fact_sync_task", None),
             getattr(self, "_okx_position_settlement_sync_task", None),
+            getattr(self, "_okx_lifecycle_fragment_repair_task", None),
             getattr(self, "_shadow_backtest_update_task", None),
             getattr(self, "_market_shadow_sample_worker_task", None),
             getattr(self, "_stale_entry_expire_task", None),
@@ -12955,6 +13097,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self._okx_order_fact_sync_force_pending = False
         self._okx_settlement_fact_sync_task = None
         self._okx_position_settlement_sync_task = None
+        self._okx_lifecycle_fragment_repair_task = None
         self._shadow_backtest_update_task = None
         self._market_shadow_sample_worker_task = None
         self._stale_entry_expire_task = None

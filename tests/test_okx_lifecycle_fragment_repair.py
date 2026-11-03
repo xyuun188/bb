@@ -15,6 +15,7 @@ from models.trade import OkxPositionHistory, Order, Position
 from services.okx_lifecycle_fragment_repair import (
     REPAIR_SOURCE,
     _history_lifecycle,
+    _index_positions_by_lifecycle_identity,
     _repair_linked_lifecycle_identity,
     repair_missing_okx_lifecycle_fragments,
 )
@@ -27,6 +28,79 @@ from services.okx_position_settlement_sync import (
     _group_candidates_by_lifecycle,
     _prepare_lifecycle_allocations,
 )
+
+
+def test_lifecycle_position_index_groups_only_matching_closed_positions() -> None:
+    closed = SimpleNamespace(
+        okx_pos_id="pos-1",
+        okx_inst_id="btc-usdt-swap",
+        symbol="BTC/USDT",
+        side="SHORT",
+        is_open=False,
+    )
+    second_fragment = SimpleNamespace(
+        okx_pos_id="pos-1",
+        okx_inst_id="BTC-USDT-SWAP",
+        symbol="BTC/USDT",
+        side="short",
+        is_open=False,
+    )
+    open_position = SimpleNamespace(
+        okx_pos_id="pos-1",
+        okx_inst_id="BTC-USDT-SWAP",
+        symbol="BTC/USDT",
+        side="short",
+        is_open=True,
+    )
+    other_position = SimpleNamespace(
+        okx_pos_id="pos-2",
+        okx_inst_id="ETH-USDT-SWAP",
+        symbol="ETH/USDT",
+        side="long",
+        is_open=False,
+    )
+
+    index = _index_positions_by_lifecycle_identity(
+        [closed, second_fragment, open_position, other_position]
+    )
+
+    assert set(index) == {
+        ("pos-1", "BTC-USDT-SWAP", "BTC/USDT", "short"),
+        ("pos-2", "ETH-USDT-SWAP", "ETH/USDT", "long"),
+    }
+    assert index[("pos-1", "BTC-USDT-SWAP", "BTC/USDT", "short")] == [
+        closed,
+        second_fragment,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_settlement_sync_can_skip_the_separately_scheduled_fragment_repair() -> None:
+    service = OkxPositionSettlementSyncService(mode="paper")
+    repair_calls = 0
+
+    async def empty_rows(*_args, **_kwargs):
+        return []
+
+    async def expire_stale(_now):
+        return 0
+
+    async def repair_fragments(*_args, **_kwargs):
+        nonlocal repair_calls
+        repair_calls += 1
+        return {"samples": []}
+
+    service._backfill_decision_outcomes = empty_rows
+    service._load_position_history_rows = empty_rows
+    service._load_candidates = empty_rows
+    service._expire_stale_settlements = expire_stale
+    service._repair_missing_lifecycle_fragments = repair_fragments
+
+    report = await service.sync_once(include_lifecycle_fragment_repair=False)
+
+    assert report["status"] == "ok"
+    assert report["checked_count"] == 0
+    assert repair_calls == 0
 
 
 def _raw_fill(

@@ -649,6 +649,92 @@ async def test_okx_settlement_fact_sync_loop_counts_deferred_separately(
 
 
 @pytest.mark.asyncio
+async def test_okx_lifecycle_fragment_repair_runs_immediately_then_waits_five_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    service._okx_lifecycle_fragment_repair_task = None
+    service._okx_lifecycle_fragment_repair_last_started_at = None
+    service._okx_lifecycle_fragment_repair_last_finished_at = None
+    service._okx_lifecycle_fragment_repair_last_row = None
+    service._okx_lifecycle_fragment_repair_last_error = None
+    service._okx_lifecycle_fragment_repair_success_count = 0
+    service._okx_lifecycle_fragment_repair_failure_count = 0
+    service.okx_lifecycle_fragment_repair_interval_seconds = (
+        lambda: 300.0
+    )  # type: ignore[method-assign]
+    calls: list[dict[str, Any]] = []
+    sleeps: list[float] = []
+
+    class FakeRepairService:
+        async def repair_missing_lifecycle_fragments_once(self) -> dict[str, Any]:
+            return {"created_count": 2, "samples": []}
+
+    def factory(**kwargs: Any) -> FakeRepairService:
+        calls.append(kwargs)
+        return FakeRepairService()
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        service._running = False
+
+    service.okx_position_settlement_sync_factory = factory
+    monkeypatch.setattr(trading_service.asyncio, "sleep", fake_sleep)
+
+    await service._okx_lifecycle_fragment_repair_loop()
+
+    status = service._okx_lifecycle_fragment_repair_status_payload()
+    assert calls == [{"mode": mode_manager.mode.value}]
+    assert sleeps == [300.0]
+    assert status["status"] == "ok"
+    assert status["success_count"] == 1
+    assert status["failure_count"] == 0
+    assert status["last_row"]["created_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_okx_position_settlement_loop_skips_lifecycle_fragment_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    service._okx_position_settlement_sync_task = None
+    service._okx_position_settlement_sync_last_started_at = None
+    service._okx_position_settlement_sync_last_finished_at = None
+    service._okx_position_settlement_sync_last_row = None
+    service._okx_position_settlement_sync_last_error = None
+    service._okx_position_settlement_sync_success_count = 0
+    service._okx_position_settlement_sync_failure_count = 0
+    service.okx_position_settlement_sync_interval_seconds = (
+        lambda: 10.0
+    )  # type: ignore[method-assign]
+    repair_flags: list[bool] = []
+
+    class FakeSettlementService:
+        async def sync_once(
+            self,
+            *,
+            include_lifecycle_fragment_repair: bool,
+        ) -> dict[str, Any]:
+            repair_flags.append(include_lifecycle_fragment_repair)
+            return {"status": "ok", "checked_count": 0}
+
+    service.okx_position_settlement_sync_factory = lambda **_kwargs: (
+        FakeSettlementService()
+    )
+
+    async def fake_sleep(_seconds: float) -> None:
+        service._running = False
+
+    monkeypatch.setattr(trading_service.asyncio, "sleep", fake_sleep)
+
+    await service._okx_position_settlement_sync_loop()
+
+    assert repair_flags == [False]
+
+
+@pytest.mark.asyncio
 async def test_okx_settlement_fact_sync_schedules_feedback_without_blocking_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -199,13 +199,21 @@ class OkxPositionSettlementSyncService:
         self.session_context_factory = session_context_factory
         self._last_terminal_sweep_at: datetime | None = None
 
-    async def sync_once(self) -> dict[str, Any]:
+    async def sync_once(
+        self,
+        *,
+        include_lifecycle_fragment_repair: bool = True,
+    ) -> dict[str, Any]:
         started_at = datetime.now(UTC)
         decision_outcome_changes = await self._backfill_decision_outcomes(started_at)
         position_history_rows = await self._load_position_history_rows()
-        fragment_repair = await self._repair_missing_lifecycle_fragments(
-            started_at,
-            position_history_rows,
+        fragment_repair = (
+            await self._repair_missing_lifecycle_fragments(
+                started_at,
+                position_history_rows,
+            )
+            if include_lifecycle_fragment_repair
+            else {"samples": []}
         )
         candidates = await self._load_candidates(started_at)
         if not candidates:
@@ -342,12 +350,7 @@ class OkxPositionSettlementSyncService:
         now: datetime,
         position_history_rows: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Backfill only uniquely proven local fragments before allocation.
-
-        This runs once per bounded settlement pass.  The repair is idempotent,
-        and unresolved/ambiguous lifecycles remain under the existing evidence
-        gate instead of being marked complete.
-        """
+        """Backfill only uniquely proven fragments from a bounded history batch."""
 
         async with self.session_context_factory() as session:
             return await repair_missing_okx_lifecycle_fragments(
@@ -356,6 +359,13 @@ class OkxPositionSettlementSyncService:
                 position_history_rows=position_history_rows,
                 now=now,
             )
+
+    async def repair_missing_lifecycle_fragments_once(self) -> dict[str, Any]:
+        """Run one independently scheduled, idempotent lifecycle repair pass."""
+
+        now = datetime.now(UTC)
+        position_history_rows = await self._load_position_history_rows()
+        return await self._repair_missing_lifecycle_fragments(now, position_history_rows)
 
     async def _load_position_history_rows(self) -> list[dict[str, Any]]:
         """Load the shared OKX history mirror once for an entire sync batch."""
