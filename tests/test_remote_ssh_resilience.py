@@ -45,7 +45,7 @@ class FakeTransport:
 
 
 class FakeSSHClient:
-    def __init__(self) -> None:
+    def __init__(self, *, first_exec_error: str = "Timeout opening channel.") -> None:
         self.system_loaded = False
         self.policy = None
         self.connect_kwargs: dict[str, object] = {}
@@ -53,6 +53,7 @@ class FakeSSHClient:
         self.close_calls = 0
         self.exec_calls = 0
         self.transport = FakeTransport()
+        self.first_exec_error = first_exec_error
 
     def load_system_host_keys(self) -> None:
         self.system_loaded = True
@@ -75,7 +76,7 @@ class FakeSSHClient:
         if self.exec_calls == 1:
             import paramiko
 
-            raise paramiko.SSHException("Timeout opening channel.")
+            raise paramiko.SSHException(self.first_exec_error)
         channel = FakeChannel(0)
         return None, FakeStream("ok\n", channel), FakeStream("")
 
@@ -183,27 +184,29 @@ def test_exec_remote_command_reconnects_before_retrying_channel_timeout(
         pass
 
     reject_policy = object()
-    fake_client = FakeSSHClient()
-    fake_client._bb_project_root = tmp_path
-    fake_client._bb_connect_kwargs = {"hostname": "203.0.113.17"}
-    fake_client._bb_keepalive_interval = 19
     monkeypatch.setitem(
         sys.modules,
         "paramiko",
         SimpleNamespace(RejectPolicy=lambda: reject_policy, SSHException=LocalSSHException),
     )
 
-    result = exec_remote_command(fake_client, "echo ok", timeout=12)
+    for first_exec_error in ("Timeout opening channel.", "No existing session."):
+        fake_client = FakeSSHClient(first_exec_error=first_exec_error)
+        fake_client._bb_project_root = tmp_path
+        fake_client._bb_connect_kwargs = {"hostname": "203.0.113.17"}
+        fake_client._bb_keepalive_interval = 19
 
-    assert result.status == 0
-    assert result.stdout == "ok\n"
-    assert fake_client.exec_calls == 2
-    assert fake_client.close_calls == 1
-    assert fake_client.connect_calls == 1
-    assert fake_client.connect_kwargs == {"hostname": "203.0.113.17"}
-    assert fake_client.system_loaded is True
-    assert fake_client.policy is reject_policy
-    assert fake_client.transport.keepalive_interval == 19
+        result = exec_remote_command(fake_client, "echo ok", timeout=12)
+
+        assert result.status == 0
+        assert result.stdout == "ok\n"
+        assert fake_client.exec_calls == 2
+        assert fake_client.close_calls == 1
+        assert fake_client.connect_calls == 1
+        assert fake_client.connect_kwargs == {"hostname": "203.0.113.17"}
+        assert fake_client.system_loaded is True
+        assert fake_client.policy is reject_policy
+        assert fake_client.transport.keepalive_interval == 19
 
 
 def test_segment_limit_is_negotiated_before_connect_and_reapplied_on_reconnect(

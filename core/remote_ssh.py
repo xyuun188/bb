@@ -33,6 +33,7 @@ REMOTE_STREAM_READ_CHUNK_BYTES = 8192
 TRANSIENT_CHANNEL_OPEN_ERROR_MARKERS = (
     "timeout opening channel",
     "ssh session not active",
+    "no existing session",
 )
 TRANSIENT_CONNECT_ERROR_MARKERS = (
     "error reading ssh protocol banner",
