@@ -7581,6 +7581,47 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   `2026-10-27T15:11:00Z` (`23:11 Asia/Shanghai`), run the single bounded G2
   audit once, record insufficiency, and register a materially new window.
 
+### Runtime Follow-Up And Current Gate (2026-11-03 16:28 Asia/Shanghai)
+
+- Deployed two bounded runtime fixes to `/data/bb/app`: the isolated Local AI
+  training cursor probe now runs at low CPU priority with a 30-minute hard
+  timeout instead of inheriting the 30-second scheduler lease; exact
+  close-order settlement projection candidates are indexed once instead of
+  rescanning all positions for each order. The deployment preserved the
+  existing runtime model routes and paper-service state. Source integrity,
+  runtime imports, model tunnels, OKX network, and Dashboard checks passed.
+- Verification passed: 491 focused tests, Ruff, and `git diff --check`.
+- A fresh read-only Go/No-Go at `2026-11-03T08:28:06Z` returned `no_go` with
+  one hard blocker, `local_ml_not_live_ready`. The position-capacity audit is
+  now available and proves
+  `strategy_learning_cannot_expand_capacity=true`; the earlier
+  `hard_capacity_boundary_unproven` blocker is cleared. The audit found zero
+  open positions, zero incomplete position-economics rows, and zero executed
+  dynamic-exit contract gaps.
+- The model remains in bootstrap/learning-only state. The authoritative
+  promotion sample is only one model-attributed return; three realized
+  historical outcomes average `-0.609592%` after all costs, so profit factor
+  is undefined and walk-forward evidence is absent. No paper or live entry
+  gate was relaxed. The current trade-loop snapshot still shows zero executed
+  entries in the preceding two hours.
+- Two issue-ledger items remain unresolved: paper-resume observation and
+  production-source health. Paper-resume preflight is blocked because
+  `bb-paper-trading.service` is already active; do not stop it to force a
+  preflight. Production-source health still has no qualifying normal
+  strategy candidates. These are not cleared by a service restart.
+- Operator safety correction: this session accidentally invoked
+  `diagnose_online_training_preflight.py --help` before the script had argument
+  parsing. Its bounded transient unit was stopped after discovery; it wrote a
+  failed diagnostic report (`bounded training preflight was terminated`) but
+  persisted no model artifact, authorized no promotion, and submitted no
+  orders. This preflight may update scheduler bookkeeping and is not strictly
+  read-only. The script now requires explicit `--execute`; `--help` and
+  invocation without that flag do not connect to the online host. Regression
+  coverage verifies both paths.
+- There is no defensible calendar ETA for production profitability. Continue
+  only with fresh, preregistered, mature return evidence and the governed
+  promotion gates; do not manufacture entries or reuse old samples.
+
 ### Paper Entry And Market-Fact Follow-Up (2026-11-02 20:29 Asia/Shanghai)
 
 - Local verification passed: `58` OKX REST client tests, `141` DataService

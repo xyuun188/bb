@@ -4018,6 +4018,27 @@ async def test_local_ai_cursor_probe_isolated_from_trading_database_pool(
         "create_subprocess_exec",
         fake_create_subprocess_exec,
     )
+    original_low_priority_command = model_training_coordinator.low_priority_training_command
+    monkeypatch.setattr(
+        model_training_coordinator,
+        "low_priority_training_command",
+        lambda command: original_low_priority_command(
+            command,
+            platform_name="posix",
+            nice_path="/usr/bin/nice",
+        ),
+    )
+    original_wait_for = model_training_coordinator.asyncio.wait_for
+
+    async def capture_wait_for(awaitable, **kwargs):
+        captured["timeout"] = kwargs["timeout"]
+        return await original_wait_for(awaitable, **kwargs)
+
+    monkeypatch.setattr(
+        model_training_coordinator.asyncio,
+        "wait_for",
+        capture_wait_for,
+    )
 
     result = await service._run_local_ai_tools_training_cursor_subprocess()
 
@@ -4025,9 +4046,15 @@ async def test_local_ai_cursor_probe_isolated_from_trading_database_pool(
     assert result["completed_shadow_sample_count"] == 14
     assert result["completed_trade_sample_count"] == 61
     assert result["training_process_isolated"] is True
-    script_path = str(captured["args"][1]).replace("\\", "/")
+    assert captured["args"][:3] == ("/usr/bin/nice", "-n", "10")
+    script_path = next(
+        str(arg).replace("\\", "/")
+        for arg in captured["args"]
+        if "run_local_ai_tools_training_cursors.py" in str(arg)
+    )
     assert script_path.endswith("scripts/run_local_ai_tools_training_cursors.py")
     assert captured["kwargs"]["cwd"] == str(trading_service.PROJECT_ROOT)
+    assert captured["timeout"] == model_training_coordinator.LOCAL_AI_TOOLS_CURSOR_PROBE_TIMEOUT_SECONDS
 
 
 @pytest.mark.parametrize(

@@ -1366,22 +1366,25 @@ def _deduplicate_exact_close_order_projections(
     """
 
     duplicates: list[Position] = []
+    rows_by_close_order_id: dict[str, list[Position]] = {}
+    for row in rows:
+        if _has_superseded_position_metadata(
+            row,
+            _safe_dict(getattr(row, "settlement_raw", None)),
+        ):
+            continue
+        close_order_ids = _split_exchange_order_ids(
+            getattr(row, "close_exchange_order_id", None)
+        )
+        if len(close_order_ids) == 1:
+            close_order_id = next(iter(close_order_ids))
+            rows_by_close_order_id.setdefault(close_order_id, []).append(row)
+
     for close_order_id, facts in order_facts.items():
         target = _safe_float(facts.get("base_quantity"), 0.0)
         if target <= 0:
             continue
-        candidates = [
-            row
-            for row in rows
-            if tuple(
-                sorted(_split_exchange_order_ids(getattr(row, "close_exchange_order_id", None)))
-            )
-            == (str(close_order_id),)
-            and not _has_superseded_position_metadata(
-                row,
-                _safe_dict(getattr(row, "settlement_raw", None)),
-            )
-        ]
+        candidates = rows_by_close_order_id.get(str(close_order_id), [])
         if len(candidates) < 2:
             continue
         exact = [

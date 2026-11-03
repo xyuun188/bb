@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import shlex
 import sys
 from pathlib import Path
@@ -84,7 +85,17 @@ raise SystemExit(exit_code)
 """
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Run the bounded non-persisting training preflight on the online server.",
+    )
+    args = parser.parse_args(argv)
+    if not args.execute:
+        parser.error("refusing to start remote training without explicit --execute")
+
     command = [
         "systemd-run",
         "--quiet",

@@ -63,6 +63,7 @@ TRAINING_BUSY_RETRY_SECONDS = 30.0
 TRAINING_MAX_BUSY_DEFERRAL_SECONDS = 15 * 60.0
 AUTO_TRAIN_FAILURE_BACKOFF_MIN_SECONDS = 30 * 60
 AUTO_TRAIN_FAILURE_BACKOFF_MAX_SECONDS = 4 * 60 * 60
+LOCAL_AI_TOOLS_CURSOR_PROBE_TIMEOUT_SECONDS = 30 * 60
 LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 
 
@@ -1235,7 +1236,7 @@ class ModelTrainingCoordinatorMixin:
             str(PROJECT_ROOT / "scripts" / "run_local_ai_tools_training_cursors.py"),
         ]
         process = await asyncio.create_subprocess_exec(
-            *command,
+            *low_priority_training_command(command),
             cwd=str(PROJECT_ROOT),
             env=training_process_env(),
             stdout=asyncio.subprocess.PIPE,
@@ -1246,7 +1247,7 @@ class ModelTrainingCoordinatorMixin:
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
-                timeout=AUTO_TRAIN_LEASE_STALE_SECONDS,
+                timeout=LOCAL_AI_TOOLS_CURSOR_PROBE_TIMEOUT_SECONDS,
             )
         except asyncio.CancelledError:
             if process.returncode is None:
@@ -1259,7 +1260,7 @@ class ModelTrainingCoordinatorMixin:
             return {
                 "trained": False,
                 "reason": "timeout",
-                "error": "isolated Local AI cursor probe exceeded its scheduler lease",
+                "error": "isolated Local AI cursor probe exceeded its 30-minute limit",
                 "training_process_isolated": True,
             }
         finally:

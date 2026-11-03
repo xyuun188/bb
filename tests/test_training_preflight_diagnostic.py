@@ -105,6 +105,7 @@ def test_preflight_worker_limits_resources_and_runtime(
 
     ssh = SSH()
     monkeypatch.setattr(diagnostic, "connect_remote_ssh", lambda *_args, **_kwargs: ssh)
+    monkeypatch.setattr(sys, "argv", ["preflight"])
 
     def run_remote(_ssh: SSH, command: str, **kwargs: Any) -> str:
         assert _ssh is ssh
@@ -113,7 +114,7 @@ def test_preflight_worker_limits_resources_and_runtime(
 
     monkeypatch.setattr(diagnostic, "run_remote_text", run_remote)
 
-    assert diagnostic.main() == 0
+    assert diagnostic.main(["--execute"]) == 0
     assert ssh.closed
     command, kwargs = commands[0]
     assert "--property=CPUQuota=200%" in command
@@ -122,3 +123,25 @@ def test_preflight_worker_limits_resources_and_runtime(
     assert "--property=TimeoutStopSec=30" in command
     assert "--setenv=DATABASE_POOL_SIZE=2" in command
     assert kwargs["timeout"] > 3600
+
+
+def test_preflight_requires_explicit_execute_and_help_is_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        diagnostic,
+        "connect_remote_ssh",
+        lambda *_args, **_kwargs: calls.append("connected"),
+    )
+
+    with pytest.raises(SystemExit) as help_result:
+        diagnostic.main(["--help"])
+    assert help_result.value.code == 0
+    assert "--execute" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as missing_execute:
+        diagnostic.main([])
+    assert missing_execute.value.code == 2
+    assert calls == []

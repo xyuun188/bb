@@ -1538,6 +1538,54 @@ def test_exact_close_fill_quantity_keeps_ambiguous_partial_fragments() -> None:
     assert third.settlement_status == "settling"
 
 
+def test_exact_close_projection_dedup_indexes_order_ids_once(monkeypatch) -> None:
+    from services import okx_position_settlement_sync as settlement_sync
+
+    row_count = 100
+    rows = [
+        Position(
+            id=index,
+            execution_mode="paper",
+            symbol="BTC/USDT",
+            side="long",
+            quantity=1.0,
+            okx_inst_id="BTC-USDT-SWAP",
+            okx_pos_id=f"position-{index}",
+            entry_exchange_order_id=f"entry-{index}",
+            close_exchange_order_id=f"close-{index}",
+            settlement_status="settling",
+            settlement_raw={},
+        )
+        for index in range(1, row_count + 1)
+    ]
+    order_facts = {
+        f"close-{index}": {"base_quantity": 1.0}
+        for index in range(1, row_count + 1)
+    }
+    original_split = settlement_sync._split_exchange_order_ids
+    split_calls = 0
+
+    def count_split_calls(value):
+        nonlocal split_calls
+        split_calls += 1
+        return original_split(value)
+
+    monkeypatch.setattr(
+        settlement_sync,
+        "_split_exchange_order_ids",
+        count_split_calls,
+    )
+
+    duplicates = settlement_sync._deduplicate_exact_close_order_projections(
+        rows,
+        order_facts,
+        now=datetime.now(UTC),
+    )
+
+    assert duplicates == []
+    assert split_calls <= row_count * 6
+
+
 def test_single_lifecycle_prefers_authoritative_order_economics() -> None:
     from services.okx_position_settlement_sync import (
         SettlementSuccess,
