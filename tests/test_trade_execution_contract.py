@@ -72,6 +72,8 @@ async def test_contract_report_marks_bounded_dataset_as_truncated(
         async def execute(self, _statement: object) -> _Result:
             self.calls += 1
             if self.calls == 1:
+                return _Result([{"action": "long", "count": 2}])
+            if self.calls == 2:
                 return _Result([{"id": 1}, {"id": 2}])
             return _Result([])
 
@@ -91,6 +93,58 @@ async def test_contract_report_marks_bounded_dataset_as_truncated(
 
     assert report["coverage_complete"] is False
     assert report["coverage"]["decision_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_market_candidate_volume_does_not_truncate_execution_contract_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+
+    class _Result:
+        def __init__(self, rows: list[dict[str, object]]) -> None:
+            self._rows = rows
+
+        def mappings(self) -> _Result:
+            return self
+
+        def all(self) -> list[dict[str, object]]:
+            return self._rows
+
+    class _Session:
+        async def execute(self, statement: object) -> _Result:
+            statements.append(str(statement))
+            if len(statements) == 1:
+                return _Result(
+                    [
+                        {"action": "long", "count": 600},
+                        {"action": "short", "count": 450},
+                    ]
+                )
+            return _Result([])
+
+    @asynccontextmanager
+    async def _session_factory():
+        yield _Session()
+
+    monkeypatch.setattr(
+        trade_execution_contract_module,
+        "load_training_epoch_start",
+        lambda: datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    report = await TradeExecutionContractService(_session_factory).report(
+        hours=24,
+        limit=500,
+        since=datetime.now(UTC) - timedelta(hours=24),
+    )
+
+    assert report["coverage_complete"] is True
+    assert report["coverage"]["execution_decision_count"] == 0
+    assert report["coverage"]["candidate_entry_decision_count"] == 1050
+    assert report["summary"]["decision_count"] == 0
+    assert report["summary"]["entry_direction_counts"] == {"long": 600, "short": 450}
+    assert "count(*)" in statements[0].lower()
+    assert "ai_decisions.was_executed" in statements[1]
 
 
 @pytest.mark.asyncio
@@ -127,13 +181,14 @@ async def test_contract_report_bounds_decision_ids_before_loading_json_payloads(
     )
 
     assert report["summary"]["decision_count"] == 0
-    assert len(statements) == 3
-    assert "SELECT ai_decisions.id" in statements[0]
-    assert " LIMIT " in statements[0]
-    assert "raw_llm_response" not in statements[0]
-    assert "SELECT orders.id" in statements[1]
-    assert "SELECT okx_position_history.id" in statements[2]
-    assert "LIMIT" in statements[0]
+    assert len(statements) == 4
+    assert "count(*)" in statements[0].lower()
+    assert "SELECT ai_decisions.id" in statements[1]
+    assert " LIMIT " in statements[1]
+    assert "raw_llm_response" not in statements[1]
+    assert "SELECT orders.id" in statements[2]
+    assert "SELECT okx_position_history.id" in statements[3]
+    assert "LIMIT" in statements[1]
 
 
 def _provenance(*, samples: int = 8, fallback_reason: str = "") -> dict[str, object]:

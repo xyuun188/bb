@@ -100,7 +100,7 @@ class TradeExecutionContractService:
         limit: int = 500,
         since: datetime | None = None,
     ) -> dict[str, Any]:
-        from sqlalchemy import or_, select
+        from sqlalchemy import func, or_, select
 
         from db.session import get_read_session_ctx
         from models.decision import AIDecision
@@ -116,13 +116,28 @@ class TradeExecutionContractService:
         since_naive = since_utc.replace(tzinfo=None)
         session_factory = self._session_context_factory or get_read_session_ctx
         async with session_factory() as session:
-            # Select the bounded decision id window before reading JSON payloads.
-            # PostgreSQL otherwise has to decompress every eligible decision in
-            # the time window before applying the LIMIT, which made this
-            # read-only audit exceed its deadline during a busy analysis day.
-            # Materialize the bounded id set in a separate round trip. PostgreSQL
-            # may inline a LIMIT subquery and decompress JSON for every eligible
-            # row before limiting it, which caused large-window audits to time out.
+            candidate_direction_rows = (
+                await session.execute(
+                    select(AIDecision.action, func.count().label("count"))
+                    .where(
+                        AIDecision.created_at >= since_naive,
+                        AIDecision.decision_learning_snapshot_version >= 1,
+                        AIDecision.action.in_(ENTRY_ACTIONS),
+                    )
+                    .group_by(AIDecision.action)
+                )
+            ).mappings().all()
+            candidate_direction_counts = {
+                str(row["action"]): int(row["count"] or 0)
+                for row in candidate_direction_rows
+                if row.get("action") is not None
+            }
+
+            # Only executed decisions or decisions with persisted orders need
+            # full contract validation. Market-analysis candidates are counted
+            # above with a cheap aggregate; letting them consume this bounded
+            # detail window made a busy scanner mark the execution audit
+            # incomplete and could block every later entry.
             decision_id_rows = [
                 row["id"]
                 for row in (
@@ -132,10 +147,20 @@ class TradeExecutionContractService:
                             AIDecision.created_at >= since_naive,
                             AIDecision.decision_learning_snapshot_version >= 1,
                             AIDecision.action.in_(ENTRY_ACTIONS | EXIT_ACTIONS),
+                            or_(
+                                AIDecision.was_executed.is_(True),
+                                AIDecision.action.in_(EXIT_ACTIONS),
+                                AIDecision.id.in_(
+                                    select(Order.decision_id).where(
+                                        Order.created_at >= since_naive,
+                                        Order.decision_id.is_not(None),
+                                    )
+                                ),
+                            ),
                         )
                         .order_by(AIDecision.id.desc())
-                        # Keep one sentinel row so a bounded report cannot be
-                        # mistaken for a complete history window.
+                        # Keep one sentinel row so a bounded execution audit
+                        # cannot be mistaken for a complete contract window.
                         .limit(capped_limit + 1)
                     )
                 )
@@ -273,6 +298,25 @@ class TradeExecutionContractService:
             orders=orders,
             authoritative_histories=histories,
         )
+        summary = report["summary"]
+        summary["candidate_entry_decision_count"] = sum(
+            candidate_direction_counts.values()
+        )
+        summary["entry_direction_counts"] = candidate_direction_counts
+        dominant_side = "neutral"
+        dominant_share = 0.0
+        if candidate_direction_counts:
+            dominant_side, dominant_count = max(
+                candidate_direction_counts.items(),
+                key=lambda item: (item[1], item[0]),
+            )
+            dominant_share = dominant_count / sum(candidate_direction_counts.values())
+        summary["dominant_entry_direction"] = dominant_side
+        summary["dominant_entry_direction_share"] = round(dominant_share, 8)
+        summary["direction_concentration_alert"] = bool(
+            candidate_direction_counts
+            and dominant_share > NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD
+        )
         report["window_start"] = since_utc.isoformat()
         report["training_epoch_started_at"] = epoch_start.isoformat()
         report["pre_epoch_contracts_can_block_entries"] = False
@@ -283,6 +327,9 @@ class TradeExecutionContractService:
             "order_truncated": order_truncated,
             "history_truncated": history_truncated,
             "position_truncated": False,
+            "candidate_direction_counts_complete": True,
+            "execution_decision_count": len(decisions),
+            "candidate_entry_decision_count": sum(candidate_direction_counts.values()),
             "requested_limit": capped_limit,
             "window_hours": capped_hours,
         }
