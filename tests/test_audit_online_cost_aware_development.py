@@ -13,4 +13,7 @@ def test_remote_cost_ledger_is_bounded_and_development_only() -> None:
     assert "exam_opened" in audit.REMOTE_SCRIPT
     assert "native executable 1m path + fee-after-complete labels" in audit.REMOTE_SCRIPT
     assert ".limit(LIMIT)" in audit.REMOTE_SCRIPT
+    assert ".order_by(ShadowBacktest.updated_at.desc(), ShadowBacktest.id.desc())" in audit.REMOTE_SCRIPT
+    assert "raw_rows.reverse()" in audit.REMOTE_SCRIPT
+    assert '"selection_policy": "latest_completed_rows_within_window"' in audit.REMOTE_SCRIPT
     assert "hindsight_best_action_upper_bound" in audit.REMOTE_SCRIPT

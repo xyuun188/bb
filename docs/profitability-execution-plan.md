@@ -7728,3 +7728,39 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   same `local_ml_not_live_ready` blocker and unchanged issue ledger
   (`17 fixed`, `9 observing`, `1 unresolved`). This confirms deployment
   integrity, not profitability or entry authorization.
+
+### Horizon Development Diagnostic And Current Gate (2026-11-05)
+
+- Synchronized the bounded online research audit fixes with
+  `--skip-restart`: latest completed decision groups are selected first,
+  1,000-group runs retain a 300-second budget, and 2,500-group runs use a
+  bounded 900-second budget under CPU 25%, memory 1 GiB, and one database
+  connection. Remote source integrity and the three focused audit test files
+  passed (`12 passed`); no trading, Dashboard, or model-tunnel service was
+  restarted.
+- Re-ran the same 2,500-group, 24-hour horizon development window at the
+  exclusive cutoff `2026-11-04T14:58:58.729229Z` as revision `v2`, with the
+  v1 development input fingerprint
+  `6cf6c5946bd1957f7fe2aef22f74b3a2b80573611a92a2780609092457438bc0`.
+  The v2 report is
+  `data/profitability_remediation/online-horizon-development-v2-20261104T145858Z.json`;
+  it contains `7,633` rows, `2,500` decision groups, and `877` complete
+  four-horizon groups, and evaluated no exam labels, artifacts, database
+  mutations, promotions, or orders.
+- The diagnostic resolves the earlier `insufficient_inner_folds` ambiguity.
+  The production research selector still purges on the maximum label end
+  across all captured horizons; all three outer folds therefore have zero
+  ready inner folds. A diagnostic using horizon-specific purge shows that
+  5-minute inner folds are ready in all three outer folds, 15-minute folds
+  are ready in all three, 60-minute folds are ready in two, and 240-minute
+  folds are ready in none. This is evidence about coverage only; it does not
+  authorize shortening purge, changing the primary horizon, or lowering
+  entry gates.
+- The same v2 run still selected zero policies. Fixed fee-after baselines
+  remain negative or statistically unproven, and the latest read-only
+  Go/No-Go at `2026-11-04T17:39:22.753964Z` remains `no_go` with the sole hard
+  blocker `local_ml_not_live_ready`; the issue ledger is `15 fixed`,
+  `11 observing`, and `1 unresolved`. Paper/live execution remains blocked by
+  the existing profitability and authoritative-return gates. There is no
+  defensible time-to-profit ETA; the next admissible step is fresh mature
+  fee-after evidence and the governed promotion flow.

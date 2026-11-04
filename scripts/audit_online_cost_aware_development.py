@@ -93,13 +93,14 @@ async def main():
             ]["fee_after_complete"].as_boolean()
             .is_(True),
         )
-        .order_by(ShadowBacktest.updated_at, ShadowBacktest.id)
+        .order_by(ShadowBacktest.updated_at.desc(), ShadowBacktest.id.desc())
         .limit(LIMIT)
     )
     async with get_read_session_ctx(statement_timeout_ms=15000) as session:
         result = await session.execute(statement)
         raw_rows = list(result.mappings())
 
+    raw_rows.reverse()
     rows = []
     for raw in raw_rows:
         snapshot = _dict(raw.get("training_feature_snapshot"))
@@ -183,6 +184,7 @@ async def main():
                     "since": since.isoformat(),
                     "hours": HOURS,
                     "limit": LIMIT,
+                    "selection_policy": "latest_completed_rows_within_window",
                     "source": "native executable 1m path + fee-after-complete labels",
                     "exam_opened": False,
                 },

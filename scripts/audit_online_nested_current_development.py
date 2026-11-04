@@ -249,7 +249,7 @@ async def main():
         select(group_key.label("decision_group_key"))
         .where(*filters)
         .group_by(group_key)
-        .order_by(func.max(ShadowBacktest.updated_at), group_key)
+        .order_by(func.max(ShadowBacktest.updated_at).desc(), group_key.desc())
         .limit(GROUP_LIMIT)
         .subquery()
     )

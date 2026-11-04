@@ -23,6 +23,7 @@ def test_remote_nested_research_query_is_bounded_native_and_cost_complete() -> N
     assert '.as_boolean().is_(True)' in source
     assert ".limit(GROUP_LIMIT)" in source
     assert ".group_by(group_key)" in source
+    assert ".order_by(func.max(ShadowBacktest.updated_at).desc(), group_key.desc())" in source
     assert "group_key.in_(select(selected_groups.c.decision_group_key))" in source
     assert "exam_labels_evaluated" in source
     assert "outer_fold_coverage" in source

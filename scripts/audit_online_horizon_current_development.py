@@ -39,13 +39,20 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 from sqlalchemy import func, select
 
 from db.session import close_db, get_read_session_ctx
 from models.learning import ShadowBacktest
 from services.ml_development_snapshot import make_development_snapshot, snapshot_frame
 from services.ml_horizon_development import build_horizon_development_report
+from services.ml_nested_development import _folds as development_folds
 from services.ml_signal_service import build_training_frame
+from services.ml_signal_service import (
+    MIN_TRAINING_SAMPLE_COUNT,
+    PRIMARY_PREDICTION_HORIZON_MINUTES,
+    _decision_group_availability,
+)
 from services.ml_training_dataset import (
     shadow_training_columns,
     shadow_training_row_from_mapping,
@@ -114,6 +121,7 @@ def _compact_fold(fold):
     } | {
         "selection_reason": selection.get("reason"),
         "selected_policy": selection.get("policy"),
+        "inner_folds": selection.get("inner_folds", []),
         "candidate_count": len(compact_candidates),
         "eligible_candidate_count": sum(
             item.get("inner_selection_eligible") is True
@@ -131,6 +139,86 @@ def _compact_fold(fold):
             name: _compact_evidence((fold.get("outer_evidence") or {}).get(name))
             for name in ("all_opportunities", "nonoverlapping")
         },
+    }
+
+
+def _fold_coverage(frame, count, purge_horizon_minutes=None):
+    boundary_frame = frame
+    if purge_horizon_minutes is not None:
+        boundary_frame = frame[
+            frame["horizon_minutes"] == int(purge_horizon_minutes)
+        ].copy()
+    groups, bounds = _decision_group_availability(boundary_frame)
+    initial = max(int(np.ceil(len(groups) * 0.5)), 1)
+    chunks = np.array_split(np.asarray(groups[initial:]), count)
+    folds = []
+    for index, chunk in enumerate(chunks):
+        validation_groups = chunk.tolist()
+        if not validation_groups:
+            folds.append({
+                "fold_index": index,
+                "status": "empty_validation_groups",
+                "validation_group_count": 0,
+            })
+            continue
+        start = min(bounds[group]["decision_start"] for group in validation_groups)
+        chronological_groups = {
+            group for group in groups
+            if bounds[group]["decision_start"] < start
+        }
+        train_groups = {
+            group for group in groups if bounds[group]["end"] < start
+        }
+        train = frame[
+            frame["decision_group"].astype(str).isin(train_groups)
+        ]
+        validation = frame[
+            frame["decision_group"].astype(str).isin(validation_groups)
+        ]
+        primary_train_count = int(
+            (
+                train["horizon_minutes"]
+                == PRIMARY_PREDICTION_HORIZON_MINUTES
+            ).sum()
+        )
+        primary_validation_count = int(
+            (
+                validation["horizon_minutes"]
+                == PRIMARY_PREDICTION_HORIZON_MINUTES
+            ).sum()
+        )
+        folds.append({
+            "fold_index": index,
+            "status": (
+                "ready"
+                if primary_train_count >= MIN_TRAINING_SAMPLE_COUNT
+                and primary_validation_count > 0
+                else "primary_horizon_coverage_insufficient"
+            ),
+            "validation_group_count": len(validation_groups),
+            "chronological_training_group_count": len(chronological_groups),
+            "label_purged_group_count": len(
+                chronological_groups - train_groups
+            ),
+            "training_group_count": len(train_groups),
+            "primary_train_sample_count": primary_train_count,
+            "primary_validation_sample_count": primary_validation_count,
+            "training_sample_count_by_horizon": {
+                str(horizon): int(
+                    (train["horizon_minutes"] == horizon).sum()
+                )
+                for horizon in (5, 15, 60, 240)
+            },
+            "training_label_end": max(
+                (bounds[group]["end"] for group in train_groups),
+                default=None,
+            ),
+            "validation_decision_start": start,
+        })
+    return {
+        "fold_count": len(folds),
+        "ready_fold_count": sum(item["status"] == "ready" for item in folds),
+        "folds": folds,
     }
 
 
@@ -156,7 +244,7 @@ async def main():
         select(group_key.label("decision_group_key"))
         .where(*filters)
         .group_by(group_key)
-        .order_by(func.max(ShadowBacktest.updated_at), group_key)
+        .order_by(func.max(ShadowBacktest.updated_at).desc(), group_key.desc())
         .limit(GROUP_LIMIT)
         .subquery()
     )
@@ -181,6 +269,17 @@ async def main():
             cutoff=CUTOFF.isoformat(),
         )
         development = snapshot_frame(snapshot, cutoff=CUTOFF.isoformat())
+        horizon_coverage = development.groupby(
+            "decision_group"
+        )["horizon_minutes"].agg(set)
+        complete_group_keys = set(
+            horizon_coverage[
+                horizon_coverage.map(lambda values: {5, 15, 60, 240} <= values)
+            ].index
+        )
+        common = development[
+            development["decision_group"].isin(complete_group_keys)
+        ].copy()
         research = build_horizon_development_report(
             development,
             snapshot=snapshot,
@@ -189,7 +288,7 @@ async def main():
             str(int(value))
             for value in development["horizon_minutes"].tolist()
         ) if not development.empty else Counter()
-        complete_groups = (
+        complete_group_count = (
             int(research.get("common_horizon_decision_group_count") or 0)
         )
         report = {
@@ -211,7 +310,7 @@ async def main():
                 "decision_group_count": int(
                     development["decision_group"].nunique()
                 ) if not development.empty else 0,
-                "common_horizon_group_count": complete_groups,
+                "common_horizon_group_count": complete_group_count,
                 "horizon_row_counts": dict(sorted(horizon_counts.items())),
                 "development_input_sha256": snapshot["development_input_sha256"],
                 "snapshot_sha256": snapshot["snapshot_sha256"],
@@ -236,6 +335,11 @@ async def main():
                 ),
                 "folds": [_compact_fold(fold) for fold in research.get("folds", [])],
             },
+            "fold_coverage_diagnostics_scope": {
+                "current_selection_purge": "maximum_label_end_across_all_horizons",
+                "horizon_specific_purge": "diagnostic_only_not_used_for_selection",
+            },
+            "fold_coverage_diagnostics": [],
             "safety": {
                 "exam_labels_evaluated": False,
                 "artifact_persisted": False,
@@ -246,10 +350,26 @@ async def main():
                 "output_is_development_only": True,
                 "cpu_quota_percent": 25,
                 "memory_limit_bytes": 1073741824,
-                "runtime_limit_seconds": 300,
+                "runtime_limit_seconds": __RUNTIME_LIMIT_SECONDS__,
                 "database_connection_limit": 1,
             },
         }
+        if not common.empty:
+            for index, (outer_train, _, _) in enumerate(
+                development_folds(common, 3)
+            ):
+                report["fold_coverage_diagnostics"].append({
+                    "outer_fold_index": index,
+                    "current_all_horizon_purge": _fold_coverage(
+                        outer_train, 2
+                    ),
+                    "horizon_specific_purge_diagnostics": {
+                        str(horizon): _fold_coverage(
+                            outer_train, 2, purge_horizon_minutes=horizon
+                        )
+                        for horizon in (5, 15, 60, 240)
+                    },
+                })
         print(json.dumps(report, ensure_ascii=False, allow_nan=False, default=str))
     finally:
         await close_db()
@@ -275,6 +395,10 @@ def _render_remote_script(
     return (
         REMOTE_SCRIPT.replace("__GROUP_LIMIT__", str(limit))
         .replace("__HOURS__", str(hours))
+        .replace(
+            "__RUNTIME_LIMIT_SECONDS__",
+            str(_remote_runtime_limit_seconds(limit)),
+        )
         .replace("__CUTOFF__", repr(cutoff.isoformat().replace("+00:00", "Z")))
         .replace("__REVISION__", repr(revision))
         .replace("__DEPENDENCIES__", repr(DEPENDENCIES))
@@ -307,7 +431,7 @@ def _build_remote_command(
             "--property=EnvironmentFile=/etc/bb/bb-runtime.env",
             "--property=CPUQuota=25%",
             "--property=MemoryMax=1G",
-            "--property=RuntimeMaxSec=300s",
+            f"--property=RuntimeMaxSec={_remote_runtime_limit_seconds(limit)}s",
             "--property=TimeoutStopSec=15s",
             "--property=KillMode=control-group",
             "--setenv=DATABASE_POOL_SIZE=1",
@@ -318,6 +442,27 @@ def _build_remote_command(
             shlex.quote(runner),
         )
     )
+
+
+def _remote_runtime_limit_seconds(limit: int) -> int:
+    return 300 if int(limit) <= 1000 else 900
+
+
+def _validate_expected_input_hash(
+    report: dict[str, object], expected_hash: str | None
+) -> None:
+    if not expected_hash:
+        return
+    input_report = report.get("input")
+    actual = (
+        input_report.get("development_input_sha256")
+        if isinstance(input_report, dict)
+        else None
+    )
+    if actual != expected_hash:
+        raise RuntimeError(
+            "development input fingerprint changed; refusing same-window comparison"
+        )
 
 
 def _parse_cutoff(value: str | None) -> datetime:
@@ -336,7 +481,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=1000)
     parser.add_argument("--hours", type=int, default=24)
     parser.add_argument("--cutoff")
-    parser.add_argument("--revision", choices=("v1",), default="v1")
+    parser.add_argument("--revision", choices=("v1", "v2"), default="v1")
+    parser.add_argument("--expected-input-sha256")
     args = parser.parse_args()
     limit = max(1, min(int(args.limit), 2500))
     hours = max(1, min(int(args.hours), 168))
@@ -389,7 +535,12 @@ def main() -> None:
             f"{_build_remote_command(limit=limit, hours=hours, cutoff=cutoff, unit=unit, revision=args.revision)} "
             f"> {shlex.quote(remote_result)}"
         )
-        run_remote_text(ssh, command, timeout=330, max_output_chars=3000)
+        run_remote_text(
+            ssh,
+            command,
+            timeout=_remote_runtime_limit_seconds(limit) + 30,
+            max_output_chars=3000,
+        )
         with sftp.file(remote_result, "r") as remote_file:
             report = json.loads(remote_file.read().decode("utf-8"))
     finally:
@@ -402,6 +553,7 @@ def main() -> None:
         raise RuntimeError("horizon development unexpectedly evaluated exam labels")
     if report.get("input", {}).get("dependency_sha256") != expected_hashes:
         raise RuntimeError("remote horizon report dependency identity mismatch")
+    _validate_expected_input_hash(report, args.expected_input_sha256)
     result_path.parent.mkdir(parents=True, exist_ok=True)
     result_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
