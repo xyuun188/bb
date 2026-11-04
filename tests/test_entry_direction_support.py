@@ -29,6 +29,7 @@ def _opinion(name: str, action: str, *, source_group: str) -> dict:
         "effective_weight": 0.2,
         "source_group": source_group,
         "trace_only_fallback": False,
+        "entry_support_eligible": True,
     }
 
 
@@ -149,6 +150,110 @@ def test_two_independent_expert_groups_can_block_strong_opposition() -> None:
     assert "direction_support_strong_expert_opposition" in support[
         "blocking_reasons"
     ]
+
+
+def test_observation_only_experts_do_not_count_as_directional_opposition() -> None:
+    opinions = [
+        {
+            **_opinion("trend", "long", source_group="llm:trend"),
+            "entry_support_eligible": False,
+        },
+        {
+            **_opinion("sentiment", "long", source_group="llm:sentiment"),
+            "entry_support_eligible": False,
+        },
+        _opinion("momentum", "hold", source_group="llm:momentum"),
+    ]
+    support = assess_paper_model_trade_support(
+        {
+            "short": {"evidence": [_row("local_ml")]},
+            "long": {
+                "evidence": [
+                    _row("local_ml", raw=-0.2, objective=-0.3),
+                ]
+            },
+        },
+        opinions,
+        "short",
+        execution_cost_pct=0.1,
+    )
+
+    assert support["eligible"] is True
+    assert support["auditable_expert_count"] == 1
+    assert support["aligned_expert_count"] == 0
+    assert support["opposition_expert_count"] == 0
+    assert support["strong_expert_opposition"] is False
+
+
+def test_explicitly_eligible_experts_still_count_as_directional_opposition() -> None:
+    opinions = [
+        {
+            **_opinion("trend", "long", source_group="llm:trend"),
+            "entry_support_eligible": True,
+        },
+        {
+            **_opinion("sentiment", "long", source_group="llm:sentiment"),
+            "entry_support_eligible": True,
+        },
+        {
+            **_opinion("momentum", "short", source_group="llm:momentum"),
+            "entry_support_eligible": True,
+        },
+    ]
+    support = assess_paper_model_trade_support(
+        {
+            "short": {"evidence": [_row("local_ml")]},
+            "long": {
+                "evidence": [
+                    _row("local_ml", raw=-0.2, objective=-0.3),
+                ]
+            },
+        },
+        opinions,
+        "short",
+        execution_cost_pct=0.1,
+    )
+
+    assert support["eligible"] is False
+    assert support["strong_expert_opposition"] is True
+    assert "direction_support_strong_expert_opposition" in support[
+        "blocking_reasons"
+    ]
+
+
+def test_observation_only_expert_opposition_does_not_block_governed_candidate() -> None:
+    support = assess_directional_entry_support(
+        {
+            "long": {"evidence": [_row("local_ml"), _row("server_profit")]},
+            "short": {
+                "evidence": [
+                    _row("local_ml", raw=-0.2, objective=-0.3),
+                    _row("server_profit", raw=-0.1, objective=-0.2),
+                ]
+            },
+        },
+        [
+            {
+                **_opinion("trend", "short", source_group="llm:trend"),
+                "entry_support_eligible": False,
+            },
+            {
+                **_opinion("sentiment", "short", source_group="llm:sentiment"),
+                "entry_support_eligible": False,
+            },
+            {
+                **_opinion("momentum", "hold", source_group="llm:momentum"),
+                "entry_support_eligible": False,
+            },
+        ],
+        "long",
+        support_scope="governed_return_candidate",
+    )
+
+    assert support["eligible"] is True
+    assert support["auditable_expert_count"] == 0
+    assert support["strong_expert_opposition"] is False
+    assert directional_entry_support_reasons(support, "long") == []
 
 
 @pytest.mark.parametrize(

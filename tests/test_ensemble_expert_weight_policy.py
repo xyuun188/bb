@@ -317,16 +317,15 @@ def test_no_position_overlay_keeps_position_tiny_and_risk_out_of_direction_vote(
     assert "legacy_expert_vote_permission_enabled" not in candidate
 
 
-def test_authoritative_return_candidate_requires_expert_direction_confirmation() -> None:
+def test_authoritative_return_candidate_does_not_require_observation_only_expert_votes() -> None:
     decision = _coordinator().combine(_features(), _return_context(), {})
 
-    assert decision.action == Action.HOLD
+    assert decision.action == Action.LONG
     candidate = decision.raw_response["authoritative_return_candidate"]
     assert candidate["return_candidate_eligible"] is True
-    assert candidate["production_eligible"] is False
-    assert candidate["independent_direction_support"]["reason"] == (
-        "direction_support_expert_analysis_incomplete"
-    )
+    assert candidate["production_eligible"] is True
+    assert candidate["independent_direction_support"]["eligible"] is True
+    assert candidate["independent_direction_support"]["auditable_expert_count"] == 0
 
 
 def test_paper_entry_aggregates_matching_model_trade_plan() -> None:
@@ -420,7 +419,7 @@ def test_paper_exploration_candidate_remains_hold_in_live_mode() -> None:
     assert "paper_exploration" not in decision.raw_response
 
 
-def test_model_direction_is_blocked_by_strong_independent_expert_opposition() -> None:
+def test_negative_training_direction_stays_blocked_despite_expert_opposition() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -460,7 +459,8 @@ def test_model_direction_is_blocked_by_strong_independent_expert_opposition() ->
     assert "paper_training" not in decision.raw_response
     assert decision.raw_response["entry_permission"]["granted"] is False
     support = decision.raw_response["paper_trade_selection"]["by_side"]["short"]
-    assert support["strong_expert_opposition"] is True
+    assert support["strong_expert_opposition"] is False
+    assert "direction_support_quant_evidence_missing" in support["blocking_reasons"]
 
 
 def test_negative_model_observation_remains_hold_without_sampling_order() -> None:
@@ -626,7 +626,8 @@ def test_unpromoted_positive_net_model_trades_when_all_experts_hold() -> None:
 
     assert decision.action == Action.LONG
     support = decision.raw_response["independent_direction_support"]
-    assert support["hold_expert_count"] == 5
+    assert support["hold_expert_count"] == 0
+    assert support["auditable_expert_count"] == 0
     assert support["blocking_reasons"] == []
     assert decision.raw_response["normal_paper_trade"]["authorized"] is True
 
@@ -681,32 +682,8 @@ def test_positive_expected_net_with_negative_objective_remains_shadow_only() -> 
     assert decision.raw_response["entry_permission"]["granted"] is False
 
 
-def test_unresolved_expert_opposition_blocks_normal_paper_entry() -> None:
-    context = _return_context(
-        execution_mode="paper",
-        paper_training_mode="bootstrap",
-        paper_strategy_champion={"active": False, "paper_execution_permission": False},
-        direction_competition={
-            "preferred_side": "neutral",
-            "training_preferred_side": "long",
-            "long": _training_evidence(
-                "long",
-                1,
-                raw_return=0.3,
-                objective_return=0.2,
-                horizon_minutes=10,
-            ),
-            "training_long": {
-                "score": 0.2,
-                "raw_expected_return_pct": 0.3,
-                "objective_expected_return_pct": 0.2,
-                "horizon_minutes": 10,
-                "observation_count": 1,
-            },
-        },
-    )
-    context["entry_candidate_evidence"]["preferred_side_by_evidence"] = "neutral"
-    context["entry_candidate_evidence"]["preferred_exploration_side"] = "neutral"
+def test_observation_only_expert_opposition_does_not_block_normal_paper_entry() -> None:
+    context = _return_context(execution_mode="paper")
     opinions = {
         "trend_expert": _decision("trend_expert", Action.LONG, confidence=0.6),
         "momentum_expert": _decision("momentum_expert", Action.SHORT, confidence=0.6),
@@ -717,10 +694,11 @@ def test_unresolved_expert_opposition_blocks_normal_paper_entry() -> None:
 
     decision = _coordinator().combine(_features(), context, opinions)
 
-    assert decision.action == Action.HOLD
-    assert "paper_training" not in decision.raw_response
-    support = decision.raw_response["paper_trade_selection"]["by_side"]["long"]
-    assert support["strong_expert_opposition"] is True
+    assert decision.action == Action.LONG
+    assert decision.raw_response["normal_paper_trade"]["authorized"] is True
+    assert decision.raw_response["paper_trade_selection"]["by_side"]["long"][
+        "strong_expert_opposition"
+    ] is False
 
 
 def test_paper_training_route_is_never_created_for_live_execution() -> None:
@@ -901,7 +879,7 @@ def test_continuous_weights_are_ignored_by_live_ensemble_path() -> None:
     assert "continuous_model_weights" not in with_report.raw_response
 
 
-def test_paper_model_direction_with_strong_opposition_remains_hold() -> None:
+def test_unavailable_training_direction_stays_blocked_without_expert_veto() -> None:
     context = _return_context(
         execution_mode="paper",
         paper_training_mode="bootstrap",
@@ -942,7 +920,8 @@ def test_paper_model_direction_with_strong_opposition_remains_hold() -> None:
     assert "paper_training" not in decision.raw_response
     assert decision.raw_response["entry_permission"]["granted"] is False
     support = decision.raw_response["paper_trade_selection"]["by_side"]["short"]
-    assert support["strong_expert_opposition"] is True
+    assert support["strong_expert_opposition"] is False
+    assert "direction_support_quant_evidence_missing" in support["blocking_reasons"]
 
 
 def test_stable_continuous_strategy_route_disables_loss_tolerant_bootstrap() -> None:

@@ -1,4 +1,4 @@
-"""Auditable model direction and independent expert-conflict assessment."""
+"""Auditable model direction and explicitly eligible expert diagnostics."""
 
 from __future__ import annotations
 
@@ -13,11 +13,9 @@ from services.normal_paper_trade import (
     normal_paper_current_return_ready,
 )
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-10-10.paper-model-direction.v14"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-11-04.paper-model-direction.v16"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 PAPER_TRAINING_ENTRY_SCOPE = "paper_training_entry"
-MIN_GOVERNED_ALIGNED_EXPERT_COUNT = 2
-MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT = 2
 MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY = (
     NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
 )
@@ -349,7 +347,11 @@ def assess_directional_entry_support(
     support_scope: str = "governed_return_candidate",
     execution_cost_pct: float | None = None,
 ) -> dict[str, Any]:
-    """Require one auditable model direction and block only strong opposition."""
+    """Use quantitative return evidence for eligibility and experts for diagnostics.
+
+    Expert opinions can contribute conflict diagnostics only when their producer
+    explicitly opts them into direction support. They never authorize an entry.
+    """
 
     side = str(selected_side or "").lower()
     opposite_side = "short" if side == "long" else "long"
@@ -535,6 +537,7 @@ def assess_directional_entry_support(
         item
         for item in expert_opinions or []
         if isinstance(item, dict)
+        and item.get("entry_support_eligible") is True
         and (_float(item.get("effective_weight")) or 0.0) > 0.0
         and item.get("trace_only_fallback") is not True
         and str(item.get("reasoning") or "").strip()
@@ -606,22 +609,6 @@ def assess_directional_entry_support(
     if paper_scope:
         if strong_expert_opposition:
             blockers.append("direction_support_strong_expert_opposition")
-        if training_scope:
-            if len(aligned) < MIN_GOVERNED_ALIGNED_EXPERT_COUNT:
-                blockers.append("paper_training_aligned_experts_insufficient")
-            if len(aligned) <= len(opposition):
-                blockers.append("paper_training_expert_direction_not_resolved")
-    else:
-        if len(auditable_experts) < 3:
-            blockers.append("direction_support_expert_analysis_incomplete")
-        if auditable_experts and len(holds) == len(auditable_experts):
-            blockers.append("direction_support_experts_all_hold")
-        if len(aligned) < MIN_GOVERNED_ALIGNED_EXPERT_COUNT:
-            blockers.append("direction_support_aligned_experts_insufficient")
-        if len(aligned) <= len(opposition):
-            blockers.append("direction_support_expert_opposition_not_resolved")
-        if len(support_groups) < MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT:
-            blockers.append("direction_support_independent_groups_insufficient")
 
     result = {
         "version": INDEPENDENT_DIRECTION_SUPPORT_VERSION,
@@ -776,28 +763,6 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
             reasons.append(
                 "direction_support_quality_observation_loss_probability_too_high"
             )
-        if support.get("support_scope") == PAPER_TRAINING_ENTRY_SCOPE:
-            if int(support.get("aligned_expert_count") or 0) < (
-                MIN_GOVERNED_ALIGNED_EXPERT_COUNT
-            ):
-                reasons.append("paper_training_aligned_experts_insufficient")
-            if int(support.get("aligned_expert_count") or 0) <= int(
-                support.get("opposition_expert_count") or 0
-            ):
-                reasons.append("paper_training_expert_direction_not_resolved")
-    else:
-        if int(support.get("aligned_expert_count") or 0) < (
-            MIN_GOVERNED_ALIGNED_EXPERT_COUNT
-        ):
-            reasons.append("direction_support_aligned_experts_insufficient")
-        if int(support.get("aligned_expert_count") or 0) <= int(
-            support.get("opposition_expert_count") or 0
-        ):
-            reasons.append("direction_support_expert_opposition_not_resolved")
-        if int(support.get("independent_support_group_count") or 0) < (
-            MIN_GOVERNED_INDEPENDENT_SUPPORT_GROUP_COUNT
-        ):
-            reasons.append("direction_support_independent_groups_insufficient")
     if support.get("blocking_reasons"):
         reasons.append("direction_support_contains_blockers")
     if support.get("contract_fingerprint") != _fingerprint(
