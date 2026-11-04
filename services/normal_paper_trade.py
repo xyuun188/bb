@@ -857,8 +857,6 @@ def reconcile_normal_paper_trade_contract(
     scored = _dict(opportunity)
     expected_net = _float(scored.get("expected_net_return_pct"), None)
     return_lcb = _float(scored.get("return_lcb_pct"), None)
-    if expected_net is None or return_lcb is None:
-        return contract
 
     distribution = _dict(scored.get("return_distribution_contract"))
     gross_distribution = _dict(distribution.get("gross_market_distribution"))
@@ -870,12 +868,18 @@ def reconcile_normal_paper_trade_contract(
             "current_raw_expected_return_pct"
         ),
     }
-    contract["expected_net_return_pct"] = round(expected_net, 8)
-    contract["objective_net_return_pct"] = round(return_lcb, 8)
-    if gross_expected is not None:
-        contract["current_raw_expected_return_pct"] = round(gross_expected, 8)
+    contract["expected_net_return_pct"] = (
+        round(expected_net, 8) if expected_net is not None else None
+    )
+    contract["objective_net_return_pct"] = (
+        round(return_lcb, 8) if return_lcb is not None else None
+    )
+    contract["current_raw_expected_return_pct"] = (
+        round(gross_expected, 8) if gross_expected is not None else None
+    )
     contract["current_edge_validated"] = bool(
-        expected_net > 0.0
+        expected_net is not None
+        and expected_net > 0.0
         and not contract.get("strong_expert_opposition")
     )
     quality_permissions = _dict(contract.get("quant_quality_permissions"))
@@ -909,6 +913,17 @@ def reconcile_normal_paper_trade_contract(
         and normal_paper_entry_return_ready(expected_net, return_lcb)
     )
     entry_eligible = training_entry_eligible or validated_entry_eligible
+    reconciliation_reason = (
+        "current_execution_expected_return_missing"
+        if expected_net is None
+        else "current_execution_expected_return_not_positive"
+        if expected_net <= 0.0
+        else "current_execution_return_lcb_missing"
+        if return_lcb is None
+        else "current_execution_return_lcb_not_positive"
+        if return_lcb <= 0.0
+        else None
+    )
     contract["reconciliation"] = {
         "version": "2026-10-18.normal-paper-current-execution-return.v1",
         "source": "opportunity_score",
@@ -918,10 +933,13 @@ def reconcile_normal_paper_trade_contract(
             and contract.get("authorized") is True
             else "blocked_current_execution_return"
         ),
+        "reason": reconciliation_reason,
         "previous": previous,
         "current": {
-            "expected_net_return_pct": round(expected_net, 8),
-            "return_lcb_pct": round(return_lcb, 8),
+            "expected_net_return_pct": (
+                round(expected_net, 8) if expected_net is not None else None
+            ),
+            "return_lcb_pct": round(return_lcb, 8) if return_lcb is not None else None,
             "new_entry_return_ready": normal_paper_entry_return_ready(
                 expected_net, return_lcb
             ),
@@ -939,6 +957,11 @@ def reconcile_normal_paper_trade_contract(
         contract["authorized"] = False
     contract["contract_fingerprint"] = _fingerprint(
         _contract_fingerprint_payload(contract)
+    )
+    contract["reconciliation"]["blocking_reasons"] = (
+        normal_paper_entry_contract_reasons(contract)
+        if contract.get("authorized") is not True
+        else []
     )
     return contract
 

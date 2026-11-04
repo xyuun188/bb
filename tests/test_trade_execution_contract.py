@@ -144,6 +144,8 @@ async def test_market_candidate_volume_does_not_truncate_execution_contract_audi
     assert report["summary"]["decision_count"] == 0
     assert report["summary"]["entry_direction_counts"] == {"long": 600, "short": 450}
     assert "count(*)" in statements[0].lower()
+    assert "ai_decisions.is_paper is true" in statements[0].lower()
+    assert "ai_decisions.analysis_type" in statements[0].lower()
     assert "ai_decisions.was_executed" in statements[1]
 
 

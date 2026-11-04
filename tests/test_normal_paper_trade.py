@@ -178,6 +178,65 @@ def test_reconcile_normal_trade_keeps_positive_current_execution_edge_authorized
 
 
 @pytest.mark.parametrize(
+    "opportunity, missing_field",
+    [
+        ({"return_lcb_pct": 0.02}, "expected_net_return_pct"),
+        ({"expected_net_return_pct": 0.08}, "objective_net_return_pct"),
+        ({}, "expected_net_return_pct"),
+    ],
+)
+def test_reconcile_revokes_authorization_when_current_execution_evidence_is_missing(
+    opportunity: dict[str, float],
+    missing_field: str,
+) -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=_support("long", expected_net=0.2, objective_net=0.1),
+    )
+
+    reconciled = reconcile_normal_paper_trade_contract(contract, opportunity)
+
+    assert reconciled["authorized"] is False
+    assert reconciled[missing_field] is None
+    assert reconciled["current_raw_expected_return_pct"] is None
+    assert reconciled["reconciliation"]["reason"] in {
+        "current_execution_expected_return_missing",
+        "current_execution_return_lcb_missing",
+    }
+    assert reconciled["reconciliation"]["blocking_reasons"]
+    assert normal_paper_entry_contract_reasons(reconciled)
+
+
+def test_reconcile_records_non_positive_current_lower_bound_as_blocker() -> None:
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support=_support("long", expected_net=0.2, objective_net=0.1),
+    )
+
+    reconciled = reconcile_normal_paper_trade_contract(
+        contract,
+        {
+            "expected_net_return_pct": 0.08,
+            "return_lcb_pct": -0.22,
+        },
+    )
+
+    assert reconciled["reconciliation"]["reason"] == (
+        "current_execution_return_lcb_not_positive"
+    )
+    assert "normal_paper_trade_return_lcb_not_positive" in (
+        reconciled["reconciliation"]["blocking_reasons"]
+    )
+    assert reconciled["reconciliation"]["status"] == (
+        "blocked_current_execution_return"
+    )
+
+
+@pytest.mark.parametrize(
     "selection_reason",
     ["strategy_edge_selected", "paper_training_entry"],
 )

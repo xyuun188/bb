@@ -122,6 +122,8 @@ class TradeExecutionContractService:
                     .where(
                         AIDecision.created_at >= since_naive,
                         AIDecision.decision_learning_snapshot_version >= 1,
+                        AIDecision.is_paper.is_(True),
+                        AIDecision.analysis_type == "market",
                         AIDecision.action.in_(ENTRY_ACTIONS),
                     )
                     .group_by(AIDecision.action)

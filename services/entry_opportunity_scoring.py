@@ -1046,14 +1046,39 @@ class EntryOpportunityScoringPolicy:
             entry_contract_reasons = normal_paper_entry_contract_reasons(reconciled)
             if reconciled.get("authorized") is not True or entry_contract_reasons:
                 permission = safe_dict(raw.get("entry_permission"))
+                actionable_reasons = [
+                    reason
+                    for reason in entry_contract_reasons
+                    if reason != "normal_paper_trade_not_authorized"
+                ]
+                reconciliation_reason = safe_dict(
+                    reconciled.get("reconciliation")
+                ).get("reason")
+                primary_reason = (
+                    reconciliation_reason
+                    or (actionable_reasons[0] if actionable_reasons else None)
+                    or (
+                        entry_contract_reasons[0]
+                        if entry_contract_reasons
+                        else "current_execution_return_not_positive"
+                    )
+                )
+                ordered_reasons = [
+                    *actionable_reasons,
+                    *(
+                        ["normal_paper_trade_not_authorized"]
+                        if "normal_paper_trade_not_authorized"
+                        in entry_contract_reasons
+                        else []
+                    ),
+                ]
                 permission.update(
                     {
                         "granted": False,
-                        "reason": entry_contract_reasons[0]
-                        if entry_contract_reasons
-                        else "current_execution_return_not_positive",
+                        "reason": primary_reason,
                         "blocking_category": "profit_gate",
-                        "blocking_reasons": entry_contract_reasons
+                        "blocking_reasons": ordered_reasons
+                        or entry_contract_reasons
                         or ["current_execution_return_not_positive"],
                     }
                 )

@@ -5,6 +5,7 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_opportunity_scoring import EntryOpportunityScoringPolicy
+from services.normal_paper_trade import build_normal_paper_trade_contract
 from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
     PROFIT_SUPERVISION_VERSION,
@@ -19,6 +20,7 @@ from services.return_objective import (
     RETURN_OBJECTIVE_VERSION,
     standardized_return_distribution,
 )
+from tests.normal_paper_test_fixtures import paper_quality_permissions
 from tests.paper_canary_fixtures import complete_paper_canary_raw
 
 
@@ -236,6 +238,52 @@ def _decision() -> DecisionOutput:
                 ),
             },
         },
+    )
+
+
+def test_missing_final_return_distribution_revokes_paper_contract_with_specific_reason() -> None:
+    decision = _decision()
+    decision.raw_response["ml_signal"] = {}
+    decision.raw_response["local_ai_tools"] = {}
+    decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason="strategy_edge_selected",
+        direction_support={
+            "eligible": True,
+            "selected_side": "long",
+            "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.2,
+            "raw_expected_return_pct": 0.3,
+            "objective_net_return_pct": 0.1,
+            "loss_probability": 0.2,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
+            "strong_expert_opposition": False,
+            "current_edge_validated": True,
+        },
+    )
+    assert decision.raw_response["normal_paper_trade"]["authorized"] is True
+
+    _scorer().score_candidate(decision, {"execution_mode": "paper"})
+
+    raw = decision.raw_response
+    contract = raw["normal_paper_trade"]
+    assert contract["authorized"] is False
+    assert contract["expected_net_return_pct"] is None
+    assert contract["objective_net_return_pct"] is None
+    assert contract["reconciliation"]["reason"] == (
+        "current_execution_expected_return_missing"
+    )
+    assert raw["entry_permission"]["granted"] is False
+    assert raw["entry_permission"]["reason"] == (
+        "current_execution_expected_return_missing"
+    )
+    assert "normal_paper_trade_expected_net_not_positive" in (
+        raw["entry_permission"]["blocking_reasons"]
+    )
+    assert raw["entry_permission"]["blocking_reasons"][-1] == (
+        "normal_paper_trade_not_authorized"
     )
 
 
