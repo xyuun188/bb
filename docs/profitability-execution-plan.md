@@ -7764,3 +7764,14 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   the existing profitability and authoritative-return gates. There is no
   defensible time-to-profit ETA; the next admissible step is fresh mature
   fee-after evidence and the governed promotion flow.
+- A further read-only strategy-health check at `2026-11-04T17:46:55Z`
+  confirms the runtime loop is healthy rather than silently failing:
+  scheduler heartbeats are fresh, no training timeout or stale scheduler is
+  present, and the latest challenger completed at `17:39:52Z` but was
+  rejected. In the trailing 24-hour candidate set, `83/86` directions were
+  short (`96.5%` concentration), yet zero entries were authorized or
+  executed because the short fee-after lower bound remained negative. The
+  current strategy scheduler has `43` candidates and `0` governed candidates;
+  this is an evidence-quality block, not permission to force a trade. The
+  paper, Dashboard, and model-tunnel services remain active, with no restart
+  performed by this audit.
