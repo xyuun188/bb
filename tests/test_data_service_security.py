@@ -225,6 +225,27 @@ async def test_derivatives_background_refresh_concurrency_is_bounded() -> None:
 
 
 @pytest.mark.asyncio
+async def test_background_derivatives_refresh_skips_funding_and_open_interest() -> None:
+    service = _service()
+    calls: list[tuple[str, bool]] = []
+
+    async def refresh(
+        symbol: str,
+        *,
+        required_only: bool = False,
+    ) -> dict[str, Any]:
+        calls.append((symbol, required_only))
+        return {"symbol": symbol}
+
+    service._refresh_derivatives_snapshot = refresh  # type: ignore[method-assign]
+
+    result = await service._refresh_derivatives_snapshot_in_background("ETH/USDT")
+
+    assert result == {"symbol": "ETH/USDT"}
+    assert calls == [("ETH/USDT", True)]
+
+
+@pytest.mark.asyncio
 async def test_priority_queue_wait_does_not_consume_native_provider_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2613,7 +2634,7 @@ async def test_derivatives_refresh_timeout_keeps_shared_task_alive(
 
 
 @pytest.mark.asyncio
-async def test_blocking_derivatives_refresh_prioritizes_required_routes() -> None:
+async def test_blocking_market_derivatives_refresh_skips_optional_routes() -> None:
     service = _service()
     service._derivatives_failed_at = {}
     service._derivatives_refresh_tasks = {}
@@ -2643,7 +2664,7 @@ async def test_blocking_derivatives_refresh_prioritizes_required_routes() -> Non
 
     await service._get_derivatives_snapshot("ETH/USDT", block_on_remote=True)
 
-    assert calls == [(False, False, True)]
+    assert calls == [(True, False, True)]
 
 
 @pytest.mark.asyncio

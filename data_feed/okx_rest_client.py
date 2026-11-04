@@ -94,6 +94,9 @@ PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY = max(
 # consume executable quote slots, while allowing one snapshot to complete
 # within its caller budget instead of serializing four ~8s requests.
 PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY = OKX_INDICATOR_MARKET_API_POOL_SIZE
+# Funding is optional context during broad scans, but an indicator refresh
+# wave must not starve the route needed by final entry validation.
+PUBLIC_MARKET_FUNDING_REQUEST_CONCURRENCY = 2
 # Native one-minute candles are part of the executable-market-fact proof. They
 # must not queue behind the larger indicator K-line fan-out. Four bounded slots
 # let a four-horizon shadow-maintenance batch drain without turning a provider
@@ -142,6 +145,7 @@ PUBLIC_MARKET_PRIORITY_METHODS = frozenset(
         "publicGetMarketTicker",
     }
 )
+PUBLIC_MARKET_FUNDING_METHODS = frozenset({"fetch_funding_rate"})
 PUBLIC_MARKET_OPTIONAL_METHODS = frozenset(
     {
         # Indicator K-lines are analytical enrichment and must not consume
@@ -397,6 +401,7 @@ class OKXRestClient:
         self._instrument_spec_lock = asyncio.Lock()
         self._public_market_request_gate: _PriorityRequestGate | None = None
         self._public_market_optional_request_gate: _PriorityRequestGate | None = None
+        self._public_market_funding_request_gate: _PriorityRequestGate | None = None
         self._native_consistency_request_gate: _PriorityRequestGate | None = None
         self._historical_request_gate: _PriorityRequestGate | None = None
         self._exchange_ready = False
@@ -496,6 +501,19 @@ class OKXRestClient:
             self._public_market_optional_request_gate = gate
         return gate
 
+    def _public_market_funding_gate(self) -> _PriorityRequestGate:
+        gate = self._public_market_funding_request_gate
+        if not isinstance(gate, _PriorityRequestGate):
+            gate = _PriorityRequestGate(
+                PUBLIC_MARKET_FUNDING_REQUEST_CONCURRENCY,
+                normal_limit=max(
+                    1,
+                    PUBLIC_MARKET_FUNDING_REQUEST_CONCURRENCY - 1,
+                ),
+            )
+            self._public_market_funding_request_gate = gate
+        return gate
+
     def _native_consistency_gate(self) -> _PriorityRequestGate:
         gate = self._native_consistency_request_gate
         if not isinstance(gate, _PriorityRequestGate):
@@ -524,9 +542,12 @@ class OKXRestClient:
             self._ensure_rest_url()
             method = getattr(ex, method_name)
             is_public_method = self._is_public_market_method(method_name)
+            is_funding_method = method_name in PUBLIC_MARKET_FUNDING_METHODS
             is_optional_method = method_name in PUBLIC_MARKET_OPTIONAL_METHODS
             gate = request_gate or (
-                self._public_market_optional_gate()
+                self._public_market_funding_gate()
+                if is_public_method and is_funding_method
+                else self._public_market_optional_gate()
                 if is_public_method and is_optional_method
                 else self._public_market_gate()
                 if is_public_method

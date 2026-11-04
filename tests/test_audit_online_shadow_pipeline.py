@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from scripts.audit_online_shadow_pipeline import (
+    _COMPACT_REPORT_KEYS,
     REMOTE_SCRIPT,
     _fingerprint,
     verify_shadow_evidence_fingerprint,
@@ -22,9 +23,18 @@ def test_native_route_probe_is_bounded_read_only_and_compiles() -> None:
     assert '"window_coverage_miss"' in remote_script
     assert "due_timestamp_ms" in remote_script
     assert "stored_result_fact" in remote_script
+    assert "stored_instrument_identity_mismatch" in remote_script
+    assert "within_candle_range" in remote_script
+    assert "saved_price_checks" in remote_script
+    assert 'report.pop("native_route_probe_inputs", None)' in remote_script
+    assert '"saved_price_check_counts"' in remote_script
+    assert '"outside_candle_range"' in remote_script
+    assert '"saved_price_checks": price_observations[:2]' in remote_script
+    assert "if len(probes) < 1" in remote_script
     assert "stored_reason_codes" in remote_script
     assert "training_feature_snapshot" in remote_script
     assert '"orders_submitted": False' in remote_script
+    assert "native_route_probe_inputs" not in _COMPACT_REPORT_KEYS
 
 
 def _native_contract() -> tuple[dict, dict]:

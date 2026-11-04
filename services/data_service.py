@@ -4401,10 +4401,10 @@ class DataService:
                 self._schedule_derivatives_background_refresh(normalized)
                 return {"derivatives_refresh_in_background": True}
             return {}
-        # A normal synchronous market refresh only needs executable facts.
-        # Final entry analysis opts into a funding-aware refresh explicitly;
-        # open interest remains optional in both modes.
-        required_only = not allow_background_refresh
+        # Market scans only need executable facts. Funding is fetched for a
+        # final candidate only when that caller explicitly requires it;
+        # open interest remains optional and off the entry-critical path.
+        required_only = True
 
         async def refresh() -> dict[str, Any]:
             refresh_fn = self._refresh_derivatives_snapshot
@@ -4564,7 +4564,10 @@ class DataService:
         async with self._derivatives_background_refresh_gate():
             refresh_fn = self._refresh_derivatives_snapshot
             try:
-                return await refresh_fn(symbol, required_only=False)
+                # Broad discovery refreshes executable facts only. Funding and
+                # open interest are fetched for final candidates, not fanned
+                # out across the entire scan universe.
+                return await refresh_fn(symbol, required_only=True)
             except TypeError as exc:
                 if "required_only" not in safe_error_text(exc):
                     raise

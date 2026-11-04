@@ -17,6 +17,22 @@ from core.remote_ssh import connect_remote_ssh  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 from scripts import audit_online_market_hold_economics as transport  # noqa: E402
 
+_COMPACT_REPORT_KEYS = frozenset(
+    {
+        "checked_at",
+        "database_activity",
+        "queue",
+        "settlement_throughput",
+        "native_fee_after_groups",
+        "entry_exit_counts",
+        "recovery_coverage",
+        "native_fingerprint_check",
+        "native_route_probe",
+        "executed_entry_evidence",
+        "runtime",
+    }
+)
+
 
 def _fingerprint(value: Any) -> str:
     return hashlib.sha256(
@@ -99,6 +115,7 @@ from time import monotonic
 
 from sqlalchemy import text
 from db.session import get_read_session_ctx
+from core.symbols import okx_inst_id_from_symbol
 
 
 async def main():
@@ -387,7 +404,12 @@ async def main():
                    training_feature_snapshot->'training_market_fact_contract'
                        ->>'path_status' AS stored_path_status,
                    training_feature_snapshot->'training_market_fact_contract'
-                       ->>'path_fingerprint' AS stored_path_fingerprint
+                       ->>'path_fingerprint' AS stored_path_fingerprint,
+                   feature_snapshot->'market_fact_contract'->'entry_fact'
+                       AS entry_fact,
+                   feature_snapshot->'market_fact' AS market_fact,
+                   feature_snapshot->'market_source_snapshots'
+                       AS market_source_snapshots
             FROM shadow_backtests
             WHERE execution_mode='paper'
               AND status='quarantined'
@@ -399,20 +421,184 @@ async def main():
             ORDER BY id DESC
             LIMIT 8
         """)
+        # The rows contain full market facts and source snapshots. Keep them
+        # only for this audit's calculations, not in the emitted report.
+        report.pop("native_route_probe_inputs", None)
         from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
 
         exchange = OkxPerpetualSdkExchange("paper")
         probes = []
+        probe_status_counts = {}
+        price_check_counts = {
+            "within_candle_range": 0,
+            "outside_candle_range": 0,
+            "candle_unavailable": 0,
+        }
+
+        def record_probe_status(status):
+            probe_status_counts[status] = probe_status_counts.get(status, 0) + 1
+
+        def append_probe(probe):
+            if len(probes) < 1:
+                probes.append(probe)
+
         try:
             for item in probe_inputs:
+                def add_prices(
+                    observations,
+                    *,
+                    source,
+                    timestamp_ms,
+                    prices,
+                    fields,
+                ):
+                    try:
+                        source_ms = int(float(timestamp_ms or 0))
+                    except (TypeError, ValueError):
+                        return
+                    if source_ms <= 0 or not isinstance(prices, dict):
+                        return
+                    for field in fields:
+                        try:
+                            price = float(prices.get(field))
+                        except (TypeError, ValueError):
+                            continue
+                        if price > 0:
+                            observations.append({
+                                "source": source,
+                                "field": field,
+                                "source_timestamp_ms": source_ms,
+                                "price": price,
+                            })
+
+                entry_fact = item.get("entry_fact")
+                entry_fact = entry_fact if isinstance(entry_fact, dict) else {}
+                if not entry_fact:
+                    entry_fact = item.get("market_fact")
+                entry_fact = entry_fact if isinstance(entry_fact, dict) else {}
+                identity = entry_fact.get("native_identity")
+                identity = identity if isinstance(identity, dict) else {}
+                saved_inst_id = str(identity.get("inst_id") or "").upper()
+                try:
+                    requested_inst_id = okx_inst_id_from_symbol(
+                        str(item.get("symbol") or "")
+                    ).upper()
+                except Exception:
+                    requested_inst_id = ""
+                spec = identity.get("contract_spec")
+                spec = spec if isinstance(spec, dict) else {}
+                try:
+                    tick_size = float(spec.get("tick_size") or 0)
+                except (TypeError, ValueError):
+                    tick_size = 0.0
+                price_observations = []
+                add_prices(
+                    price_observations,
+                    source=str(entry_fact.get("source_endpoint") or "market_fact"),
+                    timestamp_ms=entry_fact.get("source_timestamp_ms"),
+                    prices=entry_fact.get("prices"),
+                    fields=("last", "bid", "ask"),
+                )
+                source_snapshots = item.get("market_source_snapshots")
+                for snapshot in (
+                    source_snapshots if isinstance(source_snapshots, list) else []
+                ):
+                    if not isinstance(snapshot, dict):
+                        continue
+                    source = str(
+                        snapshot.get("source_endpoint")
+                        or snapshot.get("source")
+                        or "market_source_snapshot"
+                    )
+                    timestamp_ms = (
+                        snapshot.get("source_timestamp_ms")
+                        or snapshot.get("timestamp")
+                    )
+                    add_prices(
+                        price_observations,
+                        source=source,
+                        timestamp_ms=timestamp_ms,
+                        prices={
+                            "last": snapshot.get("last_price") or snapshot.get("last"),
+                            "bid": snapshot.get("bid"),
+                            "ask": snapshot.get("ask"),
+                        },
+                        fields=("last", "bid", "ask"),
+                    )
+                    orderbook = snapshot.get("orderbook_fact")
+                    if isinstance(orderbook, dict):
+                        add_prices(
+                            price_observations,
+                            source=str(
+                                orderbook.get("source_endpoint")
+                                or f"{source}:orderbook"
+                            ),
+                            timestamp_ms=(
+                                orderbook.get("source_timestamp_ms")
+                                or timestamp_ms
+                            ),
+                            prices=orderbook,
+                            fields=("bid", "ask"),
+                        )
+                consistency = entry_fact.get("source_consistency")
+                consistency = consistency if isinstance(consistency, dict) else {}
+                for interval in consistency.get("executable_intervals") or []:
+                    if not isinstance(interval, dict):
+                        continue
+                    add_prices(
+                        price_observations,
+                        source=str(interval.get("source") or "executable_interval"),
+                        timestamp_ms=interval.get("source_timestamp_ms"),
+                        prices=interval,
+                        fields=("bid", "ask"),
+                    )
+                consistency_orderbook = consistency.get("orderbook_fact")
+                if isinstance(consistency_orderbook, dict):
+                    add_prices(
+                        price_observations,
+                        source=str(
+                            consistency_orderbook.get("source_endpoint")
+                            or "orderbook_fact"
+                        ),
+                        timestamp_ms=consistency_orderbook.get("source_timestamp_ms"),
+                        prices=consistency_orderbook,
+                        fields=("bid", "ask"),
+                    )
+                deduplicated = {}
+                for observation in price_observations:
+                    key = (
+                        observation["source"],
+                        observation["field"],
+                        observation["source_timestamp_ms"],
+                        observation["price"],
+                    )
+                    deduplicated[key] = observation
+                price_observations = list(deduplicated.values())[:24]
                 entry_ms = int(item.get("entry_timestamp_ms") or 0)
                 result_ms = int(item.get("result_timestamp_ms") or 0)
                 due_ms = int(item.get("due_timestamp_ms") or 0)
                 end_ms = result_ms if result_ms > 0 else due_ms
-                if entry_ms <= 0 or end_ms <= 0 or end_ms < entry_ms:
-                    probes.append({
+                if (
+                    not saved_inst_id
+                    or not requested_inst_id
+                    or saved_inst_id != requested_inst_id
+                ):
+                    record_probe_status("stored_instrument_identity_mismatch")
+                    append_probe({
                         "id": item.get("id"),
                         "symbol": item.get("symbol"),
+                        "stored_inst_id": saved_inst_id or None,
+                        "requested_inst_id": requested_inst_id or None,
+                        "status": "stored_instrument_identity_mismatch",
+                        "read_only": True,
+                    })
+                    continue
+                if entry_ms <= 0 or end_ms <= 0 or end_ms < entry_ms:
+                    record_probe_status("missing_or_invalid_path_timestamps")
+                    append_probe({
+                        "id": item.get("id"),
+                        "symbol": item.get("symbol"),
+                        "stored_inst_id": saved_inst_id,
                         "status": "missing_or_invalid_path_timestamps",
                         "has_entry_timestamp": entry_ms > 0,
                         "has_result_timestamp": result_ms > 0,
@@ -425,9 +611,11 @@ async def main():
                     range(start_open_ms, end_open_ms + 60_000, 60_000)
                 )
                 if len(expected_opens) > 300:
-                    probes.append({
+                    record_probe_status("window_exceeds_probe_limit")
+                    append_probe({
                         "id": item.get("id"),
                         "symbol": item.get("symbol"),
+                        "stored_inst_id": saved_inst_id,
                         "horizon_minutes": item.get("horizon_minutes"),
                         "status": "window_exceeds_probe_limit",
                         "expected_bar_count": len(expected_opens),
@@ -454,6 +642,41 @@ async def main():
                             except (TypeError, ValueError):
                                 continue
                     covered_count = len(expected_opens.intersection(opens))
+                    bars_by_open = {}
+                    for row in rows:
+                        if not isinstance(row, (list, tuple)) or len(row) < 6:
+                            continue
+                        try:
+                            open_ms = int(float(row[0]))
+                            bars_by_open[open_ms - open_ms % 60_000] = {
+                                "high": float(row[2]),
+                                "low": float(row[3]),
+                            }
+                        except (TypeError, ValueError):
+                            continue
+                    for observation in price_observations:
+                        source_ms = observation["source_timestamp_ms"]
+                        bar = bars_by_open.get(source_ms - source_ms % 60_000)
+                        observation["minute_open_ms"] = (
+                            source_ms - source_ms % 60_000
+                        )
+                        observation["ohlc"] = bar
+                        observation["within_candle_range"] = (
+                            bool(
+                                bar
+                                and bar["low"] - tick_size
+                                <= observation["price"]
+                                <= bar["high"] + tick_size
+                            )
+                            if bar
+                            else None
+                        )
+                        if observation["within_candle_range"] is True:
+                            price_check_counts["within_candle_range"] += 1
+                        elif observation["within_candle_range"] is False:
+                            price_check_counts["outside_candle_range"] += 1
+                        else:
+                            price_check_counts["candle_unavailable"] += 1
                     status = (
                         "empty_response"
                         if not rows
@@ -461,9 +684,11 @@ async def main():
                         if covered_count == len(expected_opens)
                         else "window_coverage_miss"
                     )
-                    probes.append({
+                    record_probe_status(status)
+                    append_probe({
                         "id": item.get("id"),
                         "symbol": item.get("symbol"),
+                        "stored_inst_id": saved_inst_id,
                         "horizon_minutes": item.get("horizon_minutes"),
                         "start_open_ms": start_open_ms,
                         "end_open_ms": end_open_ms,
@@ -482,12 +707,25 @@ async def main():
                         "covered_expected_bar_count": covered_count,
                         "expected_bar_count": len(expected_opens),
                         "missing_expected_bar_count": len(expected_opens.difference(opens)),
+                        "tick_size": tick_size or None,
+                        "ohlc_path_low": min(
+                            (bar["low"] for bar in bars_by_open.values()),
+                            default=None,
+                        ),
+                        "ohlc_path_high": max(
+                            (bar["high"] for bar in bars_by_open.values()),
+                            default=None,
+                        ),
+                        "saved_price_check_count": len(price_observations),
+                        "saved_price_checks": price_observations[:2],
                         "elapsed_seconds": round(monotonic() - started, 3),
                     })
                 except asyncio.TimeoutError:
-                    probes.append({
+                    record_probe_status("request_timeout")
+                    append_probe({
                         "id": item.get("id"),
                         "symbol": item.get("symbol"),
+                        "stored_inst_id": saved_inst_id,
                         "horizon_minutes": item.get("horizon_minutes"),
                         "start_open_ms": start_open_ms,
                         "end_open_ms": end_open_ms,
@@ -498,9 +736,11 @@ async def main():
                         "elapsed_seconds": round(monotonic() - started, 3),
                     })
                 except Exception as exc:
-                    probes.append({
+                    record_probe_status("request_error")
+                    append_probe({
                         "id": item.get("id"),
                         "symbol": item.get("symbol"),
+                        "stored_inst_id": saved_inst_id,
                         "horizon_minutes": item.get("horizon_minutes"),
                         "start_open_ms": start_open_ms,
                         "end_open_ms": end_open_ms,
@@ -517,6 +757,9 @@ async def main():
             "read_only": True,
             "database_mutated": False,
             "orders_submitted": False,
+            "probe_count": len(probe_inputs),
+            "status_counts": probe_status_counts,
+            "saved_price_check_counts": price_check_counts,
             "probes": probes,
         }
     await read("executed_entry_evidence", """
@@ -657,20 +900,6 @@ def main() -> None:
     finally:
         ssh.close()
     if args.compact:
-        keep = {
-            "checked_at",
-            "database_activity",
-            "queue",
-            "settlement_throughput",
-            "native_fee_after_groups",
-            "entry_exit_counts",
-            "recovery_coverage",
-            "native_fingerprint_check",
-            "native_route_probe_inputs",
-            "native_route_probe",
-            "executed_entry_evidence",
-            "runtime",
-        }
         runtime = report.get("runtime")
         compact_runtime = {
             key: runtime.get(key)
@@ -688,7 +917,11 @@ def main() -> None:
                 "last_market_round_finished_at",
             )
         } if isinstance(runtime, dict) else runtime
-        report = {key: value for key, value in report.items() if key in keep}
+        report = {
+            key: value
+            for key, value in report.items()
+            if key in _COMPACT_REPORT_KEYS
+        }
         if compact_runtime is not None:
             report["runtime"] = compact_runtime
     safe_print(json.dumps(report, ensure_ascii=False, indent=2, default=str))

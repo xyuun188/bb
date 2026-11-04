@@ -11,6 +11,7 @@ import data_feed.okx_rest_client as okx_rest_client_module
 from data_feed.feature_vector import build_feature_vector
 from data_feed.okx_rest_client import (
     PUBLIC_MARKET_DIAGNOSTIC_METHODS,
+    PUBLIC_MARKET_FUNDING_METHODS,
     PUBLIC_MARKET_NORMAL_REQUEST_CONCURRENCY,
     PUBLIC_MARKET_OPTIONAL_METHODS,
     PUBLIC_MARKET_PRIORITY_METHODS,
@@ -31,6 +32,7 @@ def test_required_market_fact_routes_use_priority_lane() -> None:
     assert {"fetch_ohlcv", "fetch_open_interest"} == (
         set(PUBLIC_MARKET_OPTIONAL_METHODS)
     )
+    assert PUBLIC_MARKET_FUNDING_METHODS == {"fetch_funding_rate"}
 
 
 def test_required_route_waits_fit_under_outer_snapshot_cap() -> None:
@@ -52,6 +54,12 @@ def test_required_route_waits_fit_under_outer_snapshot_cap() -> None:
 def test_optional_derivatives_routes_use_a_separate_gate() -> None:
     client = OKXRestClient()
     assert client._public_market_gate() is not client._public_market_optional_gate()
+    assert client._public_market_funding_gate() is not client._public_market_optional_gate()
+    assert (
+        client._public_market_funding_gate()._limit
+        == okx_rest_client_module.PUBLIC_MARKET_FUNDING_REQUEST_CONCURRENCY
+        == 2
+    )
     assert (
         client._public_market_optional_gate()._limit
         == okx_rest_client_module.PUBLIC_MARKET_OPTIONAL_REQUEST_CONCURRENCY
@@ -106,6 +114,96 @@ async def test_indicator_ohlcv_uses_optional_market_gate(
 
     assert result == []
     assert calls == [("acquire", False), ("release", False)]
+
+
+@pytest.mark.parametrize("priority", [False, True])
+@pytest.mark.asyncio
+async def test_funding_uses_dedicated_market_gate_without_consuming_quote_lane(
+    monkeypatch: pytest.MonkeyPatch,
+    priority: bool,
+) -> None:
+    client = OKXRestClient()
+    calls: list[tuple[str, bool]] = []
+
+    class Gate:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def acquire(self, *, priority: bool) -> None:
+            calls.append((f"{self.name}_acquire", priority))
+
+        def release(self, *, priority: bool = False) -> None:
+            calls.append((f"{self.name}_release", priority))
+
+    class Exchange:
+        async def fetch_funding_rate(self, _symbol: str) -> dict[str, Any]:
+            return {
+                "fundingRate": "0.0001",
+                "fundingDatetime": "1783958400000",
+                "nextFundingDatetime": "1783987200000",
+            }
+
+    funding_gate = Gate("funding")
+    optional_gate = Gate("optional")
+    quote_gate = Gate("quote")
+    monkeypatch.setattr(client, "_public_market_funding_gate", lambda: funding_gate)
+    monkeypatch.setattr(client, "_public_market_optional_gate", lambda: optional_gate)
+    monkeypatch.setattr(client, "_public_market_gate", lambda: quote_gate)
+    monkeypatch.setattr(
+        client,
+        "_get_exchange",
+        lambda: asyncio.sleep(0, result=Exchange()),
+    )
+    monkeypatch.setattr(client, "_ensure_rest_url", lambda: None)
+
+    funding = await client.fetch_funding_rate("BTC/USDT", priority=priority)
+
+    assert funding["funding_data_available"] is True
+    assert calls == [
+        ("funding_acquire", priority),
+        ("funding_release", priority),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_funding_does_not_wait_behind_saturated_indicator_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+    optional_gate = _PriorityRequestGate(1)
+    funding_gate = _PriorityRequestGate(
+        okx_rest_client_module.PUBLIC_MARKET_FUNDING_REQUEST_CONCURRENCY,
+        normal_limit=1,
+    )
+    await optional_gate.acquire(priority=False)
+
+    class Exchange:
+        async def fetch_funding_rate(self, _symbol: str) -> dict[str, Any]:
+            return {
+                "fundingRate": "0.0001",
+                "fundingDatetime": "1783958400000",
+                "nextFundingDatetime": "1783987200000",
+            }
+
+    monkeypatch.setattr(client, "_public_market_optional_gate", lambda: optional_gate)
+    monkeypatch.setattr(client, "_public_market_funding_gate", lambda: funding_gate)
+    monkeypatch.setattr(
+        client,
+        "_get_exchange",
+        lambda: asyncio.sleep(0, result=Exchange()),
+    )
+    monkeypatch.setattr(client, "_ensure_rest_url", lambda: None)
+    try:
+        funding = await asyncio.wait_for(
+            client.fetch_funding_rate("BTC/USDT"),
+            timeout=0.1,
+        )
+    finally:
+        optional_gate.release(priority=False)
+
+    assert funding["funding_data_available"] is True
+    assert optional_gate._active == 0
+    assert funding_gate._active == 0
 
 
 def test_native_consistency_route_uses_a_separate_gate() -> None:
@@ -191,7 +289,7 @@ async def test_funding_timeout_logs_market_latency_and_remains_unavailable(
         async def fetch_funding_rate(self, _symbol: str) -> dict[str, Any]:
             raise TimeoutError("bounded request timed out")
 
-    monkeypatch.setattr(client, "_public_market_gate", lambda: Gate())
+    monkeypatch.setattr(client, "_public_market_funding_gate", lambda: Gate())
     monkeypatch.setattr(client, "_get_exchange", lambda: asyncio.sleep(0, result=Exchange()))
     monkeypatch.setattr(client, "_ensure_rest_url", lambda: None)
     monkeypatch.setattr(
