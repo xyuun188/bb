@@ -118,10 +118,12 @@ def test_preflight_worker_limits_resources_and_runtime(
     assert ssh.closed
     command, kwargs = commands[0]
     assert "--property=CPUQuota=200%" in command
-    assert "--property=MemoryMax=2G" in command
+    assert "--property=MemoryHigh=6G" in command
+    assert "--property=MemoryMax=8G" in command
     assert "--property=RuntimeMaxSec=3600" in command
     assert "--property=TimeoutStopSec=30" in command
     assert "--setenv=DATABASE_POOL_SIZE=2" in command
+    assert "--setenv=LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES=8589934592" in command
     assert kwargs["timeout"] > 3600
 
 

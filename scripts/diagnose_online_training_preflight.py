@@ -107,7 +107,11 @@ def main(argv: list[str] | None = None) -> int:
         "--property=EnvironmentFile=-/data/bb/app/.env",
         "--property=EnvironmentFile=/etc/bb/bb-runtime.env",
         "--property=CPUQuota=200%",
-        "--property=MemoryMax=2G",
+        # Match the persistent local-ML worker's resource contract.  A
+        # diagnostic that is killed by a smaller cgroup cannot tell us whether
+        # the real scheduler can train and leaves a stale preflight report.
+        "--property=MemoryHigh=6G",
+        "--property=MemoryMax=8G",
         "--property=RuntimeMaxSec=3600",
         "--property=TimeoutStopSec=30",
         "--property=KillMode=control-group",
@@ -115,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         "--setenv=OMP_NUM_THREADS=1",
         "--setenv=OPENBLAS_NUM_THREADS=1",
         "--setenv=MKL_NUM_THREADS=1",
+        "--setenv=LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES=8589934592",
         "--setenv=DATABASE_POOL_SIZE=2",
         "--setenv=DATABASE_MAX_OVERFLOW=0",
         "/data/bb/app/.venv/bin/python",
