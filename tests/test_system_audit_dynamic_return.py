@@ -41,8 +41,8 @@ def test_dashboard_policy_cannot_drift_from_execution_policy() -> None:
     assert canonical["paper_training_entry_is_shadow_only"] is False
     assert canonical["paper_training_entry_authorizes_normal_entry"] is True
     assert canonical["paper_training_entry_is_bounded_paper_only"] is True
-    assert canonical["paper_training_entry_requires_positive_return_lcb"] is False
-    assert canonical["paper_training_entry_allows_non_positive_return_lcb"] is True
+    assert canonical["paper_training_entry_requires_positive_return_lcb"] is True
+    assert canonical["paper_training_entry_allows_non_positive_return_lcb"] is False
     assert canonical["paper_training_entry_requires_finite_downside_stress"] is True
     assert canonical["paper_training_entry_production_permission"] is False
     assert canonical["paper_training_entry_single_trade_risk_fraction"] == pytest.approx(
@@ -237,8 +237,8 @@ def _required_go_no_go_cards() -> list[dict[str, Any]]:
                     "paper_training_entry_is_bounded_paper_only": True,
                     "paper_training_entry_authorizes_normal_entry": True,
                     "paper_training_entry_requires_positive_size_aware_net_return": True,
-                    "paper_training_entry_requires_positive_return_lcb": False,
-                    "paper_training_entry_allows_non_positive_return_lcb": True,
+                    "paper_training_entry_requires_positive_return_lcb": True,
+                    "paper_training_entry_allows_non_positive_return_lcb": False,
                     "paper_training_entry_requires_finite_downside_stress": True,
                     "paper_training_entry_allows_non_positive_fee_after_return": False,
                     "paper_training_entry_is_shadow_only": False,

@@ -268,7 +268,7 @@ def test_reconcile_does_not_authorize_validated_entry_with_non_positive_lcb() ->
     )
 
 
-def test_reconcile_authorizes_bounded_training_entry_with_non_positive_lcb() -> None:
+def test_reconcile_blocks_bounded_training_entry_with_non_positive_lcb() -> None:
     support = _quality_observation_support(
         "long",
         expected_net=0.2,
@@ -298,14 +298,18 @@ def test_reconcile_authorizes_bounded_training_entry_with_non_positive_lcb() -> 
         },
     )
 
-    assert reconciled["authorized"] is True
-    assert reconciled["reconciliation"]["status"] == "authorized"
-    assert reconciled["reconciliation"]["reason"] == (
-        "current_execution_return_lcb_non_positive_allowed_for_bounded_training"
+    assert reconciled["authorized"] is False
+    assert reconciled["reconciliation"]["status"] == (
+        "blocked_current_execution_return"
     )
-    assert reconciled["reconciliation"]["current"]["new_entry_return_ready"] is True
-    assert reconciled["reconciliation"]["current"]["positive_return_lcb_required"] is False
-    assert normal_paper_entry_contract_reasons(reconciled) == []
+    assert reconciled["reconciliation"]["reason"] == (
+        "current_execution_return_lcb_not_positive"
+    )
+    assert reconciled["reconciliation"]["current"]["new_entry_return_ready"] is False
+    assert reconciled["reconciliation"]["current"]["positive_return_lcb_required"] is True
+    assert "normal_paper_trade_return_lcb_not_positive" in (
+        normal_paper_entry_contract_reasons(reconciled)
+    )
 
 
 def test_training_entry_requires_present_lcb_and_positive_current_raw_return() -> None:
@@ -663,7 +667,7 @@ def test_unpromoted_quality_model_stays_shadow_only() -> None:
     assert selection["selection_reason"] == "no_direction"
 
 
-def test_current_positive_fee_after_mean_with_negative_downside_stays_training_only() -> None:
+def test_current_positive_fee_after_mean_with_negative_downside_cannot_select_entry() -> None:
     support = _quality_observation_support(
         "short",
         expected_net=0.08,
@@ -674,23 +678,12 @@ def test_current_positive_fee_after_mean_with_negative_downside_stays_training_o
 
     selection = select_normal_paper_trade_side({"short": support})
 
-    assert selection["selected"] is True
-    assert selection["selection_reason"] == "paper_training_entry"
-
-    contract = build_normal_paper_trade_contract(
-        symbol="BTC/USDT",
-        side="short",
-        selection_reason=selection["selection_reason"],
-        direction_support=selection["selected_support"],
-    )
-    assert contract["authorized"] is True
-    assert contract["current_edge_validated"] is True
-    assert contract["objective_net_return_pct"] == pytest.approx(-0.45)
-    assert normal_paper_trade_contract_reasons(contract) == []
-    assert normal_paper_trade_observation_contract_reasons(contract) == []
+    assert selection["selected"] is False
+    assert selection["selected_side"] == "neutral"
+    assert selection["selection_reason"] == "no_direction"
 
 
-def test_current_positive_signal_with_negative_downside_and_denied_history_is_shadow_only() -> None:
+def test_current_positive_signal_with_negative_downside_and_denied_history_cannot_select_entry() -> None:
     support = _support(
         "short",
         expected_net=0.08,
@@ -704,18 +697,9 @@ def test_current_positive_signal_with_negative_downside_and_denied_history_is_sh
 
     selection = select_normal_paper_trade_side({"short": support})
 
-    assert selection["selected"] is True
-    assert selection["selection_reason"] == "paper_training_entry"
-    contract = build_normal_paper_trade_contract(
-        symbol="BTC/USDT",
-        side=selection["selected_side"],
-        selection_reason=selection["selection_reason"],
-        direction_support=selection["selected_support"],
-    )
-    assert contract["authorized"] is True
-    assert contract["objective_net_return_pct"] == pytest.approx(-0.45)
-    assert normal_paper_trade_contract_reasons(contract) == []
-    assert normal_paper_trade_observation_contract_reasons(contract) == []
+    assert selection["selected"] is False
+    assert selection["selected_side"] == "neutral"
+    assert selection["selection_reason"] == "no_direction"
 
 
 def test_current_positive_edge_does_not_override_denied_quality_permission() -> None:

@@ -166,6 +166,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         "paper_training_entry_is_bounded_paper_only",
         "paper_training_entry_authorizes_normal_entry",
         "paper_training_entry_requires_positive_size_aware_net_return",
+        "paper_training_entry_requires_positive_return_lcb",
         "paper_training_entry_requires_finite_downside_stress",
         "paper_entry_requires_historical_fee_after_quality_permission",
         "paper_entry_requires_profit_factor",
@@ -184,7 +185,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         "paper_entry_requires_model_promotion",
         "paper_quality_observation_authorizes_normal_entry",
         "paper_training_entry_is_shadow_only",
-        "paper_training_entry_requires_positive_return_lcb",
+        "paper_training_entry_allows_non_positive_return_lcb",
         "paper_training_entry_allows_non_positive_fee_after_return",
         "paper_training_entry_production_permission",
     )
@@ -194,8 +195,6 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
     missing_policy.extend(
         key for key in required_false_trade_policy if trade_policy.get(key) is not False
     )
-    if trade_policy.get("paper_training_entry_allows_non_positive_return_lcb") is not True:
-        missing_policy.append("paper_training_entry_allows_non_positive_return_lcb")
     required_numeric_trade_policy = {
         "paper_training_entry_single_trade_risk_fraction": (
             NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
