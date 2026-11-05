@@ -1061,6 +1061,12 @@ class ModelTrainingStateStore:
 
         checked_at = now or self.now_provider()
         model_set = {str(model_id) for model_id in model_ids if str(model_id)}
+        # A scheduler subprocess can be killed after persisting ``running`` but
+        # before its lease cleanup runs.  Recover that dead owner before
+        # evaluating the gate; otherwise every future check is permanently
+        # reported as ``training_in_progress`` and never reaches lease
+        # reclamation.
+        self.recover_interrupted_runs()
         payload = self.read()
         models = payload.get("models") if isinstance(payload.get("models"), dict) else {}
         rows = [

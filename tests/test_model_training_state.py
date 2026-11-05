@@ -688,6 +688,40 @@ def test_recovery_marks_interrupted_training_and_preserves_history(tmp_path) -> 
     assert training_timeline(row)["latest_training_attempt_error"] == "training_process_interrupted"
 
 
+def test_training_gate_recovers_dead_running_owner_before_blocking(tmp_path) -> None:
+    store = ModelTrainingStateStore(tmp_path / "model_training_state.json")
+    run_id = "dead-running-run"
+    store.record_check(
+        scheduler_id="local_ml_auto_train",
+        model_ids=LOCAL_ML_MODEL_IDS,
+        run_id=run_id,
+        force=False,
+    )
+    store.start_run(
+        scheduler_id="local_ml_auto_train",
+        model_ids=LOCAL_ML_MODEL_IDS,
+        run_id=run_id,
+        trigger_reason="training_due",
+    )
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    for model_id in LOCAL_ML_MODEL_IDS:
+        payload["models"][model_id]["owner_pid"] = 2147483647
+    store.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    gate = store.training_gate(
+        scheduler_id="local_ml_auto_train",
+        model_ids=LOCAL_ML_MODEL_IDS,
+        force=True,
+    )
+
+    assert gate["allowed"] is True
+    assert gate["reason"] == "manual_force_override"
+    for model_id in LOCAL_ML_MODEL_IDS:
+        row = store.read()["models"][model_id]
+        assert row["state"] == "interrupted"
+        assert row["active_run_id"] is None
+
+
 def test_recovery_schedules_existing_interrupted_run_without_duplicate_event(tmp_path) -> None:
     now = [datetime(2026, 8, 22, 1, 0, tzinfo=UTC)]
     store = ModelTrainingStateStore(tmp_path / "model_training_state.json", now_provider=lambda: now[0])
