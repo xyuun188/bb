@@ -107,6 +107,7 @@ def training_input_fingerprint(value: Any) -> str:
             "training_distribution_profile",
             "training_transport_version",
             "cursor_policy",
+            "cursor_count_scope",
             "authoritative_trade_training_probe",
         )
         if key in payload

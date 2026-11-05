@@ -64,6 +64,10 @@ TRAINING_MAX_BUSY_DEFERRAL_SECONDS = 15 * 60.0
 AUTO_TRAIN_FAILURE_BACKOFF_MIN_SECONDS = 30 * 60
 AUTO_TRAIN_FAILURE_BACKOFF_MAX_SECONDS = 4 * 60 * 60
 LOCAL_AI_TOOLS_CURSOR_PROBE_TIMEOUT_SECONDS = 30 * 60
+_MARKET_CURSOR_SCOPES = {
+    "clean_market_groups_and_settlement_fact_fingerprint",
+    "bounded_training_sample_and_candidate_decision_groups_and_settlement_fact_fingerprint",
+}
 LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 
 
@@ -773,8 +777,9 @@ class ModelTrainingCoordinatorMixin:
                 cursor_result.get("completed_training_decision_group_count"),
                 0,
             )
-            market_cursor_only = str(cursor_result.get("cursor_count_scope") or "") == (
-                "clean_market_groups_and_settlement_fact_fingerprint"
+            cursor_count_scope = str(cursor_result.get("cursor_count_scope") or "")
+            market_cursor_only = (
+                cursor_count_scope in _MARKET_CURSOR_SCOPES
             )
             trade_probe = cursor_result.get("authoritative_trade_training_probe") or {}
             previous_trade_probe: dict[str, Any] = {}
@@ -810,6 +815,10 @@ class ModelTrainingCoordinatorMixin:
                 previous_group_total = self._safe_int(
                     (status or {}).get("completed_market_decision_group_count"), 0
                 )
+            previous_cursor_scope = str((status or {}).get("cursor_count_scope") or "")
+            previous_distribution_profile = (status or {}).get(
+                "training_distribution_profile"
+            ) or {}
             training_state_cursor = 0
             training_state_shadow_cursor = 0
             training_state_trade_cursor = 0
@@ -829,11 +838,15 @@ class ModelTrainingCoordinatorMixin:
                     model_row = model_rows.get(model_id) or {}
                     successful_result = model_row.get("last_successful_result") or {}
                     last_result = model_row.get("last_result") or {}
+                    successful_cursor_scope = str(
+                        successful_result.get("cursor_count_scope") or ""
+                    )
                     training_state_cursor = max(
                         training_state_cursor,
                         self._safe_int(
                             successful_result.get("completed_market_decision_group_count")
                             if market_cursor_only
+                            and successful_cursor_scope == cursor_count_scope
                             else (model_row.get("sample_cursor") or {}).get("decision_group"),
                             0,
                         ),
@@ -888,11 +901,18 @@ class ModelTrainingCoordinatorMixin:
                         or str(attempt_at) > str(latest_attempt_at)
                     ):
                         latest_attempt_at = attempt_at
+                        previous_cursor_scope = str(
+                            attempt_result.get("cursor_count_scope") or ""
+                        )
+                        previous_distribution_profile = (
+                            attempt_result.get("training_distribution_profile") or {}
+                        )
                         previous_trade_probe = (
                             attempt_result.get("authoritative_trade_training_probe") or {}
                         )
-                        if attempt_result.get("cursor_count_scope") == (
-                            "clean_market_groups_and_settlement_fact_fingerprint"
+                        if (
+                            str(attempt_result.get("cursor_count_scope") or "")
+                            in _MARKET_CURSOR_SCOPES
                         ):
                             latest_attempt_market_cursor = self._safe_int(
                                 attempt_result.get("completed_market_decision_group_count"),
@@ -944,11 +964,17 @@ class ModelTrainingCoordinatorMixin:
                 previous_group_total,
                 training_state_cursor,
             )
-            if market_cursor_only and canonical_market_cursor is not None:
-                previous_group_total = canonical_market_cursor
+            if market_cursor_only:
+                if previous_cursor_scope != cursor_count_scope:
+                    # Counts from different cursor protocols are not comparable.
+                    # Establish a baseline instead of treating migration as new data.
+                    previous_group_total = completed_group_total
+                    previous_distribution_profile = {}
+                elif canonical_market_cursor is not None:
+                    previous_group_total = canonical_market_cursor
             distribution_drift = training_distribution_drift(
                 cursor_result.get("training_distribution_profile") or {},
-                (status or {}).get("training_distribution_profile") or {},
+                previous_distribution_profile,
                 threshold=LOCAL_ML_TRAINING_PARAMS.distribution_drift_threshold,
             )
             trigger = decision_group_training_trigger(

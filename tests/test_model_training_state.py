@@ -188,9 +188,22 @@ def test_training_input_fingerprint_changes_with_canonical_cursor() -> None:
             "training_distribution_profile": {"features": {"returns_5": {"mean": 0.1}}},
         }
     )
+    changed_scope = training_input_fingerprint(
+        {
+            "completed_shadow_sample_count": 100,
+            "completed_trade_sample_count": 20,
+            "completed_training_decision_group_count": 40,
+            "training_distribution_profile": {"features": {"returns_5": {"mean": 0.1}}},
+            "cursor_count_scope": (
+                "bounded_training_sample_and_candidate_decision_groups_and_"
+                "settlement_fact_fingerprint"
+            ),
+        }
+    )
 
     assert first == same
     assert changed != first
+    assert changed_scope != first
 
 
 def test_training_input_fingerprint_includes_current_transport_contract() -> None:

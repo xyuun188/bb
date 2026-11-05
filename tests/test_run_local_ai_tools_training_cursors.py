@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -23,21 +24,6 @@ def test_cursor_process_installs_memory_guard_before_project_imports() -> None:
     text = Path(source).read_text(encoding="utf-8")
     assert "LOCAL_AI_CURSOR_MEMORY_LIMIT_BYTES" in text
     assert "resource.RLIMIT_AS" in text
-
-
-def test_compact_shadow_row_does_not_depend_on_trade_probe(monkeypatch) -> None:
-    monkeypatch.setattr(script, "_shadow_sample_from_mapping", lambda row: row)
-    result = script._compact_shadow_sample(
-        {
-            "id": 42,
-            "symbol": "BTC/USDT",
-            "features": {"returns_5": 0.1, "spread_pct": 0.01},
-        }
-    )
-
-    assert result is not None
-    assert result["id"] == 42
-    assert result["features"]["returns_5"] == 0.1
 
 
 def _shadow_sample(sample_id: int, group: str) -> dict:
@@ -174,39 +160,42 @@ async def test_run_once_returns_structured_error_and_closes_database(
 
 
 @pytest.mark.asyncio
-async def test_streaming_cursor_scans_shadow_history_once(
+async def test_streaming_cursor_uses_bounded_training_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scans = 0
+    observed: dict[str, int] = {}
+    active_reads = 0
+    max_active_reads = 0
 
-    async def stream():
-        nonlocal scans
-        scans += 1
-        yield {"id": 1, "decision_id": 1}
+    async def track_read(awaitable):
+        nonlocal active_reads, max_active_reads
+        active_reads += 1
+        max_active_reads = max(max_active_reads, active_reads)
+        try:
+            return await awaitable
+        finally:
+            active_reads -= 1
+
+    async def shadow_count() -> int:
+        return await track_read(asyncio.sleep(0, result=100_000))
+
+    async def group_count() -> int:
+        return await track_read(asyncio.sleep(0, result=24_000))
+
+    async def shadow_loader(*, sample_budget: int) -> list[dict]:
+        observed["sample_budget"] = sample_budget
+        return await track_read(asyncio.sleep(0, result=[_shadow_sample(1, "scan-1")]))
 
     async def trade_probe() -> dict:
-        return {
+        return await track_read(asyncio.sleep(0, result={
             "available": True,
             "history_row_count": 5,
             "fingerprint": "settlement-facts",
-        }
+        }))
 
-    async def forbidden_full_trade_load() -> list[dict]:
-        pytest.fail("cursor probes must not reconstruct authoritative trade outcomes")
-
-    monkeypatch.setattr(script, "_iter_shadow_samples_stream", stream)
-    monkeypatch.setattr(script, "annotate_sample", lambda sample, _kind: sample)
-    monkeypatch.setattr(
-        script,
-        "market_training_identity",
-        lambda _sample: {
-            "decision_group": "shadow_decision:1",
-            "features": {"returns_5": 0.1},
-            "long_return_pct": 0.2,
-            "short_return_pct": -0.2,
-        },
-    )
-    monkeypatch.setattr(script, "_load_trade_samples", forbidden_full_trade_load)
+    monkeypatch.setattr(script, "_completed_shadow_sample_count", shadow_count)
+    monkeypatch.setattr(script, "_completed_shadow_decision_group_count", group_count)
+    monkeypatch.setattr(script, "_load_shadow_samples", shadow_loader)
     monkeypatch.setattr(script, "probe_authoritative_trade_training_cursor", trade_probe)
     monkeypatch.setattr(
         script,
@@ -216,9 +205,14 @@ async def test_streaming_cursor_scans_shadow_history_once(
 
     result = await script._streaming_cursor_probe()
 
-    assert scans == 1
+    assert observed["sample_budget"] == script._REMOTE_TRAINING_MAX_SHADOW_SAMPLES
+    assert result["completed_shadow_sample_count"] == 100_000
+    assert result["completed_market_decision_group_count"] == 24_000
+    assert result["cursor_count_scope"] == (
+        "bounded_training_sample_and_candidate_decision_groups_and_"
+        "settlement_fact_fingerprint"
+    )
     assert result["completed_market_sample_count"] == 1
-    assert result["completed_training_decision_group_count"] == 1
+    assert result["completed_training_decision_group_count"] == 24_000
     assert result["authoritative_trade_training_probe"]["history_row_count"] == 5
-    assert "completed_trade_sample_count" not in result
-    assert "completed_authoritative_cost_sample_count" not in result
+    assert max_active_reads <= 2

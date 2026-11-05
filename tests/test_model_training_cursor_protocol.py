@@ -129,3 +129,52 @@ async def test_failed_training_attempt_advances_cursor_without_repeating(
 
     assert second["reason"] == "not_due"
     assert host.training_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("previous_scope", "expected_calls"),
+    [
+        ("clean_market_groups_and_settlement_fact_fingerprint", 0),
+        (
+            "bounded_training_sample_and_candidate_decision_groups_and_"
+            "settlement_fact_fingerprint",
+            1,
+        ),
+    ],
+)
+async def test_market_cursor_migration_does_not_compare_different_scopes(
+    monkeypatch,
+    previous_scope,
+    expected_calls,
+):
+    monkeypatch.setattr(
+        "services.okx_training_gate.okx_training_refresh_gate", lambda: {"allowed": True}
+    )
+    host = CursorCoordinator(
+        age_hours=7,
+        previous_fingerprint="same",
+        current_fingerprint="same",
+    )
+    current_scope = (
+        "bounded_training_sample_and_candidate_decision_groups_and_"
+        "settlement_fact_fingerprint"
+    )
+    host.previous_result["cursor_count_scope"] = previous_scope
+    host.previous_result["completed_market_decision_group_count"] = 20
+    host.state_row["sample_cursor"]["decision_group"] = 20
+    host.current_cursor.update(
+        {
+            "cursor_count_scope": current_scope,
+            "completed_market_decision_group_count": 24_000,
+            "completed_training_decision_group_count": 24_000,
+        }
+    )
+
+    result = await host._maybe_train_local_ai_tools_process()
+
+    assert host.training_calls == expected_calls
+    if expected_calls:
+        assert result["training_policy"]["trigger"] != "not_due"
+    else:
+        assert result["reason"] == "not_due"
