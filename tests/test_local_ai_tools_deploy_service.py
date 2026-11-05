@@ -15,6 +15,7 @@ import pytest
 
 from scripts import deploy_local_ai_tools_service as deploy
 from scripts.deploy_local_ai_tools_service import SERVICE_CODE
+from services.local_ai_training_contract import LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,6 +103,9 @@ def _test_artifact_metadata(
         "training_cost_policy": ("shadow_market_opportunity_plus_authoritative_okx_execution_cost"),
         "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
         "time_split_policy": "independent_chronological_disjoint_decision_groups",
+        "training_transport_report": {
+            "version": LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
+        },
         "quality_report": {
             "market_fact_contract": {
                 "status": "clean",
@@ -966,7 +970,7 @@ def test_health_metadata_exposes_separated_supervision_contract(monkeypatch) -> 
     assert "tail_loss_threshold_pct" not in module._STATUS_METADATA_KEYS
 
 
-def test_shadow_model_metadata_blocks_runtime_production_eligibility(monkeypatch) -> None:
+def test_shadow_model_metadata_blocks_runtime_trading_eligibility(monkeypatch) -> None:
     module = ModuleType("local_ai_tools_api_return_contract_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
     monkeypatch.setattr(
@@ -1019,9 +1023,10 @@ def test_shadow_model_metadata_blocks_runtime_production_eligibility(monkeypatch
     assert payload["route_mode"] == "paper_analysis"
     assert payload["production_permission"] is False
     assert payload["live_ml_ready"] is False
-    assert payload["paper_trading_permission"] is True
+    assert payload["paper_trading_permission"] is False
+    assert payload["paper_trading_blockers"] == ["artifact_activation_not_paper_authorized"]
     assert payload["prediction_quality"]["production_eligible"] is False
-    assert payload["prediction_quality"]["paper_eligible"] is True
+    assert payload["prediction_quality"]["paper_eligible"] is False
     assert payload["prediction_quality"]["contract_complete"] is True
     assert payload["prediction_quality"]["anomalous"] is False
     assert payload["prediction_quality"]["blockers"] == []
@@ -1031,7 +1036,7 @@ def test_shadow_model_metadata_blocks_runtime_production_eligibility(monkeypatch
     )
     assert all(
         item["production_eligible"] is False
-        and item["paper_eligible"] is True
+        and item["paper_eligible"] is False
         and item["contract_complete"] is True
         and item["blockers"] == []
         and "artifact_activation_not_production_authorized" in item["production_blockers"]
@@ -1137,7 +1142,21 @@ def test_timeseries_selects_best_governed_native_horizon(
     assert different_request["horizon_minutes"] == 240
 
 
-def test_shadow_model_metadata_is_idempotent_for_paper_permission(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("activation_stage", "paper_permission", "expected_paper_permission"),
+    [
+        ("candidate", False, False),
+        ("shadow", False, False),
+        ("canary", True, True),
+        ("canary", False, False),
+    ],
+)
+def test_model_metadata_is_idempotent_for_paper_permission(
+    monkeypatch,
+    activation_stage,
+    paper_permission,
+    expected_paper_permission,
+) -> None:
     module = ModuleType("local_ai_tools_api_idempotent_metadata_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
     monkeypatch.setattr(
@@ -1154,11 +1173,14 @@ def test_shadow_model_metadata_is_idempotent_for_paper_permission(monkeypatch) -
                 ),
                 "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
                 "artifact_persisted": True,
-                "model_stage": "canary",
-                "artifact_lifecycle": "canary",
+                "model_stage": activation_stage,
+                "artifact_lifecycle": activation_stage,
                 "artifact_activation_manifest": {
-                    "activation_stage": "canary",
+                    "activation_stage": activation_stage,
                     "paper_canary_authorized": True,
+                    "paper_execution_permission": paper_permission,
+                    "execution_scope": "paper_only",
+                    "production_permission": False,
                     "live_ml_ready": False,
                     "readiness_state": "paper_canary_ready",
                     "blocking_reasons": [],
@@ -1193,20 +1215,23 @@ def test_shadow_model_metadata_is_idempotent_for_paper_permission(monkeypatch) -
 
     first = module.with_model_metadata("time_series_prediction", initial)
     second = module.with_model_metadata("time_series_prediction", first)
+    paper_authorized = expected_paper_permission
 
     for payload in (first, second):
-        assert payload["paper_trading_permission"] is True
-        assert payload["paper_trading_blockers"] == []
+        assert payload["paper_trading_permission"] is paper_authorized
+        assert payload["paper_trading_blockers"] == (
+            [] if paper_authorized else ["artifact_activation_not_paper_authorized"]
+        )
         assert payload["production_permission"] is False
         assert payload["live_ml_ready"] is False
         assert payload["prediction_quality"]["contract_complete"] is True
-        assert payload["prediction_quality"]["paper_eligible"] is True
+        assert payload["prediction_quality"]["paper_eligible"] is paper_authorized
         assert payload["prediction_quality"]["production_eligible"] is False
         assert payload["prediction_quality"]["anomalous"] is False
         assert payload["prediction_quality"]["blockers"] == []
         assert all(
             item["contract_complete"] is True
-            and item["paper_eligible"] is True
+            and item["paper_eligible"] is paper_authorized
             and item["production_eligible"] is False
             for item in payload["return_distribution_inputs"].values()
         )
@@ -1251,6 +1276,8 @@ def test_local_ai_tools_status_endpoints_do_not_load_joblib_bundle(tmp_path: Pat
     assert status["status_endpoint_uses_metadata_only"] is True
     assert status["artifact_activation_manifest"]["activation_stage"] == "shadow"
     assert status["artifact_activation_manifest"]["live_ml_ready"] is False
+    assert status["paper_trading_permission"] is False
+    assert status["paper_trading_blockers"] == ["artifact_activation_not_paper_authorized"]
 
 
 def test_local_ai_tools_status_payload_is_bounded_and_exposes_child_contracts(
@@ -1808,6 +1835,38 @@ def test_local_ai_registry_replaces_incompatible_activation_permission_contract(
 
     assert replacement is None
     assert reason == "Local AI activation belongs to an incompatible permission contract."
+
+
+@pytest.mark.parametrize("transport_version", [None, "2026-10-09.bounded-training-transport.v2"])
+def test_local_ai_registry_retires_old_label_availability_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport_version: str | None,
+) -> None:
+    module = ModuleType("local_ai_tools_label_availability_contract_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    assert module.LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION == (
+        LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
+    )
+    _persist_test_shadow_artifact(module, tmp_path)
+    with monkeypatch.context() as old_runtime:
+        old_runtime.setattr(module, "LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION", transport_version)
+        _persist_test_shadow_artifact(
+            module,
+            tmp_path,
+            training_transport_report={"version": transport_version},
+        )
+
+    with pytest.raises(module.IncompatibleArtifactContractError, match="label availability"):
+        module._resolve_artifact_pointer(module.CURRENT_POINTER_PATH, role="current")
+    assert module.load_bundle() is None
+    comparison = module._compare_candidate_to_current(
+        _test_artifact_metadata(module),
+        candidate_stage="shadow",
+    )
+    assert comparison["accepted"] is True
+    assert comparison["reason"] == "incompatible_champion_contract_replaced"
+    assert module.health()["trained_models_available"] is False
 
 
 def test_local_ai_tools_generated_service_reports_specialist_model_chains() -> None:
@@ -2735,9 +2794,9 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
 
     assert missing_calibration["prediction_quality"]["production_eligible"] is False
     assert missing_calibration["prediction_quality"]["reason"] == (
-        "standardized_return_distribution_ready_for_paper"
+        "standardized_return_distribution_ready_for_observation"
     )
-    assert missing_calibration["prediction_quality"]["paper_eligible"] is True
+    assert missing_calibration["prediction_quality"]["paper_eligible"] is False
     assert missing_calibration["prediction_quality"]["anomalous"] is False
     assert missing_calibration["prediction_quality"]["blockers"] == []
     assert (
@@ -3015,8 +3074,28 @@ def _training_request(
     return module.TrainRequest(
         shadow_samples=shadow_samples,
         trade_samples=trade_samples or _training_trade_samples(),
+        training_transport_report={"version": LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION},
         **kwargs,
     )
+
+
+@pytest.mark.parametrize("transport_version", [None, "2026-10-09.bounded-training-transport.v2"])
+def test_local_ai_training_rejects_old_transport_before_fitting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport_version: str | None,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    monkeypatch.setattr(
+        module, "_market_training_rows", lambda *_args: pytest.fail("must reject before fitting")
+    )
+    result = module._train_impl_inner(
+        module.TrainRequest(training_transport_report={"version": transport_version})
+    )
+    assert result["trained"] is False
+    assert result["reason"] == "training_transport_contract_mismatch"
+    assert result["artifact_persisted"] is False
+    assert not module.CURRENT_POINTER_PATH.exists()
 
 
 def test_local_ai_tools_generated_service_train_defaults_to_preflight_only(
@@ -3266,7 +3345,12 @@ def test_local_ai_training_requires_authoritative_trade_cost_rows(
 ) -> None:
     module = _local_ai_tools_training_module(tmp_path)
 
-    missing = module.train(module.TrainRequest(shadow_samples=_training_shadow_samples(count=2)))
+    missing = module.train(
+        module.TrainRequest(
+            shadow_samples=_training_shadow_samples(count=2),
+            training_transport_report={"version": LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION},
+        )
+    )
     wrong_authority = _training_trade_samples(count=2)
     for sample in wrong_authority:
         sample["profit_supervision"]["tasks"][module.EXECUTION_COST_TASK]["source_authority"] = (
@@ -3276,6 +3360,7 @@ def test_local_ai_training_requires_authoritative_trade_cost_rows(
         module.TrainRequest(
             shadow_samples=_training_shadow_samples(count=2),
             trade_samples=wrong_authority,
+            training_transport_report={"version": LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION},
         )
     )
 
@@ -3375,6 +3460,7 @@ def test_local_ai_paper_bootstrap_persists_gross_only_paper_artifact(
             training_mode="paper_bootstrap",
             persist_artifact=True,
             confirm_phase3_rebuild=True,
+            training_transport_report={"version": LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION},
         )
     )
 
@@ -3423,6 +3509,7 @@ def test_local_ai_paper_bootstrap_rejects_available_cost_holdout(
             shadow_samples=_training_shadow_samples(count=20),
             trade_samples=_training_trade_samples(count=20),
             training_mode="paper_bootstrap",
+            training_transport_report={"version": LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION},
         )
     )
 

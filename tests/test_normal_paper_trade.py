@@ -236,26 +236,12 @@ def test_reconcile_records_non_positive_current_lower_bound_as_blocker() -> None
     )
 
 
-@pytest.mark.parametrize(
-    "selection_reason",
-    ["strategy_edge_selected", "paper_training_entry"],
-)
-def test_reconcile_does_not_authorize_non_positive_current_return_lcb(
-    selection_reason: str,
-) -> None:
+def test_reconcile_does_not_authorize_validated_entry_with_non_positive_lcb() -> None:
     support = _support("long", expected_net=0.2, objective_net=0.1)
-    if selection_reason == "paper_training_entry":
-        support["quant_quality_permissions"]["local_ml"][
-            "paper_execution_permission"
-        ] = False
-        selection = select_normal_paper_trade_side({"long": support})
-        assert selection["selection_reason"] == "paper_training_entry"
-        support = selection["selected_support"]
-
     contract = build_normal_paper_trade_contract(
         symbol="BTC/USDT",
         side="long",
-        selection_reason=selection_reason,
+        selection_reason="strategy_edge_selected",
         direction_support=support,
     )
     assert contract
@@ -280,6 +266,90 @@ def test_reconcile_does_not_authorize_non_positive_current_return_lcb(
     assert "normal_paper_trade_return_lcb_not_positive" in (
         normal_paper_entry_contract_reasons(reconciled)
     )
+
+
+def test_reconcile_authorizes_bounded_training_entry_with_non_positive_lcb() -> None:
+    support = _quality_observation_support(
+        "long",
+        expected_net=0.2,
+        objective_net=0.1,
+    )
+    support["current_edge_validated"] = True
+    support["raw_expected_return_pct"] = 0.3
+    selection = select_normal_paper_trade_side({"long": support})
+    assert selection["selection_reason"] == "paper_training_entry"
+
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason=selection["selection_reason"],
+        direction_support=selection["selected_support"],
+    )
+    reconciled = reconcile_normal_paper_trade_contract(
+        contract,
+        {
+            "expected_net_return_pct": 0.08,
+            "return_lcb_pct": -0.22,
+            "server_profit_loss_probability": 0.4,
+            "execution_cost": {"total_pct": 0.19},
+            "return_distribution_contract": {
+                "gross_market_distribution": {"raw_expected_return_pct": 0.27}
+            },
+        },
+    )
+
+    assert reconciled["authorized"] is True
+    assert reconciled["reconciliation"]["status"] == "authorized"
+    assert reconciled["reconciliation"]["reason"] == (
+        "current_execution_return_lcb_non_positive_allowed_for_bounded_training"
+    )
+    assert reconciled["reconciliation"]["current"]["new_entry_return_ready"] is True
+    assert reconciled["reconciliation"]["current"]["positive_return_lcb_required"] is False
+    assert normal_paper_entry_contract_reasons(reconciled) == []
+
+
+def test_training_entry_requires_present_lcb_and_positive_current_raw_return() -> None:
+    support = _quality_observation_support(
+        "long",
+        expected_net=0.2,
+        objective_net=0.1,
+    )
+    support["current_edge_validated"] = True
+    support["raw_expected_return_pct"] = 0.3
+    selection = select_normal_paper_trade_side({"long": support})
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side="long",
+        selection_reason=selection["selection_reason"],
+        direction_support=selection["selected_support"],
+    )
+
+    missing_lcb = reconcile_normal_paper_trade_contract(
+        contract,
+        {
+            "expected_net_return_pct": 0.08,
+            "return_distribution_contract": {
+                "gross_market_distribution": {"raw_expected_return_pct": 0.27}
+            },
+        },
+    )
+    non_positive_raw = reconcile_normal_paper_trade_contract(
+        contract,
+        {
+            "expected_net_return_pct": 0.08,
+            "return_lcb_pct": -0.22,
+            "server_profit_loss_probability": 0.4,
+            "return_distribution_contract": {
+                "gross_market_distribution": {"raw_expected_return_pct": -0.01}
+            },
+        },
+    )
+
+    assert missing_lcb["authorized"] is False
+    assert "normal_paper_trade_return_lcb_not_positive" in (
+        normal_paper_entry_contract_reasons(missing_lcb)
+    )
+    assert non_positive_raw["authorized"] is False
 
 
 def test_negative_return_lcb_remains_sizing_evidence_but_cannot_submit_entry() -> None:

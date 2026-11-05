@@ -268,6 +268,9 @@ def _training_evaluation_contract_errors(metadata: dict[str, Any]) -> list[str]:
     if not metadata:
         return []
     errors: list[str] = []
+    partition = _safe_dict(metadata.get("decision_group_partition"))
+    if partition.get("version") != DECISION_GROUP_PARTITION_VERSION:
+        errors.append("decision_group_partition_contract_stale")
     walk_forward = _safe_dict(metadata.get("walk_forward_report"))
     holdout_contract = _safe_dict(metadata.get("holdout_return_metric_contract"))
     if walk_forward.get("version") != WALK_FORWARD_REPORT_VERSION:
@@ -1997,6 +2000,8 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
         snapshot = _parse_json(getattr(row, "feature_snapshot", None))
         if not snapshot:
             continue
+        if snapshot.get("historical_market_path_only") is True:
+            continue
         raw_long_return = getattr(row, "long_return_pct", None)
         raw_short_return = getattr(row, "short_return_pct", None)
         if raw_long_return is None or raw_short_return is None:
@@ -2011,6 +2016,13 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
             expected_label_version=label_version,
         )
         if not multitask_labels:
+            continue
+        label_contract = _safe_dict(snapshot.get("training_label_contract"))
+        label_values = _safe_dict(label_contract.get("labels")) or label_contract
+        # Splits must use result availability, not the scheduled horizon,
+        # which can precede receipt of the actual outcome.
+        label_available_at = label_values.get("label_timestamp")
+        if not label_available_at:
             continue
         horizon_minutes = int(getattr(row, "horizon_minutes", 10) or 10)
         supervision = _safe_dict(quality_sample.get("profit_supervision"))
@@ -2051,7 +2063,7 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                     "correlation_group"
                 ),
                 "decision_timestamp": snapshot.get("original_decision_timestamp"),
-                "label_timestamp": getattr(row, "due_at", None) or getattr(row, "created_at", None),
+                "label_timestamp": label_available_at,
                 "symbol": str(getattr(row, "symbol", "") or ""),
                 "market_regime": _market_regime_label(snapshot),
                 "liquidity_regime": (
@@ -2071,6 +2083,16 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                 "long_execution_cost_pct": long_cost,
                 "short_execution_cost_pct": short_cost,
                 "execution_cost": cost_task,
+                "training_quality_sample": quality_sample,
+                "training_market_fact_contract": _safe_dict(
+                    snapshot.get("training_market_fact_contract")
+                ) or _safe_dict(snapshot.get("market_fact_contract")),
+                "historical_market_path_only": (
+                    snapshot.get("historical_market_path_only") is True
+                ),
+                "historical_shadow_rebuild_version": snapshot.get(
+                    "historical_shadow_rebuild_version"
+                ),
                 "profit_supervision": supervision,
                 "sample_weight": _safe_float(quality_sample.get("sample_weight"), 0.0),
                 "data_quality_status": quality_sample.get("data_quality_status"),
@@ -2459,17 +2481,41 @@ def train_from_frame(
 
     now = datetime.now(UTC).isoformat()
     completed_count = int(completed_sample_count or len(frame))
-    frame_quality_report = training_quality_report or quality_report(
+    # Report the exact fitted/holdout view, including after memory recovery has
+    # narrowed it. Candidate rows that never reached this frame remain auditable.
+    artifact_quality_frame = frame.loc[
+        partition.train.index.union(partition.holdout.index)
+    ]
+    frame_quality_report = quality_report(
         {
             "shadow": [
-                {
-                    "data_quality_status": row.get("data_quality_status", "included"),
-                    "sample_weight": row.get("sample_weight", 1.0),
-                    "quality_reasons": row.get("quality_reasons", []),
+                row.get("training_quality_sample") or {
+                    **row,
+                    "features": {
+                        key: row.get(key)
+                        for key in (
+                            "training_market_fact_contract",
+                            "historical_market_path_only",
+                            "historical_shadow_rebuild_version",
+                        )
+                    },
                 }
-                for row in frame.to_dict("records")
+                for row in artifact_quality_frame.to_dict("records")
             ]
         }
+    ) if "training_market_fact_contract" in frame.columns else (
+        training_quality_report or quality_report(
+            {
+                "shadow": [
+                    {
+                        "data_quality_status": row.get("data_quality_status", "included"),
+                        "sample_weight": row.get("sample_weight", 1.0),
+                        "quality_reasons": row.get("quality_reasons", []),
+                    }
+                    for row in frame.to_dict("records")
+                ]
+            }
+        )
     )
     actual_trade_calibration = authoritative_trade_calibration(trade_samples or [])
     authoritative_return_evidence = _authoritative_trade_return_evidence(trade_samples or [])
@@ -2578,6 +2624,8 @@ def train_from_frame(
         "replay_weight_manifest": replay_weight_manifest,
         "training_distribution_profile": _training_distribution_profile(frame),
         "quality_report": frame_quality_report,
+        "candidate_quality_report": training_quality_report or {},
+        "artifact_quality_scope": "training_and_holdout_rows_excluding_purged_labels",
         "market_fact_contract": _safe_dict(frame_quality_report.get("market_fact_contract")),
         "governance_report": artifact_bound_governance_report(
             frame_quality_report,

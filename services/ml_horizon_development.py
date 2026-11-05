@@ -14,10 +14,14 @@ from services.ml_development_baselines import (
     _evidence,
     _net_returns,
 )
-from services.ml_nested_development import ALPHAS, NET_THRESHOLDS_PCT, _folds, _sides
-from services.ml_signal_service import FEATURE_KEYS, MIN_TRAINING_SAMPLE_COUNT
+from services.ml_nested_development import ALPHAS, NET_THRESHOLDS_PCT, _sides
+from services.ml_signal_service import (
+    FEATURE_KEYS,
+    MIN_TRAINING_SAMPLE_COUNT,
+    _decision_group_availability,
+)
 
-HORIZON_POLICY_VERSION = "2026-10-21.frozen-nested-horizons.v1"
+HORIZON_POLICY_VERSION = "2026-11-05.frozen-nested-horizons.v2"
 HORIZONS = (5, 15, 60, 240)
 _NON_MARKET_KEYS = {
     "decision_confidence", "sentiment_data_available",
@@ -33,6 +37,47 @@ FEATURE_POLICIES = {
 
 def _at_horizon(frame: pd.DataFrame, horizon: int) -> pd.DataFrame:
     return frame[frame["horizon_minutes"] == horizon].copy()
+
+
+def _folds(
+    frame: pd.DataFrame, count: int,
+) -> list[tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]]:
+    groups, bounds = _decision_group_availability(frame)
+    initial = max(int(np.ceil(len(groups) * 0.5)), 1)
+    decisions = pd.to_datetime(frame["decision_timestamp"], utc=True)
+    labels = pd.to_datetime(frame["label_timestamp"], utc=True)
+    group_keys = frame["decision_group"].astype(str)
+    result = []
+    for fold_index, chunk in enumerate(np.array_split(np.asarray(groups[initial:]), count)):
+        validation_groups = chunk.tolist()
+        if not validation_groups:
+            continue
+        start = min(bounds[group]["decision_start"] for group in validation_groups)
+        # A settled short label remains usable even if its group's long label
+        # crosses this boundary. No unobserved outcome enters training.
+        chronological = (decisions < start) & ~group_keys.isin(validation_groups)
+        train = frame[chronological & (labels < start)].copy()
+        validation = frame[group_keys.isin(validation_groups)].copy()
+        weights = train.get("sample_weight", pd.Series(1.0, index=train.index))
+        overlap = set(train["decision_group"].astype(str)).intersection(validation_groups)
+        label_end = pd.to_datetime(train["label_timestamp"], utc=True).max()
+        if overlap or (not train.empty and label_end >= start):
+            raise ValueError("horizon development label periods overlap")
+        result.append((train, validation, {
+            "fold_index": fold_index,
+            "training_sample_count": len(train),
+            "training_positive_weight_sample_count": int((weights > 0).sum()),
+            "validation_sample_count": len(validation),
+            "training_sample_count_by_horizon": {
+                str(horizon): len(_at_horizon(train, horizon)) for horizon in HORIZONS
+            },
+            "label_purged_training_sample_count": int(chronological.sum()) - len(train),
+            "training_label_end": str(label_end) if not train.empty else None,
+            "validation_decision_start": str(start),
+            "decision_group_overlap_count": 0,
+            "chronological_label_disjoint": True,
+        }))
+    return result
 
 
 def _predict(
@@ -110,30 +155,40 @@ def _rejections(views: dict[str, Any], per_fold: list[dict[str, Any]]) -> list[s
 
 
 def _select_policy(train: pd.DataFrame) -> dict[str, Any]:
-    folds = _folds(train, 2)
-    if len(folds) != 2:
-        return {
-            "policy": None, "reason": "insufficient_inner_folds",
-            "inner_folds": [], "candidates": [],
-        }
-    if any(
-        len(_at_horizon(inner_train, horizon).query("sample_weight > 0"))
-        < MIN_TRAINING_SAMPLE_COUNT
-        for inner_train, _, _ in folds for horizon in HORIZONS
-    ):
-        return {
-            "policy": None, "reason": "insufficient_positive_weight_inner_training",
-            "inner_folds": [boundary for _, _, boundary in folds], "candidates": [],
-        }
     candidates = []
+    inner_folds = []
+    horizon_coverage = {}
     for horizon in HORIZONS:
-        validations = [_at_horizon(validation, horizon) for _, validation, _ in folds]
+        folds = _folds(_at_horizon(train, horizon), 2)
+        boundaries = [
+            {**boundary, "horizon_minutes": horizon} for _, _, boundary in folds
+        ]
+        ready_count = sum(
+            boundary["training_positive_weight_sample_count"] >= MIN_TRAINING_SAMPLE_COUNT
+            for boundary in boundaries
+        )
+        exclusions = []
+        if len(folds) != 2:
+            exclusions.append("insufficient_inner_folds")
+        if ready_count != len(folds):
+            exclusions.append("insufficient_positive_weight_inner_training")
+        horizon_coverage[str(horizon)] = {
+            "fold_count": len(folds),
+            "required_fold_count": 2,
+            "ready_fold_count": ready_count,
+            "exclusion_reasons": exclusions,
+            "folds": boundaries,
+        }
+        inner_folds.extend(boundaries)
+        if exclusions:
+            continue
+        validations = [validation for _, validation, _ in folds]
         evaluation = pd.concat(validations)
         for feature_policy in FEATURE_POLICIES:
             for alpha in ALPHAS:
                 predictions = [
                     _predict(
-                        _at_horizon(inner_train, horizon), validation,
+                        inner_train, validation,
                         alpha=alpha, feature_policy=feature_policy,
                     )
                     for (inner_train, _, _), validation in zip(
@@ -169,17 +224,25 @@ def _select_policy(train: pd.DataFrame) -> dict[str, Any]:
         ),
         default=None,
     )
+    reason = "inner_evidence_qualified" if best else "no_inner_policy_qualified"
+    if not candidates:
+        reason = (
+            "insufficient_positive_weight_inner_training"
+            if any(coverage["fold_count"] == 2 for coverage in horizon_coverage.values())
+            else "insufficient_inner_folds"
+        )
     return {
         "policy": {
             key: best[key]
             for key in ("horizon_minutes", "feature_policy", "alpha", "net_threshold_pct")
         } if best else None,
-        "reason": "inner_evidence_qualified" if best else "no_inner_policy_qualified",
+        "reason": reason,
         "candidate_rejection_counts": dict(Counter(
             reason for candidate in candidates
             for reason in candidate["rejection_reasons"]
         )),
-        "inner_folds": [boundary for _, _, boundary in folds],
+        "inner_folds": inner_folds,
+        "horizon_coverage": horizon_coverage,
         "candidates": candidates,
     }
 
@@ -193,7 +256,7 @@ def build_horizon_development_report(
         raise ValueError("one observation per group and horizon required")
     coverage = development.groupby("decision_group")["horizon_minutes"].agg(set)
     complete = set(coverage[coverage.map(lambda values: set(HORIZONS) <= values)].index)
-    # Purging always sees all captured horizons, including horizons outside a policy.
+    # Compare policies on common decision groups; purge their labels separately.
     common = development[development["decision_group"].isin(complete)].copy()
     report: dict[str, Any] = {
         "version": HORIZON_POLICY_VERSION,
@@ -215,6 +278,10 @@ def build_horizon_development_report(
             "two_purged_inner_folds_only; both_all_and_nonoverlapping_views:"
             "minimum_16_selected_positive_lcb_pf_above_one;"
             "positive_means_and_nonzero_selections_in_each_inner_fold_else_hold"
+        ),
+        "purge_policy": (
+            "outer_training_labels_strictly_before_validation_start;"
+            "inner_folds_built_separately_for_each_target_horizon"
         ),
         "nonoverlap_policy": "one_global_position_ordered_by_decision_time_and_group",
         "metric_limitations": (

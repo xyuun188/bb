@@ -91,9 +91,8 @@ def normal_paper_entry_return_ready(expected_net: Any, downside_return: Any) -> 
     """Require positive mean and positive downside bound before a new order.
 
     ``normal_paper_current_return_ready`` remains intentionally permissive for
-    sizing and observation records.  New order authorization is stricter:
-    a positive mean with a non-positive lower bound is retained as evidence,
-    but cannot create another position.
+    sizing and observation records. New order authorization is stricter: a
+    positive mean with a non-positive lower bound remains observation-only.
     """
 
     expected = _float(expected_net, None)
@@ -894,13 +893,14 @@ def reconcile_normal_paper_trade_contract(
     )
     if current_loss_probability is not None:
         contract["loss_probability"] = current_loss_probability
+    training_entry = selection_reason == "paper_training_entry"
     training_entry_eligible = bool(
-        selection_reason == "paper_training_entry"
+        training_entry
         and contract.get("paper_training_only") is True
         and contract["current_edge_validated"]
         and current_raw is not None
         and current_raw > 0.0
-        and normal_paper_entry_return_ready(expected_net, return_lcb)
+        and normal_paper_current_return_ready(expected_net, return_lcb)
         and current_loss_probability is not None
         and current_loss_probability <= (
             NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
@@ -933,16 +933,23 @@ def reconcile_normal_paper_trade_contract(
             and contract.get("authorized") is True
             else "blocked_current_execution_return"
         ),
-        "reason": reconciliation_reason,
+        "reason": (
+            "current_execution_return_lcb_non_positive_allowed_for_bounded_training"
+            if training_entry_eligible and return_lcb is not None and return_lcb <= 0.0
+            else reconciliation_reason
+        ),
         "previous": previous,
         "current": {
             "expected_net_return_pct": (
                 round(expected_net, 8) if expected_net is not None else None
             ),
             "return_lcb_pct": round(return_lcb, 8) if return_lcb is not None else None,
-            "new_entry_return_ready": normal_paper_entry_return_ready(
-                expected_net, return_lcb
+            "new_entry_return_ready": (
+                normal_paper_current_return_ready(expected_net, return_lcb)
+                if training_entry
+                else normal_paper_entry_return_ready(expected_net, return_lcb)
             ),
+            "positive_return_lcb_required": not training_entry,
             "gross_expected_return_pct": (
                 round(gross_expected, 8) if gross_expected is not None else None
             ),
@@ -1200,10 +1207,19 @@ def normal_paper_entry_contract_reasons(value: Any) -> list[str]:
 
     contract = _dict(value)
     reasons = normal_paper_trade_contract_reasons(contract)
-    if not normal_paper_entry_return_ready(
-        contract.get("expected_net_return_pct"),
-        contract.get("objective_net_return_pct"),
-    ):
+    training_entry = contract.get("selection_reason") == "paper_training_entry"
+    return_ready = (
+        normal_paper_current_return_ready(
+            contract.get("expected_net_return_pct"),
+            contract.get("objective_net_return_pct"),
+        )
+        if training_entry
+        else normal_paper_entry_return_ready(
+            contract.get("expected_net_return_pct"),
+            contract.get("objective_net_return_pct"),
+        )
+    )
+    if not return_ready:
         reasons.append("normal_paper_trade_return_lcb_not_positive")
     return list(dict.fromkeys(reasons))
 

@@ -26,7 +26,7 @@ from config.settings import ENSEMBLE_TRADER_NAME, settings
 from core.logging_config import setup_logging
 from core.redis_runtime import create_redis_client
 from core.safe_output import safe_error_text
-from db.session import close_db, init_db
+from db.session import close_db, init_db, repair_shadow_training_snapshots
 from services.data_service import DataService
 from services.secure_runtime_config import load_secure_settings_into_runtime
 from services.trading_service import TradingService
@@ -142,6 +142,7 @@ async def main():
 
     # Start trading loop in background
     trading_task = asyncio.create_task(trading_service.start())
+    shadow_training_repair_task = asyncio.create_task(repair_shadow_training_snapshots())
 
     # Periodic WebSocket push for real-time dashboard updates
     async def periodic_ws_push():
@@ -219,12 +220,17 @@ async def main():
     if not trading_task.done():
         trading_task.cancel()
     ws_push_task.cancel()
+    shadow_training_repair_task.cancel()
     try:
         await trading_task
     except asyncio.CancelledError:
         pass
     try:
         await ws_push_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await shadow_training_repair_task
     except asyncio.CancelledError:
         pass
 

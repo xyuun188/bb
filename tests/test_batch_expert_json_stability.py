@@ -884,6 +884,72 @@ async def test_qwen_batch_incomplete_response_uses_one_compact_repair(
 
 
 @pytest.mark.asyncio
+async def test_registry_reserves_second_qwen_call_for_incomplete_batch_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_batch_experts_enabled", True)
+    monkeypatch.setattr(
+        model_registry_module,
+        "_wait_for_target_model_ready",
+        _ready_probe_immediately,
+    )
+    calls: list[list[Any]] = []
+
+    class FakeChatOpenAI:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def ainvoke(self, messages: list[Any]) -> SimpleNamespace:
+            calls.append(messages)
+            # An invalid-length vector is rejected as a whole, so the compact
+            # repair must return all four actions.
+            return SimpleNamespace(
+                content='{"a":["l","s"]}'
+                if len(calls) == 1
+                else '{"a":["h","h","h","h"]}',
+                response_metadata={"finish_reason": "stop"},
+                usage_metadata={"completion_tokens": 12},
+            )
+
+    monkeypatch.setattr("ai_brain.llm_agent.ChatOpenAI", FakeChatOpenAI)
+    registry = ModelRegistry()
+    expert_names = (
+        "trend_expert",
+        "momentum_expert",
+        "sentiment_expert",
+        "risk_expert",
+    )
+    for name in expert_names:
+        agent = LLMAgent(
+            name=name,
+            api_config={
+                "api_base": LOCAL_QWEN_TEST_BASE,
+                "api_key": "test-key",
+                "model": "qwen3.8-27b",
+                "role": name,
+            },
+        )
+        registry.register(agent)
+
+    context: dict[str, Any] = {
+        "execution_mode": "paper",
+        "_llm_call_budget": {"max_calls": 1, "used": 0, "calls": []},
+    }
+    decisions = await registry.decide_all(
+        FeatureVector(symbol="BTC/USDT"),
+        context,
+    )
+
+    assert set(decisions) == set(expert_names)
+    assert len(calls) == 2
+    assert all(decision.action is Action.HOLD for decision in decisions.values())
+    budget = context["_llm_call_budget"]
+    assert budget["max_calls"] == 2
+    assert budget["used"] == 2
+    assert budget["calls"] == ["batch_expert", "batch_expert_repair"]
+
+
+@pytest.mark.asyncio
 async def test_qwen_batch_vector_accepts_full_action_aliases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

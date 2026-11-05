@@ -487,7 +487,10 @@ def _clean_training_label_contract(
     long_return_pct: float = 0.1,
     short_return_pct: float = -0.1,
     best_action: str = "hold",
+    available_at: datetime | None = None,
 ) -> dict[str, object]:
+    market_fact = _clean_training_market_fact_contract(due_at)
+    market_fact["result_received_at"] = (available_at or due_at).isoformat()
     return compact_shadow_label_contract(
         build_shadow_label_contract(
             shadow_backtest_id=row_id,
@@ -506,9 +509,10 @@ def _clean_training_label_contract(
             short_take_profit_triggered=False,
             long_first_touch="none",
             short_first_touch="none",
-            market_fact_contract=_clean_training_market_fact_contract(due_at),
+            market_fact_contract=market_fact,
             cost_facts={"round_trip_fee_pct": 0.08},
-            label_timestamp=due_at,
+            label_timestamp=available_at or due_at,
+            scheduled_label_at=due_at,
         )
     )
 
@@ -1048,6 +1052,61 @@ def test_train_from_frame_binds_exact_market_fact_training_view_contract() -> No
     assert metadata["market_fact_contract"]["provenance"]["data_fingerprint"]
 
 
+@pytest.mark.parametrize("executable", [True, False])
+def test_artifact_quality_binds_fitted_rows_instead_of_candidate_cohort(
+    executable: bool,
+) -> None:
+    frame = _training_frame(80)
+    contracts = [_clean_training_market_fact_contract() for _ in range(80)]
+    contracts[0]["executable_market_fact_verified"] = executable
+    frame["training_market_fact_contract"] = contracts
+    candidate_report = quality_report({
+        "shadow": [{
+            "data_quality_status": "included",
+            "sample_weight": 1.0,
+            "features": {"training_market_fact_contract": {
+                **_clean_training_market_fact_contract(),
+                "executable_market_fact_verified": not executable,
+            }},
+        }],
+    })
+    reduced = ml_signal_module._reduced_training_frame(frame, 0.5)
+    # Keep the failed assertion inside the reduced frame when present.
+    reduced.at[reduced.index[0], "training_market_fact_contract"] = contracts[0]
+
+    metadata = train_from_frame(
+        reduced,
+        training_quality_report=candidate_report,
+        persist_artifact=False,
+    )
+
+    contract = metadata["market_fact_contract"]
+    assert contract["assertions"]["executable_market_fact_verified"] is executable
+    assert contract["provenance"]["sample_count"] == len(reduced) == 40
+    assert metadata["quality_report"]["totals"]["total"] == 40
+    assert metadata["candidate_quality_report"] == candidate_report
+    assert metadata["artifact_quality_scope"] == (
+        "training_and_holdout_rows_excluding_purged_labels"
+    )
+
+
+def test_build_training_frame_retains_original_quality_and_cost_evidence() -> None:
+    row = _shadow_row(1, best_action="long")
+
+    frame = build_training_frame([row])
+
+    sample = frame.iloc[0]["training_quality_sample"]
+    assert sample["features"]["round_trip_fee_pct"] == 0.08
+    assert sample["features"]["funding_interval_minutes"] == 480.0
+    assert sample["features"]["training_label_contract"] == (
+        row.feature_snapshot["training_label_contract"]
+    )
+    assert sample["profit_learning_labels"]
+    assert sample["profit_supervision"]["tasks"][COUNTERFACTUAL_EXECUTION_COST_TASK][
+        "eligible"
+    ] is True
+
+
 def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:
     frame = _training_frame(120)
     frame["decision_action"] = ["hold", "long", "short"] * 40
@@ -1570,6 +1629,37 @@ def test_build_training_frame_preserves_diagnostic_sample_context() -> None:
     )
 
 
+def test_training_splits_and_snapshot_wait_for_actual_label_availability() -> None:
+    from services.ml_development_snapshot import make_development_snapshot, snapshot_frame
+
+    decision_at = datetime(2026, 11, 1, tzinfo=UTC)
+    delayed = _db_shadow_row(1, decision_at)
+    available_at = delayed.due_at + timedelta(seconds=45)
+    delayed.feature_snapshot["training_market_fact_contract"]["result_received_at"] = (
+        available_at.isoformat()
+    )
+    delayed.feature_snapshot["training_label_contract"] = _clean_training_label_contract(
+        delayed.id,
+        delayed.due_at,
+        decision_id=delayed.decision_id,
+        horizon_minutes=delayed.horizon_minutes,
+        available_at=available_at,
+    )
+    earlier = _db_shadow_row(2, decision_at - timedelta(hours=1))
+    frame = build_training_frame([earlier, delayed])
+
+    assert len(frame) == 2
+    label_at = pd.Timestamp(frame.loc[frame["id"] == delayed.id, "label_timestamp"].iloc[0])
+    assert label_at == available_at
+    assert label_at > delayed.due_at
+    before_receipt = (delayed.due_at + timedelta(seconds=20)).isoformat()
+    frozen = make_development_snapshot(frame, cutoff=before_receipt)
+    assert snapshot_frame(frozen, cutoff=before_receipt)["id"].tolist() == [earlier.id]
+    after_receipt = (available_at + timedelta(seconds=1)).isoformat()
+    frozen = make_development_snapshot(frame, cutoff=after_receipt)
+    assert set(snapshot_frame(frozen, cutoff=after_receipt)["id"]) == {earlier.id, delayed.id}
+
+
 @pytest.mark.asyncio
 async def test_train_ml_signal_script_defaults_to_preflight_without_persist(
     monkeypatch: pytest.MonkeyPatch,
@@ -1992,7 +2082,9 @@ def test_cached_dry_run_candidate_is_persisted_without_refitting(
     assert id(metadata) not in ml_signal_module._TRAINING_CANDIDATE_CACHE
 
 
-@pytest.mark.parametrize("contract_kind", ("data_quality", "evaluation", "selection_policy"))
+@pytest.mark.parametrize(
+    "contract_kind", ("data_quality", "evaluation", "selection_policy", "label_availability"),
+)
 @pytest.mark.asyncio
 async def test_ml_signal_retrains_when_training_contract_changes(
     monkeypatch: pytest.MonkeyPatch,
@@ -2038,6 +2130,11 @@ async def test_ml_signal_retrains_when_training_contract_changes(
         }
     elif contract_kind == "selection_policy":
         stale_metadata.pop("shadow_selection_policy")
+    elif contract_kind == "label_availability":
+        stale_metadata["decision_group_partition"] = {
+            **stale_metadata["decision_group_partition"],
+            "version": "2026-07-24.chronological-purged-holdout.v1",
+        }
     else:
         stale_metadata["horizons"] = [5, 15, 60, 240]
         stale_metadata.pop("primary_prediction_horizon_minutes", None)
@@ -2080,11 +2177,16 @@ async def test_ml_signal_retrains_when_training_contract_changes(
         contract_kind in {"data_quality", "selection_policy"}
     )
     assert result["training_policy"]["training_evaluation_contract_stale"] is (
-        contract_kind == "evaluation"
+        contract_kind in {"evaluation", "label_availability"}
     )
     if contract_kind == "evaluation":
         assert (
             "primary_prediction_horizon_contract_stale"
+            in result["training_policy"]["training_evaluation_contract_errors"]
+        )
+    if contract_kind == "label_availability":
+        assert (
+            "decision_group_partition_contract_stale"
             in result["training_policy"]["training_evaluation_contract_errors"]
         )
     assert len(promotion_evidence) == 2

@@ -111,6 +111,9 @@ RETURN_LABEL_NAME = "separated_market_cost_and_realized_return_tasks"
 RETURN_LABEL_VERSION = "2026-07-27.separated-source-supervision.v3"
 COST_MODEL_VERSION = "okx_authoritative_execution_cost_distribution_v3"
 PROFIT_SUPERVISION_VERSION = "2026-10-22.separated-profit-component-availability.v4"
+LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION = (
+    "2026-11-05.executable-cohort-training-transport.v4"
+)
 RETURN_DISTRIBUTION_INPUT_VERSION = "2026-07-15.model-return-distribution-input.v1"
 MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
 EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
@@ -1675,6 +1678,13 @@ def _resolve_artifact_pointer(
     if metadata_hash != manifest.get("metadata_sha256") or sha256_file(metadata_path) != metadata_hash:
         raise ValueError("Local AI artifact metadata hash verification failed.")
     metadata = read_json_object(metadata_path)
+    transport = metadata.get("training_transport_report")
+    if not isinstance(transport, dict) or (
+        transport.get("version") != LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
+    ):
+        raise IncompatibleArtifactContractError(
+            "Local AI artifact label availability belongs to an incompatible training transport."
+        )
     training_cost_policy = (
         PAPER_BOOTSTRAP_COST_POLICY
         if metadata.get("paper_bootstrap") is True
@@ -2789,12 +2799,10 @@ def _model_artifact_status() -> dict[str, Any]:
     model_bundle_available = current is not None and bool(raw_metadata)
     activation_stage = str((activation or {}).get("activation_stage") or "unregistered")
     paper_lifecycle_valid = activation_stage in {
-        "candidate",
-        "shadow",
         "bootstrap",
         "canary",
         "active",
-    }
+    } and (activation or {}).get("paper_execution_permission") is True
     def candidate_summary(resolved: dict[str, Any] | None) -> dict[str, Any]:
         metadata = resolved.get("metadata") if isinstance(resolved, dict) else {}
         metadata = metadata if isinstance(metadata, dict) else {}
@@ -2875,7 +2883,7 @@ def _model_artifact_status() -> dict[str, Any]:
             if model_bundle_available and paper_lifecycle_valid
             else ["model_bundle_unavailable"]
             if not model_bundle_available
-            else ["artifact_lifecycle_invalid"]
+            else ["artifact_activation_not_paper_authorized"]
         ),
         "live_ml_ready": bool(
             (activation or {}).get("live_ml_ready")
@@ -4414,6 +4422,7 @@ def with_model_metadata(
     payload.setdefault("promotion_flow", PHASE3_REQUIRED_PROMOTION_FLOW)
     payload.setdefault("production_permission", False)
     payload.setdefault("live_ml_ready", False)
+    payload.setdefault("paper_trading_permission", False)
     if payload.get("trained") is True:
         bundle = load_bundle()
         metadata = bundle.get("metadata") if isinstance(bundle, dict) else {}
@@ -4444,10 +4453,18 @@ def with_model_metadata(
             or metadata.get("model_stage")
             or "candidate"
         ).lower()
+        activation_manifest = metadata.get("artifact_activation_manifest")
+        activation_manifest = (
+            activation_manifest if isinstance(activation_manifest, dict) else {}
+        )
         live_authorized = bool(
             activation_stage == "active"
             and metadata.get("live_ml_ready") is True
             and not _production_return_evidence_blockers(metadata)
+        )
+        paper_authorized = bool(
+            activation_stage in {"bootstrap", "canary", "active"}
+            and activation_manifest.get("paper_execution_permission") is True
         )
         paper_bootstrap_contract = bool(
             activation_stage == PAPER_BOOTSTRAP_ARTIFACT_STAGE
@@ -4478,7 +4495,7 @@ def with_model_metadata(
                 structurally_eligible and not structural_blockers
             )
             distribution_input["contract_complete"] = contract_complete
-            distribution_input["paper_eligible"] = contract_complete
+            distribution_input["paper_eligible"] = bool(contract_complete and paper_authorized)
             distribution_input["production_eligible"] = bool(
                 contract_complete and live_authorized
             )
@@ -4504,8 +4521,12 @@ def with_model_metadata(
         payload["route_mode"] = "live" if live_authorized else "paper_analysis"
         payload["production_permission"] = live_authorized
         payload["live_ml_ready"] = live_authorized
-        payload["paper_trading_permission"] = distribution_inputs_ready
-        payload["paper_trading_blockers"] = []
+        payload["paper_trading_permission"] = bool(
+            distribution_inputs_ready and paper_authorized
+        )
+        payload["paper_trading_blockers"] = (
+            [] if paper_authorized else ["artifact_activation_not_paper_authorized"]
+        )
         contract_ready = bool(
             payload.get("objective_name") == RETURN_OBJECTIVE_NAME
             and payload.get("objective_version") == RETURN_OBJECTIVE_VERSION
@@ -4554,6 +4575,7 @@ def with_model_metadata(
             payload["paper_trading_blockers"] = list(
                 dict.fromkeys(
                     [
+                        *payload["paper_trading_blockers"],
                         "runtime_return_artifact_contract_incomplete",
                     ]
                 )
@@ -4562,7 +4584,9 @@ def with_model_metadata(
             prediction_quality.get("production_eligible") is True
         )
         prediction_quality["contract_complete"] = quality_contract_complete
-        prediction_quality["paper_eligible"] = quality_contract_complete
+        prediction_quality["paper_eligible"] = bool(
+            quality_contract_complete and paper_authorized
+        )
         prediction_quality["production_eligible"] = bool(
             quality_contract_complete
             and original_production_eligible
@@ -4584,6 +4608,8 @@ def with_model_metadata(
             "standardized_return_distribution_ready"
             if prediction_quality["production_eligible"]
             else "standardized_return_distribution_ready_for_paper"
+            if prediction_quality["paper_eligible"]
+            else "standardized_return_distribution_ready_for_observation"
             if quality_contract_complete
             else quality_blockers[0]
             if quality_blockers
@@ -5404,6 +5430,15 @@ def _with_post_training_inference_warmup(payload: dict[str, Any]) -> dict[str, A
 
 
 def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
+    transport_version = (req.training_transport_report or {}).get("version")
+    if transport_version != LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION:
+        return {
+            "trained": False,
+            "reason": "training_transport_contract_mismatch",
+            "artifact_persisted": False,
+            "expected_transport_version": LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
+            "received_transport_version": transport_version,
+        }
     rows = _market_training_rows(req.shadow_samples or [])
     cost_rows = _authoritative_cost_training_rows(req.trade_samples or [])
     bootstrap_mode = (

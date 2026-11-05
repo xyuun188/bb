@@ -1,6 +1,6 @@
 from typing import Any
 
-DECISION_GROUP_PARTITION_VERSION = "2026-07-24.chronological-purged-holdout.v1"
+DECISION_GROUP_PARTITION_VERSION = "2026-11-05.result-availability-purged-holdout.v2"
 WALK_FORWARD_REPORT_VERSION = "2026-08-16.expanding-decision-group-walk-forward.v2"
 PRIMARY_PREDICTION_HORIZON_MINUTES = 5
 LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX = "BB_LOCAL_ML_AUTO_TRAIN_RESULT_JSON="

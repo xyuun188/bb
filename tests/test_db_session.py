@@ -749,7 +749,7 @@ async def test_postgres_model_health_snapshot_skips_steady_state_alters(
 
 
 @pytest.mark.asyncio
-async def test_postgres_shadow_training_snapshot_schema_uses_trigger_and_full_backfill(
+async def test_postgres_shadow_training_snapshot_schema_defers_history_repair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -783,18 +783,199 @@ async def test_postgres_shadow_training_snapshot_schema_uses_trigger_and_full_ba
         "trg_shadow_backtests_training_feature_snapshot" in statement
         for statement in fake_conn.statements
     )
-    assert any(
-        "UPDATE shadow_backtests" in statement
-        and "training_feature_snapshot_version < 1" in statement
-        for statement in fake_conn.statements
+    assert not any(
+        "SET feature_snapshot" in statement for statement in fake_conn.statements
     )
     assert any(
-        "WITH candidates AS" in statement
-        and "training_market_fact_contract" in statement
-        and "training_label_contract" in statement
-        and "LIMIT 500" in statement
+        "bb_shadow_training_repair_progress" in statement
+        and "COALESCE(MAX(id), 0)" in statement
+        and "ON CONFLICT (repair_key) DO NOTHING" in statement
         for statement in fake_conn.statements
     )
+
+
+class _ShadowRepairConnection(_FakeConnection):
+    def __init__(self, *, progress=(0, 800, False), batch=(100, 100, 3), fail=False):
+        super().__init__()
+        self.progress = progress
+        self.batch = batch
+        self.fail = fail
+        self.parameters = []
+
+    async def execute(self, statement, params=None):
+        self.statements.append(str(statement))
+        self.parameters.append(params)
+        if "FOR UPDATE SKIP LOCKED" in str(statement):
+            return _FakeResult([] if self.progress is None else [self.progress])
+        if "WITH scanned AS MATERIALIZED" in str(statement):
+            if self.fail:
+                raise RuntimeError("interrupted repair")
+            return _FakeResult([self.batch])
+        return _FakeResult([])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("progress", "batch", "completed"),
+    [
+        ((0, 800, False), (100, 100, 3), False),
+        ((100, 800, False), (20, 800, 2), True),
+        ((100, 800, False), (0, 100, 0), True),
+        ((700, 800, False), (100, 800, 0), True),
+    ],
+)
+async def test_shadow_repair_advances_bounded_window_and_checkpoint(
+    progress, batch, completed
+) -> None:
+    conn = _ShadowRepairConnection(progress=progress, batch=batch)
+    report = await session_module._repair_shadow_training_snapshot_batch(conn)
+
+    assert report["completed"] is completed
+    assert report["scanned"] == batch[0]
+    assert report["repaired"] == batch[2]
+    query = next(sql for sql in conn.statements if "WITH scanned AS MATERIALIZED" in sql)
+    window, predicate = query.split("), repaired AS")
+    assert "LIMIT :batch_size" in window
+    assert "feature_snapshot::JSONB" not in window
+    assert "id > :last_id AND id <= :upper_id" in window
+    assert "training_market_fact_contract" in predicate
+    assert "training_label_contract" in predicate
+    assert "training_feature_snapshot_version < 1" in predicate
+    assert conn.parameters[-1] == {
+        "repair_key": session_module._SHADOW_TRAINING_REPAIR_KEY,
+        "last_id": batch[1],
+        "completed": completed,
+    }
+    assert any("statement_timeout = '5s'" in sql for sql in conn.statements)
+    assert any("lock_timeout = '1s'" in sql for sql in conn.statements)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("progress", [None, (800, 800, True)])
+async def test_shadow_repair_skips_busy_or_completed_work(progress) -> None:
+    conn = _ShadowRepairConnection(progress=progress)
+    report = await session_module._repair_shadow_training_snapshot_batch(conn)
+
+    assert report["completed"] is (progress is not None)
+    assert not any("WITH scanned" in sql for sql in conn.statements)
+
+
+@pytest.mark.asyncio
+async def test_shadow_repair_does_not_advance_checkpoint_on_query_failure() -> None:
+    conn = _ShadowRepairConnection(fail=True)
+    with pytest.raises(RuntimeError, match="interrupted repair"):
+        await session_module._repair_shadow_training_snapshot_batch(conn)
+    assert not any(
+        "UPDATE bb_shadow_training_repair_progress" in sql for sql in conn.statements
+    )
+
+
+@pytest.mark.asyncio
+async def test_shadow_repair_worker_retries_with_smaller_transaction_and_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module.settings, "database_url", "postgresql+asyncpg://bb")
+    transaction_outcomes = []
+    batch_sizes = []
+    pauses = []
+
+    class Engine:
+        @asynccontextmanager
+        async def begin(self):
+            try:
+                yield object()
+            except Exception:
+                transaction_outcomes.append("rollback")
+                raise
+            else:
+                transaction_outcomes.append("commit")
+
+    async def get_engine():
+        return Engine()
+
+    async def repair(_conn, *, batch_size):
+        batch_sizes.append(batch_size)
+        if len(batch_sizes) == 1:
+            raise TimeoutError("slow historical payload")
+        return {"completed": len(batch_sizes) == 3, "scanned": 50, "repaired": 1}
+
+    async def sleep(seconds):
+        pauses.append(seconds)
+
+    monkeypatch.setattr(session_module, "get_engine", get_engine)
+    monkeypatch.setattr(session_module, "_repair_shadow_training_snapshot_batch", repair)
+    monkeypatch.setattr(session_module.asyncio, "sleep", sleep)
+    await session_module.repair_shadow_training_snapshots()
+
+    assert transaction_outcomes == ["rollback", "commit", "commit"]
+    assert batch_sizes == [100, 50, 50]
+    assert pauses == [5, 0.1]
+
+
+@pytest.mark.asyncio
+async def test_shadow_repair_worker_backs_off_after_repeated_database_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module.settings, "database_url", "postgresql+asyncpg://bb")
+    batch_sizes = []
+    pauses = []
+    attempts = 0
+
+    class Engine:
+        @asynccontextmanager
+        async def begin(self):
+            yield object()
+
+    async def get_engine():
+        return Engine()
+
+    async def repair(_conn, *, batch_size):
+        nonlocal attempts
+        attempts += 1
+        batch_sizes.append(batch_size)
+        if attempts <= 8:
+            raise TimeoutError("temporary database timeout")
+        return {"completed": True, "scanned": 1, "repaired": 0}
+
+    async def sleep(seconds):
+        pauses.append(seconds)
+
+    monkeypatch.setattr(session_module, "get_engine", get_engine)
+    monkeypatch.setattr(session_module, "_repair_shadow_training_snapshot_batch", repair)
+    monkeypatch.setattr(session_module.asyncio, "sleep", sleep)
+
+    await session_module.repair_shadow_training_snapshots()
+
+    assert batch_sizes == [100, 50, 25, 12, 6, 3, 1, 1, 1]
+    assert pauses == [5, 10, 20, 40, 80, 160, 300, 300]
+
+
+@pytest.mark.asyncio
+async def test_shadow_repair_worker_propagates_shutdown_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module.settings, "database_url", "postgresql+asyncpg://bb")
+    transaction_closed = []
+
+    class Engine:
+        @asynccontextmanager
+        async def begin(self):
+            try:
+                yield object()
+            finally:
+                transaction_closed.append(True)
+
+    async def get_engine():
+        return Engine()
+
+    async def repair(_conn, *, batch_size):
+        raise session_module.asyncio.CancelledError
+
+    monkeypatch.setattr(session_module, "get_engine", get_engine)
+    monkeypatch.setattr(session_module, "_repair_shadow_training_snapshot_batch", repair)
+    with pytest.raises(session_module.asyncio.CancelledError):
+        await session_module.repair_shadow_training_snapshots()
+    assert transaction_closed == [True]
 
 
 def test_postgres_training_feature_snapshot_functions_are_single_ddl_statements() -> None:

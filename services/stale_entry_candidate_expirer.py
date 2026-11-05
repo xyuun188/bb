@@ -13,13 +13,26 @@ from types import SimpleNamespace
 from typing import Any
 
 import structlog
-from sqlalchemy import ARRAY, Text, bindparam, cast, func, literal, or_, select, update
+from sqlalchemy import (
+    ARRAY,
+    JSON,
+    Text,
+    bindparam,
+    case,
+    cast,
+    func,
+    literal,
+    or_,
+    select,
+    tuple_,
+    update,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm.attributes import flag_modified
 
 from config.settings import settings
 from core.safe_output import safe_error_text
-from db.session import get_session_ctx
+from db.session import get_read_session_ctx, get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order
 from services.decision_freshness import (
@@ -40,7 +53,7 @@ from web_dashboard.api.text_sanitize import sanitize_text
 logger = structlog.get_logger(__name__)
 
 ENTRY_PENDING_EXECUTION_MAX_SECONDS = ENTRY_EXECUTION_PENDING_RECOVERY_SECONDS
-STALE_ENTRY_MAINTENANCE_BATCH_LIMIT = 250
+STALE_ENTRY_MAINTENANCE_BATCH_LIMIT = 25
 STALE_ENTRY_MAINTENANCE_LOOKBACK = timedelta(hours=24)
 STALE_ENTRY_MAINTENANCE_MIN_INTERVAL_SECONDS = 60.0
 _STALE_ENTRY_RAW_COLUMN_PREFIX = "stale_entry_raw__"
@@ -57,6 +70,17 @@ FlushCallback = Callable[[], Awaitable[None]]
 
 def _stale_entry_scan_columns() -> tuple[Any, ...]:
     raw = AIDecision.raw_llm_response
+    if "postgresql" in settings.database_url:
+        # These scalars survive the compact learning projection. Only the full
+        # stage history below must still be read from the original audit payload.
+        raw = case(
+            (
+                (AIDecision.decision_learning_snapshot_version >= 1)
+                & AIDecision.decision_learning_snapshot.is_not(None),
+                cast(AIDecision.decision_learning_snapshot, JSON),
+            ),
+            else_=AIDecision.raw_llm_response,
+        )
     return (
         AIDecision.id,
         AIDecision.symbol,
@@ -93,9 +117,25 @@ def _stale_entry_scan_columns() -> tuple[Any, ...]:
         raw["paper_training"].label(
             f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}paper_training"
         ),
-        raw["decision_state_machine"]["stages"].label(
+        AIDecision.raw_llm_response["decision_state_machine"]["stages"].label(
             f"{_STALE_ENTRY_RAW_COLUMN_PREFIX}stages"
         ),
+    )
+
+
+def _bounded_stale_entry_scan(ids: Any) -> Any:
+    # Materialization prevents PostgreSQL from evaluating large JSON for every
+    # matching row before its sort/limit selects the small maintenance batch.
+    batch = (
+        ids.order_by(AIDecision.created_at.asc(), AIDecision.id.asc())
+        .limit(STALE_ENTRY_MAINTENANCE_BATCH_LIMIT)
+        .cte("stale_entry_batch")
+        .prefix_with("MATERIALIZED", dialect="postgresql")
+    )
+    return (
+        select(*_stale_entry_scan_columns())
+        .join(batch, AIDecision.id == batch.c.id)
+        .order_by(AIDecision.created_at.asc(), AIDecision.id.asc())
     )
 
 
@@ -231,6 +271,9 @@ class StaleEntryCandidateExpirer:
 
     float_parser: FloatParser
     _last_completed_monotonic: float | None = field(default=None, init=False, repr=False)
+    _open_state_scan_cursor: tuple[datetime, int] | None = field(
+        default=None, init=False, repr=False
+    )
 
     async def expire(self) -> int:
         """Expire one bounded batch without retaining a session during evaluation."""
@@ -246,8 +289,9 @@ class StaleEntryCandidateExpirer:
 
         now = datetime.utcnow()
         maintenance_since = now - STALE_ENTRY_MAINTENANCE_LOOKBACK
+        previous_scan_cursor = self._open_state_scan_cursor
         try:
-            async with get_session_ctx() as session:
+            async with get_read_session_ctx(statement_timeout_ms=8_000) as session:
                 waiting_rows = await self._load_rows(
                     session,
                     since=maintenance_since,
@@ -334,6 +378,7 @@ class StaleEntryCandidateExpirer:
             )
             return len(updates)
         except Exception as exc:
+            self._open_state_scan_cursor = previous_scan_cursor
             logger.warning("failed to expire stale entry candidates", error=safe_error_text(exc))
             return 0
         finally:
@@ -528,17 +573,15 @@ class StaleEntryCandidateExpirer:
         cutoff: datetime | None,
         reason_patterns: tuple[str, ...],
     ) -> list[Any]:
-        stmt = select(*_stale_entry_scan_columns()).where(
+        ids = select(AIDecision.id).where(
             AIDecision.was_executed.is_(False),
             AIDecision.action.in_(["long", "short", "open_long", "open_short"]),
             AIDecision.created_at >= since,
             or_(*[AIDecision.execution_reason.like(pattern) for pattern in reason_patterns]),
         )
         if cutoff is not None:
-            stmt = stmt.where(AIDecision.created_at <= cutoff)
-        stmt = stmt.order_by(AIDecision.created_at.asc(), AIDecision.id.asc()).limit(
-            STALE_ENTRY_MAINTENANCE_BATCH_LIMIT
-        )
+            ids = ids.where(AIDecision.created_at <= cutoff)
+        stmt = _bounded_stale_entry_scan(ids)
         return [
             _stale_entry_row_from_mapping(row) for row in (await session.execute(stmt)).mappings().all()
         ]
@@ -550,21 +593,27 @@ class StaleEntryCandidateExpirer:
         since: datetime,
         cutoff: datetime,
     ) -> list[Any]:
-        stmt = (
-            select(*_stale_entry_scan_columns())
-            .where(
-                AIDecision.was_executed.is_(False),
-                AIDecision.action.in_(["long", "short", "open_long", "open_short"]),
-                AIDecision.created_at >= since,
-                AIDecision.created_at <= cutoff,
-            )
-            .order_by(AIDecision.created_at.asc(), AIDecision.id.asc())
-            .limit(STALE_ENTRY_MAINTENANCE_BATCH_LIMIT)
+        ids = select(AIDecision.id).where(
+            AIDecision.was_executed.is_(False),
+            AIDecision.action.in_(["long", "short", "open_long", "open_short"]),
+            AIDecision.created_at >= since,
+            AIDecision.created_at <= cutoff,
         )
+        if self._open_state_scan_cursor is not None:
+            ids = ids.where(
+                tuple_(AIDecision.created_at, AIDecision.id)
+                > self._open_state_scan_cursor
+            )
+        stmt = _bounded_stale_entry_scan(ids)
         rows = [
             _stale_entry_row_from_mapping(row)
             for row in (await session.execute(stmt)).mappings().all()
         ]
+        self._open_state_scan_cursor = (
+            (rows[-1].created_at, int(rows[-1].id))
+            if len(rows) == STALE_ENTRY_MAINTENANCE_BATCH_LIMIT
+            else None
+        )
         return [row for row in rows if _needs_terminal_state_repair(row)]
 
     def _waiting_expiration_reason(self, row: Any) -> str:

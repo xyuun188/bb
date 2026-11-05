@@ -28,7 +28,7 @@ TRAINING_DISTRIBUTION_PROFILE_VERSION = "2026-07-27.training-distribution-profil
 TRAINING_DISTRIBUTION_DRIFT_VERSION = "2026-07-27.standardized-mean-shift.v1"
 TRAINING_TRIGGER_POLICY_VERSION = "2026-09-27.sample-or-decision-group-cadence.v1"
 LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION = (
-    "2026-10-09.bounded-training-transport.v2"
+    "2026-11-05.executable-cohort-training-transport.v4"
 )
 LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX = "BB_LOCAL_AI_TOOLS_TRAIN_RESULT_JSON="
 

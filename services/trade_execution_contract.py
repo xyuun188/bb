@@ -578,11 +578,13 @@ def trade_execution_policy() -> dict[str, Any]:
         "paper_quality_observation_max_loss_probability": 0.60,
         "paper_training_entry_requires_current_raw_return": True,
         "paper_training_entry_requires_positive_size_aware_net_return": True,
-        "paper_training_entry_requires_positive_return_lcb": True,
+        "paper_training_entry_requires_positive_return_lcb": False,
+        "paper_training_entry_allows_non_positive_return_lcb": True,
+        "paper_training_entry_requires_finite_downside_stress": True,
         "paper_validated_entry_requires_positive_fee_after_return": True,
         "paper_training_entry_allows_non_positive_fee_after_return": False,
-        # Training entries remain bounded paper-only orders, but a non-positive
-        # return lower bound is now observation-only and cannot open a position.
+        # Bounded training paper risk permits an uncertain lower bound only
+        # when the current fee-after mean and finite downside stress are valid.
         "paper_training_entry_is_shadow_only": False,
         "paper_training_entry_authorizes_normal_entry": True,
         "paper_training_entry_is_bounded_paper_only": True,

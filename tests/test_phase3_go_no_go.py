@@ -28,6 +28,9 @@ def _cards() -> list[dict]:
                     "paper_training_entry_is_bounded_paper_only": True,
                     "paper_training_entry_authorizes_normal_entry": True,
                     "paper_training_entry_requires_positive_size_aware_net_return": True,
+                    "paper_training_entry_requires_positive_return_lcb": False,
+                    "paper_training_entry_allows_non_positive_return_lcb": True,
+                    "paper_training_entry_requires_finite_downside_stress": True,
                     "paper_training_entry_allows_non_positive_fee_after_return": False,
                     "paper_training_entry_is_shadow_only": False,
                     "paper_training_entry_production_permission": False,
@@ -170,7 +173,7 @@ def test_phase3_go_no_go_rejects_incomplete_return_contract_policy() -> None:
     assert "dynamic_return_contract_policy_incomplete" in report["blocker_codes"]
 
 
-def test_phase3_go_no_go_requires_positive_return_lcb_for_paper_entries() -> None:
+def test_phase3_go_no_go_requires_positive_lcb_only_for_validated_paper_entries() -> None:
     for key in (
         "paper_normal_entry_requires_positive_return_lcb",
         "paper_validated_entry_requires_positive_return_lcb",
@@ -178,6 +181,25 @@ def test_phase3_go_no_go_requires_positive_return_lcb_for_paper_entries() -> Non
         cards = deepcopy(_cards())
         trade = next(card for card in cards if card["key"] == "trade_execution_contract")
         trade["details"]["policy"][key] = False
+
+        report = evaluate_phase3_go_no_go_cards(cards)
+
+        blocker = next(
+            item
+            for item in report["blockers"]
+            if item["code"] == "dynamic_return_contract_policy_incomplete"
+        )
+        assert key in blocker["evidence"]["missing"]
+
+
+def test_phase3_go_no_go_requires_bounded_training_downside_policy() -> None:
+    for key, value in (
+        ("paper_training_entry_allows_non_positive_return_lcb", False),
+        ("paper_training_entry_requires_finite_downside_stress", False),
+    ):
+        cards = deepcopy(_cards())
+        trade = next(card for card in cards if card["key"] == "trade_execution_contract")
+        trade["details"]["policy"][key] = value
 
         report = evaluate_phase3_go_no_go_cards(cards)
 

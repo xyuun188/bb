@@ -36,6 +36,7 @@ _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 _session_gate: asyncio.Semaphore | None = None
 _session_gate_limit: int | None = None
 logger = structlog.get_logger(__name__)
+_SHADOW_TRAINING_REPAIR_KEY = "2026-11-05.shadow-training-provenance.v1"
 
 
 def _session_gate_capacity() -> int:
@@ -1712,51 +1713,23 @@ async def _ensure_shadow_backtest_training_snapshot_columns(conn: Any) -> None:
                 """
             )
         )
-        # The trainer retains up to 20,000 completed samples. Backfill all
-        # historical shadows once so switching reads never shrinks that window.
-        await conn.execute(
-            text(
-                """
-                UPDATE shadow_backtests
-                SET feature_snapshot = feature_snapshot
-                WHERE training_feature_snapshot_version < 1
-                """
+        # Historical JSON must not be read under the startup schema lock.
+        # The trading process resumes this finite repair in separate transactions.
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS bb_shadow_training_repair_progress (
+                repair_key VARCHAR(160) PRIMARY KEY,
+                last_id BIGINT NOT NULL DEFAULT 0,
+                upper_id BIGINT NOT NULL,
+                completed BOOLEAN NOT NULL DEFAULT FALSE
             )
-        )
-        # Recompact a bounded batch whose source retains required label
-        # provenance but whose old training view lost it to optional diagnostics.
+        """))
         await conn.execute(
-            text(
-                """
-                WITH candidates AS (
-                    SELECT id
-                    FROM shadow_backtests
-                    WHERE feature_snapshot IS NOT NULL
-                      AND (
-                          (
-                              (feature_snapshot::JSONB) ? 'training_market_fact_contract'
-                              AND NOT (
-                                  COALESCE(training_feature_snapshot, '{}'::JSONB)
-                                  ? 'training_market_fact_contract'
-                              )
-                          )
-                          OR (
-                              (feature_snapshot::JSONB) ? 'training_label_contract'
-                              AND NOT (
-                                  COALESCE(training_feature_snapshot, '{}'::JSONB)
-                                  ? 'training_label_contract'
-                              )
-                          )
-                      )
-                    ORDER BY id DESC
-                    LIMIT 500
-                )
-                UPDATE shadow_backtests AS shadow
-                SET feature_snapshot = shadow.feature_snapshot
-                FROM candidates
-                WHERE shadow.id = candidates.id
-                """
-            )
+            text("""
+                INSERT INTO bb_shadow_training_repair_progress (repair_key, upper_id)
+                SELECT :repair_key, COALESCE(MAX(id), 0) FROM shadow_backtests
+                ON CONFLICT (repair_key) DO NOTHING
+            """),
+            {"repair_key": _SHADOW_TRAINING_REPAIR_KEY},
         )
         return
 
@@ -1786,6 +1759,134 @@ async def _ensure_shadow_backtest_training_snapshot_columns(conn: Any) -> None:
             "WHERE decision_id IS NOT NULL"
         )
     )
+
+
+async def _repair_shadow_training_snapshot_batch(
+    conn: Any, *, batch_size: int = 100
+) -> dict[str, Any]:
+    """Advance one primary-key window atomically with its durable checkpoint."""
+
+    batch_size = max(1, min(int(batch_size), 500))
+    await conn.execute(text("SET LOCAL statement_timeout = '5s'"))
+    await conn.execute(text("SET LOCAL lock_timeout = '1s'"))
+    progress = await conn.execute(
+        text("""
+            SELECT last_id, upper_id, completed
+            FROM bb_shadow_training_repair_progress
+            WHERE repair_key = :repair_key
+            FOR UPDATE SKIP LOCKED
+        """),
+        {"repair_key": _SHADOW_TRAINING_REPAIR_KEY},
+    )
+    rows = progress.fetchall()
+    if not rows:
+        return {"completed": False, "busy": True}
+    last_id, upper_id, completed = rows[0]
+    if completed:
+        return {"completed": True, "scanned": 0, "repaired": 0}
+    result = await conn.execute(
+        text("""
+            WITH scanned AS MATERIALIZED (
+                SELECT id, feature_snapshot, training_feature_snapshot,
+                       training_feature_snapshot_version
+                FROM shadow_backtests
+                WHERE id > :last_id AND id <= :upper_id
+                ORDER BY id
+                LIMIT :batch_size
+            ), repaired AS (
+                UPDATE shadow_backtests AS shadow
+                SET feature_snapshot = shadow.feature_snapshot
+                FROM scanned
+                WHERE shadow.id = scanned.id
+                  AND (
+                    scanned.training_feature_snapshot_version < 1
+                    OR (
+                        scanned.feature_snapshot IS NOT NULL
+                        AND (
+                            CASE WHEN COALESCE(scanned.training_feature_snapshot, '{}'::JSONB)
+                                      ? 'training_market_fact_contract' THEN FALSE
+                                 ELSE (scanned.feature_snapshot::JSONB)
+                                      ? 'training_market_fact_contract' END
+                            OR
+                            CASE WHEN COALESCE(scanned.training_feature_snapshot, '{}'::JSONB)
+                                      ? 'training_label_contract' THEN FALSE
+                                 ELSE (scanned.feature_snapshot::JSONB)
+                                      ? 'training_label_contract' END
+                        )
+                    )
+                  )
+                RETURNING shadow.id
+            )
+            SELECT COUNT(*), COALESCE(MAX(id), :last_id),
+                   (SELECT COUNT(*) FROM repaired)
+            FROM scanned
+        """),
+        {"last_id": last_id, "upper_id": upper_id, "batch_size": batch_size},
+    )
+    scanned, next_id, repaired = result.fetchall()[0]
+    completed = scanned < batch_size or next_id >= upper_id
+    await conn.execute(
+        text("""
+            UPDATE bb_shadow_training_repair_progress
+            SET last_id = :last_id, completed = :completed
+            WHERE repair_key = :repair_key
+        """),
+        {
+            "repair_key": _SHADOW_TRAINING_REPAIR_KEY,
+            "last_id": next_id,
+            "completed": completed,
+        },
+    )
+    return {
+        "completed": completed,
+        "scanned": scanned,
+        "repaired": repaired,
+        "last_id": next_id,
+        "upper_id": upper_id,
+    }
+
+
+async def repair_shadow_training_snapshots() -> None:
+    """Resume historical provenance repair without delaying trading startup."""
+
+    if "postgresql" not in settings.database_url:
+        return
+    engine = await get_engine()
+    batch_size = 100
+    scanned_total = repaired_total = 0
+    consecutive_failures = 0
+    while True:
+        try:
+            async with engine.begin() as conn:
+                report = await _repair_shadow_training_snapshot_batch(
+                    conn, batch_size=batch_size
+                )
+        except Exception as exc:
+            # Rollback also preserves the cursor. Smaller retries allow large
+            # historical payloads to make progress within the statement budget.
+            consecutive_failures += 1
+            batch_size = max(1, batch_size // 2)
+            retry_delay = min(5 * (2 ** min(consecutive_failures - 1, 6)), 300)
+            logger.warning(
+                "shadow training snapshot repair deferred",
+                error_type=type(exc).__name__,
+                batch_size=batch_size,
+                consecutive_failures=consecutive_failures,
+                retry_delay_seconds=retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
+            continue
+        consecutive_failures = 0
+        scanned_total += int(report.get("scanned") or 0)
+        repaired_total += int(report.get("repaired") or 0)
+        if report["completed"]:
+            logger.info(
+                "shadow training snapshot repair complete",
+                scanned=scanned_total,
+                repaired=repaired_total,
+            )
+            return
+        await asyncio.sleep(0.1 if not report.get("busy") else 5)
 
 
 async def _ensure_okx_account_bill_indexes(conn: Any) -> None:

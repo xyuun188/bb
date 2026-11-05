@@ -206,6 +206,11 @@ def _use_bounded_training_entry(
     *,
     raw_return_pct: float = 0.9,
 ) -> dict:
+    decision.raw_response["opportunity_score"][
+        "return_distribution_contract"
+    ]["gross_market_distribution"] = {
+        "raw_expected_return_pct": raw_return_pct,
+    }
     normal_trade = decision.raw_response["normal_paper_trade"]
     normal_trade.update(
         {
@@ -785,6 +790,12 @@ async def test_paper_training_negative_fee_after_return_is_shadow_only() -> None
     decision.raw_response["opportunity_score"]["return_distribution_contract"][
         "raw_expected_return_pct"
     ] = -0.05
+    decision.raw_response["opportunity_score"]["return_distribution_contract"][
+        "gross_market_distribution"
+    ]["raw_expected_return_pct"] = (
+        -0.05
+        + decision.raw_response["opportunity_score"]["execution_cost"]["total_pct"]
+    )
     policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
 
     await policy.apply(decision, "paper", [])
@@ -795,7 +806,9 @@ async def test_paper_training_negative_fee_after_return_is_shadow_only() -> None
     assert sizing["paper_profitability_gate_applied"] is True
     assert sizing["paper_training_entry_mode"] is True
     assert sizing["paper_training_shadow_only"] is False
-    assert "normal_paper_expected_net_not_positive_after_size_cost" in sizing["reason"]
+    assert "normal_paper_size_aware_no_positive_expected_net_at_exchange_minimum" in (
+        sizing["reason"]
+    )
 
 
 @pytest.mark.asyncio
@@ -805,8 +818,11 @@ async def test_paper_training_reprices_against_distribution_slippage_floor_once(
     opportunity = decision.raw_response["opportunity_score"]
     opportunity["return_distribution_contract"].update(
         {
-            "raw_expected_return_pct": 0.9,
+            "raw_expected_return_pct": 0.44,
             "objective_expected_return_pct": 0.2,
+            "gross_market_distribution": {
+                "raw_expected_return_pct": 2.5,
+            },
             "transformations": {
                 "authoritative_slippage_cost_basis": "expected",
                 "authoritative_slippage_expected_pct": 2.0,

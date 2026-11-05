@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -238,10 +239,18 @@ async def test_stale_candidate_loader_bounds_one_background_batch() -> None:
         reason_patterns=("waiting%",),
     ) == []
 
-    assert statements[0]._limit_clause.value == STALE_ENTRY_MAINTENANCE_BATCH_LIMIT
     compiled = statements[0].compile()
     assert "ai_decisions.created_at >=" in str(compiled)
     assert since in compiled.params.values()
+    assert STALE_ENTRY_MAINTENANCE_BATCH_LIMIT in compiled.params.values()
+    from sqlalchemy.dialects import postgresql
+
+    postgres_sql = str(statements[0].compile(dialect=postgresql.dialect()))
+    bounded_ids, projection = postgres_sql.split(")\n SELECT", 1)
+    assert "AS MATERIALIZED" in bounded_ids
+    assert "LIMIT" in bounded_ids
+    assert "raw_llm_response" not in bounded_ids
+    assert "raw_llm_response" in projection
 
     assert await expirer._load_stale_open_state_rows(
         FakeSession(),
@@ -251,6 +260,96 @@ async def test_stale_candidate_loader_bounds_one_background_batch() -> None:
     compiled_open_state = statements[1].compile()
     assert "ai_decisions.created_at >=" in str(compiled_open_state)
     assert since in compiled_open_state.params.values()
+
+
+@pytest.mark.asyncio
+async def test_stale_candidate_scan_uses_projection_and_preserves_full_stage_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sqlalchemy.dialects import postgresql
+
+    monkeypatch.setattr(
+        stale_expirer_module.settings, "database_url", "postgresql+asyncpg://bb"
+    )
+    columns = stale_expirer_module._stale_entry_scan_columns()
+    sql = str(columns[6].compile(dialect=postgresql.dialect()))
+    stages_sql = str(columns[-1].compile(dialect=postgresql.dialect()))
+
+    assert "CASE WHEN" in sql
+    assert "decision_learning_snapshot_version" in sql
+    assert "CAST(ai_decisions.decision_learning_snapshot AS JSON)" in sql
+    assert "ELSE ai_decisions.raw_llm_response END ->" in sql
+    assert "CASE" not in stages_sql
+    assert "ai_decisions.raw_llm_response" in stages_sql
+
+
+@pytest.mark.asyncio
+async def test_stale_open_state_scan_advances_past_terminal_rows_and_wraps() -> None:
+    statements = []
+    created_at = datetime.utcnow() - timedelta(hours=1)
+    rows = [
+        {
+            "id": index + 1,
+            "created_at": created_at,
+            "stale_entry_raw__stages": [{
+                "stage": DecisionStage.RISK_CHECK,
+                "status": DecisionStageStatus.SKIPPED,
+            }],
+        }
+        for index in range(STALE_ENTRY_MAINTENANCE_BATCH_LIMIT)
+    ]
+
+    class Result:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return rows if len(statements) == 1 else []
+
+    class Session:
+        async def execute(self, stmt):
+            statements.append(stmt)
+            return Result()
+
+    expirer = StaleEntryCandidateExpirer(_float)
+    since = created_at - timedelta(hours=1)
+    assert await expirer._load_stale_open_state_rows(
+        Session(), since=since, cutoff=datetime.utcnow()
+    ) == []
+    assert expirer._open_state_scan_cursor == (
+        created_at, STALE_ENTRY_MAINTENANCE_BATCH_LIMIT
+    )
+    assert await expirer._load_stale_open_state_rows(
+        Session(), since=since, cutoff=datetime.utcnow()
+    ) == []
+    assert "(ai_decisions.created_at, ai_decisions.id) >" in str(statements[-1])
+    assert expirer._open_state_scan_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_stale_scan_failure_restores_cursor_and_cools_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits = []
+    cursor = (datetime.utcnow(), 17)
+    expirer = StaleEntryCandidateExpirer(_float)
+    expirer._open_state_scan_cursor = cursor
+
+    @asynccontextmanager
+    async def read_session(**kwargs):
+        limits.append(kwargs)
+        yield object()
+
+    async def fail_scan(*_args, **_kwargs):
+        expirer._open_state_scan_cursor = None
+        raise TimeoutError("slow read")
+
+    monkeypatch.setattr(stale_expirer_module, "get_read_session_ctx", read_session)
+    monkeypatch.setattr(StaleEntryCandidateExpirer, "_load_rows", fail_scan)
+    assert await expirer.expire() == 0
+    assert limits == [{"statement_timeout_ms": 8_000}]
+    assert expirer._open_state_scan_cursor == cursor
+    assert expirer._last_completed_monotonic is not None
 
 
 @pytest.mark.asyncio

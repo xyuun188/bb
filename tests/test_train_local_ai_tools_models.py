@@ -206,7 +206,9 @@ async def test_shadow_loader_evenly_bounds_rows_at_database_query(
         await session.commit()
 
     try:
-        samples = await train_script._load_shadow_samples(sample_budget=4)
+        samples = await train_script._load_shadow_samples(
+            sample_budget=4, executable_only=False
+        )
     finally:
         await close_db()
 
@@ -216,6 +218,117 @@ async def test_shadow_loader_evenly_bounds_rows_at_database_query(
         "S6/USDT",
         "S9/USDT",
     ]
+
+
+@pytest.mark.asyncio
+async def test_executable_shadow_loader_separates_history_without_selecting_winners(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    created_at = PHASE3_CLEAN_START_UTC + timedelta(minutes=5)
+    rows = []
+    for index in range(12):
+        historical = index % 2 == 0
+        rows.append(ShadowBacktest(
+            decision_id=index + 1,
+            model_name="ensemble_trader",
+            execution_mode="paper",
+            symbol=f"S{index}/USDT",
+            feature_snapshot={
+                "current_price": 100.0,
+                "historical_market_path_only": historical,
+                "training_market_fact_contract": {
+                    "version": MARKET_FACT_CONTRACT_VERSION,
+                    "status": "historical_ohlcv_only" if historical else "clean",
+                    "violation_count": 0,
+                    "native_instrument_identity_verified": True,
+                    "same_contract_price_path_verified": True,
+                    "executable_market_fact_verified": not historical,
+                },
+            },
+            status="completed",
+            created_at=created_at + timedelta(minutes=index),
+            due_at=created_at + timedelta(minutes=index + 5),
+            horizon_minutes=5,
+            long_return_pct=-0.2 if index < 6 else 0.2,
+            short_return_pct=0.2 if index < 6 else -0.2,
+        ))
+    async with get_session_ctx() as session:
+        session.add_all(rows)
+        await session.commit()
+
+    try:
+        selected = await train_script._load_shadow_samples(sample_budget=4)
+        research = await train_script._load_shadow_samples(executable_only=False)
+        selected_ids = [sample["id"] for sample in selected]
+        assert len(selected) == 4
+        assert all(
+            sample["features"].get("historical_market_path_only") is not True
+            for sample in selected
+        )
+        assert any(sample["long_return_pct"] < 0 for sample in selected)
+        assert any(sample["short_return_pct"] < 0 for sample in selected)
+        assert len(research) == 12
+        assert sum(
+            sample["features"].get("historical_market_path_only") is True
+            for sample in research
+        ) == 6
+        async with get_session_ctx() as session:
+            from sqlalchemy import update
+
+            await session.execute(update(ShadowBacktest).values(
+                long_return_pct=-9.0, short_return_pct=-8.0, best_action="hold"
+            ))
+            await session.commit()
+        changed = await train_script._load_shadow_samples(sample_budget=4)
+        assert [sample["id"] for sample in changed] == selected_ids
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_executable_shadow_loader_bounds_provenance_reads_before_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    created_at = PHASE3_CLEAN_START_UTC + timedelta(minutes=5)
+    monkeypatch.setattr(train_script, "_EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER", 2)
+    async with get_session_ctx() as session:
+        session.add_all([
+            ShadowBacktest(
+                model_name="ensemble_trader",
+                execution_mode="paper",
+                symbol="BTC/USDT",
+                feature_snapshot={"current_price": 100.0},
+                status="completed",
+                created_at=created_at + timedelta(minutes=index),
+                due_at=created_at + timedelta(minutes=index + 5),
+                horizon_minutes=5,
+                long_return_pct=0.2,
+                short_return_pct=-0.2,
+            )
+            for index in range(40)
+        ])
+        await session.commit()
+    reads = []
+    original = train_script._compact_training_shadow_sample
+
+    def compact(row):
+        reads.append(row["id"])
+        return original(row)
+
+    monkeypatch.setattr(train_script, "_compact_training_shadow_sample", compact)
+    try:
+        selected = await train_script._load_shadow_samples(sample_budget=4)
+    finally:
+        await close_db()
+
+    assert selected == []
+    assert len(reads) <= 8
+    assert min(reads) == 1
+    assert max(reads) == 40
 
 
 @pytest.mark.asyncio
@@ -330,7 +443,7 @@ async def test_local_ai_tools_shadow_loader_uses_clean_compact_feature_projectio
         )
 
     try:
-        samples = await train_script._load_shadow_samples()
+        samples = await train_script._load_shadow_samples(executable_only=False)
     finally:
         await close_db()
 
@@ -430,7 +543,7 @@ async def test_shadow_loader_recovers_compacted_provenance_from_linked_source_co
         await session.commit()
 
     try:
-        samples = await train_script._load_shadow_samples()
+        samples = await train_script._load_shadow_samples(executable_only=False)
     finally:
         await close_db()
 
@@ -615,6 +728,40 @@ def test_remote_training_transport_bounds_sequence_sample_count() -> None:
     assert report["sent_sample_counts"]["sequence"] == (
         train_script._REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES
     )
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_shadow_transport_preserves_actual_availability_and_decision_time(nested: bool) -> None:
+    decision = "2026-11-05T01:00:03+00:00"
+    scheduled = "2026-11-05T01:05:03+00:00"
+    available = "2026-11-05T01:05:48+00:00"
+    label = {"label_timestamp": available, "scheduled_label_at": scheduled}
+    sample = {
+        "id": 1, "label_timestamp": scheduled,
+        "features": {
+            "original_decision_timestamp": decision,
+            "training_label_contract": {"labels": label} if nested else label,
+        },
+    }
+
+    transported = train_script._transport_sample(sample, kind="shadow")
+
+    assert transported["label_timestamp"] == available
+    assert transported["decision_timestamp"] == decision
+    assert sample["label_timestamp"] == scheduled
+    assert "training_label_contract" not in transported["features"]
+    assert train_script._transport_sample(
+        sample, kind="trade"
+    )["label_timestamp"] == scheduled
+
+
+def test_shadow_transport_cannot_fall_back_to_unverified_scheduled_time() -> None:
+    transported = train_script._transport_sample(
+        {"label_timestamp": "2026-11-05T01:05:03+00:00", "features": {}},
+        kind="shadow",
+    )
+    assert transported["label_timestamp"] is None
+    assert transported["decision_timestamp"] is None
 
 
 def test_local_ai_tools_training_headers_use_bearer_token() -> None:

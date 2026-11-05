@@ -20,11 +20,11 @@ from services.ml_signal_service import FEATURE_KEYS
 CUTOFF = "2026-08-12T00:00:00+00:00"
 
 
-def _frame() -> pd.DataFrame:
+def _frame(*, step_minutes: int = 30) -> pd.DataFrame:
     rows = []
     for index in range(480):
         decision = pd.Timestamp("2026-08-01", tz="UTC") + pd.Timedelta(
-            minutes=index * 30
+            minutes=index * step_minutes
         )
         for horizon in research.HORIZONS:
             rows.append({
@@ -128,7 +128,7 @@ def test_rows_after_cutoff_cannot_affect_research_inputs():
     assert changed["development_input_sha256"] == original["development_input_sha256"]
 
 
-def test_common_coverage_and_all_horizon_purging(monkeypatch):
+def test_common_coverage_and_horizon_specific_purging(monkeypatch):
     monkeypatch.setattr(research, "_predict", _predictions)
     frame = _frame()
     frame = frame[~(
@@ -149,10 +149,146 @@ def test_common_coverage_and_all_horizon_purging(monkeypatch):
         assert len(candidates) == 72
         for horizon in research.HORIZONS:
             assert any(row["horizon_minutes"] == horizon for row in candidates)
+            coverage = fold["selection"]["horizon_coverage"][str(horizon)]
+            assert coverage["ready_fold_count"] == 2
+            assert coverage["exclusion_reasons"] == []
+            assert all(
+                boundary["horizon_minutes"] == horizon
+                for boundary in coverage["folds"]
+            )
     assert report["exam_labels_evaluated"] is False
     assert report["artifact_persisted"] is False
     assert report["submits_orders"] is False
     assert report["promotion_authorized"] is False
+
+
+def test_long_labels_do_not_erase_short_horizon_inner_folds(monkeypatch):
+    monkeypatch.setattr(research, "_predict", _predictions)
+    selection = research._select_policy(_frame(step_minutes=1))
+
+    assert selection["policy"]["horizon_minutes"] == 5
+    assert len(selection["candidates"]) == 54
+    for horizon in (5, 15, 60):
+        assert selection["horizon_coverage"][str(horizon)]["ready_fold_count"] == 2
+    excluded = selection["horizon_coverage"]["240"]
+    assert excluded["ready_fold_count"] < 2
+    assert "insufficient_positive_weight_inner_training" in excluded["exclusion_reasons"]
+    assert all(row["horizon_minutes"] != 240 for row in selection["candidates"])
+
+
+def test_outer_training_keeps_only_settled_rows_without_losing_short_labels(monkeypatch):
+    checked = []
+    monkeypatch.setattr(research, "ALPHAS", (1.0,))
+    monkeypatch.setattr(research, "NET_THRESHOLDS_PCT", (0.0,))
+
+    def check_training(train, validation, **kwargs):
+        assert train["horizon_minutes"].nunique() == 1
+        assert train["label_timestamp"].max() < validation["decision_timestamp"].min()
+        assert set(train["decision_group"]).isdisjoint(validation["decision_group"])
+        checked.append(len(train))
+        return _predictions(train, validation, **kwargs)
+
+    monkeypatch.setattr(research, "_predict", check_training)
+    development, snapshot = _snapshot(_frame(step_minutes=1))
+    folds = research._folds(development, 3)
+    train, validation, boundary = folds[0]
+    start = validation["decision_timestamp"].min()
+    expected = development[
+        (development["decision_timestamp"] < start)
+        & (development["label_timestamp"] < start)
+    ]
+    pd.testing.assert_frame_equal(train, expected)
+    assert set(train["horizon_minutes"]) == {5, 15, 60}
+    assert train["decision_timestamp"].max() > start - pd.Timedelta(minutes=240)
+    assert boundary["label_purged_training_sample_count"] > 0
+
+    report = research.build_horizon_development_report(development, snapshot=snapshot)
+    assert checked
+    assert report["status"] == "complete"
+    assert len(report["folds"]) == 3
+    assert any(
+        candidate["horizon_minutes"] == 5
+        for candidate in report["folds"][0]["selection"]["candidates"]
+    )
+
+    unavailable = (
+        (development["decision_timestamp"] < start)
+        & (development["label_timestamp"] >= start)
+    )
+    development.loc[unavailable, ["long_return_pct", "short_return_pct"]] = -1000.0
+    market_features = [key for key in FEATURE_KEYS if key != "horizon_minutes"]
+    development.loc[unavailable, market_features] = 1e9
+    changed_frame, changed_snapshot = _snapshot(development)
+    changed = research.build_horizon_development_report(
+        changed_frame, snapshot=changed_snapshot
+    )
+    assert changed["folds"][0]["selection"] == report["folds"][0]["selection"]
+
+
+def test_zero_weight_horizon_does_not_disable_other_horizons(monkeypatch):
+    monkeypatch.setattr(research, "_predict", _predictions)
+    frame = _frame()
+    frame.loc[frame["horizon_minutes"] == 5, "sample_weight"] = 0.0
+
+    selection = research._select_policy(frame)
+
+    assert selection["policy"]["horizon_minutes"] == 15
+    assert len(selection["candidates"]) == 54
+    assert selection["horizon_coverage"]["5"]["exclusion_reasons"] == [
+        "insufficient_positive_weight_inner_training"
+    ]
+    assert all(row["horizon_minutes"] != 5 for row in selection["candidates"])
+
+
+def test_insufficient_horizons_report_coverage_and_choose_no_trade(monkeypatch):
+    def forbidden_prediction(*_args, **_kwargs):
+        raise AssertionError("excluded horizons must not be fitted")
+
+    monkeypatch.setattr(research, "_predict", forbidden_prediction)
+    selection = research._select_policy(_frame().iloc[:24])
+
+    assert selection["policy"] is None
+    assert selection["candidates"] == []
+    assert all(
+        coverage["exclusion_reasons"]
+        for coverage in selection["horizon_coverage"].values()
+    )
+
+
+def test_negative_lcb_still_rejects_positive_mean_candidates(monkeypatch):
+    monkeypatch.setattr(research, "_predict", _predictions)
+    monkeypatch.setattr(research, "ALPHAS", (1.0,))
+    monkeypatch.setattr(research, "NET_THRESHOLDS_PCT", (0.0,))
+    frame = _frame(step_minutes=1)
+    frame["long_return_pct"] = 0.1 + np.repeat(
+        np.where(np.arange(480) % 2 == 0, 0.5, -0.46), len(research.HORIZONS)
+    )
+
+    selection = research._select_policy(frame)
+
+    candidate = selection["candidates"][0]
+    assert candidate["evidence"]["all_opportunities"]["avg_return_pct"] > 0.0
+    assert candidate["evidence"]["all_opportunities"]["return_lcb_pct"] < 0.0
+    assert "all_opportunities_nonpositive_naive_lcb" in candidate["rejection_reasons"]
+    assert selection["policy"] is None
+
+
+def test_positive_aggregate_cannot_hide_a_losing_inner_fold(monkeypatch):
+    monkeypatch.setattr(research, "_predict", _predictions)
+    monkeypatch.setattr(research, "ALPHAS", (1.0,))
+    monkeypatch.setattr(research, "NET_THRESHOLDS_PCT", (0.0,))
+    frame = _frame()
+    frame.loc[
+        frame["decision_group"] >= "group-0360", "long_return_pct"
+    ] = 0.05
+
+    selection = research._select_policy(frame)
+
+    candidate = selection["candidates"][0]
+    assert candidate["evidence"]["nonoverlapping"]["return_lcb_pct"] > 0.0
+    assert candidate["per_fold"][1]["nonoverlapping"]["avg_return_pct"] < 0.0
+    assert "inner_fold_fee_after_instability" in candidate["rejection_reasons"]
+    assert selection["policy"] is None
 
 
 def test_outer_labels_cannot_choose_horizon_or_policy(monkeypatch):
@@ -223,6 +359,23 @@ def test_real_ridge_supports_both_feature_policies():
             feature_policy=policy,
         )
         assert all(np.isfinite(values).all() for values in predictions.values())
+
+
+def test_real_ridge_can_evaluate_short_horizons_when_long_folds_are_unavailable(monkeypatch):
+    monkeypatch.setattr(research, "ALPHAS", (1.0,))
+    monkeypatch.setattr(research, "NET_THRESHOLDS_PCT", (0.0,))
+
+    selection = research._select_policy(_frame(step_minutes=1))
+
+    assert selection["policy"]["horizon_minutes"] == 5
+    assert len(selection["candidates"]) == 6
+    assert selection["horizon_coverage"]["240"]["exclusion_reasons"]
+    selected = next(
+        candidate for candidate in selection["candidates"]
+        if all(candidate[key] == value for key, value in selection["policy"].items())
+    )
+    assert selected["evidence"]["nonoverlapping"]["return_lcb_pct"] > 0.0
+    assert selected["inner_selection_eligible"] is True
 
 
 def test_zero_weight_rows_do_not_affect_model_or_preprocessing():

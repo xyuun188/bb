@@ -30,7 +30,7 @@ LOCAL_ML_TRAINING_MAX_DECISION_GROUPS = min(
     LOCAL_ML_TRAINING_HARD_MAX_DECISION_GROUPS,
 )
 LOCAL_ML_TRAINING_READ_PAGE_SIZE = 500
-SHADOW_SELECTION_POLICY_VERSION = "2026-10-21.outcome-independent-shadow-selection.v1"
+SHADOW_SELECTION_POLICY_VERSION = "2026-11-05.artifact-bound-executable-shadow-view.v2"
 
 
 @dataclass(frozen=True)

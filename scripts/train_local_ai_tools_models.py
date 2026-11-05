@@ -33,6 +33,7 @@ load_runtime_env_files(project_root=ROOT)
 drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 
 from config.settings import settings  # noqa: E402
+from core.market_facts import market_fact_contract_reasons  # noqa: E402
 from core.safe_output import safe_error_text, safe_print, safe_response_error_text  # noqa: E402
 from core.training_feature_snapshot import compact_training_feature_snapshot  # noqa: E402
 from core.url_safety import normalize_http_base_url  # noqa: E402
@@ -81,6 +82,7 @@ _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
 _REMOTE_TRAINING_TRANSPORT_VERSION = LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
 _REMOTE_TRAINING_MAX_SHADOW_SAMPLES = 512
+_EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER = 8
 _REMOTE_TRAINING_MAX_TRADE_SAMPLES = 128
 _REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES = 32
 _REMOTE_TRAINING_MAX_SEQUENCE_LENGTH = 128
@@ -488,6 +490,14 @@ def _transport_sample(sample: dict[str, Any], *, kind: str) -> dict[str, Any]:
         for key in _TRAINING_SAMPLE_SCALAR_KEYS
         if key in sample
     }
+    if kind == "shadow":
+        features = _snapshot(sample.get("features"))
+        label = _snapshot(features.get("training_label_contract"))
+        label = _snapshot(label.get("labels")) or label
+        # Quality validation uses the row's scheduled time. Only the model
+        # transport replaces it with the verified result-availability clock.
+        projected["label_timestamp"] = label.get("label_timestamp")
+        projected["decision_timestamp"] = features.get("original_decision_timestamp")
     projected["features"] = _training_transport_features(sample.get("features"))
     if "profit_supervision" in sample:
         projected["profit_supervision"] = _training_transport_profit_supervision(
@@ -886,15 +896,31 @@ def _compact_training_shadow_sample(row: Mapping[str, Any]) -> dict[str, Any] | 
 async def _load_shadow_samples(
     *,
     sample_budget: int | None = None,
+    executable_only: bool = True,
 ) -> list[dict[str, Any]]:
+    """Separate executable training from explicitly requested historical research.
+
+    Bound raw identities before inspecting provenance. Historical rejection must
+    never refill a time stratum according to its realized return or label quality.
+    """
+
     before_id: int | None = None
     samples: list[dict[str, Any]] = []
     epoch_start = load_training_data_start()
 
     def append_sample(row: Mapping[str, Any]) -> None:
         sample = _compact_training_shadow_sample(row)
-        if sample is not None:
-            samples.append(sample)
+        if sample is None:
+            return
+        if executable_only:
+            features = sample["features"]
+            if features.get("historical_market_path_only") is True:
+                return
+            if market_fact_contract_reasons(
+                features.get("training_market_fact_contract")
+            ):
+                return
+        samples.append(sample)
 
     filters = (
         ShadowBacktest.status == "completed",
@@ -903,15 +929,18 @@ async def _load_shadow_samples(
         ShadowBacktest.short_return_pct.is_not(None),
     )
     requested_limit = max(int(sample_budget or 0), 2) if sample_budget is not None else 0
+    candidate_limit = requested_limit * (
+        _EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER if executable_only else 1
+    )
     if requested_limit:
         async with _training_read_session_ctx() as session:
             total_result = await session.execute(
                 select(func.count(ShadowBacktest.id)).where(*filters)
             )
             total_count = int(total_result.scalar() or 0)
-            if total_count > requested_limit:
+            if total_count > candidate_limit:
                 stride = max(
-                    math.ceil((total_count - 1) / (requested_limit - 1)),
+                    math.ceil((total_count - 1) / (candidate_limit - 1)),
                     1,
                 )
                 selected_ranks = list(range(1, total_count + 1, stride))
@@ -942,10 +971,15 @@ async def _load_shadow_samples(
                 async for row in result.mappings():
                     append_sample(_shadow_sample_from_mapping(row))
                 samples.reverse()
-                return samples
+                return _evenly_spaced_rows(samples, requested_limit)
 
+    raw_rows_read = 0
     while True:
         page_limit = _LOCAL_AI_TOOLS_SHADOW_READ_PAGE_SIZE
+        if requested_limit:
+            page_limit = min(page_limit, candidate_limit - raw_rows_read)
+            if page_limit <= 0:
+                break
         async with _training_read_session_ctx() as session:
             stmt = (
                 select(*_shadow_sample_columns())
@@ -958,13 +992,14 @@ async def _load_shadow_samples(
             rows = [_shadow_sample_from_mapping(row) for row in (await session.execute(stmt)).mappings().all()]
         if not rows:
             break
+        raw_rows_read += len(rows)
         before_id = int(rows[-1].get("id") or 0) or before_id
         for row in rows:
             append_sample(row)
         if len(rows) < page_limit:
             break
     samples.reverse()
-    return samples
+    return _evenly_spaced_rows(samples, requested_limit) if requested_limit else samples
 
 
 async def _load_trade_samples(*, compact: bool = False) -> list[dict[str, Any]]:
