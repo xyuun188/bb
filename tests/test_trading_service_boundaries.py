@@ -5101,7 +5101,7 @@ async def test_market_shortlist_uses_selected_account_instrument_availability(
             target_count: int,
             concurrency: int,
         ) -> dict[str, Any]:
-            assert target_count == 2
+            assert target_count == len(symbols)
             assert concurrency == 4
             availability = {}
             selected = []
@@ -5418,6 +5418,107 @@ async def test_market_shortlist_keeps_bounded_unverified_tail_when_verified_cand
     assert diagnostics["analysis_only_selected_count"] == 3
     assert diagnostics["analysis_only_fallback_limit"] == 8
     assert diagnostics["analysis_only_fallback_truncated_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_market_instrument_refresh_merges_candidates_while_batch_is_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._market_instrument_refresh_tasks = {}
+    service._market_instrument_refresh_queue_by_mode = {"paper": []}
+    service._market_instrument_refresh_status_by_mode = {}
+    service._verified_entry_symbols_by_mode = {"paper": set(), "live": set()}
+    service._unavailable_entry_symbols_by_mode = {"paper": {}, "live": {}}
+    service._entry_unavailable_cache_persist_enabled = False
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[list[str]] = []
+
+    class FakeExecutor:
+        async def entry_instrument_availability_shortlist(
+            self,
+            symbols: list[str],
+            *,
+            target_count: int,
+            concurrency: int,
+        ) -> dict[str, Any]:
+            assert target_count == len(symbols)
+            assert concurrency == 4
+            calls.append(list(symbols))
+            started.set()
+            await release.wait()
+            return {
+                "availability": {
+                    symbol: {"available": True, "cache_hit": False}
+                    for symbol in symbols
+                },
+                "evaluated_count": len(symbols),
+            }
+
+    monkeypatch.setattr(trading_service, "MARKET_INSTRUMENT_REFRESH_BATCH_SIZE", 2)
+    service._schedule_market_instrument_availability_refresh(
+        FakeExecutor(),
+        ["A/USDT", "B/USDT", "C/USDT"],
+        target_count=3,
+        mode="paper",
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    service._schedule_market_instrument_availability_refresh(
+        FakeExecutor(),
+        ["D/USDT"],
+        target_count=1,
+        mode="paper",
+    )
+    release.set()
+    await asyncio.wait_for(service._market_instrument_refresh_tasks["paper"], timeout=1)
+
+    assert calls == [["A/USDT", "B/USDT"], ["C/USDT", "D/USDT"]]
+    assert service._verified_entry_symbols_by_mode["paper"] == {
+        "A/USDT",
+        "B/USDT",
+        "C/USDT",
+        "D/USDT",
+    }
+    assert service._market_instrument_refresh_queue_by_mode["paper"] == []
+    assert service._market_instrument_refresh_status_by_mode["paper"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_market_instrument_refresh_requeues_timed_out_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._market_instrument_refresh_tasks = {}
+    service._market_instrument_refresh_queue_by_mode = {"paper": []}
+    service._market_instrument_refresh_status_by_mode = {}
+    service._verified_entry_symbols_by_mode = {"paper": set(), "live": set()}
+    service._unavailable_entry_symbols_by_mode = {"paper": {}, "live": {}}
+    service._entry_unavailable_cache_persist_enabled = False
+
+    class SlowExecutor:
+        async def entry_instrument_availability_shortlist(self, *_args, **_kwargs):
+            await asyncio.sleep(60)
+
+    monkeypatch.setattr(
+        trading_service,
+        "MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS",
+        0.01,
+    )
+    service._schedule_market_instrument_availability_refresh(
+        SlowExecutor(),
+        ["A/USDT", "B/USDT"],
+        target_count=2,
+        mode="paper",
+    )
+    await asyncio.wait_for(service._market_instrument_refresh_tasks["paper"], timeout=1)
+
+    status = service._market_instrument_refresh_status_by_mode["paper"]
+    assert status["status"] == "timeout"
+    assert service._market_instrument_refresh_queue_by_mode["paper"] == [
+        "A/USDT",
+        "B/USDT",
+    ]
 
 
 def test_hydration_rerank_does_not_restore_unverified_analysis_tail() -> None:

@@ -290,6 +290,7 @@ MARKET_MODEL_COMPLETION_RESERVE_SECONDS = 3.0
 MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS = 30.0
 MARKET_INSTRUMENT_SHORTLIST_WAIT_SECONDS = 8.0
 MARKET_INSTRUMENT_REFRESH_BATCH_SIZE = 24
+MARKET_INSTRUMENT_REFRESH_QUEUE_LIMIT = 96
 AUTHORITATIVE_OUTCOME_FEEDBACK_TIMEOUT_SECONDS = 120.0
 AUTHORITATIVE_OUTCOME_FEEDBACK_MAX_ATTEMPTS = 3
 AUTHORITATIVE_OUTCOME_FEEDBACK_RETRY_DELAY_SECONDS = 15.0
@@ -1128,6 +1129,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self._entry_unavailable_cache_persist_enabled = True
         self._load_unavailable_entry_symbol_cache()
         self._market_instrument_refresh_status_by_mode: dict[str, dict[str, Any]] = {}
+        self._market_instrument_refresh_tasks: dict[str, asyncio.Task] = {}
+        self._market_instrument_refresh_queue_by_mode: dict[str, list[str]] = {
+            "paper": [],
+            "live": [],
+        }
         self._active_analysis_symbols: set[str] = set()
         self._analysis_symbol_lock = asyncio.Lock()
         self._market_analysis_task: asyncio.Task | None = None
@@ -9709,12 +9715,40 @@ class TradingService(ModelTrainingCoordinatorMixin):
             tasks = {}
             self._market_instrument_refresh_tasks = tasks
         key = str(mode or "paper")
+        queues = getattr(self, "_market_instrument_refresh_queue_by_mode", None)
+        if not isinstance(queues, dict):
+            queues = {}
+            self._market_instrument_refresh_queue_by_mode = queues
+        pending = queues.get(key)
+        if not isinstance(pending, list):
+            pending = []
+            queues[key] = pending
+        pending_symbols = set(pending)
+        overflow_count = 0
+        for symbol in dict.fromkeys(str(item) for item in symbols if str(item)):
+            if symbol in pending_symbols:
+                continue
+            if len(pending) >= MARKET_INSTRUMENT_REFRESH_QUEUE_LIMIT:
+                overflow_count += 1
+                continue
+            pending.append(symbol)
+            pending_symbols.add(symbol)
         existing = tasks.get(key)
         if isinstance(existing, asyncio.Task) and not existing.done():
+            statuses = getattr(self, "_market_instrument_refresh_status_by_mode", {})
+            if isinstance(statuses, dict) and isinstance(statuses.get(key), dict):
+                statuses[key]["queued_count"] = len(pending)
+                statuses[key]["queue_overflow_count"] = int(
+                    statuses[key].get("queue_overflow_count") or 0
+                ) + overflow_count
             return
 
         async def refresh() -> None:
             started_at = datetime.now(UTC)
+            deadline = asyncio.get_running_loop().time() + max(
+                float(MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS),
+                0.05,
+            )
             status = {
                 "status": "running",
                 "started_at": started_at.isoformat(),
@@ -9723,98 +9757,129 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 "verified_count": 0,
                 "error": None,
                 "next_retry_at": None,
+                "queued_count": len(pending),
+                "queue_overflow_count": overflow_count,
             }
             statuses = getattr(self, "_market_instrument_refresh_status_by_mode", {})
             if not isinstance(statuses, dict):
                 statuses = {}
             statuses[key] = status
             self._market_instrument_refresh_status_by_mode = statuses
+            evaluated_count = 0
+            verified_count = 0
+            unavailable_changed = False
+            active_batch: list[str] = []
+
+            def requeue_active_batch() -> None:
+                if not active_batch:
+                    return
+                current_pending = queues.get(key)
+                if not isinstance(current_pending, list):
+                    current_pending = []
+                merged_pending = list(dict.fromkeys([*active_batch, *current_pending]))
+                queues[key] = merged_pending[:MARKET_INSTRUMENT_REFRESH_QUEUE_LIMIT]
+
             try:
-                async with asyncio.timeout(
-                    max(float(MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS), 0.05)
-                ):
-                    result = await executor.entry_instrument_availability_shortlist(
-                        list(dict.fromkeys(symbols))[:MARKET_INSTRUMENT_REFRESH_BATCH_SIZE],
-                        target_count=max(
-                            1,
-                            min(
-                                int(target_count or 1),
-                                len(list(dict.fromkeys(symbols))[:MARKET_INSTRUMENT_REFRESH_BATCH_SIZE]),
-                            ),
-                        ),
-                        concurrency=4,
-                    )
-                availability = result.get("availability") if isinstance(result, dict) else {}
-                verified = {
-                    str(symbol)
-                    for symbol, facts in (availability or {}).items()
-                    if isinstance(facts, dict) and facts.get("available") is True
-                }
-                verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
-                if not isinstance(verified_by_mode, dict):
-                    verified_by_mode = {}
-                merged = set(verified_by_mode.get(key, set()) or set())
-                unavailable_rows = self._entry_unavailable_cache_for_mode(key)
-                unavailable_changed = False
-                for symbol, facts in (availability or {}).items():
-                    if not isinstance(facts, dict):
-                        continue
-                    normalized_symbol = self._normalize_position_symbol(str(symbol))
-                    if facts.get("available") is True:
-                        merged.add(normalized_symbol)
-                        unavailable_changed = (
-                            unavailable_rows.pop(normalized_symbol, None) is not None
-                            or unavailable_changed
+                while pending:
+                    batch_size = max(1, int(MARKET_INSTRUMENT_REFRESH_BATCH_SIZE))
+                    active_batch = pending[:batch_size]
+                    del pending[:batch_size]
+                    remaining_seconds = deadline - asyncio.get_running_loop().time()
+                    if remaining_seconds <= 0:
+                        raise TimeoutError("market instrument refresh deadline reached")
+                    async with asyncio.timeout(remaining_seconds):
+                        result = await executor.entry_instrument_availability_shortlist(
+                            active_batch,
+                            target_count=len(active_batch),
+                            concurrency=4,
                         )
-                    else:
-                        cache_ttl = entry_instrument_unavailable_cache_ttl(facts)
-                        if cache_ttl is None:
+                    if not isinstance(result, dict):
+                        raise TypeError("market instrument refresh returned an invalid result")
+                    availability = result.get("availability")
+                    availability = availability if isinstance(availability, dict) else {}
+                    verified = {
+                        str(symbol)
+                        for symbol, facts in availability.items()
+                        if isinstance(facts, dict) and facts.get("available") is True
+                    }
+                    verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
+                    if not isinstance(verified_by_mode, dict):
+                        verified_by_mode = {}
+                    merged = set(verified_by_mode.get(key, set()) or set())
+                    unavailable_rows = self._entry_unavailable_cache_for_mode(key)
+                    batch_unavailable_changed = False
+                    for symbol, facts in availability.items():
+                        if not isinstance(facts, dict):
                             continue
-                        # A capability response revokes a previously cached
-                        # execution permission. Durable failures use the long
-                        # negative cache; price drift uses only the short
-                        # retry-cooling window.
-                        merged.discard(normalized_symbol)
-                        self._remember_unavailable_entry_symbol(
-                            key,
-                            normalized_symbol,
-                            facts,
-                            persist=False,
-                            ttl_seconds=cache_ttl,
-                        )
-                        unavailable_changed = True
-                verified_by_mode[key] = merged
-                self._verified_entry_symbols_by_mode = verified_by_mode
+                        normalized_symbol = self._normalize_position_symbol(str(symbol))
+                        if facts.get("available") is True:
+                            merged.add(normalized_symbol)
+                            batch_unavailable_changed = (
+                                unavailable_rows.pop(normalized_symbol, None) is not None
+                                or batch_unavailable_changed
+                            )
+                        else:
+                            cache_ttl = entry_instrument_unavailable_cache_ttl(facts)
+                            if cache_ttl is None:
+                                continue
+                            # A capability response revokes a previously cached
+                            # execution permission. Durable failures use the long
+                            # negative cache; price drift uses only the short
+                            # retry-cooling window.
+                            merged.discard(normalized_symbol)
+                            self._remember_unavailable_entry_symbol(
+                                key,
+                                normalized_symbol,
+                                facts,
+                                persist=False,
+                                ttl_seconds=cache_ttl,
+                            )
+                            batch_unavailable_changed = True
+                    verified_by_mode[key] = merged
+                    self._verified_entry_symbols_by_mode = verified_by_mode
+                    unavailable_changed = unavailable_changed or batch_unavailable_changed
+                    evaluated_count += int(result.get("evaluated_count") or 0)
+                    verified_count += len(verified)
+                    active_batch = []
+                    status.update(
+                        {
+                            "evaluated_count": evaluated_count,
+                            "verified_count": verified_count,
+                            "queued_count": len(pending),
+                        }
+                    )
+                unavailable_rows = self._entry_unavailable_cache_for_mode(key)
                 if unavailable_changed:
                     self._persist_unavailable_entry_symbol_cache()
                 status.update(
                     {
                         "status": "ok",
                         "finished_at": datetime.now(UTC).isoformat(),
-                        "evaluated_count": int(result.get("evaluated_count") or 0)
-                        if isinstance(result, dict)
-                        else 0,
-                        "verified_count": len(verified),
                         "known_unavailable_count": len(unavailable_rows),
+                        "queued_count": len(pending),
                     }
                 )
                 logger.info(
                     "background market instrument availability refresh completed",
                     mode=key,
-                    evaluated_count=int(result.get("evaluated_count") or 0)
-                    if isinstance(result, dict)
-                    else 0,
-                    verified_count=len(verified),
+                    evaluated_count=evaluated_count,
+                    verified_count=verified_count,
                     known_unavailable_count=len(unavailable_rows),
+                    queued_count=len(pending),
                 )
             except asyncio.CancelledError:
+                requeue_active_batch()
                 raise
             except Exception as exc:
+                requeue_active_batch()
                 error = safe_error_text(exc, limit=220)
                 status.update(
                     {
                         "status": "timeout" if isinstance(exc, TimeoutError) else "degraded",
                         "finished_at": datetime.now(UTC).isoformat(),
+                        "evaluated_count": evaluated_count,
+                        "verified_count": verified_count,
+                        "queued_count": len(pending),
                         "error": error,
                         "next_retry_at": (
                             datetime.now(UTC) + timedelta(seconds=30)
@@ -9826,6 +9891,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     mode=key,
                     error=error,
                     status=status["status"],
+                    queued_count=len(pending),
                 )
 
         task = asyncio.create_task(refresh())
