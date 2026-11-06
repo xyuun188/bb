@@ -21,6 +21,9 @@ from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 
 DEPENDENCIES = ("services/fast_exit_shadow_replay.py",)
+SCAN_BATCH_SIZE = 250
+MAX_SCAN_MULTIPLIER = 20
+MAX_SCAN_ROWS = 50_000
 
 REMOTE_SCRIPT = r"""
 import asyncio
@@ -37,6 +40,9 @@ from services.fast_exit_shadow_replay import build_fast_exit_shadow_report
 
 HOURS = __HOURS__
 LIMIT = __LIMIT__
+SCAN_BATCH_SIZE = __SCAN_BATCH_SIZE__
+MAX_SCAN_MULTIPLIER = __MAX_SCAN_MULTIPLIER__
+MAX_SCAN_ROWS = __MAX_SCAN_ROWS__
 CUTOFF = datetime.fromisoformat(__CUTOFF__.replace("Z", "+00:00")).astimezone(UTC)
 DEPENDENCIES = __DEPENDENCIES__
 NATIVE_SOURCE = "shadow_entry_result_and_okx_native_1m_path"
@@ -51,80 +57,116 @@ def dependency_hashes():
 
 async def main():
     since = CUTOFF - timedelta(hours=HOURS)
-    statement = (
-        select(
-            ShadowBacktest.id,
-            ShadowBacktest.decision_id,
-            ShadowBacktest.created_at,
-            ShadowBacktest.symbol,
-            ShadowBacktest.training_feature_snapshot,
-            ShadowBacktest.long_return_pct,
-            ShadowBacktest.short_return_pct,
-            ShadowBacktest.raw_llm_response["paper_trade_selection"]["selected"].as_boolean()
-            .label("selection_selected"),
-            ShadowBacktest.raw_llm_response["paper_trade_selection"]["selected_side"].as_string()
-            .label("selected_side"),
-        )
-        .where(
-            ShadowBacktest.execution_mode == "paper",
-            ShadowBacktest.analysis_type == "market",
-            ShadowBacktest.status == "completed",
-            ShadowBacktest.horizon_minutes == 5,
-            ShadowBacktest.updated_at >= since,
-            ShadowBacktest.updated_at < CUTOFF,
-            ShadowBacktest.training_feature_snapshot[
-                "training_market_fact_contract"
-            ]["source"].as_string()
-            == NATIVE_SOURCE,
-            ShadowBacktest.training_feature_snapshot[
-                "training_label_contract"
-            ]["fee_after_complete"].as_boolean()
-            .is_(True),
-            ShadowBacktest.training_feature_snapshot[
-                "training_label_contract"
-            ]["long_mfe_pct"].is_not(None),
-            ShadowBacktest.training_feature_snapshot[
-                "training_label_contract"
-            ]["short_mfe_pct"].is_not(None),
-        )
-        .order_by(ShadowBacktest.created_at, ShadowBacktest.id)
-        .limit(LIMIT)
-    )
     try:
         async with get_read_session_ctx(
             statement_timeout_ms=15000,
             transaction_isolation="REPEATABLE READ READ ONLY",
         ) as session:
-            result = await session.execute(statement)
-            source_rows = list(result.mappings())
-        rows = []
-        for row in source_rows:
-            if row.get("selection_selected") is not True:
-                continue
-            snapshot = row.get("training_feature_snapshot")
-            snapshot = snapshot if isinstance(snapshot, dict) else {}
-            label = snapshot.get("training_label_contract")
-            label = label if isinstance(label, dict) else {}
-            decision_id = int(row.get("decision_id") or 0) or None
-            rows.append(
-                {
-                    "id": row.get("id"),
-                    "decision_id": decision_id,
-                    "decision_at": row.get("created_at"),
-                    "symbol": row.get("symbol"),
-                    "selected_side": row.get("selected_side"),
-                    "long_mfe_pct": label.get("long_mfe_pct"),
-                    "short_mfe_pct": label.get("short_mfe_pct"),
-                    "long_gross_return_pct": label.get("long_gross_return_pct"),
-                    "short_gross_return_pct": label.get("short_gross_return_pct"),
-                    "long_net_return_pct": label.get(
-                        "long_net_return_after_all_cost_pct"
-                    ),
-                    "short_net_return_pct": label.get(
-                        "short_net_return_after_all_cost_pct"
-                    ),
-                }
-            )
+            rows = []
+            scanned = 0
+            source_row_count = 0
+            cursor_updated_at = None
+            cursor_id = None
+            scan_limit = min(max(LIMIT * MAX_SCAN_MULTIPLIER, SCAN_BATCH_SIZE), MAX_SCAN_ROWS)
+            while scanned < scan_limit and len(rows) < LIMIT:
+                filters = [
+                    ShadowBacktest.execution_mode == "paper",
+                    ShadowBacktest.analysis_type == "market",
+                    ShadowBacktest.status == "completed",
+                    ShadowBacktest.horizon_minutes == 5,
+                    ShadowBacktest.updated_at >= since,
+                    ShadowBacktest.updated_at < CUTOFF,
+                    ShadowBacktest.training_feature_snapshot[
+                        "training_market_fact_contract"
+                    ]["source"].as_string()
+                    == NATIVE_SOURCE,
+                    ShadowBacktest.training_feature_snapshot[
+                        "training_label_contract"
+                    ]["fee_after_complete"].as_boolean()
+                    .is_(True),
+                    ShadowBacktest.training_feature_snapshot[
+                        "training_label_contract"
+                    ]["long_mfe_pct"].is_not(None),
+                    ShadowBacktest.training_feature_snapshot[
+                        "training_label_contract"
+                    ]["short_mfe_pct"].is_not(None),
+                    ShadowBacktest.raw_llm_response[
+                        "paper_trade_selection"
+                    ]["selected"].as_boolean()
+                    .is_(True),
+                ]
+                if cursor_updated_at is not None and cursor_id is not None:
+                    filters.append(
+                        (ShadowBacktest.updated_at < cursor_updated_at)
+                        | (
+                            (ShadowBacktest.updated_at == cursor_updated_at)
+                            & (ShadowBacktest.id < cursor_id)
+                        )
+                    )
+                statement = (
+                    select(
+                        ShadowBacktest.id,
+                        ShadowBacktest.decision_id,
+                        ShadowBacktest.created_at,
+                        ShadowBacktest.updated_at,
+                        ShadowBacktest.symbol,
+                        ShadowBacktest.training_feature_snapshot[
+                            "training_label_contract"
+                        ]["long_mfe_pct"].label("long_mfe_pct"),
+                        ShadowBacktest.training_feature_snapshot[
+                            "training_label_contract"
+                        ]["short_mfe_pct"].label("short_mfe_pct"),
+                        ShadowBacktest.training_feature_snapshot[
+                            "training_label_contract"
+                        ]["long_gross_return_pct"].label("long_gross_return_pct"),
+                        ShadowBacktest.training_feature_snapshot[
+                            "training_label_contract"
+                        ]["short_gross_return_pct"].label("short_gross_return_pct"),
+                        ShadowBacktest.training_feature_snapshot[
+                            "training_label_contract"
+                        ]["long_net_return_after_all_cost_pct"].label("long_net_return_pct"),
+                        ShadowBacktest.training_feature_snapshot[
+                            "training_label_contract"
+                        ]["short_net_return_after_all_cost_pct"].label("short_net_return_pct"),
+                        ShadowBacktest.raw_llm_response[
+                            "paper_trade_selection"
+                        ]["selected"].as_boolean().label("selection_selected"),
+                        ShadowBacktest.raw_llm_response[
+                            "paper_trade_selection"
+                        ]["selected_side"].as_string().label("selected_side"),
+                    )
+                    .where(*filters)
+                    .order_by(ShadowBacktest.updated_at.desc(), ShadowBacktest.id.desc())
+                    .limit(min(SCAN_BATCH_SIZE, scan_limit - scanned))
+                )
+                result = await session.execute(statement)
+                batch = list(result.mappings())
+                if not batch:
+                    break
+                scanned += len(batch)
+                source_row_count += len(batch)
+                cursor_updated_at = batch[-1]["updated_at"]
+                cursor_id = batch[-1]["id"]
+                for row in batch:
+                    decision_id = int(row.get("decision_id") or 0) or None
+                    rows.append(
+                        {
+                            "id": row.get("id"),
+                            "decision_id": decision_id,
+                            "decision_at": row.get("created_at"),
+                            "symbol": row.get("symbol"),
+                            "selected_side": row.get("selected_side"),
+                            "long_mfe_pct": row.get("long_mfe_pct"),
+                            "short_mfe_pct": row.get("short_mfe_pct"),
+                            "long_gross_return_pct": row.get("long_gross_return_pct"),
+                            "short_gross_return_pct": row.get("short_gross_return_pct"),
+                            "long_net_return_pct": row.get("long_net_return_pct"),
+                            "short_net_return_pct": row.get("short_net_return_pct"),
+                        }
+                    )
+                    if len(rows) >= LIMIT:
+                        break
+            rows.reverse()
         report = build_fast_exit_shadow_report(
             rows,
             window={
@@ -134,9 +176,12 @@ async def main():
                 "source": NATIVE_SOURCE,
                 "horizon_minutes": 5,
                 "decision_group_limit": LIMIT,
+                "time_basis": (
+                    "outcome_updated_at within [since, cutoff); updated_at is pagination key"
+                ),
                 "filter": (
-                    "completed paper rows, native 1m path provenance, complete "
-                    "fee-after labels, and selected paper training side"
+                    "completed paper rows updated within the window, native 1m path provenance, complete "
+                    "fee-after labels, and selected paper training side; all filters are applied in SQL"
                 ),
                 "independent_exam": False,
             },
@@ -144,9 +189,15 @@ async def main():
         report["checked_at"] = datetime.now(UTC).isoformat()
         report["input"].update(
             {
-                "source_row_count": len(source_rows),
+                "source_row_count": source_row_count,
                 "selected_candidate_row_count": len(rows),
                 "dependency_sha256": dependency_hashes(),
+                "query_rows_scanned": scanned,
+                "query_scan_limit": scan_limit,
+                "query_scan_limit_reached": scanned >= scan_limit and len(rows) < LIMIT,
+                "query_strategy": (
+                    "updated_at_index_keyset_pages_with_sql_contract_filters"
+                ),
             }
         )
         print(json.dumps(report, ensure_ascii=False, allow_nan=False, default=str))
@@ -162,6 +213,9 @@ def _render_remote_script(*, hours: int, limit: int, cutoff: datetime) -> str:
     return (
         REMOTE_SCRIPT.replace("__HOURS__", str(hours))
         .replace("__LIMIT__", str(limit))
+        .replace("__SCAN_BATCH_SIZE__", str(SCAN_BATCH_SIZE))
+        .replace("__MAX_SCAN_MULTIPLIER__", str(MAX_SCAN_MULTIPLIER))
+        .replace("__MAX_SCAN_ROWS__", str(MAX_SCAN_ROWS))
         .replace("__CUTOFF__", repr(cutoff.isoformat().replace("+00:00", "Z")))
         .replace("__DEPENDENCIES__", repr(DEPENDENCIES))
     )

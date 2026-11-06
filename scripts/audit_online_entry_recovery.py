@@ -35,6 +35,7 @@ from services.shadow_training_quarantine import (
 
 LIMIT = __LIMIT__
 SINCE_MINUTES = __SINCE_MINUTES__
+INCLUDE_HISTORICAL_REQUALIFICATION = __INCLUDE_HISTORICAL_REQUALIFICATION__
 
 
 def _dict(value):
@@ -261,13 +262,19 @@ async def main():
         "schedulers": state.get("schedulers"),
         "models": models,
     }
-    report["historical_requalification_dry_run"] = (
-        await requalify_verified_historical_shadow_samples(
-            batch_size=1000,
-            max_batches=300,
-            dry_run=True,
+    if INCLUDE_HISTORICAL_REQUALIFICATION:
+        report["historical_requalification_dry_run"] = (
+            await requalify_verified_historical_shadow_samples(
+                batch_size=1000,
+                max_batches=300,
+                dry_run=True,
+            )
         )
-    )
+    else:
+        report["historical_requalification_dry_run"] = {
+            "skipped": True,
+            "reason": "enable with --include-historical-requalification",
+        }
     metadata = MLSignalService().status_metadata()
     report["model"] = {key: metadata.get(key) for key in (
         "version", "artifact_version", "trained_at", "latest_training",
@@ -280,12 +287,26 @@ asyncio.run(main())
 '''
 
 
+def _render_remote_script(*, include_historical_requalification: bool) -> str:
+    return REMOTE_SCRIPT.replace(
+        "__INCLUDE_HISTORICAL_REQUALIFICATION__",
+        "True" if include_historical_requalification else "False",
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=80)
     parser.add_argument("--minutes", type=int, default=840)
+    parser.add_argument(
+        "--include-historical-requalification",
+        action="store_true",
+        help="Run the expensive, bounded historical shadow requalification dry-run.",
+    )
     args = parser.parse_args()
-    transport.REMOTE_SCRIPT = REMOTE_SCRIPT
+    transport.REMOTE_SCRIPT = _render_remote_script(
+        include_historical_requalification=args.include_historical_requalification,
+    )
     ssh = connect_remote_ssh(ROOT, timeout=25)
     try:
         report = transport._read_remote_report(
