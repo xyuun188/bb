@@ -192,10 +192,10 @@ def test_active_pipeline_with_risk_adjusted_return_gate_is_observing() -> None:
     ]
     for row in rows:
         for support in row.raw_llm_response["paper_trade_selection"]["by_side"].values():
-            support["blocking_reasons"] = [
-                gate_reason,
-                "direction_support_quant_evidence_missing",
-            ]
+            support["eligible"] = True
+            support["reason"] = "independent_positive_direction_support_ready"
+            support["expected_net_return_pct"] = 0.2
+            support["objective_net_return_pct"] = -0.01
 
     report = summarize_production_source_health(rows, now=now)
 
@@ -203,7 +203,6 @@ def test_active_pipeline_with_risk_adjusted_return_gate_is_observing() -> None:
     assert report["quality_gated_decision_count"] == 1
     assert report["quality_gate_reason_counts"] == {
         gate_reason: 1,
-        "direction_support_quant_evidence_missing": 1,
     }
     assert report["observing"] is True
     assert report["hard_failure"] is False

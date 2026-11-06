@@ -86,6 +86,13 @@ def _paper_trade_gate_reasons(raw: dict[str, Any]) -> list[str]:
         blockers = support.get("blocking_reasons")
         if isinstance(blockers, list):
             reasons.extend(str(reason) for reason in blockers if str(reason).strip())
+        try:
+            expected_net = float(support.get("expected_net_return_pct"))
+            objective_net = float(support.get("objective_net_return_pct"))
+        except (TypeError, ValueError):
+            expected_net = objective_net = 0.0
+        if expected_net > 0.0 and objective_net <= 0.0:
+            reasons.append("direction_support_risk_adjusted_return_not_positive")
         reason = str(support.get("reason") or "").strip()
         if reason and reason != "independent_positive_direction_support_ready":
             reasons.append(reason)
