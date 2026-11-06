@@ -898,11 +898,16 @@ def test_positive_expected_net_with_non_positive_objective_stays_shadow_only() -
         expected_net=0.2,
         objective_net=-0.01,
     )
+    support["current_edge_validated"] = True
     selection = select_normal_paper_trade_side({"long": support})
 
     assert selection["selected"] is False
     assert selection["selected_side"] == "neutral"
     assert selection["selection_reason"] == "no_direction"
+    assert (
+        "direction_support_risk_adjusted_return_not_positive"
+        in selection["blocking_reasons"]
+    )
 
 
 def test_existing_signed_contract_can_be_attached_to_paper_decision() -> None:

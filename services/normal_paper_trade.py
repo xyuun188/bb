@@ -496,6 +496,16 @@ def select_normal_paper_trade_side(
             support.get("current_edge_validated") is True
             and normal_paper_entry_return_ready(expected_net, objective_net)
         )
+        if (
+            support.get("current_edge_validated") is True
+            and expected_net is not None
+            and expected_net > 0.0
+            and objective_net is not None
+            and objective_net <= 0.0
+        ):
+            support["blocking_reasons"].append(
+                "direction_support_risk_adjusted_return_not_positive"
+            )
         families = sorted(
             {
                 str(item).strip()
@@ -608,6 +618,7 @@ def select_normal_paper_trade_side(
     )
     quality_gate_reasons = {
         "direction_support_expected_net_not_positive",
+        "direction_support_risk_adjusted_return_not_positive",
         "direction_support_objective_net_not_positive",
         "direction_support_objective_net_missing",
         "direction_support_quality_observation_loss_probability_too_high",
