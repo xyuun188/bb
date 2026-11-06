@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from core.symbols import normalize_trading_symbol
 from services.ml_development_baselines import (
     _baseline_model,
     _development_input_sha256,
@@ -21,7 +22,7 @@ from services.ml_signal_service import (
     _decision_group_availability,
 )
 
-HORIZON_POLICY_VERSION = "2026-11-05.frozen-nested-horizons.v2"
+HORIZON_POLICY_VERSION = "2026-11-06.capacity-aware-symbol-horizons.v3"
 HORIZONS = (5, 15, 60, 240)
 _NON_MARKET_KEYS = {
     "decision_confidence", "sentiment_data_available",
@@ -126,10 +127,41 @@ def _serial_sides(frame: pd.DataFrame, sides: np.ndarray) -> np.ndarray:
     return result
 
 
+def _symbol_serial_sides(frame: pd.DataFrame, sides: np.ndarray) -> np.ndarray:
+    """Keep one position per symbol while allowing different symbols in parallel.
+
+    The executor rejects duplicate exposure for the same symbol, but it can
+    hold independent symbols concurrently. A global serial position therefore
+    understates the executable opportunity set for multi-symbol research,
+    especially at longer horizons. Rows without a usable symbol retain the
+    conservative global fallback.
+    """
+
+    if "symbol" not in frame.columns:
+        return _serial_sides(frame, sides)
+
+    symbols = frame["symbol"].map(
+        lambda value: normalize_trading_symbol("" if pd.isna(value) else value)
+    )
+    if not symbols.astype(bool).all():
+        return _serial_sides(frame, sides)
+
+    result = np.full(len(frame), "hold", dtype=object)
+    known_positions: dict[str, list[int]] = {}
+    for position, symbol in enumerate(symbols):
+        known_positions.setdefault(symbol, []).append(position)
+
+    for positions in known_positions.values():
+        subset = frame.iloc[positions]
+        subset_sides = np.asarray(sides)[positions]
+        result[positions] = _serial_sides(subset, subset_sides)
+    return result
+
+
 def _views(frame: pd.DataFrame, sides: np.ndarray) -> dict[str, Any]:
     return {
         "all_opportunities": _evidence(frame, sides),
-        "nonoverlapping": _evidence(frame, _serial_sides(frame, sides)),
+        "nonoverlapping": _evidence(frame, _symbol_serial_sides(frame, sides)),
     }
 
 
@@ -283,7 +315,11 @@ def build_horizon_development_report(
             "outer_training_labels_strictly_before_validation_start;"
             "inner_folds_built_separately_for_each_target_horizon"
         ),
-        "nonoverlap_policy": "one_global_position_ordered_by_decision_time_and_group",
+        "nonoverlap_policy": (
+            "one_position_per_symbol_ordered_by_decision_time_and_group; "
+            "different symbols may be held in parallel; rows without a symbol "
+            "use the global conservative fallback"
+        ),
         "metric_limitations": (
             "development counterfactuals, not settled portfolio PnL; "
             "nonoverlapping windows can still be serially correlated; "

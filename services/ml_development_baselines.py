@@ -165,6 +165,8 @@ def _development_input_sha256(development: pd.DataFrame) -> str:
         "horizon_minutes", *FEATURE_KEYS, "long_return_pct", "short_return_pct",
         "long_execution_cost_pct", "short_execution_cost_pct",
     ]
+    if "symbol" in development:
+        identity_columns.append("symbol")
     if "sample_weight" in development:
         identity_columns.append("sample_weight")
     return hashlib.sha256(

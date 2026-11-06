@@ -103,6 +103,31 @@ def test_snapshot_preserves_signed_funding_costs_and_zero_weights():
         _snapshot(frame)
 
 
+def test_snapshot_preserves_canonical_symbols_and_uses_them_for_parallel_capacity():
+    frame = _frame().query("horizon_minutes == 240").iloc[[0, 1, 8, 9]].copy()
+    frame["symbol"] = [
+        "BTC-USDT-SWAP", "ETH/USDT:USDT", "BTC/USDT", "ETH-USDT-SWAP"
+    ]
+
+    development, snapshot = _snapshot(frame)
+    assert development["symbol"].tolist() == [
+        "BTC/USDT", "ETH/USDT", "BTC/USDT", "ETH/USDT"
+    ]
+    assert snapshot["version"] == "2026-11-06.symbol-bound-frozen-development.v2"
+    views = research._views(development, np.array(["long", "short", "long", "short"]))
+    assert views["nonoverlapping"]["selected_count"] == 4
+
+
+def test_missing_symbol_forces_conservative_global_nonoverlap_fallback():
+    frame = _frame().query("horizon_minutes == 240").iloc[[0, 1, 8, 9]].copy()
+    frame["symbol"] = ["BTC-USDT-SWAP", None, "ETH/USDT", "ETH-USDT-SWAP"]
+    sides = np.array(["long", "short", "long", "short"])
+
+    assert research._symbol_serial_sides(frame, sides).tolist() == (
+        research._serial_sides(frame, sides).tolist()
+    )
+
+
 def test_snapshot_accepts_mixed_iso_timestamp_precision(tmp_path: Path):
     frame = _frame()
     frame.loc[frame.index[::2], "decision_timestamp"] = frame.loc[
@@ -329,6 +354,16 @@ def test_nonoverlap_carries_position_across_fold_boundary():
     frame = _frame().query("horizon_minutes == 240").iloc[[0, 1, 9]]
     sides = np.array(["long", "short", "long"])
     assert research._serial_sides(frame, sides).tolist() == ["long", "hold", "long"]
+
+
+def test_symbol_nonoverlap_allows_independent_symbols_in_parallel():
+    frame = _frame().query("horizon_minutes == 240").iloc[[0, 1, 8, 9]].copy()
+    frame["symbol"] = ["BTC/USDT", "ETH/USDT", "BTC/USDT", "ETH/USDT"]
+    sides = np.array(["long", "short", "long", "short"])
+
+    assert research._symbol_serial_sides(frame, sides).tolist() == [
+        "long", "short", "long", "short"
+    ]
 
 
 def test_unqualified_signals_still_choose_no_trade(monkeypatch):

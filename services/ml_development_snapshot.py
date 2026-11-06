@@ -13,12 +13,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from core.symbols import normalize_trading_symbol
 from services.ml_development_baselines import _development_input_sha256
 from services.ml_signal_service import FEATURE_KEYS, _decision_group_availability
 
-SNAPSHOT_VERSION = "2026-10-21.frozen-development.v1"
+SNAPSHOT_VERSION = "2026-11-06.symbol-bound-frozen-development.v2"
 SNAPSHOT_COLUMNS = list(dict.fromkeys([
-    "id", "decision_group", "decision_timestamp", "label_timestamp",
+    "id", "decision_group", "symbol", "decision_timestamp", "label_timestamp",
     "horizon_minutes", *FEATURE_KEYS,
     "long_return_pct", "short_return_pct",
     "long_execution_cost_pct", "short_execution_cost_pct", "sample_weight",
@@ -32,7 +33,10 @@ def _digest(payload: dict[str, Any]) -> str:
 
 
 def _normalize(frame: pd.DataFrame) -> pd.DataFrame:
-    result = frame[SNAPSHOT_COLUMNS].copy()
+    source = frame.copy()
+    if "symbol" not in source:
+        source["symbol"] = ""
+    result = source[SNAPSHOT_COLUMNS].copy()
     for column in ("decision_timestamp", "label_timestamp"):
         result[column] = pd.to_datetime(
             result[column].map(pd.Timestamp), utc=True, errors="raise"
@@ -44,8 +48,13 @@ def _normalize(frame: pd.DataFrame) -> pd.DataFrame:
     result["decision_group"] = result["decision_group"].astype(str)
     if result["decision_group"].isin(("", "None", "nan")).any():
         raise ValueError("snapshot decision group must be present")
+    result["symbol"] = result["symbol"].map(
+        lambda value: normalize_trading_symbol("" if pd.isna(value) else value)
+    )
     for column in SNAPSHOT_COLUMNS:
-        if column in ("decision_group", "decision_timestamp", "label_timestamp"):
+        if column in (
+            "decision_group", "symbol", "decision_timestamp", "label_timestamp"
+        ):
             continue
         result[column] = pd.to_numeric(result[column], errors="raise").astype(float)
         if not np.isfinite(result[column]).all():

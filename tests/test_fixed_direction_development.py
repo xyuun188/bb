@@ -20,6 +20,7 @@ def _frame(*, positive: bool = True) -> pd.DataFrame:
             {
                 "id": index + 1,
                 "decision_group": f"g-{index + 1}",
+                "symbol": f"ASSET-{index % 2}/USDT",
                 "decision_timestamp": decision,
                 "label_timestamp": label,
                 "horizon_minutes": 60,
@@ -46,6 +47,10 @@ def test_fixed_direction_report_passes_only_when_all_purged_folds_are_positive()
 
     assert report["status"] == "development_candidate_qualified"
     assert report["policy"]["selection_or_tuning"] is False
+    assert report["policy"]["position_policy"] == (
+        "one_position_per_symbol_for_nonoverlapping_view;"
+        "different_symbols_may_be_held_in_parallel"
+    )
     assert report["exam_labels_evaluated"] is False
     assert len(report["folds"]) == 3
     assert all(fold["chronological_label_disjoint"] for fold in report["folds"])

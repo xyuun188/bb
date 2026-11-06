@@ -11,7 +11,7 @@ from services.ml_development_baselines import (
     _development_input_sha256,
     _evidence,
 )
-from services.ml_horizon_development import _serial_sides
+from services.ml_horizon_development import _symbol_serial_sides
 from services.ml_signal_service import _decision_group_availability
 
 MIN_FOLD_SAMPLE_COUNT = 16
@@ -83,7 +83,9 @@ def build_fixed_direction_development_report(
 
         sides = np.full(len(validation), direction, dtype=object)
         all_opportunities = _evidence(validation, sides)
-        nonoverlapping = _evidence(validation, _serial_sides(validation, sides))
+        nonoverlapping = _evidence(
+            validation, _symbol_serial_sides(validation, sides)
+        )
         validation_frames.append(validation)
         validation_sides.append(sides)
         folds.append(
@@ -108,7 +110,7 @@ def build_fixed_direction_development_report(
         "all_opportunities": _evidence(aggregate_validation, aggregate_sides),
         "nonoverlapping": _evidence(
             aggregate_validation,
-            _serial_sides(aggregate_validation, aggregate_sides),
+            _symbol_serial_sides(aggregate_validation, aggregate_sides),
         ),
     }
     required_views = ("all_opportunities", "nonoverlapping")
@@ -150,7 +152,10 @@ def build_fixed_direction_development_report(
             "horizon_minutes": horizon,
             "selection_or_tuning": False,
             "entry_costs": "recorded_native_fee_after_complete_labels",
-            "position_policy": "one_global_position_for_nonoverlapping_view",
+            "position_policy": (
+                "one_position_per_symbol_for_nonoverlapping_view;"
+                "different_symbols_may_be_held_in_parallel"
+            ),
         },
         "row_count": len(selected),
         "decision_group_count": len(groups),
