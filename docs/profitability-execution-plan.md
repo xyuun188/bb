@@ -7775,3 +7775,40 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   this is an evidence-quality block, not permission to force a trade. The
   paper, Dashboard, and model-tunnel services remain active, with no restart
   performed by this audit.
+
+### Fast-Exit Audit Repair And Fresh Entry State (2026-11-06)
+
+- Repaired the bounded fast-exit development audit after its first rerun
+  reached the 5,000-row scan cap while searching by decision creation time.
+  The audit now applies the outcome-update window and native-path,
+  fee-after-label, MFE, and selected-paper filters in SQL, then paginates by
+  `updated_at,id`. The report exposes scanned-row and cap status so a capped
+  sample cannot be mistaken for a complete zero-candidate result.
+- The fresh six-hour report at
+  `data/profitability_remediation/online-fast-exit-development-20261106T115030Z.json`
+  found zero rows matching the complete selected-paper research contract and
+  did not hit its scan cap. Therefore it neither identifies nor validates a
+  fast-exit policy; its counterfactual remains research-only and is not an
+  independent promotion exam.
+- A fresh online entry-recovery read at `2026-11-06T11:51:04Z` found `1,523`
+  market analyses in six hours, all completed as unexecuted `HOLD`. The latest
+  80 rows had complete sealed feature availability (`80/80`) and were all
+  `no_candidate`; representative blockers were
+  `direction_support_expected_net_not_positive` and
+  `direction_support_quant_evidence_missing`. The execution funnel did not
+  show order rejection as the cause.
+- The same report showed fresh training scheduler heartbeats and no training
+  errors. Local ML remained learning-only; its available authoritative
+  evidence had mean return `0.00277`, lower bound `-0.001927`, and profit
+  factor `1.236987`, so its positive-lower-bound permission remained false.
+  Recent short point estimates can be positive while their lower bounds are
+  materially negative. Keep the current positive-LCB new-entry contract and
+  do not force orders or weaken it to create training samples.
+- The audit scripts were synced without changing runtime trading policy;
+  source integrity, runtime imports, model tunnels, OKX connectivity, and
+  Dashboard health passed. Commit `ae0209ec` was pushed to `origin/main`.
+- Closure status: the audit completeness defect is fixed and verified.
+  No fast-exit candidate, model profitability, independent profitability
+  exam, or live readiness was established. The remaining profitability
+  blocker requires fresh, valid, mature fee-after evidence and the existing
+  governed promotion flow; elapsed waiting alone does not clear it.
