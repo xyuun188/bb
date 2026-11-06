@@ -14,6 +14,7 @@ from services.normal_paper_trade import normal_paper_entry_contract_reasons
 
 _NORMAL_PAPER_PRIMARY_QUALITY_GATE_REASONS = {
     "direction_support_expected_net_not_positive",
+    "direction_support_risk_adjusted_return_not_positive",
     "direction_support_objective_net_not_positive",
     "direction_support_quality_observation_loss_probability_too_high",
     "direction_support_quant_family_conflict",

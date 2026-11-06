@@ -177,6 +177,38 @@ def test_active_pipeline_with_positive_return_gate_rejections_is_observing() -> 
     assert report["recovery_state"] == "normal_paper_quality_gate_waiting"
 
 
+def test_active_pipeline_with_risk_adjusted_return_gate_is_observing() -> None:
+    now = datetime(2026, 7, 17, 12, tzinfo=UTC)
+    gate_reason = "direction_support_risk_adjusted_return_not_positive"
+    rows = [
+        _decision(
+            now - timedelta(minutes=2),
+            quality_gate_reason=gate_reason,
+        ),
+        _decision(
+            now - timedelta(hours=2),
+            quality_gate_reason=gate_reason,
+        ),
+    ]
+    for row in rows:
+        for support in row.raw_llm_response["paper_trade_selection"]["by_side"].values():
+            support["blocking_reasons"] = [
+                gate_reason,
+                "direction_support_quant_evidence_missing",
+            ]
+
+    report = summarize_production_source_health(rows, now=now)
+
+    assert report["reason"] == "normal_paper_quality_gate_waiting"
+    assert report["quality_gated_decision_count"] == 1
+    assert report["quality_gate_reason_counts"] == {
+        gate_reason: 1,
+        "direction_support_quant_evidence_missing": 1,
+    }
+    assert report["observing"] is True
+    assert report["hard_failure"] is False
+
+
 def test_missing_quant_evidence_alone_is_not_a_quality_gate_observation() -> None:
     now = datetime(2026, 7, 17, 12, tzinfo=UTC)
     rows = [
