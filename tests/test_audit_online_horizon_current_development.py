@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import ast
+import json
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
+import pandas as pd
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.dialects import postgresql
 
@@ -175,3 +180,67 @@ def test_time_coverage_sampling_preserves_old_groups_and_all_horizons() -> None:
         rejected = list(connection.execute(statement).mappings())
         assert {row["decision_id"] for row in rejected} == {1, 2, 3}
     engine.dispose()
+
+
+def test_liquidity_regime_remote_payload_selects_fixed_family():
+    rendered = audit._render_remote_script(
+        limit=2500, hours=672,
+        cutoff=datetime(2026, 11, 7, 15, 30, tzinfo=UTC),
+        revision="v3", family="liquidity_regime",
+    )
+    assert "FAMILY = 'liquidity_regime'" in rendered
+    assert "build_liquidity_regime_development_report" in rendered
+    assert "services/liquidity_regime_development.py" in audit.DEPENDENCIES
+    compile(rendered, "<liquidity-regime-audit>", "exec")
+
+
+def test_registration_is_immutable_and_preserves_original_timestamp(tmp_path):
+    path = tmp_path / "protocol.json"
+    registration = {"cutoff": "2026-11-07T15:30:00Z", "candidate_count": 8}
+    sealed = audit._register_protocol(path, registration)
+    assert sealed["registered_at"]
+    original = path.read_bytes()
+    assert audit._register_protocol(path, registration) == sealed
+    with pytest.raises(ValueError, match="protocol cannot change"):
+        audit._register_protocol(path, {**registration, "candidate_count": 9})
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("family", ("ridge", "liquidity_regime"))
+def test_remote_empty_source_is_reported_without_evaluation(monkeypatch, capsys, family):
+    from db import session as db_session
+    from services import liquidity_regime_development, ml_horizon_development, ml_signal_service
+
+    async def execute(_statement):
+        return SimpleNamespace(mappings=lambda: [])
+
+    @asynccontextmanager
+    async def read_session(**_kwargs):
+        yield SimpleNamespace(execute=execute)
+
+    async def close():
+        pass
+
+    def forbidden_research(*_args, **_kwargs):
+        raise AssertionError("empty development must not be evaluated")
+
+    monkeypatch.setattr(db_session, "get_read_session_ctx", read_session)
+    monkeypatch.setattr(db_session, "close_db", close)
+    monkeypatch.setattr(ml_signal_service, "build_training_frame", lambda _rows: pd.DataFrame())
+    monkeypatch.setattr(
+        liquidity_regime_development, "build_liquidity_regime_development_report", forbidden_research,
+    )
+    monkeypatch.setattr(
+        ml_horizon_development, "build_horizon_development_report", forbidden_research,
+    )
+    rendered = audit._render_remote_script(
+        limit=2500, hours=672,
+        cutoff=datetime(2026, 11, 7, 15, 30, tzinfo=UTC),
+        revision="v3", family=family,
+    )
+    exec(rendered, {})  # noqa: S102 - Run the actual bounded remote payload.
+    report = json.loads(capsys.readouterr().out)
+    assert report["research"]["status"] == "insufficient_development_data"
+    assert report["input"]["source_row_count"] == 0
+    assert report["input"]["decision_time_start"] is None
+    assert report["safety"]["orders_submitted"] is False

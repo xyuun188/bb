@@ -29,6 +29,7 @@ DEPENDENCIES = (
     "services/ml_development_baselines.py",
     "services/ml_development_snapshot.py",
     "services/ml_horizon_development.py",
+    "services/liquidity_regime_development.py",
     "services/ml_nested_development.py",
     "services/ml_signal_service.py",
     "services/ml_training_contract.py",
@@ -136,6 +137,8 @@ from db.session import close_db, get_read_session_ctx
 from scripts.audit_online_horizon_current_development import _build_development_statement
 from services.ml_development_snapshot import make_development_snapshot, snapshot_frame
 from services.ml_horizon_development import build_horizon_development_report
+from services.liquidity_regime_development import build_liquidity_regime_development_report
+from services.ml_development_snapshot import InsufficientDevelopmentDataError
 from services.ml_signal_service import build_training_frame
 from services.ml_training_dataset import (
     shadow_training_row_from_mapping,
@@ -145,6 +148,7 @@ GROUP_LIMIT = __GROUP_LIMIT__
 HOURS = __HOURS__
 CUTOFF = datetime.fromisoformat(__CUTOFF__.replace("Z", "+00:00")).astimezone(UTC)
 REVISION = __REVISION__
+FAMILY = __FAMILY__
 NATIVE_SOURCE = "shadow_entry_result_and_okx_native_1m_path"
 DEPENDENCIES = __DEPENDENCIES__
 
@@ -245,15 +249,23 @@ async def main():
                 for row in result.mappings()
             ]
         frame = build_training_frame(rows)
-        snapshot = make_development_snapshot(
-            frame,
-            cutoff=CUTOFF.isoformat(),
-        )
-        development = snapshot_frame(snapshot, cutoff=CUTOFF.isoformat())
-        research = build_horizon_development_report(
-            development,
-            snapshot=snapshot,
-        )
+        try:
+            snapshot = make_development_snapshot(frame, cutoff=CUTOFF.isoformat())
+        except InsufficientDevelopmentDataError as exc:
+            snapshot = {}
+            development = frame.iloc[0:0]
+            research = {
+                "status": "insufficient_development_data",
+                "reason": str(exc),
+                "folds": [],
+            }
+        else:
+            development = snapshot_frame(snapshot, cutoff=CUTOFF.isoformat())
+            builder = (
+                build_liquidity_regime_development_report
+                if FAMILY == "liquidity_regime" else build_horizon_development_report
+            )
+            research = builder(development, snapshot=snapshot)
         horizon_counts = Counter(
             str(int(value))
             for value in development["horizon_minutes"].tolist()
@@ -262,7 +274,10 @@ async def main():
             int(research.get("common_horizon_decision_group_count") or 0)
         )
         report = {
-            "experiment": "bounded-native-fee-after-horizon-current-development",
+            "experiment": (
+                "bounded-native-fee-after-horizon-current-development" if FAMILY == "ridge"
+                else "bounded-native-fee-after-liquidity-regime-current-development"
+            ),
             "protocol_revision": REVISION,
             "generated_at": datetime.now(UTC).isoformat(),
             "window": {
@@ -286,24 +301,29 @@ async def main():
                 ) if not development.empty else 0,
                 "common_horizon_group_count": complete_group_count,
                 "horizon_row_counts": dict(sorted(horizon_counts.items())),
-                "decision_time_start": development["decision_timestamp"].min().isoformat(),
-                "decision_time_end": development["decision_timestamp"].max().isoformat(),
+                "decision_time_start": (
+                    development["decision_timestamp"].min().isoformat() if len(development) else None
+                ),
+                "decision_time_end": (
+                    development["decision_timestamp"].max().isoformat() if len(development) else None
+                ),
                 "decision_time_span_hours": (
                     development["decision_timestamp"].max()
                     - development["decision_timestamp"].min()
-                ).total_seconds() / 3600.0,
+                ).total_seconds() / 3600.0 if len(development) else 0,
                 "decision_group_counts_by_day": {
                     str(day): int(count)
                     for day, count in development.assign(
                         day=development["decision_timestamp"].dt.strftime("%Y-%m-%d")
                     ).groupby("day")["decision_group"].nunique().items()
-                },
-                "development_input_sha256": snapshot["development_input_sha256"],
-                "snapshot_sha256": snapshot["snapshot_sha256"],
+                } if len(development) else {},
+                "development_input_sha256": snapshot.get("development_input_sha256"),
+                "snapshot_sha256": snapshot.get("snapshot_sha256"),
                 "dependency_sha256": _dependency_hashes(),
             },
-            "research": {
+            "research": research if FAMILY == "liquidity_regime" else {
                 "status": research.get("status"),
+                "reason": research.get("reason"),
                 "version": research.get("version"),
                 "search_space": research.get("search_space"),
                 "selection_policy": research.get("selection_policy"),
@@ -357,6 +377,7 @@ def _render_remote_script(
     hours: int,
     cutoff: datetime,
     revision: str,
+    family: str = "ridge",
 ) -> str:
     return (
         REMOTE_SCRIPT.replace("__GROUP_LIMIT__", str(limit))
@@ -367,6 +388,7 @@ def _render_remote_script(
         )
         .replace("__CUTOFF__", repr(cutoff.isoformat().replace("+00:00", "Z")))
         .replace("__REVISION__", repr(revision))
+        .replace("__FAMILY__", repr(family))
         .replace("__DEPENDENCIES__", repr(DEPENDENCIES))
     )
 
@@ -378,12 +400,14 @@ def _build_remote_command(
     cutoff: datetime,
     unit: str,
     revision: str,
+    family: str = "ridge",
 ) -> str:
     remote_script = _render_remote_script(
         limit=limit,
         hours=hours,
         cutoff=cutoff,
         revision=revision,
+        family=family,
     )
     encoded = base64.b64encode(remote_script.encode("utf-8")).decode("ascii")
     runner = f"import base64;exec(base64.b64decode({encoded!r}))"
@@ -442,6 +466,21 @@ def _parse_cutoff(value: str | None) -> datetime:
     return cutoff.astimezone(UTC)
 
 
+def _register_protocol(path: Path, registration: dict[str, object]) -> dict[str, object]:
+    """Seal the complete hypothesis before opening a source-data connection."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if {key: value for key, value in existing.items() if key != "registered_at"} != registration:
+            raise ValueError("registered development protocol cannot change")
+        return existing
+    sealed = {**registration, "registered_at": datetime.now(UTC).isoformat()}
+    with path.open("x", encoding="utf-8") as handle:
+        json.dump(sealed, handle, ensure_ascii=False, indent=2, allow_nan=False)
+    return sealed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=1000)
@@ -449,24 +488,40 @@ def main() -> None:
     parser.add_argument("--cutoff")
     parser.add_argument("--revision", choices=("v1", "v2", "v3"), default="v3")
     parser.add_argument("--expected-input-sha256")
+    parser.add_argument("--family", choices=("ridge", "liquidity_regime"), default="ridge")
     args = parser.parse_args()
     limit = max(1, min(int(args.limit), 2500))
     max_hours = 672 if args.revision == "v3" else 168
     default_hours = 672 if args.revision == "v3" else 24
     hours = max(1, min(int(args.hours or default_hours), max_hours))
     cutoff = _parse_cutoff(args.cutoff)
-    unit = f"bb-horizon-dev-{args.revision}-{cutoff.strftime('%Y%m%dT%H%M%SZ')}"
+    if args.family == "liquidity_regime" and (not args.cutoff or args.revision != "v3"):
+        raise ValueError("liquidity_regime requires explicit --cutoff and time-stratified v3 sampling")
+    name = "horizon" if args.family == "ridge" else "liquidity-regime"
+    unit = f"bb-{name}-dev-{args.revision}-{cutoff.strftime('%Y%m%dT%H%M%SZ')}"
     result_path = (
         ROOT
         / "data"
         / "profitability_remediation"
-        / f"online-horizon-development-{args.revision}-"
+        / f"online-{name}-development-{args.revision}-"
         f"{cutoff.strftime('%Y%m%dT%H%M%SZ')}.json"
     )
     if result_path.exists():
         raise FileExistsError(f"refusing to overwrite existing report: {result_path}")
 
     expected_hashes = _local_dependency_hashes()
+    registration = None
+    if args.family == "liquidity_regime":
+        from services.liquidity_regime_development import protocol
+
+        registration = {
+            "protocol": protocol(), "cutoff_exclusive": cutoff.isoformat(),
+            "hours": hours, "decision_group_limit": limit, "sampling_revision": args.revision,
+            "dependency_sha256": expected_hashes,
+        }
+        registration_path = result_path.with_suffix(".protocol.json")
+        registration = _register_protocol(registration_path, registration)
+        safe_print(f"registered_protocol={registration_path}")
     ssh = connect_remote_ssh(ROOT, timeout=25)
     sftp = ssh.open_sftp()
     remote_result = (
@@ -500,7 +555,7 @@ def main() -> None:
         command = (
             "set -e\numask 077\n"
             "install -d -m 0700 /data/bb/app/tmp/codex-horizon-development\n"
-            f"{_build_remote_command(limit=limit, hours=hours, cutoff=cutoff, unit=unit, revision=args.revision)} "
+            f"{_build_remote_command(limit=limit, hours=hours, cutoff=cutoff, unit=unit, revision=args.revision, family=args.family)} "
             f"> {shlex.quote(remote_result)}"
         )
         run_remote_text(
@@ -522,12 +577,27 @@ def main() -> None:
     if report.get("input", {}).get("dependency_sha256") != expected_hashes:
         raise RuntimeError("remote horizon report dependency identity mismatch")
     _validate_expected_input_hash(report, args.expected_input_sha256)
+    if registration is not None:
+        report["registered_protocol"] = registration
     result_path.parent.mkdir(parents=True, exist_ok=True)
     result_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
-    safe_print(json.dumps(report, ensure_ascii=False, indent=2))
+    if args.family == "liquidity_regime":
+        safe_print(json.dumps({
+            "input": report["input"],
+            "status": report["research"]["status"],
+            "reason": report["research"].get("reason"),
+            "qualified_candidate_ids": report["research"].get("qualified_candidate_ids", []),
+            "candidates": [{
+                "id": item["policy"]["id"],
+                "aggregate_capacity": item["aggregate_evidence"]["capacity"],
+                "rejection_reasons": item["rejection_reasons"],
+            } for item in report["research"].get("candidates", [])],
+        }, ensure_ascii=False, indent=2))
+    else:
+        safe_print(json.dumps(report, ensure_ascii=False, indent=2))
     safe_print(f"saved_report={result_path}")
 
 

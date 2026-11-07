@@ -7,6 +7,76 @@ This file is the durable recovery checkpoint for the current Codex chat.
 
 ## Latest Verified State And Active Work (2026-11-07)
 
+- Completed implementation: fixed liquidity/regime development v1, registered
+  before any new result inspection. Window `[2026-10-10T15:30:00Z,
+  2026-11-07T15:30:00Z)`, budget of 2,500 time-stratified decision groups, mature native
+  fee-after-complete labels only. Eight fixed hypotheses: 60/240-minute
+  horizons x trend/reversion x liquid/tight contemporaneous liquidity filters.
+  No fitted thresholds, outcome-cost entry filters, or post-hoc choice of side.
+  Exact signal rules and acceptance rules are in
+  `services/liquidity_regime_development.py:protocol`; three chronological
+  folds and aggregate must each pass the existing positive fee-after mean,
+  naive LCB, PF>1 and minimum-16 checks in both opportunity/capacity views.
+  Capacity is three slots, one per symbol, fixed-horizon exits, carried across
+  folds. Baselines are hold/long/short on identical inputs. Budget stays at
+  CPU 25%, RAM 1 GiB, one DB connection, 900 seconds. Local protocol/dependency
+  hashes are sealed before the remote query. All data remain development;
+  neither an independent exam nor execution is authorized by this batch.
+- The registered real-data run completed with `status=rejected` and zero
+  qualified policies. Report:
+  `data/profitability_remediation/online-liquidity-regime-development-v3-20261107T153000Z.json`;
+  registration: the adjacent `.protocol.json`. It read `2,453` eligible
+  native rows from `985` decision groups. Actual coverage was
+  `2026-10-23T16:18:55.643987Z` through `2026-11-07T15:24:45.885323Z`,
+  about 359 hours, rather than the requested 672-hour window. Only `394`
+  groups had both required horizons; the last half supplied `197`
+  validation opportunities per horizon. Do not describe the requested
+  2,500-group budget or 28-day window as observed sample coverage.
+- Fixed capacity results, with selected counts by chronological fold:
+
+  | Policy | Fold Counts | Mean Net Return | Net LCB | PF |
+  | --- | --- | --- | --- | --- |
+  | trend-liquid-60m | 2 / 2 / 1 | -1.3322% | -1.6399% | 0 |
+  | reversion-liquid-60m | 1 / 2 / 0 | +0.2351% | -0.9194% | 1.8228 |
+  | trend-liquid-240m | 2 / 2 / 1 | -2.1012% | -5.0001% | 0.0769 |
+  | reversion-liquid-240m | 1 / 2 / 0 | -2.9577% | -10.0826% | 0.2335 |
+  | all four tight-liquidity policies | 0 / 0 / 0 | unavailable | unavailable | unavailable |
+
+  Selected mean execution costs were about `0.134%-0.141%`. The positive
+  three-observation reversion slice fails count and lower-bound checks and
+  cannot authorize entry. Both unconditional long capacity baselines had
+  slightly positive means but negative lower bounds; unconditional shorts
+  lost money at both horizons. All folds had disjoint decision groups and
+  training labels strictly before validation. This rejects the registered
+  family on this development sample; it does not establish profitability.
+- A second bounded, read-only screening attribution matched the original
+  input SHA-256
+  `0ce66e9bd14a51104cabb3d7524ea51eb081e94b4349758e70ed6c5e319fcbac`.
+  At either horizon, the `197` validation opportunities became `100` after
+  the liquid spread/notional filter and `34` after the activity filter;
+  those contained `11` trending and `23` ranging observations before the
+  direction/oscillator rules selected `5` and `3`. Tight liquidity retained
+  `20`, then `7` active (`3` trending, `4` ranging), but none matched the
+  registered side rules. This attribution used no changed hypothesis and
+  did not replace or overwrite the sealed result. Sparse signals in this
+  sample are explained by the registered screening intersections; they
+  were not established to be a missing market-data route or a capacity bug.
+- Verification/deployment: the focused local suite passed `57` tests and
+  Ruff passed. Four code/test files were synchronized with exact source
+  hashes verified; the exact online research/test suite passed `17` tests.
+  No trading-service restart, runtime configuration change, model activation,
+  independent exam or order was part of this deployment. This checkpoint
+  document is local/Git documentation and was excluded by the uploader.
+- The newer read-only entry-recovery check at `2026-11-07T15:39:34Z` found
+  `331` paper analyses in 90 minutes, all unexecuted HOLD. The latest `20`
+  were `no_candidate`, with clean sealed features and completed required
+  market-data routes. Local-ML permission remained false on `109`
+  observations (`mean=0.000305`, `LCB=-0.004404`, `PF=1.024533`);
+  server-profit/timeseries each had `128` observations
+  (`mean=-0.032478`, `LCB=-0.062968`, `PF=0.566085`). Champion
+  `20261105T233808459234Z-b595d2be` was retained after the latest candidate
+  completed. These replace the older quality counts below, not the frozen
+  experiment's input. Model execution influence remained disabled.
 - The read-only entry-recovery report at `2026-11-07T14:38:18Z` covered
   `1,426` paper market analyses in six hours, all unexecuted HOLD. The latest
   `80` had clean sealed feature availability: `74` were classified as
@@ -62,12 +132,14 @@ This file is the durable recovery checkpoint for the current Codex chat.
 1. Do not repeat an unchanged rejected policy search or treat elapsed time as
    profitability acceptance. Keep the currently unqualified model's execution
    influence disabled while development continues.
-2. Preregister the next materially different research hypothesis before its
-   result is inspected: reduce turnover and use contemporaneous liquidity,
-   execution cost and market regime to define candidate opportunities. Compare
-   with no-trade and the existing transparent baselines on identical inputs.
-   Existing inspected data may be reused as development data, never relabeled
-   as an untouched exam.
+2. The fixed 60/240-minute liquidity/regime family above has been implemented
+   and rejected. Do not repeat it unchanged, select its positive three-trade
+   slice, or remove the failed count/LCB gates. Before another hypothesis,
+   attribute sparse coverage to the data window, horizon completeness and
+   contemporaneous screening on the exact input fingerprint. A materially
+   changed sampling or strategy design needs its own registration and complete
+   result. Existing inspected data remain development data, never an untouched
+   exam.
 3. Run bounded development batches with fixed candidate sets, chronological
    purging, symbol capacity, complete costs and the existing acceptance rules.
    Record a pass, rejection, or exact missing-data condition after each batch.
