@@ -18,12 +18,17 @@ from services.ml_development_baselines import _development_input_sha256
 from services.ml_signal_service import FEATURE_KEYS, _decision_group_availability
 
 SNAPSHOT_VERSION = "2026-11-06.symbol-bound-frozen-development.v2"
+SNAPSHOT_FILENAME = "frozen_development_v2.json"
 SNAPSHOT_COLUMNS = list(dict.fromkeys([
     "id", "decision_group", "symbol", "decision_timestamp", "label_timestamp",
     "horizon_minutes", *FEATURE_KEYS,
     "long_return_pct", "short_return_pct",
     "long_execution_cost_pct", "short_execution_cost_pct", "sample_weight",
 ]))
+
+
+class InsufficientDevelopmentDataError(ValueError):
+    """The frozen source window cannot supply usable development observations."""
 
 
 def _digest(payload: dict[str, Any]) -> str:
@@ -71,7 +76,9 @@ def _normalize(frame: pd.DataFrame) -> pd.DataFrame:
     if (result["sample_weight"] < 0).any():
         raise ValueError("invalid snapshot sample weights")
     if not (result["sample_weight"] > 0).any():
-        raise ValueError("snapshot needs at least one positive sample weight")
+        raise InsufficientDevelopmentDataError(
+            "snapshot needs at least one positive sample weight"
+        )
     return result.sort_values([
         "decision_timestamp", "decision_group", "horizon_minutes", "id",
     ]).reset_index(drop=True)
@@ -84,17 +91,20 @@ def make_development_snapshot(
     if boundary.tzinfo is None:
         raise ValueError("development cutoff must have a timezone")
     boundary = boundary.tz_convert("UTC")
+    if frame.empty:
+        raise InsufficientDevelopmentDataError("no development rows before frozen cutoff")
     groups, bounds = _decision_group_availability(frame)
     allowed = {
         group for group in groups
         if bounds[group]["end"] < boundary
         and bounds[group]["decision_end"] < boundary
     }
-    development = _normalize(frame[
+    eligible = frame[
         frame["decision_group"].astype(str).isin(allowed)
-    ])
-    if development.empty:
-        raise ValueError("no development rows before frozen cutoff")
+    ]
+    if eligible.empty:
+        raise InsufficientDevelopmentDataError("no development rows before frozen cutoff")
+    development = _normalize(eligible)
     serializable = development.copy()
     for column in ("decision_timestamp", "label_timestamp"):
         serializable[column] = serializable[column].map(lambda value: value.isoformat())

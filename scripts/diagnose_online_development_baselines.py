@@ -24,7 +24,8 @@ from db.session import close_db
 from services.ml_development_baselines import build_development_baseline_report
 from services.ml_nested_development import build_nested_development_report
 from services.ml_development_snapshot import (
-    load_development_snapshot, make_development_snapshot, save_development_snapshot,
+    SNAPSHOT_FILENAME, InsufficientDevelopmentDataError, load_development_snapshot,
+    make_development_snapshot, save_development_snapshot,
 )
 from services.ml_horizon_development import build_horizon_development_report
 from services.ml_signal_service import build_training_frame
@@ -39,14 +40,35 @@ async def main():
     try:
         directory = settings.data_dir / "strategy_replay"
         if HORIZONS:
-            snapshot_path = directory / "frozen_development_v1.json"
+            snapshot = None
+            snapshot_path = directory / SNAPSHOT_FILENAME
             if snapshot_path.exists():
                 development, snapshot = load_development_snapshot(snapshot_path, cutoff=CUTOFF)
             else:
                 rows = await load_shadow_training_rows()
-                snapshot = make_development_snapshot(build_training_frame(rows), cutoff=CUTOFF)
-                development, snapshot = save_development_snapshot(snapshot, path=snapshot_path)
-            report = build_horizon_development_report(development, snapshot=snapshot)
+                frame = build_training_frame(rows)
+                try:
+                    snapshot = make_development_snapshot(frame, cutoff=CUTOFF)
+                except InsufficientDevelopmentDataError as exc:
+                    report = {
+                        "status": "insufficient_development_data",
+                        "reason_code": "frozen_development_data_unavailable",
+                        "reason": str(exc),
+                        "development_cutoff": CUTOFF,
+                        "source_row_count": len(rows),
+                        "source_frame_row_count": len(frame),
+                        "diagnostic_only": True,
+                        "exam_labels_evaluated": False,
+                        "artifact_persisted": False,
+                        "promotion_authorized": False,
+                        "submits_orders": False,
+                        "selected_policy_fold_count": 0,
+                        "folds": [],
+                    }
+                else:
+                    development, snapshot = save_development_snapshot(snapshot, path=snapshot_path)
+            if snapshot is not None:
+                report = build_horizon_development_report(development, snapshot=snapshot)
         else:
             rows = await load_shadow_training_rows()
             builder = build_nested_development_report if NESTED else build_development_baseline_report

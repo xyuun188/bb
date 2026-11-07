@@ -1,9 +1,83 @@
 # Profitability Remediation Execution Plan
 
-Updated: 2026-10-30, Asia/Shanghai.
+Updated: 2026-11-07, Asia/Shanghai.
 Status: ACTIVE. Profitability acceptance has NOT passed.
 Repository: `G:\数字量化\bb`; remote application: `/data/bb/app`.
 This file is the durable recovery checkpoint for the current Codex chat.
+
+## Latest Verified State And Active Work (2026-11-07)
+
+- The read-only entry-recovery report at `2026-11-07T14:38:18Z` covered
+  `1,426` paper market analyses in six hours, all unexecuted HOLD. The latest
+  `80` had clean sealed feature availability: `74` were classified as
+  `no_candidate` and `6` as `insufficient_evidence`. Representative completed
+  decisions lacked positive expected net return and qualifying quant evidence;
+  their required order-book and reference-price routes completed successfully.
+- The latest account reconciliation allowed new entries and training refresh.
+  There were no open paper positions. Paper and Dashboard were subsequently
+  verified active/running with `NRestarts=0`; their start time remained
+  `2026-11-06T14:40:03Z`. Neither an account stop nor a service restart is the
+  demonstrated remedy for the missing qualified signals.
+- Local-ML paper permission remained false on `112` authoritative observations
+  (`average_return=-0.001251`, `return_lcb=-0.005962`, `profit_factor=0.908256`).
+  Server-profit and timeseries evidence each reported `142` observations with
+  positive means but non-positive lower bounds. These model-family summaries
+  are not independent candidate exams. Specialist shadow counts were zero in
+  these quality summaries; do not reinterpret missing inference evidence as
+  successful candidate evaluation.
+- The latest inspected seven-day horizon-development report remains
+  `data/profitability_remediation/online-horizon-development-v3-20261106T140230Z.json`.
+  All three outer folds selected zero policies; all `72` candidates in each
+  fold failed inner eligibility. Positive four-hour short baseline results in
+  the inspected outer development slices did not establish a stable selected
+  policy. They cannot authorize a model, a new horizon, or an execution gate
+  bypass.
+- Recovered the pending research-tool fix: the v2 symbol-aware snapshot schema
+  now has its own `frozen_development_v2.json` filename. The horizon diagnostic
+  reuses that version and preserves the existing v1 evidence file. Local
+  diagnostic/snapshot/evidence tests passed `40`; targeted synchronization
+  verified all three source/test paths, and the exact remote diagnostic tests
+  passed `8`. This deployment required no trading-service restart.
+- The real-data `diagnose_online_development_baselines.py --horizons` smoke is
+  bounded to one CPU, 2 GiB, two database connections and 900 seconds. Its
+  fixed development cutoff remains `2026-09-26T22:11:51.501105Z`; this is an
+  old-cutoff research-tool acceptance run, not a fresh profitability exam.
+  The first run exposed an additional unhandled empty-window exception.
+  Snapshot construction now distinguishes insufficient data from integrity
+  errors; the diagnostic reports only the former as insufficiency. Negative
+  weights and corrupted stored snapshots remain fatal errors.
+- The final real-data smoke at `2026-11-07T15:12:20Z` exited successfully with
+  `status=insufficient_development_data` and
+  `reason_code=frozen_development_data_unavailable`. It read `18,781` source
+  rows and built `12,191` training-frame rows, but none was before the frozen
+  cutoff. It created no replacement snapshot, selected no policy, persisted
+  no model, authorized no promotion and submitted no orders. This closes the
+  exception-handling defect, not the missing historical data or profitability.
+  Use `audit_online_horizon_current_development.py` with an explicitly
+  preregistered current development window for new research; do not keep
+  rerunning the unavailable old-cutoff window or change its frozen boundary.
+
+### Concrete Next Decisions
+
+1. Do not repeat an unchanged rejected policy search or treat elapsed time as
+   profitability acceptance. Keep the currently unqualified model's execution
+   influence disabled while development continues.
+2. Preregister the next materially different research hypothesis before its
+   result is inspected: reduce turnover and use contemporaneous liquidity,
+   execution cost and market regime to define candidate opportunities. Compare
+   with no-trade and the existing transparent baselines on identical inputs.
+   Existing inspected data may be reused as development data, never relabeled
+   as an untouched exam.
+3. Run bounded development batches with fixed candidate sets, chronological
+   purging, symbol capacity, complete costs and the existing acceptance rules.
+   Record a pass, rejection, or exact missing-data condition after each batch.
+   If none qualifies, reject that candidate family and change the hypothesis;
+   waiting or repeatedly retraining the same family is not a repair.
+4. Only after development qualifies, freeze the entire policy and register a
+   new independent evaluation window. Then use the existing governed paper
+   execution pipeline with its fixed risk budget and authoritative settlement.
+   No order frequency, leverage or relaxed return bound may substitute for
+   passing this sequence. There is no verified calendar ETA for profitability.
 
 ## Phase 3 Paper Bootstrap Recovery (2026-10-30)
 
