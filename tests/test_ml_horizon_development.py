@@ -385,6 +385,21 @@ def test_unqualified_signals_still_choose_no_trade(monkeypatch):
         )
 
 
+def test_each_fold_reports_its_own_fixed_horizon_baselines():
+    development, snapshot = _snapshot(_frame())
+    report = research.build_horizon_development_report(development, snapshot=snapshot)
+
+    assert report["folds"]
+    for fold in report["folds"]:
+        baselines = fold["fixed_baselines_by_horizon"]
+        assert set(baselines) == {str(horizon) for horizon in research.HORIZONS}
+        for horizon_baselines in baselines.values():
+            assert set(horizon_baselines) == {"long", "short"}
+            for views in horizon_baselines.values():
+                assert set(views) == {"all_opportunities", "nonoverlapping"}
+                assert views["nonoverlapping"]["selected_count"] > 0
+
+
 def test_real_ridge_supports_both_feature_policies():
     development, _ = _snapshot(_frame())
     primary = development.query("horizon_minutes == 5")

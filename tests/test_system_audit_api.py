@@ -73,6 +73,62 @@ def test_required_audit_card_reuses_recent_completed_snapshot(
     assert card["status"] == "ok"
     assert card["details"]["report_source"] == "persisted_audit"
     assert card["details"]["report_age_seconds"] >= 15
+    assert card["details"][system_audit.REQUIRED_AUDIT_GENERATED_AT_KEY]
+
+
+def test_required_audit_card_expires_on_its_own_generation_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A card carried forward by many snapshots must age out by its own clock.
+
+    Regression: reuse used only the snapshot ``checked_at``, which is refreshed
+    every run, so an obsolete card structure could be replayed indefinitely.
+    """
+
+    snapshot_checked_at = datetime.now(UTC)
+    card_generated_at = datetime.now(UTC) - timedelta(
+        seconds=system_audit.REQUIRED_AUDIT_SNAPSHOT_MAX_AGE_SECONDS + 30
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "_load_canonical_audit_snapshot",
+        lambda: (
+            snapshot_checked_at,
+            {
+                "status": "ok",
+                "checked_at": snapshot_checked_at.isoformat(),
+                "cards": [
+                    {
+                        "key": "model_training",
+                        "status": "ok",
+                        "details": {
+                            system_audit.REQUIRED_AUDIT_GENERATED_AT_KEY: card_generated_at.isoformat()
+                        },
+                    }
+                ],
+            },
+        ),
+    )
+
+    assert system_audit._cached_required_audit_card("model_training") is None
+
+
+@pytest.mark.asyncio
+async def test_required_audit_stamps_generated_at_on_fresh_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        system_audit,
+        "_cached_required_audit_card",
+        lambda _key: None,
+    )
+
+    async def live_audit() -> dict[str, Any]:
+        return {"status": "ok", "details": {}}
+
+    card = await system_audit._run_required_audit("model_training", live_audit)
+
+    assert card["details"][system_audit.REQUIRED_AUDIT_GENERATED_AT_KEY]
 
 
 def test_required_audit_card_does_not_reuse_deferred_snapshot(

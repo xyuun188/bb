@@ -182,6 +182,29 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
         lifecycle = "trained"
     else:
         lifecycle = "not_trained"
+    side_metrics = {
+        side: {
+            "profit_factor": _first_present(
+                metrics.get(f"top_{side}_profit_factor")
+            ),
+            "return_lcb_pct": _first_present(
+                metrics.get(f"top_{side}_return_lcb_pct")
+            ),
+            "mean_return_pct": _first_present(
+                metrics.get(f"top_{side}_avg_return_pct")
+            ),
+            "bottom_return_pct": _first_present(
+                metrics.get(f"bottom_{side}_avg_return_pct")
+            ),
+            "top_bottom_spread_pct": _first_present(
+                metrics.get(f"top_{side}_bottom_return_spread_pct")
+            ),
+            "tail_loss_rate": _first_present(
+                metrics.get(f"top_{side}_tail_loss_rate")
+            ),
+        }
+        for side in ("long", "short")
+    }
     return {
         "model_id": "local_ml_profit_quality",
         "display_name": "Local ML profit quality",
@@ -221,6 +244,14 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
             "long": metrics.get("top_long_return_lcb_pct"),
             "short": metrics.get("top_short_return_lcb_pct"),
         },
+        "side_metrics": side_metrics,
+        "walk_forward_status": _safe_dict(status.get("walk_forward_report")).get(
+            "status"
+        ),
+        "walk_forward_stable": _safe_dict(status.get("walk_forward_report")).get(
+            "stable"
+        ),
+        "fallback_used": status.get("live_ml_ready") is not True,
         "blocking_reasons": (
             ["status_query_timeout"]
             if diagnostic_timeout

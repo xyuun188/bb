@@ -54,6 +54,8 @@ REMOTE_MODEL_READINESS_SERVICE_NAME = "bb-phase3-model-server-readiness.service"
 REMOTE_DASHBOARD_PROXY_SERVICE_NAME = "nginx.service"
 REMOTE_DASHBOARD_PROXY_SITE = "/etc/nginx/sites-available/bb-dashboard"
 REMOTE_DASHBOARD_PROXY_LINK = "/etc/nginx/sites-enabled/bb-dashboard"
+TARGET_MODEL_MANIFEST_REMOTE_PATH = "/data/BB/manifests/target_model_candidate.json"
+TARGET_MODEL_MANIFEST_LOCAL_NAME = ".target_model_candidate.remote.json"
 MODEL_TUNNEL_DEPLOY_READY_TIMEOUT_SECONDS = 75
 REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
 # The online platform may use a different service account than the model host.
@@ -111,7 +113,7 @@ SKIP_FILES = {
     "requirements-dev.txt",
     "requirements-scraping.txt",
     "requirements-target-inference.txt",
-    ".target_model_candidate.remote.json",
+    TARGET_MODEL_MANIFEST_LOCAL_NAME,
 }
 SKIP_SUFFIXES = {
     ".pyc",
@@ -283,6 +285,47 @@ def _model_tunnel_endpoint_pairs(profile: str | None = None) -> tuple[tuple[int,
     return tuple((route.local_port, route.health_path) for route in model_tunnel_routes(selected))
 
 
+def _refresh_target_model_manifest(
+    project_root: Path,
+    destination: Path,
+) -> ModelCandidateManifest:
+    """Fetch and verify the model-host manifest before deployment.
+
+    The local copy is only a deploy-time cache.  Reading it without contacting
+    the model host lets an expired snapshot block a deployment even after the
+    model-server refresh timer has written newer evidence.
+    """
+
+    from core.model_server_bridge import load_model_server_info_from_platform
+
+    info = load_model_server_info_from_platform(project_root)
+    ssh = connect_remote_ssh(project_root, timeout=20, info=info)
+    try:
+        sftp = ssh.open_sftp()
+        try:
+            with sftp.open(TARGET_MODEL_MANIFEST_REMOTE_PATH, "rb") as handle:
+                raw = handle.read()
+        finally:
+            sftp.close()
+    finally:
+        ssh.close()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("model-host candidate manifest is not valid UTF-8 JSON") from exc
+    manifest = ModelCandidateManifest.from_dict(payload)
+    manifest.to_topology(stage="candidate_validated")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        temporary.write_bytes(raw)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return manifest
+
+
 def _target_topology_from_environment() -> ModelTopology:
     """Load only a model-host-generated verified manifest.
 
@@ -293,9 +336,13 @@ def _target_topology_from_environment() -> ModelTopology:
 
     manifest_path = str(os.environ.get("BB_TARGET_MODEL_MANIFEST") or "").strip()
     if not manifest_path:
-        default_manifest = PROJECT_ROOT / ".target_model_candidate.remote.json"
-        if default_manifest.is_file():
-            manifest_path = str(default_manifest)
+        default_manifest = PROJECT_ROOT / TARGET_MODEL_MANIFEST_LOCAL_NAME
+        manifest = _refresh_target_model_manifest(PROJECT_ROOT, default_manifest)
+        safe_print(
+            f"Refreshed target-model manifest from {TARGET_MODEL_MANIFEST_REMOTE_PATH} "
+            f"(validated_at={manifest.validated_at})."
+        )
+        manifest_path = str(default_manifest)
     if not manifest_path:
         return topology_for_profile(TARGET_SINGLE_MODEL_PROFILE)
     manifest = ModelCandidateManifest.load(manifest_path)

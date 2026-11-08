@@ -303,6 +303,92 @@ def test_phase3_go_no_go_rejects_unprofitable_model_metrics() -> None:
     }.issubset(report["blocker_codes"])
 
 
+def _local_ml_evidence(*, long_pf: float, short_pf: float) -> dict:
+    return {
+        "model_id": "local_ml_profit_quality",
+        "available": True,
+        "live_ml_ready": False,
+        "walk_forward_status": "complete",
+        "walk_forward_stable": False,
+        "fallback_used": True,
+        "sides": {
+            "long": {
+                "profit_factor": long_pf,
+                "return_lcb_pct": -2.0421,
+                "mean_return_pct": -1.0188,
+            },
+            "short": {
+                "profit_factor": short_pf,
+                "return_lcb_pct": -3.9919,
+                "mean_return_pct": -1.3916,
+            },
+        },
+    }
+
+
+def test_phase3_go_no_go_uses_current_local_ml_evidence_over_legacy_bundle() -> None:
+    cards = deepcopy(_cards())
+    training = next(card for card in cards if card["key"] == "model_training")
+    training["details"]["live_ml_ready"] = True
+    training["details"]["local_ai_tools"] = {
+        "live_ml_ready": True,
+        "profit_factor": 1.42,
+        "return_lcb_pct": 0.31,
+        "mean_fee_after_return_pct": 0.26,
+    }
+    training["details"]["local_ml_profit_quality"] = _local_ml_evidence(
+        long_pf=0.2939,
+        short_pf=0.6222,
+    )
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert report["status"] == "no_go"
+    assert report["summary"]["model_profitability_source"] == "local_ml_profit_quality"
+    assert report["summary"]["model_profit_factor"] == 0.2939
+    blocker = next(
+        item
+        for item in report["blockers"]
+        if item["code"] == "model_profit_factor_below_unity"
+    )
+    assert blocker["evidence"]["source"] == "local_ml_profit_quality"
+    assert report["summary"]["model_profitability_sides"]["short"]["profit_factor"] == 0.6222
+
+
+def test_phase3_go_no_go_local_ml_live_flag_overrides_legacy_promotion() -> None:
+    cards = deepcopy(_cards())
+    training = next(card for card in cards if card["key"] == "model_training")
+    training["details"]["live_ml_ready"] = True
+    training["details"]["local_ai_tools"] = {"live_ml_ready": True}
+    training["details"]["local_ml_profit_quality"] = _local_ml_evidence(
+        long_pf=0.9,
+        short_pf=0.95,
+    )
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert "local_ml_not_live_ready" in report["blocker_codes"]
+
+
+def test_phase3_go_no_go_blocks_when_local_ml_metrics_are_missing() -> None:
+    cards = deepcopy(_cards())
+    training = next(card for card in cards if card["key"] == "model_training")
+    training["details"]["local_ml_profit_quality"] = {
+        "model_id": "local_ml_profit_quality",
+        "available": True,
+        "live_ml_ready": False,
+        "sides": {},
+    }
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert {
+        "model_profit_factor_evidence_missing",
+        "model_return_lcb_evidence_missing",
+        "model_fee_after_return_evidence_missing",
+    }.issubset(report["blocker_codes"])
+
+
 def test_phase3_go_no_go_rejects_paper_resume_without_operator_safe_preflight() -> None:
     cards = deepcopy(_cards())
     preflight = next(

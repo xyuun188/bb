@@ -226,17 +226,68 @@ def test_walk_forward_report_scopes_primary_horizon_and_keeps_other_horizons_dia
 
     report = ml_signal_module._walk_forward_return_report(frame)
 
-    assert report["primary_horizon_minutes"] == 5
+    primary = ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES
+    assert report["primary_horizon_minutes"] == primary
     assert report["primary_horizon_available"] is True
-    assert set(report["horizon_diagnostics"]) == {"5", "15", "60", "240"}
+    assert report["version"] == ml_signal_module.WALK_FORWARD_REPORT_VERSION
+    assert report["fitted_horizons"] == [primary]
+    assert report["source_horizons"] == [5, 15, 60, 240]
+    assert report["training_horizon_policy"] == ml_signal_module.TRAINING_HORIZON_POLICY
+    assert report["mixed_horizon_fit_allowed"] is False
+    assert set(report["unfitted_horizon_diagnostics"]) == {
+        str(horizon) for horizon in (5, 15, 60, 240) if horizon != primary
+    }
     assert set(report["sides"]) == {"long", "short"}
-    assert report["sides"]["long"] == report["horizon_diagnostics"]["5"]["long"]
-    assert set(report["mixed_horizon_diagnostics"]) == {"long", "short"}
+    assert report["folds"]
+    assert report["evaluation_horizon_minutes"] == primary
+    assert all(fold["horizon_minutes"] == primary for fold in report["folds"])
 
 
-def test_holdout_metrics_bind_to_primary_horizon_instead_of_mixed_periods() -> None:
+def test_primary_horizon_fit_ignores_contradicting_short_horizon_labels() -> None:
+    """Short-horizon labels must not leak into the 240-minute fit."""
+
+    primary = ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES
+    other = 5 if primary != 5 else 15
+
+    primary_only = _training_frame(80)
+    primary_only["horizon_minutes"] = primary
+
+    mixed = primary_only.copy()
+    contradictory = primary_only.copy()
+    contradictory["horizon_minutes"] = other
+    contradictory["long_return_pct"] = -9.0
+    contradictory["short_return_pct"] = -8.0
+    contradictory["long_win"] = 0
+    contradictory["short_win"] = 0
+    mixed = pd.concat([mixed, contradictory], ignore_index=True)
+
+    baseline = train_from_frame(primary_only, persist_artifact=False)
+    contaminated = train_from_frame(mixed, persist_artifact=False)
+
+    assert baseline["primary_prediction_horizon_minutes"] == primary
+    assert contaminated["primary_prediction_horizon_minutes"] == primary
+    assert contaminated["fitted_horizons"] == [primary]
+    assert contaminated["source_training_horizons"] == sorted({primary, other})
+    assert contaminated["unfitted_horizon_minutes"] == [other]
+    assert contaminated["mixed_horizon_fit_allowed"] is False
+    assert (
+        contaminated["holdout_return_metric_contract"]["sample_count"]
+        == baseline["holdout_return_metric_contract"]["sample_count"]
+    )
+    for side in ("long", "short"):
+        assert contaminated["metrics"][f"top_{side}_avg_return_pct"] == pytest.approx(
+            baseline["metrics"][f"top_{side}_avg_return_pct"]
+        )
+        assert contaminated["metrics"][f"top_{side}_profit_factor"] == pytest.approx(
+            baseline["metrics"][f"top_{side}_profit_factor"]
+        )
+
+
+def test_holdout_metrics_bind_to_primary_horizon_only() -> None:
+    primary = ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES
+    other = 5 if primary != 5 else 15
     frame = _training_frame(80)
-    frame["horizon_minutes"] = [5, 15] * 40
+    frame["horizon_minutes"] = [primary, other] * 40
 
     metadata = train_from_frame(
         frame,
@@ -245,14 +296,22 @@ def test_holdout_metrics_bind_to_primary_horizon_instead_of_mixed_periods() -> N
         persist_artifact=False,
     )
 
-    assert metadata["primary_prediction_horizon_minutes"] == 5
+    primary_key = str(primary)
+    assert metadata["primary_prediction_horizon_minutes"] == primary
     assert metadata["primary_holdout_horizon_available"] is True
-    assert metadata["holdout_horizon_diagnostics"]["5"]["sample_count"] < len(frame)
-    assert metadata["metrics"] == metadata["holdout_horizon_diagnostics"]["5"]["metrics"]
+    assert metadata["fitted_horizons"] == [primary]
+    assert metadata["source_training_horizons"] == sorted({primary, other})
+    assert metadata["unfitted_horizon_minutes"] == [other]
+    assert metadata["holdout_horizon_diagnostics"][primary_key]["sample_count"] < len(frame)
     assert (
-        metadata["mixed_horizon_holdout_diagnostics"]["sample_count"]
-        > metadata["holdout_horizon_diagnostics"]["5"]["sample_count"]
+        metadata["metrics"]
+        == metadata["holdout_horizon_diagnostics"][primary_key]["metrics"]
     )
+    # Unfitted horizons are recorded as excluded instead of contributing
+    # mixed-horizon holdout evidence.
+    unfitted = metadata["unfitted_horizon_holdout_diagnostics"][str(other)]
+    assert unfitted["status"] == "not_fitted"
+    assert unfitted["evidence_eligible"] is False
 
 
 def _with_return_objective(metadata: dict) -> dict:
@@ -456,6 +515,50 @@ def _with_return_objective(metadata: dict) -> dict:
         metrics.setdefault(f"top_{side}_tail_loss_rate", 0.05)
         metrics.setdefault(f"bottom_{side}_tail_loss_rate", 0.10)
     metadata["metrics"] = metrics
+
+    # Primary-horizon isolation contract: only the fitted primary horizon may
+    # carry promotion evidence; other source horizons stay diagnostic.
+    primary_horizon = ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES
+    metadata.setdefault("horizons", [primary_horizon])
+    metadata.setdefault("fitted_horizons", [primary_horizon])
+    metadata.setdefault("source_training_horizons", [primary_horizon])
+    metadata.setdefault(
+        "source_horizon_sample_counts",
+        {str(primary_horizon): int(metadata.get("sample_count") or 1)},
+    )
+    metadata.setdefault("unfitted_horizon_minutes", [])
+    metadata.setdefault(
+        "training_horizon_policy",
+        ml_signal_module.TRAINING_HORIZON_POLICY,
+    )
+    metadata.setdefault("mixed_horizon_fit_allowed", False)
+    metadata.setdefault("primary_prediction_horizon_minutes", primary_horizon)
+    metadata.setdefault(
+        "primary_prediction_horizon_runtime_policy",
+        "runtime_predict_primary_from_training_contract",
+    )
+    metadata.setdefault(
+        "holdout_horizon_diagnostics",
+        {
+            str(primary_horizon): {
+                "sample_count": int(metadata.get("test_count") or 1),
+                "metrics": dict(metrics),
+                "horizon_minutes": primary_horizon,
+            }
+        },
+    )
+    metadata.setdefault(
+        "unfitted_horizon_holdout_diagnostics",
+        {str(horizon): {"status": "not_fitted"} for horizon in metadata["unfitted_horizon_minutes"]},
+    )
+    metadata.setdefault("primary_holdout_horizon_available", True)
+    walk_forward = metadata.setdefault("walk_forward_report", {})
+    walk_forward.setdefault("primary_horizon_minutes", primary_horizon)
+    walk_forward.setdefault("evaluation_horizon_minutes", primary_horizon)
+    walk_forward.setdefault("primary_horizon_available", True)
+    walk_forward.setdefault("fitted_horizons", [primary_horizon])
+    walk_forward.setdefault("training_horizon_policy", ml_signal_module.TRAINING_HORIZON_POLICY)
+    walk_forward.setdefault("mixed_horizon_fit_allowed", False)
     return metadata
 
 
@@ -1108,10 +1211,11 @@ def test_build_training_frame_retains_original_quality_and_cost_evidence() -> No
 
 
 def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:
+    primary = ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES
     frame = _training_frame(120)
     frame["decision_action"] = ["hold", "long", "short"] * 40
     frame["best_action"] = ["short", "hold", "long"] * 40
-    frame["horizon_minutes"] = [10, 30, 60] * 40
+    frame["horizon_minutes"] = [primary, 5, 15] * 40
     frame["data_quality_status"] = ["included", "downweighted", "included"] * 40
     frame["sample_weight"] = [1.0, 0.35, 0.8] * 40
     frame["quality_reasons"] = [
@@ -1140,6 +1244,7 @@ def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:
             assert summary["horizon_counts"]
             assert summary["data_quality_status_counts"]
             assert isinstance(summary["top_quality_reasons"], list)
+    assert set(diagnostics["long"]["top"]["horizon_counts"]) == {str(primary)}
 
 
 def test_train_from_frame_holdout_quality_metrics_use_fee_after_returns() -> None:
@@ -1222,13 +1327,18 @@ def test_tail_policy_is_derived_only_from_chronological_training_partition() -> 
     )
 
 
-def test_walk_forward_purges_unavailable_multi_horizon_decision_groups() -> None:
+def test_walk_forward_purges_unavailable_decision_groups_on_primary_horizon() -> None:
+    primary = ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES
     rows: list[dict[str, object]] = []
     decision_start = datetime(2026, 7, 14, tzinfo=UTC)
     row_id = 0
     for decision_index in range(30):
-        decision_at = decision_start + timedelta(minutes=decision_index * 5)
-        for horizon in (10, 60):
+        # Space decisions closer than the fitted horizon so the latest labels
+        # are unavailable at the next decision boundary and must be purged.
+        decision_at = decision_start + timedelta(
+            minutes=decision_index * (primary - 40)
+        )
+        for horizon in (primary, 5):
             row_id += 1
             row: dict[str, object] = {key: 0.0 for key in FEATURE_KEYS}
             row.update(
@@ -1251,9 +1361,19 @@ def test_walk_forward_purges_unavailable_multi_horizon_decision_groups() -> None
     report = ml_signal_module._walk_forward_return_report(pd.DataFrame(rows))
 
     assert report["status"] == "complete"
-    assert report["version"] == "2026-08-16.expanding-decision-group-walk-forward.v2"
+    assert report["version"] == ml_signal_module.WALK_FORWARD_REPORT_VERSION
     assert report["chronological_label_disjoint"] is True
     assert report["initial_training_fraction"] == pytest.approx(0.20)
+    assert report["fitted_horizons"] == [primary]
+    assert report["unfitted_horizon_diagnostics"] == {
+        "5": {
+            "sample_count": 30,
+            "fitted": False,
+            "evidence_eligible": False,
+            "excluded_reason": "primary_horizon_isolation",
+        }
+    }
+    assert all(fold["horizon_minutes"] == primary for fold in report["folds"])
     assert all(
         fold["training_decision_group_count"]
         >= report["minimum_initial_training_decision_group_count"]
@@ -1265,6 +1385,19 @@ def test_walk_forward_purges_unavailable_multi_horizon_decision_groups() -> None
         and fold["decision_group_overlap_count"] == 0
         for fold in report["folds"]
     )
+
+
+def test_walk_forward_report_requires_primary_horizon_training_data() -> None:
+    frame = _training_frame(40)
+    frame["horizon_minutes"] = 5
+
+    report = ml_signal_module._walk_forward_return_report(frame)
+
+    assert report["status"] == "primary_prediction_horizon_unavailable"
+    assert report["primary_horizon_available"] is False
+    assert report["folds"] == []
+    assert report["source_horizons"] == [5]
+    assert report["mixed_horizon_fit_allowed"] is False
 
 
 def test_decision_group_partition_reports_purged_immature_training_data() -> None:

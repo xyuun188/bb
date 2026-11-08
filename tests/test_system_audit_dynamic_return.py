@@ -30,6 +30,77 @@ def test_safe_trade_execution_policy_removes_retired_paper_gate_labels() -> None
     assert policy["live_entry_requires_positive_return_lcb"] is True
 
 
+def test_local_ml_profit_quality_details_exposes_side_specific_evidence() -> None:
+    # Go/no-go must see the local ML artifact's own metrics, not the legacy
+    # local_ai_tools bundle promotion flag.
+    details = system_audit._local_ml_profit_quality_details(
+        local_ml_status={
+            "available": True,
+            "status": "degraded",
+            "artifact_version": "20261108T165428250368Z-a19e748c",
+            "live_ml_ready": False,
+            "paper_model_eligible": False,
+            "readiness": {
+                "state": "degraded",
+                "blocking_reasons": [
+                    {"code": "long_top_profit_factor_not_above_one"},
+                ],
+                "metrics": {
+                    "top_long_profit_factor": 0.2939,
+                    "top_long_return_lcb_pct": -2.0421,
+                    "top_long_avg_return_pct": -1.0188,
+                    "top_short_profit_factor": 0.6222,
+                    "top_short_return_lcb_pct": -3.9919,
+                    "top_short_avg_return_pct": -1.3916,
+                },
+            },
+            "walk_forward_report": {
+                "status": "complete",
+                "stable": False,
+                "primary_horizon_minutes": 240,
+            },
+        },
+        model_registry={"models": []},
+    )
+
+    assert details["model_id"] == "local_ml_profit_quality"
+    assert details["live_ml_ready"] is False
+    assert details["fallback_used"] is True
+    assert details["side_profit_factors"] == {"long": 0.2939, "short": 0.6222}
+    assert details["side_return_lcb_pct"] == {"long": -2.0421, "short": -3.9919}
+    assert details["profit_factor"] == 0.2939
+    assert details["evaluated_horizon_minutes"] == 240
+    assert details["blocking_reasons"] == ["long_top_profit_factor_not_above_one"]
+
+
+def test_local_ml_profit_quality_details_ignores_legacy_bundle_metrics() -> None:
+    details = system_audit._local_ml_profit_quality_details(
+        local_ml_status={
+            "available": True,
+            "status": "degraded",
+            "readiness": {
+                "state": "degraded",
+                "metrics": {
+                    "top_long_profit_factor": 0.5,
+                    "top_short_profit_factor": 0.4,
+                },
+            },
+        },
+        model_registry={
+            "models": [
+                {
+                    "model_id": "local_ml_profit_quality",
+                    "lifecycle": "promotion_blocked",
+                    "quality_state": "degraded",
+                }
+            ]
+        },
+    )
+
+    assert details["registry_lifecycle"] == "promotion_blocked"
+    assert details["profit_factor"] == 0.4
+
+
 def test_dashboard_policy_cannot_drift_from_execution_policy() -> None:
     canonical = summarize_trade_execution_contract([])["policy"]
     stale = {"policy": {"paper_quality_observation_allows_non_positive_return_lcb": False}}

@@ -345,9 +345,22 @@ def build_horizon_development_report(
                 alpha=policy["alpha"], feature_policy=policy["feature_policy"],
             ), policy["net_threshold_pct"],
         ) if policy else np.full(len(evaluation), "hold")
+        fold_baselines = {}
+        for horizon in HORIZONS:
+            horizon_validation = _at_horizon(validation, horizon)
+            fold_baselines[str(horizon)] = {
+                side: _views(
+                    horizon_validation,
+                    np.full(len(horizon_validation), side),
+                )
+                for side in ("long", "short")
+            }
         report["folds"].append({
             **boundary, "selection": selection,
             "outer_evidence": _views(evaluation, sides),
+            # Per-fold fixed-side baselines make horizon stability auditable;
+            # an aggregate positive mean can otherwise hide one lucky regime.
+            "fixed_baselines_by_horizon": fold_baselines,
         })
         evaluated_frames.append(evaluation)
         evaluated_sides.append(sides)

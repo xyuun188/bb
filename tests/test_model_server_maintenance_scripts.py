@@ -321,13 +321,57 @@ def test_sync_to_online_server_runtime_env_uses_tunnel_ports(verified_target_top
 
 
 def test_sync_to_online_server_requires_verified_candidate_manifest(monkeypatch, tmp_path) -> None:
-    from core.model_candidate_manifest import MANIFEST_VERSION
+    from core.model_candidate_manifest import MANIFEST_VERSION, ModelCandidateManifest
     from scripts import sync_to_online_server as sync
 
     monkeypatch.setenv("BB_TARGET_MODEL_ID", "fake-model-from-env")
     monkeypatch.setenv("BB_TARGET_MODEL_MANIFEST", "")
     monkeypatch.setattr(sync, "PROJECT_ROOT", tmp_path)
-    with pytest.raises(RuntimeError, match="verified candidate identity"):
+
+    def _write_unverified_manifest(destination):
+        import json
+
+        payload = {
+            "manifest_version": MANIFEST_VERSION,
+            "status": "candidate",
+            "model_id": "qwen3.8-27b-unverified",
+            "repo_id": "Qwen/Qwen3.8-27B",
+            "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+            "model_path": "/data/BB/models/qwen3.8-27b",
+            "tokenizer_path": "/data/BB/models/qwen3.8-27b",
+            "license": "apache-2.0",
+            "quantization": "bitsandbytes-nf4",
+            "architecture": "Qwen3_5ForConditionalGeneration",
+            "model_type": "qwen3_5",
+            "language_model_only": False,
+            "text_inference_verified": True,
+            "runtime": {
+                "engine": "transformers",
+                "engine_version": "5.8.1",
+                "transformers_version": "5.8.1",
+                "probe_sha256": "e" * 64,
+            },
+            "context_length": 4096,
+            "config_sha256": "a" * 64,
+            "tokenizer_sha256": "b" * 64,
+            "weight_files": [],
+            "gpu_memory_peak_gib": 23.7,
+            "inference_p95_ms": 1200.0,
+            "max_concurrency": 1,
+            "storage_available_gib": 35.0,
+            "storage_required_free_gib": 20.0,
+            "validated_at": _fresh_validated_at(),
+            "validator_version": "bb-model-validator.v1",
+        }
+        destination.write_text(json.dumps(payload), encoding="utf-8")
+        return SimpleNamespace(validated_at=payload["validated_at"])
+
+    monkeypatch.setattr(
+        sync,
+        "_refresh_target_model_manifest",
+        lambda _root, destination: _write_unverified_manifest(destination),
+    )
+    with pytest.raises(ValueError, match="status must be 'verified'"):
         sync._online_tunnel_ai_models_json("target_single_model")
 
     manifest_path = tmp_path / "candidate.json"
@@ -374,9 +418,101 @@ def test_sync_to_online_server_requires_verified_candidate_manifest(monkeypatch,
         manifest_path.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
+    monkeypatch.setattr(
+        sync,
+        "_refresh_target_model_manifest",
+        lambda _root, destination: ModelCandidateManifest.load(destination),
+    )
     rendered = sync._online_tunnel_ai_models_json("target_single_model")
     assert rendered.count("qwen3.8-27b") >= 6
     assert "deepseek" not in rendered.lower()
+
+
+def test_sync_to_online_server_refreshes_candidate_manifest_from_model_host(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import json
+
+    from core.model_candidate_manifest import MANIFEST_VERSION
+    from scripts import sync_to_online_server as sync
+
+    remote_payload = {
+        "manifest_version": MANIFEST_VERSION,
+        "status": "verified",
+        "model_id": "qwen3.8-27b",
+        "repo_id": "Qwen/Qwen3.8-27B",
+        "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+        "model_path": "/data/BB/models/qwen3.8-27b",
+        "tokenizer_path": "/data/BB/models/qwen3.8-27b",
+        "license": "apache-2.0",
+        "quantization": "bitsandbytes-nf4",
+        "architecture": "Qwen3_5ForConditionalGeneration",
+        "model_type": "qwen3_5",
+        "language_model_only": False,
+        "text_inference_verified": True,
+        "runtime": {
+            "engine": "transformers",
+            "engine_version": "5.8.1",
+            "transformers_version": "5.8.1",
+            "probe_sha256": "e" * 64,
+        },
+        "context_length": 4096,
+        "config_sha256": "a" * 64,
+        "tokenizer_sha256": "b" * 64,
+        "weight_files": [
+            {"path": "model.safetensors", "size_bytes": 1, "sha256": "c" * 64}
+        ],
+        "gpu_memory_peak_gib": 23.7,
+        "inference_p95_ms": 1200.0,
+        "max_concurrency": 1,
+        "storage_available_gib": 35.0,
+        "storage_required_free_gib": 20.0,
+        "validated_at": _fresh_validated_at(),
+        "validator_version": "bb-model-validator.v1",
+    }
+    raw = json.dumps(remote_payload).encode("utf-8")
+    destination = tmp_path / sync.TARGET_MODEL_MANIFEST_LOCAL_NAME
+    destination.write_text("{}", encoding="utf-8")
+
+    class _RemoteHandle:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def __enter__(self):
+            import io
+
+            return io.BytesIO(self._payload)
+
+        def __exit__(self, *_args):
+            return False
+
+    class _Sftp:
+        def open(self, path, mode):
+            assert path == sync.TARGET_MODEL_MANIFEST_REMOTE_PATH
+            assert mode == "rb"
+            return _RemoteHandle(raw)
+
+        def close(self):
+            return None
+
+    class _Ssh:
+        def open_sftp(self):
+            return _Sftp()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "core.model_server_bridge.load_model_server_info_from_platform",
+        lambda _root: object(),
+    )
+    monkeypatch.setattr(sync, "connect_remote_ssh", lambda *_args, **_kwargs: _Ssh())
+
+    manifest = sync._refresh_target_model_manifest(tmp_path, destination)
+
+    assert manifest.validated_at == remote_payload["validated_at"]
+    assert json.loads(destination.read_text(encoding="utf-8")) == remote_payload
 
 
 def test_sync_to_online_server_runtime_env_scrubs_stale_app_env_ai_routes(

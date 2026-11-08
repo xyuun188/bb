@@ -33,8 +33,8 @@ def _folds(
     purge_horizon_minutes: int | None = None,
 ) -> list[tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]]:
     # Fixed-horizon research must purge on the labels it actually fits. A
-    # long-horizon row in the same decision group is irrelevant to a primary
-    # five-minute target and would otherwise erase usable early training data.
+    # longer-horizon row in the same decision group is irrelevant to the
+    # primary target and would otherwise erase usable early training data.
     boundary_frame = frame
     if purge_horizon_minutes is not None:
         boundary_frame = frame[

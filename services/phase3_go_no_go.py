@@ -58,6 +58,69 @@ def _first_nested_metric(value: Any, names: tuple[str, ...], *, depth: int = 0) 
     return None
 
 
+def _model_profitability_evidence(
+    training: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Select the current local ML artifact before any legacy tool bundle.
+
+    ``local_ai_tools`` is an older, separately promoted model bundle. If the
+    audit supplies ``local_ml_profit_quality``, its explicit metrics and
+    side-level evidence are authoritative even when the legacy bundle still
+    reports a different profit factor.
+    """
+
+    local_ml = _safe_dict(training.get("local_ml_profit_quality"))
+    if not local_ml:
+        for row in _safe_list(_safe_dict(training.get("model_registry")).get("models")):
+            if isinstance(row, dict) and row.get("model_id") == "local_ml_profit_quality":
+                local_ml = row
+                break
+    if local_ml and local_ml.get("available") is not False:
+        sides = _safe_dict(
+            local_ml.get("sides")
+            or local_ml.get("side_metrics")
+        )
+        side_evidence: dict[str, dict[str, Any]] = {}
+        profit_factors: list[float] = []
+        return_lcbs: list[float] = []
+        mean_returns: list[float] = []
+        for side in ("long", "short"):
+            metrics = _safe_dict(sides.get(side))
+            profit_factor = _safe_float(metrics.get("profit_factor"))
+            return_lcb = _safe_float(metrics.get("return_lcb_pct"))
+            mean_return = _safe_float(metrics.get("mean_return_pct"))
+            side_evidence[side] = {
+                "profit_factor": profit_factor,
+                "return_lcb_pct": return_lcb,
+                "mean_return_pct": mean_return,
+                "tail_loss_rate": _safe_float(metrics.get("tail_loss_rate")),
+                "bottom_return_pct": _safe_float(metrics.get("bottom_return_pct")),
+            }
+            if profit_factor is not None:
+                profit_factors.append(profit_factor)
+            if return_lcb is not None:
+                return_lcbs.append(return_lcb)
+            if mean_return is not None:
+                mean_returns.append(mean_return)
+        return (
+            {
+                "source": "local_ml_profit_quality",
+                "artifact_version": local_ml.get("artifact_version"),
+                "walk_forward_status": local_ml.get("walk_forward_status"),
+                "walk_forward_stable": local_ml.get("walk_forward_stable"),
+                "fallback_used": local_ml.get("fallback_used"),
+                "lifecycle": local_ml.get("lifecycle"),
+                "sides": side_evidence,
+                "profit_factor": min(profit_factors) if profit_factors else None,
+                "return_lcb_pct": min(return_lcbs) if return_lcbs else None,
+                "mean_return_pct": min(mean_returns) if mean_returns else None,
+            },
+            "local_ml_profit_quality",
+        )
+    legacy = _safe_dict(training.get("local_ai_tools"))
+    return (legacy or training), "local_ai_tools" if legacy else "model_training"
+
+
 def _blocker(code: str, message: str, evidence: Any | None = None) -> dict[str, Any]:
     return {"code": code, "message": message, "evidence": evidence}
 
@@ -334,8 +397,13 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             )
 
     local_ai_tools = _safe_dict(training.get("local_ai_tools"))
-    live_ml_ready = training.get("live_ml_ready")
-    if live_ml_ready is None:
+    local_ml = _safe_dict(training.get("local_ml_profit_quality"))
+    live_ml_ready = (
+        local_ml.get("live_ml_ready")
+        if local_ml
+        else training.get("live_ml_ready")
+    )
+    if live_ml_ready is None and not local_ml:
         live_ml_ready = local_ai_tools.get("live_ml_ready")
     # Older/read-only audit cards may omit this optional promotion field. Only
     # an explicit false is a production-readiness blocker; absence is handled
@@ -359,30 +427,69 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             )
         )
 
-    profitability_evidence = local_ai_tools or training
-    profit_factor = _first_nested_metric(
-        profitability_evidence,
-        ("profit_factor", "top_profit_factor", "top_long_profit_factor"),
+    profitability_evidence, profitability_source = _model_profitability_evidence(
+        training
     )
-    return_lcb = _first_nested_metric(
-        profitability_evidence,
-        ("return_lcb_pct", "return_lcb", "return_lower_bound", "fee_after_return_lcb_pct"),
+    profit_factor = _safe_float(profitability_evidence.get("profit_factor"))
+    if profit_factor is None:
+        profit_factor = _first_nested_metric(
+            profitability_evidence,
+            ("profit_factor", "top_profit_factor", "top_long_profit_factor"),
+        )
+    return_lcb = _safe_float(profitability_evidence.get("return_lcb_pct"))
+    if return_lcb is None:
+        return_lcb = _first_nested_metric(
+            profitability_evidence,
+            ("return_lcb_pct", "return_lcb", "return_lower_bound", "fee_after_return_lcb_pct"),
+        )
+    mean_fee_after_return = _safe_float(
+        profitability_evidence.get("mean_return_pct")
     )
-    mean_fee_after_return = _first_nested_metric(
-        profitability_evidence,
-        (
-            "mean_fee_after_return_pct",
-            "avg_fee_after_return_pct",
-            "average_fee_after_return_pct",
-            "fee_after_mean_return_pct",
-        ),
-    )
+    if mean_fee_after_return is None:
+        mean_fee_after_return = _first_nested_metric(
+            profitability_evidence,
+            (
+                "mean_fee_after_return_pct",
+                "avg_fee_after_return_pct",
+                "average_fee_after_return_pct",
+                "fee_after_mean_return_pct",
+            ),
+        )
+    if profitability_source == "local_ml_profit_quality":
+        if profit_factor is None:
+            blockers.append(
+                _blocker(
+                    "model_profit_factor_evidence_missing",
+                    "Local ML profitability evidence is missing its profit factor.",
+                    evidence={"source": profitability_source},
+                )
+            )
+        if return_lcb is None:
+            blockers.append(
+                _blocker(
+                    "model_return_lcb_evidence_missing",
+                    "Local ML profitability evidence is missing its return LCB.",
+                    evidence={"source": profitability_source},
+                )
+            )
+        if mean_fee_after_return is None:
+            blockers.append(
+                _blocker(
+                    "model_fee_after_return_evidence_missing",
+                    "Local ML profitability evidence is missing its mean fee-after return.",
+                    evidence={"source": profitability_source},
+                )
+            )
     if profit_factor is not None and profit_factor < 1.0:
         blockers.append(
             _blocker(
                 "model_profit_factor_below_unity",
                 "The evaluated model loses more than it earns after costs.",
-                evidence={"profit_factor": profit_factor, "required_minimum": 1.0},
+                evidence={
+                    "profit_factor": profit_factor,
+                    "required_minimum": 1.0,
+                    "source": profitability_source,
+                },
             )
         )
     if return_lcb is not None and return_lcb <= 0.0:
@@ -390,7 +497,11 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             _blocker(
                 "model_return_lcb_not_positive",
                 "The evaluated model return lower confidence bound is not positive.",
-                evidence={"return_lcb_pct": return_lcb, "required_minimum_exclusive": 0.0},
+                evidence={
+                    "return_lcb_pct": return_lcb,
+                    "required_minimum_exclusive": 0.0,
+                    "source": profitability_source,
+                },
             )
         )
     if mean_fee_after_return is not None and mean_fee_after_return <= 0.0:
@@ -401,6 +512,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
                 evidence={
                     "mean_fee_after_return_pct": mean_fee_after_return,
                     "required_minimum_exclusive": 0.0,
+                    "source": profitability_source,
                 },
             )
         )
@@ -422,6 +534,9 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             "position_economics_incomplete_count": economics_gaps,
             "executed_dynamic_exit_contract_gap_count": exit_gaps,
             "live_ml_ready": live_ml_ready is True,
+            "model_profitability_source": profitability_source,
+            "model_profitability_sides": profitability_evidence.get("sides"),
+            "model_fallback_used": profitability_evidence.get("fallback_used"),
             "model_profit_factor": profit_factor,
             "model_return_lcb_pct": return_lcb,
             "model_mean_fee_after_return_pct": mean_fee_after_return,

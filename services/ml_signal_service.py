@@ -52,6 +52,7 @@ from services.ml_training_contract import (
     MIN_TRAINING_SAMPLE_COUNT,
     PRIMARY_PREDICTION_HORIZON_MINUTES,
     RANDOM_FOREST_MIN_SAMPLES_LEAF,
+    TRAINING_HORIZON_POLICY,
     WALK_FORWARD_REPORT_VERSION,
     decision_group_partition_errors,
 )
@@ -285,8 +286,13 @@ def _training_evaluation_contract_errors(metadata: dict[str, Any]) -> list[str]:
             if int(_safe_float(value, 0.0)) > 0
         }
     )
-    if len(horizons) <= 1:
-        return errors
+    if PRIMARY_PREDICTION_HORIZON_MINUTES not in horizons:
+        errors.append("fitted_primary_prediction_horizon_missing")
+    if (
+        metadata.get("training_horizon_policy") != TRAINING_HORIZON_POLICY
+        or metadata.get("mixed_horizon_fit_allowed") is not False
+    ):
+        errors.append("training_horizon_isolation_contract_stale")
     if metadata.get("primary_prediction_horizon_minutes") != PRIMARY_PREDICTION_HORIZON_MINUTES:
         errors.append("primary_prediction_horizon_contract_stale")
 
@@ -1551,10 +1557,72 @@ def _leave_one_symbol_out_stability(
 
 def _walk_forward_return_report(
     frame: pd.DataFrame,
+    *,
+    primary_horizon_minutes: int = PRIMARY_PREDICTION_HORIZON_MINUTES,
+    source_training_horizons: list[int] | None = None,
+    source_horizon_sample_counts: dict[int, int] | None = None,
 ) -> dict[str, Any]:
-    ordered = _chronological_frame(frame)
-    groups, group_bounds = _decision_group_availability(ordered)
     version = WALK_FORWARD_REPORT_VERSION
+    source_horizons = (
+        sorted({int(value) for value in source_training_horizons})
+        if source_training_horizons
+        else sorted(
+            {
+                int(value)
+                for value in pd.to_numeric(
+                    frame["horizon_minutes"], errors="coerce"
+                ).dropna()
+            }
+        )
+    )
+    if source_horizon_sample_counts:
+        horizon_sample_counts = {
+            int(horizon): int(count)
+            for horizon, count in source_horizon_sample_counts.items()
+        }
+    else:
+        horizon_sample_counts = {
+            int(horizon): int(count)
+            for horizon, count in pd.to_numeric(
+                frame["horizon_minutes"], errors="coerce"
+            ).value_counts().items()
+        }
+    primary_frame = frame[
+        pd.to_numeric(frame["horizon_minutes"], errors="coerce")
+        == primary_horizon_minutes
+    ]
+    unfitted_horizon_diagnostics = {
+        str(horizon): {
+            "sample_count": int(horizon_sample_counts.get(horizon, 0)),
+            "fitted": False,
+            "evidence_eligible": False,
+            "excluded_reason": "primary_horizon_isolation",
+        }
+        for horizon in source_horizons
+        if horizon != primary_horizon_minutes
+    }
+    isolation = {
+        "training_horizon_policy": TRAINING_HORIZON_POLICY,
+        "mixed_horizon_fit_allowed": False,
+        "fitted_horizons": [primary_horizon_minutes],
+        "source_horizons": source_horizons,
+        "unfitted_horizon_diagnostics": unfitted_horizon_diagnostics,
+    }
+    if primary_frame.empty:
+        return {
+            "version": version,
+            "status": "primary_prediction_horizon_unavailable",
+            "folds": [],
+            "decision_group_disjoint": False,
+            "chronological_label_disjoint": False,
+            "model_refit_per_fold": True,
+            "primary_horizon_minutes": primary_horizon_minutes,
+            "evaluation_horizon_minutes": primary_horizon_minutes,
+            "primary_horizon_available": False,
+            **isolation,
+        }
+    ordered = _chronological_frame(primary_frame)
+    groups, group_bounds = _decision_group_availability(ordered)
     if len(groups) <= 1:
         return {
             "version": version,
@@ -1563,6 +1631,10 @@ def _walk_forward_return_report(
             "decision_group_disjoint": False,
             "chronological_label_disjoint": False,
             "model_refit_per_fold": True,
+            "primary_horizon_minutes": primary_horizon_minutes,
+            "evaluation_horizon_minutes": primary_horizon_minutes,
+            "primary_horizon_available": True,
+            **isolation,
         }
     minimum_initial_training_group_count = max(
         MIN_TRAINING_DECISION_GROUP_COUNT,
@@ -1594,6 +1666,10 @@ def _walk_forward_return_report(
             "chronological_label_disjoint": False,
             "model_refit_per_fold": True,
             "chronological": True,
+            "primary_horizon_minutes": primary_horizon_minutes,
+            "evaluation_horizon_minutes": primary_horizon_minutes,
+            "primary_horizon_available": True,
+            **isolation,
         }
     validation_fold_count = max(
         int(math.ceil(math.log10(len(validation_candidates) + 1))),
@@ -1609,20 +1685,6 @@ def _walk_forward_return_report(
     ]
     folds: list[dict[str, Any]] = []
     oos_rows = {"long": [], "short": []}
-    available_horizons = sorted(
-        {
-            int(value)
-            for value in pd.to_numeric(ordered["horizon_minutes"], errors="coerce").dropna()
-        }
-    )
-    evaluation_horizon = (
-        PRIMARY_PREDICTION_HORIZON_MINUTES
-        if PRIMARY_PREDICTION_HORIZON_MINUTES in available_horizons
-        else available_horizons[0]
-        if len(available_horizons) == 1
-        else PRIMARY_PREDICTION_HORIZON_MINUTES
-    )
-    horizon_oos_rows = {str(horizon): {"long": [], "short": []} for horizon in available_horizons}
     for index, validation_groups in enumerate(group_blocks, start=1):
         validation_decision_start = min(
             group_bounds[group]["decision_start"] for group in validation_groups
@@ -1635,10 +1697,7 @@ def _walk_forward_return_report(
             raise ValueError("walk-forward decision groups overlap")
         train = ordered[ordered["decision_group"].astype(str).isin(training_set)].copy()
         validation = ordered[ordered["decision_group"].astype(str).isin(validation_set)].copy()
-        mixed_fold_side_reports: dict[str, Any] = {}
-        fold_horizon_rows = {
-            str(horizon): {"long": [], "short": []} for horizon in available_horizons
-        }
+        fold_side_reports: dict[str, Any] = {}
         for side in ("long", "short"):
             scores, fold_tail_policy = _walk_forward_side_scores(
                 train,
@@ -1652,41 +1711,10 @@ def _walk_forward_return_report(
             )
             scored_rows = _all_scored_return_rows(validation, scores, side=side)
             oos_rows[side].extend(scored_rows)
-            for row in scored_rows:
-                horizon_oos_rows.setdefault(str(row["horizon_minutes"]), {"long": [], "short": []})[
-                    side
-                ].append(row)
-                fold_horizon_rows.setdefault(
-                    str(row["horizon_minutes"]), {"long": [], "short": []}
-                )[side].append(row)
-            mixed_fold_side_reports[side] = {
+            fold_side_reports[side] = {
                 **_return_evidence(selected_rows),
                 "training_tail_loss_policy": fold_tail_policy,
             }
-        fold_horizon_reports = {
-            horizon: {
-                side: {
-                    **_return_evidence(
-                        _select_top_return_rows(fold_horizon_rows[str(horizon)][side])
-                    )
-                }
-                for side in ("long", "short")
-            }
-            for horizon in available_horizons
-        }
-        primary_fold_evidence = _safe_dict(fold_horizon_reports.get(str(evaluation_horizon)))
-        primary_fold_side_reports = {
-            side: {
-                **(
-                    _safe_dict(primary_fold_evidence.get(side))
-                    or _safe_dict(mixed_fold_side_reports.get(side))
-                ),
-                "training_tail_loss_policy": _safe_dict(mixed_fold_side_reports.get(side)).get(
-                    "training_tail_loss_policy"
-                ),
-            }
-            for side in ("long", "short")
-        }
         folds.append(
             {
                 "fold": index,
@@ -1706,38 +1734,18 @@ def _walk_forward_return_report(
                     and group not in training_set
                 ),
                 "decision_group_overlap_count": 0,
-                "sides": primary_fold_side_reports,
-                "horizon_diagnostics": fold_horizon_reports,
-                "mixed_horizon_diagnostics": mixed_fold_side_reports,
+                "sides": fold_side_reports,
+                "horizon_minutes": primary_horizon_minutes,
             }
         )
-    mixed_side_reports = {}
-    for side in ("long", "short"):
-        evidence = _return_evidence(_select_top_return_rows(oos_rows[side]))
-        mixed_side_reports[side] = {
-            **evidence,
+    side_reports = {
+        side: {
+            **_return_evidence(_select_top_return_rows(oos_rows[side])),
             "leave_one_symbol_out": _leave_one_symbol_out_stability(oos_rows[side]),
             "market_regime_stability": _market_regime_stability(oos_rows[side]),
         }
-    side_reports = {}
-    horizon_diagnostics: dict[str, dict[str, Any]] = {}
-    for horizon in available_horizons:
-        horizon_key = str(horizon)
-        horizon_diagnostics[horizon_key] = {}
-        for side in ("long", "short"):
-            rows = horizon_oos_rows[horizon_key][side]
-            evidence = _return_evidence(_select_top_return_rows(rows))
-            horizon_diagnostics[horizon_key][side] = {
-                **evidence,
-                "leave_one_symbol_out": _leave_one_symbol_out_stability(rows),
-                "market_regime_stability": _market_regime_stability(rows),
-            }
-    for side in ("long", "short"):
-        side_reports[side] = horizon_diagnostics.get(str(evaluation_horizon), {}).get(
-            side,
-            mixed_side_reports[side],
-        )
-    primary_horizon_available = PRIMARY_PREDICTION_HORIZON_MINUTES in available_horizons
+        for side in ("long", "short")
+    }
     return {
         "version": version,
         "status": "complete" if folds else "insufficient_chronological_decision_groups",
@@ -1755,11 +1763,10 @@ def _walk_forward_return_report(
         "model_refit_per_fold": True,
         "chronological": True,
         "sides": side_reports,
-        "primary_horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
-        "evaluation_horizon_minutes": evaluation_horizon,
-        "primary_horizon_available": primary_horizon_available,
-        "horizon_diagnostics": horizon_diagnostics,
-        "mixed_horizon_diagnostics": mixed_side_reports,
+        "primary_horizon_minutes": primary_horizon_minutes,
+        "evaluation_horizon_minutes": primary_horizon_minutes,
+        "primary_horizon_available": True,
+        **isolation,
         "stable": len(folds) >= MIN_ACTIVE_WALK_FORWARD_FOLDS
         and all(
             evidence["promotion_math_ready"]
@@ -2307,6 +2314,35 @@ def train_from_frame(
     trade_samples: list[dict[str, Any]] | None = None,
     persist_artifact: bool = True,
 ) -> dict[str, Any]:
+    source_training_horizons = sorted(
+        {
+            int(value)
+            for value in pd.to_numeric(frame["horizon_minutes"], errors="coerce").dropna()
+        }
+    )
+    if PRIMARY_PREDICTION_HORIZON_MINUTES in source_training_horizons:
+        effective_training_horizon = PRIMARY_PREDICTION_HORIZON_MINUTES
+    elif len(source_training_horizons) == 1:
+        effective_training_horizon = source_training_horizons[0]
+    else:
+        raise ValueError(
+            "primary prediction horizon "
+            f"{PRIMARY_PREDICTION_HORIZON_MINUTES} is required for model fitting"
+        )
+    source_training_sample_count = int(len(frame))
+    source_training_decision_group_count = int(frame["decision_group"].nunique())
+    source_horizon_sample_counts = {
+        int(horizon): int(count)
+        for horizon, count in pd.to_numeric(
+            frame["horizon_minutes"], errors="coerce"
+        ).value_counts().items()
+    }
+    frame = frame[
+        pd.to_numeric(frame["horizon_minutes"], errors="coerce")
+        == effective_training_horizon
+    ].reset_index(drop=True)
+    if frame.empty:
+        raise ValueError("primary prediction horizon training frame is empty")
     required_multitask_columns = {
         "label_contract_version",
         "label_maturity_status",
@@ -2365,10 +2401,15 @@ def train_from_frame(
     training_data_sha256 = _training_data_sha256(frame)
     source_code_version = _training_source_code_version()
     source_code_sha256 = source_code_version.removeprefix("source-sha256:")
-    walk_forward_report = _walk_forward_return_report(frame)
+    walk_forward_report = _walk_forward_return_report(
+        frame,
+        primary_horizon_minutes=effective_training_horizon,
+        source_training_horizons=source_training_horizons,
+        source_horizon_sample_counts=source_horizon_sample_counts,
+    )
     primary_test = test[
         pd.to_numeric(test["horizon_minutes"], errors="coerce")
-        == PRIMARY_PREDICTION_HORIZON_MINUTES
+        == effective_training_horizon
     ]
     replay_test = primary_test if not primary_test.empty else test
     strategy_replay_holdout = {
@@ -2379,7 +2420,7 @@ def train_from_frame(
         "shadow_source_id_ranges": _compact_integer_ranges(replay_test["id"].tolist()),
         "label_start": _fingerprint_value(replay_test["label_timestamp"].min()),
         "label_end": _fingerprint_value(replay_test["label_timestamp"].max()),
-        "horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
+        "horizon_minutes": effective_training_horizon,
         "primary_horizon_available": not primary_test.empty,
         "training_data_sha256": training_data_sha256,
     }
@@ -2447,7 +2488,7 @@ def train_from_frame(
         short_tail_scores,
         tail_loss_scale_pct=tail_scales["short"],
     )
-    mixed_holdout_evaluation = _holdout_return_evaluation(
+    primary_holdout_evaluation = _holdout_return_evaluation(
         test,
         long_win_scores=long_scores,
         short_win_scores=short_scores,
@@ -2455,28 +2496,9 @@ def train_from_frame(
         short_expected_scores=short_expected_scores,
         tail_scales=tail_scales,
     )
-    holdout_horizon_evaluations: dict[str, dict[str, Any]] = {}
-    for horizon in sorted(
-        int(value)
-        for value in pd.to_numeric(test["horizon_minutes"], errors="coerce").dropna().unique()
-    ):
-        mask = pd.to_numeric(test["horizon_minutes"], errors="coerce").to_numpy() == horizon
-        horizon_test = test.loc[mask].copy()
-        holdout_horizon_evaluations[str(horizon)] = _holdout_return_evaluation(
-            horizon_test,
-            long_win_scores=long_scores[mask],
-            short_win_scores=short_scores[mask],
-            long_expected_scores=long_expected_scores[mask],
-            short_expected_scores=short_expected_scores[mask],
-            tail_scales=tail_scales,
-        )
-    primary_holdout_evaluation = holdout_horizon_evaluations.get(
-        str(PRIMARY_PREDICTION_HORIZON_MINUTES)
-    )
-    if primary_holdout_evaluation is None:
-        primary_holdout_evaluation = next(
-            iter(holdout_horizon_evaluations.values()), mixed_holdout_evaluation
-        )
+    holdout_horizon_evaluations = {
+        str(effective_training_horizon): primary_holdout_evaluation
+    }
     metrics = primary_holdout_evaluation["metrics"]
 
     now = datetime.now(UTC).isoformat()
@@ -2621,6 +2643,10 @@ def train_from_frame(
             "shadow_market_label": int(len(frame)),
             "authoritative_okx_trade": len(trade_samples),
         },
+        "source_training_sample_count": source_training_sample_count,
+        "source_training_decision_group_count": source_training_decision_group_count,
+        "training_frame_sample_count": int(len(frame)),
+        "training_frame_decision_group_count": int(frame["decision_group"].nunique()),
         "replay_weight_manifest": replay_weight_manifest,
         "training_distribution_profile": _training_distribution_profile(frame),
         "quality_report": frame_quality_report,
@@ -2643,9 +2669,28 @@ def train_from_frame(
             str(value) for value in frame["label_contract_version"].dropna().unique().tolist()
         ),
         "multitask_prediction_contract_version": MULTITASK_PREDICTION_CONTRACT_VERSION,
-        "horizons": sorted(int(v) for v in frame["horizon_minutes"].dropna().unique().tolist()),
-        "primary_prediction_horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
-        "primary_prediction_horizon_runtime_policy": "runtime_predict_primary_matches_5m",
+        "horizons": [effective_training_horizon],
+        "fitted_horizons": [effective_training_horizon],
+        "source_training_horizons": source_training_horizons,
+        "source_horizon_sample_counts": {
+            str(horizon): count
+            for horizon, count in sorted(source_horizon_sample_counts.items())
+        },
+        "unfitted_horizon_minutes": [
+            horizon
+            for horizon in source_training_horizons
+            if horizon != effective_training_horizon
+        ],
+        "training_horizon_policy": (
+            TRAINING_HORIZON_POLICY
+            if effective_training_horizon == PRIMARY_PREDICTION_HORIZON_MINUTES
+            else "fit_single_available_horizon"
+        ),
+        "mixed_horizon_fit_allowed": False,
+        "primary_prediction_horizon_minutes": effective_training_horizon,
+        "primary_prediction_horizon_runtime_policy": (
+            "runtime_predict_primary_from_training_contract"
+        ),
         "objective_name": RETURN_OBJECTIVE_NAME,
         "objective_version": RETURN_OBJECTIVE_VERSION,
         "label_name": RETURN_LABEL_NAME,
@@ -2716,8 +2761,16 @@ def train_from_frame(
         },
         "metrics": metrics,
         "holdout_horizon_diagnostics": holdout_horizon_evaluations,
-        "mixed_horizon_holdout_diagnostics": mixed_holdout_evaluation,
-        "primary_holdout_horizon_available": str(PRIMARY_PREDICTION_HORIZON_MINUTES)
+        "unfitted_horizon_holdout_diagnostics": {
+            str(horizon): {
+                "status": "not_fitted",
+                "evidence_eligible": False,
+                "excluded_reason": "primary_horizon_isolation",
+            }
+            for horizon in source_training_horizons
+            if horizon != effective_training_horizon
+        },
+        "primary_holdout_horizon_available": str(effective_training_horizon)
         in holdout_horizon_evaluations,
         "score_bucket_diagnostics": primary_holdout_evaluation["score_bucket_diagnostics"],
         "feature_keys": FEATURE_KEYS,
@@ -4333,7 +4386,7 @@ class MLSignalService:
         self,
         features: Any,
         *,
-        horizons: tuple[int, ...] = (5, 15, 60, 240),
+        horizons: tuple[int, ...] | None = None,
     ) -> dict[str, Any]:
         self._ensure_loaded()
         if not self._bundle:
@@ -4387,8 +4440,16 @@ class MLSignalService:
             else str(getattr(features, "symbol", "") or "")
         )
 
+        fitted_horizons = tuple(
+            int(value)
+            for value in (metadata.get("fitted_horizons") or [])
+            if str(value).isdigit() and int(value) > 0
+        )
+        requested_horizons = tuple(
+            int(value) for value in (horizons or fitted_horizons or (PRIMARY_PREDICTION_HORIZON_MINUTES,))
+        )
         predictions = []
-        for horizon in horizons:
+        for horizon in requested_horizons:
             row = _feature_row_from_feature_vector(features, horizon_minutes=horizon)
             x = pd.DataFrame([row], columns=FEATURE_KEYS)
             long_win_rate = float(_positive_proba(self._bundle["long_classifier"], x)[0])

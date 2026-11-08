@@ -23,6 +23,7 @@
 | [2026-07-22 continuous model training and trading remediation](./2026-07-22-continuous-model-training-and-trading-remediation-plan.md) | 历史训练/交易整改计划，已归档。 |
 | [2026-07-27 paper/live permission and training loop remediation](./2026-07-27-paper-live-permission-and-training-loop-remediation-plan.md) | 历史权限与训练闭环计划，已归档。 |
 | [2026-08-17 quant platform full remediation](./2026-08-17-quant-platform-full-remediation-plan.md) | 历史平台整改计划，已归档。 |
+| [盈利整改执行计划（截至 2026-11-08）](./profitability-execution-plan-through-2026-11-08.md) | 7,980 行历史执行台账；当前状态已由 `docs/profitability-execution-plan.md` 的精简检查点接替。 |
 
 ## 使用限制
 

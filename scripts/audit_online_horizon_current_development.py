@@ -176,6 +176,10 @@ def _compact_evidence(value):
     return {key: value.get(key) for key in keys if key in value}
 
 
+def _as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
 def _compact_fold(fold):
     selection = fold.get("selection") or {}
     candidates = selection.get("candidates") or []
@@ -229,6 +233,18 @@ def _compact_fold(fold):
         "outer_evidence": {
             name: _compact_evidence((fold.get("outer_evidence") or {}).get(name))
             for name in ("all_opportunities", "nonoverlapping")
+        },
+        "fixed_baselines_by_horizon": {
+            str(horizon): {
+                side: {
+                    name: _compact_evidence(_as_dict(views).get(name))
+                    for name in ("all_opportunities", "nonoverlapping")
+                }
+                for side, views in _as_dict(side_views).items()
+            }
+            for horizon, side_views in _as_dict(
+                fold.get("fixed_baselines_by_horizon")
+            ).items()
         },
     }
 

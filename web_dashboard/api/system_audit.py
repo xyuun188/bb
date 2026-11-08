@@ -8,6 +8,7 @@ import copy
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import signal
@@ -108,7 +109,7 @@ SYSTEM_AUDIT_LATEST_FILE = "system_audit_latest.json"
 # Persisted snapshots are an optimization only.  Bump this whenever the
 # audit classification or safety contract changes so an older snapshot cannot
 # replay obsolete blockers after deployment.
-SYSTEM_AUDIT_SCHEMA_VERSION = "2026-09-15.v2"
+SYSTEM_AUDIT_SCHEMA_VERSION = "2026-11-09.v3"
 POSITION_PRICE_SPLIT_WARN_PCT = 0.03
 POSITION_PNL_SPLIT_WARN_USDT = 0.5
 OKX_RECONCILIATION_CACHE_TTL_SECONDS = 120
@@ -233,6 +234,10 @@ REQUIRED_AUDIT_KEYS = (
     "position_capacity_release",
     "model_training",
 )
+# Required cards are reused across audit snapshots to avoid repeating the same
+# DB scan. Each card records its own generation time so a stale structure can
+# never be replayed forever just because the enclosing snapshot was refreshed.
+REQUIRED_AUDIT_GENERATED_AT_KEY = "required_audit_generated_at"
 EARLY_DB_AUDIT_KEYS = (
     "production_source_health",
 )
@@ -4156,6 +4161,98 @@ async def _crypto_feature_coverage_audit() -> dict[str, Any]:
     )
 
 
+def _local_ml_profit_quality_details(
+    *,
+    local_ml_status: dict[str, Any],
+    model_registry: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose the current local ML artifact as the authoritative go/no-go evidence.
+
+    The legacy ``local_ai_tools`` bundle carries its own promotion flag and PF.
+    Audit consumers must evaluate the trained ``local_ml_profit_quality``
+    artifact instead, including its per-side metrics and any fallback path.
+    """
+
+    status = _safe_dict(local_ml_status)
+    readiness = _safe_dict(status.get("readiness"))
+    metrics = _safe_dict(readiness.get("metrics"))
+    governance = _safe_dict(status.get("policy_provenance")) or _safe_dict(
+        readiness.get("policy_provenance")
+    )
+    walk_forward = _safe_dict(status.get("walk_forward_report"))
+    registry_row: dict[str, Any] = {}
+    for row in _safe_list(_safe_dict(model_registry).get("models")):
+        if isinstance(row, dict) and row.get("model_id") == "local_ml_profit_quality":
+            registry_row = row
+            break
+    side_metrics: dict[str, dict[str, Any]] = {}
+    for side in ("long", "short"):
+        side_metrics[side] = {
+            "profit_factor": _safe_float_value(metrics.get(f"top_{side}_profit_factor")),
+            "return_lcb_pct": _safe_float_value(metrics.get(f"top_{side}_return_lcb_pct")),
+            "mean_return_pct": _safe_float_value(metrics.get(f"top_{side}_avg_return_pct")),
+            "tail_loss_rate": _safe_float_value(metrics.get(f"top_{side}_tail_loss_rate")),
+            "bottom_return_pct": _safe_float_value(metrics.get(f"bottom_{side}_avg_return_pct")),
+        }
+    side_pfs = [
+        side_metrics[side]["profit_factor"]
+        for side in ("long", "short")
+        if side_metrics[side]["profit_factor"] is not None
+    ]
+    side_lcbs = [
+        side_metrics[side]["return_lcb_pct"]
+        for side in ("long", "short")
+        if side_metrics[side]["return_lcb_pct"] is not None
+    ]
+    fallback_reason = str(governance.get("fallback_reason") or "")
+    live_ml_ready = status.get("live_ml_ready") is True
+    fallback_used = not live_ml_ready
+    enabled_sides = [
+        str(side)
+        for side in _safe_list(readiness.get("live_enabled_sides"))
+        if str(side) in {"long", "short"}
+    ]
+    return {
+        "model_id": "local_ml_profit_quality",
+        "artifact_version": status.get("artifact_version") or status.get("model_version"),
+        "available": bool(status.get("available")),
+        "status": status.get("status"),
+        "readiness_state": readiness.get("state") or status.get("readiness_state"),
+        "live_ml_ready": live_ml_ready,
+        "paper_model_eligible": status.get("paper_model_eligible") is True,
+        "profit_factor": min(side_pfs) if side_pfs else None,
+        "return_lcb_pct": min(side_lcbs) if side_lcbs else None,
+        "sides": side_metrics,
+        "enabled_sides": enabled_sides,
+        "side_profit_factors": {
+            side: side_metrics[side]["profit_factor"] for side in ("long", "short")
+        },
+        "side_return_lcb_pct": {
+            side: side_metrics[side]["return_lcb_pct"] for side in ("long", "short")
+        },
+        "walk_forward_status": walk_forward.get("status"),
+        "walk_forward_stable": walk_forward.get("stable"),
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason or None,
+        "evaluated_horizon_minutes": walk_forward.get("primary_horizon_minutes")
+        or status.get("prediction_horizon_minutes"),
+        "blocking_reasons": [
+            str(item.get("code") if isinstance(item, dict) else item)
+            for item in _safe_list(readiness.get("blocking_reasons"))[:12]
+        ],
+        "registry_lifecycle": registry_row.get("lifecycle"),
+        "registry_quality_state": registry_row.get("quality_state"),
+    }
+
+
+def _safe_float_value(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _model_training_health_summary(
     *,
     local_tools: dict[str, Any],
@@ -4687,6 +4784,13 @@ async def _model_training_audit() -> dict[str, Any]:
         model_server_report=_load_phase3_model_server_readiness_latest_report(),
     )
     model_registry["scheduler_state"] = training_scheduler_state
+    # Go/no-go must evaluate the local ML artifact itself. The legacy
+    # local_ai_tools bundle has its own promotion flag and must never stand in
+    # for the local_ml_profit_quality lifecycle.
+    local_ml_profit_quality = _local_ml_profit_quality_details(
+        local_ml_status=local_ml_status,
+        model_registry=model_registry,
+    )
     status = _status_from_counts(
         critical=hard_failure
         and (bool(model_critical) or local_tools_hard_missing or runtime_probe_hard_failure),
@@ -4731,6 +4835,10 @@ async def _model_training_audit() -> dict[str, Any]:
         status,
         summary,
         details={
+            # Authoritative local ML promotion state for go/no-go. The
+            # legacy local_ai_tools bundle keeps its own flag under
+            # ``local_ai_tools`` and must not stand in for this artifact.
+            "live_ml_ready": local_ml_profit_quality["live_ml_ready"],
             "local_ai_tools": {
                 "available": bool(local_tools.get("available")),
                 "status": local_tools.get("status"),
@@ -4767,6 +4875,7 @@ async def _model_training_audit() -> dict[str, Any]:
             "phase3_training_governance": phase3_training_governance,
             "training_health_summary": training_health_summary,
             "model_registry": model_registry,
+            "local_ml_profit_quality": local_ml_profit_quality,
             "phase3_rebuild_readiness": phase3_rebuild_readiness,
             "specialist_shadow_evaluation": {
                 "available": bool(specialist_shadow_evaluation.get("available")),
@@ -6585,9 +6694,6 @@ def _cached_required_audit_card(key: str) -> dict[str, Any] | None:
     if snapshot is None:
         return None
     checked_at, payload = snapshot
-    age_seconds = max((_now() - checked_at).total_seconds(), 0.0)
-    if age_seconds > REQUIRED_AUDIT_SNAPSHOT_MAX_AGE_SECONDS:
-        return None
     cards = payload.get("cards") if isinstance(payload.get("cards"), list) else []
     card = next(
         (
@@ -6599,12 +6705,26 @@ def _cached_required_audit_card(key: str) -> dict[str, Any] | None:
     )
     if not isinstance(card, dict):
         return None
+    # Prefer the card's own generation time. Older snapshots that predate this
+    # stamp fall back to the snapshot time, but then the reused card is stamped
+    # below so it cannot be replayed indefinitely at a permanently fresh age.
+    card_sources = card.get("details")
+    card_generated_at = None
+    if isinstance(card_sources, dict):
+        card_generated_at = _parse_utc_datetime(
+            card_sources.get(REQUIRED_AUDIT_GENERATED_AT_KEY)
+        )
+    reference_at = card_generated_at or checked_at
+    age_seconds = max((_now() - reference_at).total_seconds(), 0.0)
+    if age_seconds > REQUIRED_AUDIT_SNAPSHOT_MAX_AGE_SECONDS:
+        return None
     cached = copy.deepcopy(card)
     details = cached.setdefault("details", {})
     if isinstance(details, dict):
         details["report_source"] = "persisted_audit"
         details["report_age_seconds"] = round(age_seconds, 3)
         details["report_max_age_seconds"] = REQUIRED_AUDIT_SNAPSHOT_MAX_AGE_SECONDS
+        details.setdefault(REQUIRED_AUDIT_GENERATED_AT_KEY, reference_at.isoformat())
     return cached
 
 
@@ -6964,6 +7084,9 @@ async def _run_required_audit(
     )
     if not isinstance(result, dict):
         return result
+    details = result.setdefault("details", {})
+    if isinstance(details, dict):
+        details[REQUIRED_AUDIT_GENERATED_AT_KEY] = _now().isoformat()
     return result
 
 

@@ -58,7 +58,7 @@ def test_compact_report_preserves_actual_selection_coverage() -> None:
         body=[
             node for node in payload.body
             if isinstance(node, ast.FunctionDef)
-            and node.name in {"_compact_evidence", "_compact_fold"}
+            and node.name in {"_as_dict", "_compact_evidence", "_compact_fold"}
         ],
         type_ignores=[],
     )

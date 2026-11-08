@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -9,6 +9,7 @@ import pytest
 
 from core.model_artifact_safety import dump_trusted_joblib
 from services.ml_signal_service import MLSignalService
+from services.ml_training_contract import PRIMARY_PREDICTION_HORIZON_MINUTES
 from services.model_artifact_registry import ResolvedModelArtifact
 from services.model_forward_comparison import (
     common_forward_observations,
@@ -83,14 +84,14 @@ async def test_artifact_bound_service_cannot_train_or_rollback(tmp_path):
         service.rollback_to_strategy_model("old")
 
 
-def _observation(source_id=1):
+def _observation(source_id=1, horizon_minutes=5):
     return {
         "source_id": source_id,
         "decision_id": source_id,
         "symbol": "BTC",
         "decision_timestamp": "2026-10-21T00:01:00+00:00",
         "label_timestamp": "2026-10-21T00:06:00+00:00",
-        "horizon_minutes": 5,
+        "horizon_minutes": horizon_minutes,
         "training_eligible": True,
         "execution_cost_pct": 0.1,
         "long_funding_return_pct": 0.0,
@@ -100,13 +101,13 @@ def _observation(source_id=1):
     }
 
 
-def _prediction(version="challenger", side="long"):
+def _prediction(version="challenger", side="long", horizon_minutes=5):
     return {
         "available": True,
         "model_version": version,
         "predictions": [
             {
-                "horizon_minutes": 5,
+                "horizon_minutes": horizon_minutes,
                 "best_side": side,
                 "return_distribution_contract": {
                     side: {
@@ -206,7 +207,7 @@ async def test_forward_comparison_uses_same_projected_rows_and_serializable_inve
         {
             "execution_mode": "paper",
             "status": "completed",
-            "horizon_minutes": 5,
+            "horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
             "sample_count": 1,
             "latest_decision_at": datetime(2026, 10, 20, 0, 1),
         }
@@ -228,16 +229,26 @@ async def test_forward_comparison_uses_same_projected_rows_and_serializable_inve
 
         def predict_strategy_replay_batch(self, rows, **kwargs):
             assert rows == [{"price": 100.0, "symbol": "BTC"}]
-            return [_prediction(self.version)]
+            return [
+                _prediction(
+                    self.version,
+                    horizon_minutes=PRIMARY_PREDICTION_HORIZON_MINUTES,
+                )
+            ]
 
     def observations(rows, **kwargs):
         assert rows[0].training_feature_snapshot == {"price": 100.0}
         return [
             {
-                **_observation(),
+                    **_observation(
+                        horizon_minutes=PRIMARY_PREDICTION_HORIZON_MINUTES
+                    ),
                 "feature_snapshot": {"price": 100.0},
                 "decision_timestamp": "2026-10-20T00:01:00Z",
-                "label_timestamp": "2026-10-20T00:06:00Z",
+                    "label_timestamp": (
+                        datetime(2026, 10, 20, 0, 1, tzinfo=UTC)
+                        + timedelta(minutes=PRIMARY_PREDICTION_HORIZON_MINUTES)
+                    ).isoformat(),
             }
         ], {}
 

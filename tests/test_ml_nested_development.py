@@ -13,7 +13,9 @@ def _frame() -> pd.DataFrame:
         decision = pd.Timestamp("2026-08-01", tz="UTC") + pd.Timedelta(
             minutes=index * 30
         )
-        for horizon in (5, 240):
+        # Include a horizon longer than the primary target so the fold test
+        # can prove that unfitted long-horizon labels do not purge primary data.
+        for horizon in (5, 240, 480):
             rows.append({
                 **{key: float(index % 7) for key in FEATURE_KEYS},
                 "id": len(rows) + 1,
@@ -103,23 +105,27 @@ def test_no_qualified_inner_candidate_selects_no_trade(monkeypatch):
 
 def test_fixed_horizon_folds_do_not_purge_on_unfitted_long_horizon_labels() -> None:
     frame = _frame()
+    primary_horizon = nested.PRIMARY_PREDICTION_HORIZON_MINUTES
     groups, _ = nested._decision_group_availability(frame)
     all_horizon = nested._folds(frame, 3)
     primary = frame[
-        frame["horizon_minutes"] == nested.PRIMARY_PREDICTION_HORIZON_MINUTES
+        frame["horizon_minutes"] == primary_horizon
     ].copy()
     fixed_horizon = nested._folds(primary, 3)
 
     assert len(groups) == 480
     assert len(all_horizon) == len(fixed_horizon) == 3
     assert sum(
-        fold[0]["horizon_minutes"].eq(5).sum() for fold in all_horizon
+        fold[0]["horizon_minutes"].eq(primary_horizon).sum() for fold in all_horizon
     ) < sum(
-        fold[0]["horizon_minutes"].eq(5).sum() for fold in fixed_horizon
+        fold[0]["horizon_minutes"].eq(primary_horizon).sum() for fold in fixed_horizon
     )
     for train, validation, boundary in fixed_horizon:
-        assert train["horizon_minutes"].eq(5).sum() >= nested.MIN_TRAINING_SAMPLE_COUNT
-        assert validation["horizon_minutes"].eq(5).sum() > 0
+        assert (
+            train["horizon_minutes"].eq(primary_horizon).sum()
+            >= nested.MIN_TRAINING_SAMPLE_COUNT
+        )
+        assert validation["horizon_minutes"].eq(primary_horizon).sum() > 0
         assert boundary["chronological_label_disjoint"] is True
 
 

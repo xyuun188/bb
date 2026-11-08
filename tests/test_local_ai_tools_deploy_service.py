@@ -3018,13 +3018,15 @@ def _training_shadow_samples(count: int = 200) -> list[dict[str, object]]:
     samples: list[dict[str, object]] = []
     first_label_at = datetime(2026, 7, 14, tzinfo=UTC)
     for index in range(count):
+        decision_at = first_label_at + timedelta(minutes=index * 300)
         samples.append(
             {
                 "id": index + 1,
                 "decision_id": index + 1,
                 "symbol": "BTC/USDT",
-                "horizon_minutes": 10,
-                "label_timestamp": (first_label_at + timedelta(minutes=index * 11)).isoformat(),
+                "horizon_minutes": 240,
+                "decision_timestamp": decision_at.isoformat(),
+                "label_timestamp": (decision_at + timedelta(minutes=240)).isoformat(),
                 "features": {
                     "symbol": "BTC/USDT",
                     "current_price": 100.0 + index * 0.01,
@@ -3260,7 +3262,7 @@ def test_phase3_service_uses_current_supervision_and_rejects_legacy_v2(
     assert current_module.load_bundle() is None
 
 
-def test_training_builds_each_observed_horizon_without_a_fixed_sample_gate(
+def test_training_fits_only_the_primary_horizon(
     tmp_path: Path,
 ) -> None:
     module = _local_ai_tools_training_module(tmp_path)
@@ -3269,7 +3271,29 @@ def test_training_builds_each_observed_horizon_without_a_fixed_sample_gate(
         _training_request(module, shadow_samples=_training_shadow_samples(count=2))
     )
 
-    assert result["horizons"] == [10]
+    primary = module.PRIMARY_PREDICTION_HORIZON_MINUTES
+    assert result["horizons"] == [primary]
+    assert result["fitted_horizons"] == [primary]
+    assert result["primary_prediction_horizon_minutes"] == primary
+
+
+def test_training_rejects_frames_without_primary_horizon(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    samples = _training_shadow_samples(count=4)
+    for sample in samples:
+        sample["horizon_minutes"] = 10
+        sample["label_timestamp"] = (
+            datetime(2026, 7, 14, tzinfo=UTC) + timedelta(minutes=10)
+        ).isoformat()
+
+    result = module.train(_training_request(module, shadow_samples=samples))
+
+    assert result["trained"] is False
+    assert result["reason"] == "primary_prediction_horizon_training_data_unavailable"
+    assert result["source_horizons"] == [10]
+    assert result["source_horizon_sample_counts"] == {"10": 4}
 
 
 def test_local_ai_walk_forward_refits_disjoint_chronological_decision_groups(
@@ -3311,42 +3335,44 @@ def test_local_ai_walk_forward_scopes_each_fold_to_primary_horizon(
 ) -> None:
     module = _local_ai_tools_training_module(tmp_path)
     samples = _training_shadow_samples(count=80)
-    first_decision_at = datetime(2026, 7, 14, tzinfo=UTC)
     for index, sample in enumerate(samples):
-        horizon = (5, 15, 60, 240)[index % 4]
-        sample["horizon_minutes"] = horizon
-        sample["label_timestamp"] = (
-            first_decision_at + timedelta(minutes=index * 300 + horizon)
-        ).isoformat()
+        if index % 4 == 0:
+            continue
+        # Contradicting short-horizon rows must not enter the primary fit.
+        sample["horizon_minutes"] = (5, 15, 60)[index % 3]
 
     result = module.train(_training_request(module, shadow_samples=samples))
     report = result["walk_forward_report"]
 
-    assert report["primary_horizon_minutes"] == 5
+    primary = module.PRIMARY_PREDICTION_HORIZON_MINUTES
+    assert report["primary_horizon_minutes"] == primary
+    assert report["evaluation_horizon_minutes"] == primary
     assert report["primary_horizon_available"] is True
-    assert report["sides"]["long"] == report["horizon_diagnostics"]["5"]["long"]
+    assert report["fitted_horizons"] == [primary]
+    assert report["training_horizon_policy"] == module.TRAINING_HORIZON_POLICY
+    assert report["mixed_horizon_fit_allowed"] is False
+    assert set(report["unfitted_horizon_diagnostics"]) == {"5", "15", "60"}
+    assert report["source_horizons"] == [5, 15, 60, 240]
+    assert result["unfitted_horizon_minutes"] == [5, 15, 60]
     assert report["folds"]
     for fold in report["folds"]:
-        assert set(fold["horizon_diagnostics"]) == {"5", "15", "60", "240"}
-        for side in ("long", "short"):
-            assert fold["sides"][side]["count"] == fold["horizon_diagnostics"]["5"][
-                side
-            ]["count"]
-            assert fold["mixed_horizon_diagnostics"][side]["count"] >= fold["sides"][
-                side
-            ]["count"]
+        assert fold["horizon_minutes"] == primary
+        assert fold["sides"]["long"]["count"] > 0
 
 
 def test_local_ai_walk_forward_purges_unavailable_multi_horizon_groups(
     tmp_path: Path,
 ) -> None:
     module = _local_ai_tools_training_module(tmp_path)
+    primary = module.PRIMARY_PREDICTION_HORIZON_MINUTES
     decision_start = datetime(2026, 7, 14, tzinfo=UTC)
     samples: list[dict[str, object]] = []
     sample_id = 0
     for decision_index in range(30):
-        decision_at = decision_start + timedelta(minutes=decision_index * 5)
-        for horizon in (10, 60):
+        decision_at = decision_start + timedelta(
+            minutes=decision_index * (primary - 40)
+        )
+        for horizon in (primary, 5):
             sample_id += 1
             sample = _training_shadow_samples(count=1)[0]
             sample.update(
@@ -3367,6 +3393,8 @@ def test_local_ai_walk_forward_purges_unavailable_multi_horizon_groups(
     report = result["walk_forward_report"]
 
     assert report["status"] == "complete"
+    assert report["fitted_horizons"] == [primary]
+    assert report["unfitted_horizon_diagnostics"]["5"]["sample_count"] == 30
     assert report["chronological_label_disjoint"] is True
     assert any(fold["purged_training_decision_group_count"] > 0 for fold in report["folds"])
     assert all(
