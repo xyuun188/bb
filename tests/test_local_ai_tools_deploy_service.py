@@ -21,6 +21,59 @@ from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_shadow_results_retrieve_delayed_exact_request_and_preserve_kind_capacity(monkeypatch):
+    module = ModuleType("local_ai_tools_shadow_result_test")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    module.ShadowResultRequest.model_rebuild()
+    module._configure_specialist_runtime = lambda: None
+    release = threading.Event()
+    calls = []
+
+    def worker(features):
+        calls.append(features["symbol"])
+        assert release.wait(2)
+        return {"available": True, "actual_inference": True, "best_side": "long"}
+
+    try:
+        first = module._shadow_ready_or_submit("test_timeseries", {"symbol": "BTC"}, worker)
+        duplicate_kind = module._shadow_ready_or_submit("test_timeseries", {"symbol": "ETH"}, worker)
+        sentiment = module._shadow_ready_or_submit("test_sentiment", {"symbol": "BTC"}, worker)
+        assert first["status"] == sentiment["status"] == "shadow_pending"
+        assert duplicate_kind["status"] == "shadow_deferred"
+        key = first["shadow_cache_key"]
+        unknown = "0" * 64
+        missing = module.shadow_results(module.ShadowResultRequest(keys=[unknown], wait_seconds=0))
+        assert missing["results"][unknown]["status"] == "expired"
+        release.set()
+        response = module.shadow_results(module.ShadowResultRequest(keys=[key], wait_seconds=1))
+        assert response["observation_only"] is True
+        row = response["results"][key]
+        assert row["status"] == "completed"
+        assert row["shadow_cache_key"] == key
+        assert row["actual_inference"] is True
+        assert row["shadow_completed_at"]
+        assert "ETH" not in calls
+        assert len(calls) <= 2
+    finally:
+        release.set()
+        executor = module._SHADOW_EXECUTOR
+        module.shutdown_shadow_executor()
+        if executor:
+            executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("keys,wait", [([], 0), (["bad"], 0), (["a" * 64] * 4, 0), (["a" * 64], float("nan"))])
+def test_shadow_results_reject_invalid_request(keys, wait, monkeypatch):
+    module = ModuleType("local_ai_tools_shadow_invalid_test")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    module.ShadowResultRequest.model_rebuild()
+    with pytest.raises(module.HTTPException) as exc:
+        module.shadow_results(module.ShadowResultRequest(keys=keys, wait_seconds=wait))
+    assert exc.value.status_code == 400
+
+
 def _configure_local_ai_registry(module: ModuleType, root: Path) -> None:
     module.MODEL_DIR = root
     module.VERSIONS_ROOT = root / "versions"

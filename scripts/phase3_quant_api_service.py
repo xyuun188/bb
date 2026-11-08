@@ -200,6 +200,7 @@ _SPECIALIST_MODEL_CACHE_LOCK = threading.RLock()
 _SHADOW_EXECUTOR: ThreadPoolExecutor | None = None
 _SHADOW_EXECUTOR_LOCK = threading.RLock()
 _SHADOW_INFLIGHT: dict[str, Future] = {}
+_SHADOW_INFLIGHT_KIND: dict[str, str] = {}
 _SHADOW_RESULT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _SHADOW_CACHE_TTL_SECONDS = max(
     float(os.environ.get("LOCAL_AI_TOOLS_SHADOW_CACHE_TTL_SECONDS", "45")),
@@ -213,7 +214,7 @@ _SHADOW_EXECUTOR_MAX_WORKERS = max(
     int(os.environ.get("LOCAL_AI_TOOLS_SHADOW_MAX_WORKERS", "1")),
     1,
 )
-_SHADOW_MAX_INFLIGHT = _SHADOW_EXECUTOR_MAX_WORKERS * 2
+_SHADOW_MAX_INFLIGHT = max(_SHADOW_EXECUTOR_MAX_WORKERS * 2, 3)
 _SHADOW_MAX_CACHE_ENTRIES = 256
 _SPECIALIST_NUM_THREADS = max(
     int(os.environ.get("LOCAL_AI_TOOLS_SPECIALIST_NUM_THREADS", "1")),
@@ -412,13 +413,14 @@ def _shadow_ready_or_submit(kind: str, features: dict[str, Any], worker) -> dict
             return {**cached[1], "shadow_cache_hit": True}
         if key in _SHADOW_INFLIGHT:
             return {"available": False, "actual_inference": False, "status": "shadow_pending", "reason": "specialist_shadow_inference_in_progress", "shadow_cache_key": key}
-        if len(_SHADOW_INFLIGHT) >= _SHADOW_MAX_INFLIGHT:
+        if kind in _SHADOW_INFLIGHT_KIND.values() or len(_SHADOW_INFLIGHT) >= _SHADOW_MAX_INFLIGHT:
             return {"available": False, "actual_inference": False, "status": "shadow_deferred", "reason": "specialist_shadow_capacity_exhausted"}
         try:
             future = _shadow_executor().submit(worker, dict(features))
         except RuntimeError:
             return {"available": False, "actual_inference": False, "status": "shadow_deferred", "reason": "specialist_shadow_executor_unavailable"}
         _SHADOW_INFLIGHT[key] = future
+        _SHADOW_INFLIGHT_KIND[key] = kind
 
     def complete(done: Future, cache_key: str = key) -> None:
         try:
@@ -426,8 +428,11 @@ def _shadow_ready_or_submit(kind: str, features: dict[str, Any], worker) -> dict
             result = dict(value) if isinstance(value, dict) else {"available": False, "reason": "shadow_invalid_result"}
         except Exception as exc:
             result = {"available": False, "reason": safe_error(exc, 220)}
+        result["shadow_cache_key"] = cache_key
+        result["shadow_completed_at"] = datetime.now(timezone.utc).isoformat()
         with _SHADOW_EXECUTOR_LOCK:
             _SHADOW_INFLIGHT.pop(cache_key, None)
+            _SHADOW_INFLIGHT_KIND.pop(cache_key, None)
             _SHADOW_RESULT_CACHE[cache_key] = (time.monotonic(), result)
             if len(_SHADOW_RESULT_CACHE) > _SHADOW_MAX_CACHE_ENTRIES:
                 oldest = min(_SHADOW_RESULT_CACHE, key=lambda item: _SHADOW_RESULT_CACHE[item][0])
@@ -444,7 +449,17 @@ def _shadow_ready_or_submit(kind: str, features: dict[str, Any], worker) -> dict
     except Exception:
         immediate = None
     if isinstance(immediate, dict):
-        return {**immediate, "shadow_completed_inline": True}
+        with _SHADOW_EXECUTOR_LOCK:
+            completed = _SHADOW_RESULT_CACHE.get(key)
+            if completed is None:
+                inline_result = {
+                    **immediate,
+                    "shadow_cache_key": key,
+                    "shadow_completed_at": datetime.now(timezone.utc).isoformat(),
+                }
+                _SHADOW_RESULT_CACHE[key] = (time.monotonic(), inline_result)
+                completed = (time.monotonic(), inline_result)
+        return {**completed[1], "shadow_completed_inline": True}
     return {"available": False, "actual_inference": False, "status": "shadow_pending", "reason": "specialist_shadow_inference_queued", "shadow_cache_key": key}
 
 
@@ -499,6 +514,44 @@ app.add_middleware(
 )
 
 
+class ShadowResultRequest(BaseModel):
+    keys: list[str]
+    wait_seconds: float = 1.0
+
+
+@app.post("/shadow/results")
+def shadow_results(req: ShadowResultRequest) -> dict[str, Any]:
+    """Read only the exact submitted inputs; never start replacement inference."""
+
+    if not 1 <= len(req.keys) <= 3 or any(
+        not re.fullmatch(r"[0-9a-f]{64}", key) for key in req.keys
+    ) or not math.isfinite(req.wait_seconds):
+        raise HTTPException(status_code=400, detail="Invalid shadow result request.")
+    deadline = time.monotonic() + min(max(req.wait_seconds, 0.0), 1.0)
+    while True:
+        now = time.monotonic()
+        results = {}
+        with _SHADOW_EXECUTOR_LOCK:
+            for key in req.keys:
+                cached = _SHADOW_RESULT_CACHE.get(key)
+                ttl = (
+                    _SHADOW_CACHE_TTL_SECONDS
+                    if cached and cached[1].get("available")
+                    else _SHADOW_FAILURE_TTL_SECONDS
+                )
+                if cached and now - cached[0] < ttl:
+                    results[key] = {**cached[1], "status": "completed"}
+                else:
+                    results[key] = {
+                        "status": "pending" if key in _SHADOW_INFLIGHT else "expired",
+                        "shadow_cache_key": key,
+                        "actual_inference": False,
+                    }
+        if any(value["status"] != "pending" for value in results.values()) or now >= deadline:
+            return {"results": results, "observation_only": True}
+        time.sleep(min(0.05, max(deadline - now, 0.0)))
+
+
 @app.on_event("startup")
 def startup_load_current_bundle() -> None:
     """Load the verified bundle before accepting inference traffic."""
@@ -518,6 +571,7 @@ def shutdown_shadow_executor() -> None:
         executor = _SHADOW_EXECUTOR
         _SHADOW_EXECUTOR = None
         _SHADOW_INFLIGHT.clear()
+        _SHADOW_INFLIGHT_KIND.clear()
         _SHADOW_RESULT_CACHE.clear()
     if executor is not None:
         executor.shutdown(wait=False, cancel_futures=True)

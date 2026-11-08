@@ -1317,13 +1317,19 @@ class OKXRestClient:
             return {**cached[1], "orderbook_cached": True}
 
         async def fetch_and_normalize() -> dict[str, Any]:
-            book = await self._ccxt_call(
-                "fetch_order_book",
-                self._to_swap_symbol(symbol),
-                limit=limit,
-                _request_priority=bool(priority),
-            )
-            received_at = datetime.now(UTC).isoformat()
+            for attempt in range(2):
+                book = await self._ccxt_call(
+                    "fetch_order_book",
+                    self._to_swap_symbol(symbol),
+                    limit=limit,
+                    _request_priority=bool(priority),
+                )
+                receipt = datetime.now(UTC)
+                info = book.get("info") if isinstance(book.get("info"), dict) else {}
+                source_timestamp_ms = _positive_timestamp_ms(book.get("timestamp") or info.get("ts"))
+                if source_timestamp_ms <= receipt.timestamp() * 1000 or attempt:
+                    break
+            received_at = receipt.isoformat()
             bids = book.get("bids") or []
             asks = book.get("asks") or []
             bid = self._safe_float(bids[0][0] if bids else 0.0)
@@ -1345,10 +1351,6 @@ class OKXRestClient:
             contract_base_size = contract_value * contract_multiplier
             bid_depth_usdt = bid_depth * contract_base_size if contract_base_size > 0 else 0.0
             ask_depth_usdt = ask_depth * contract_base_size if contract_base_size > 0 else 0.0
-            info = book.get("info") if isinstance(book.get("info"), dict) else {}
-            source_timestamp_ms = int(
-                self._safe_float(book.get("timestamp") or info.get("ts"))
-            )
             payload = {
                 "spread_pct": spread_pct,
                 "orderbook_bid_depth": bid_depth_usdt,
@@ -1380,6 +1382,9 @@ class OKXRestClient:
                     "contract_spec_version": normalized_spec.get("spec_version"),
                 },
             }
+            payload["orderbook_data_available"] = _orderbook_snapshot_is_complete(payload)
+            if not payload["orderbook_data_available"] and contract_spec_available:
+                payload["orderbook_unavailable_reason"] = "orderbook_fact_incomplete"
             if payload["orderbook_data_available"]:
                 self._orderbook_cache[inst_id] = (time.monotonic(), payload)
             return payload

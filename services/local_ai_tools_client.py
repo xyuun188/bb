@@ -346,6 +346,9 @@ class LocalAIToolsClient:
                     )
                     for index, item in zip(retry_indexes, retried, strict=False):
                         results[index] = item
+                await self._collect_shadow_results(
+                    tool_specs, results, deadline=batch_deadline,
+                )
             else:
                 results.extend(
                     {
@@ -459,6 +462,109 @@ class LocalAIToolsClient:
             self._record_success()
             data.update(self._breaker_fields())
         return data
+
+    async def _collect_shadow_results(
+        self,
+        tool_specs: list[tuple[str, str]],
+        results: list[Any],
+        *,
+        deadline: float,
+    ) -> None:
+        pending: dict[str, tuple[int, str]] = {}
+        for index, ((name, _path), item) in enumerate(zip(tool_specs, results, strict=False)):
+            if name not in {"time_series_prediction", "sentiment_analysis"} or not isinstance(item, dict):
+                continue
+            professional = item.get("professional_model_shadow")
+            if not isinstance(professional, dict):
+                continue
+            fields = (
+                ("primary_shadow_result", "challenger_shadow_result")
+                if name == "time_series_prediction" else ("",)
+            )
+            for field in fields:
+                value = professional.get(field) if field else professional
+                if not isinstance(value, dict):
+                    continue
+                key = value.get("shadow_cache_key")
+                if (
+                    isinstance(key, str) and len(key) == 64
+                    and all(char in "0123456789abcdef" for char in key)
+                    and value.get("actual_inference") is not True
+                    and value.get("status") == "shadow_pending"
+                ):
+                    pending[key] = (index, field)
+        while pending:
+            remaining = deadline - monotonic()
+            if remaining < _MIN_INFERENCE_ATTEMPT_SECONDS:
+                break
+            task = asyncio.create_task(self._post(
+                "/shadow/results",
+                {"keys": list(pending), "wait_seconds": min(remaining / 2, 1.0)},
+                request_timeout=remaining,
+            ))
+            try:
+                done, _ = await asyncio.wait({task}, timeout=remaining)
+            except asyncio.CancelledError:
+                task.cancel()
+                self._track_background_task(task)
+                raise
+            if not done:
+                task.cancel()
+                self._track_background_task(task)
+                break
+            try:
+                response = task.result()
+            except Exception as exc:
+                logger.debug("shadow result collection unavailable", error=safe_error_text(exc, limit=120))
+                break
+            rows = response.get("results") if isinstance(response, dict) else None
+            if not isinstance(rows, dict):
+                break
+            for key, (index, field) in list(pending.items()):
+                value = rows.get(key)
+                if not isinstance(value, dict) or value.get("shadow_cache_key") != key:
+                    pending.pop(key)
+                    continue
+                if value.get("status") == "pending":
+                    continue
+                pending.pop(key)
+                if (
+                    value.get("status") != "completed"
+                    or value.get("available") is not True
+                    or value.get("actual_inference") is not True
+                ):
+                    continue
+                item = results[index]
+                professional = item["professional_model_shadow"]
+                collected = {**value, "shadow_result_collected": True}
+                if field:
+                    professional[field] = collected
+                    primary = professional.get("primary_shadow_result") or {}
+                    challenger = professional.get("challenger_shadow_result") or {}
+                    professional["shadow_result"] = (
+                        primary if primary.get("actual_inference") is True else challenger
+                    )
+                    prefix = "timesfm" if field == "primary_shadow_result" else "chronos"
+                    for target, source in (
+                        ("expected_move_pct", "expected_move_pct"),
+                        ("expected_return_pct", "expected_return_pct"),
+                        ("side", "best_side"), ("confidence", "confidence"),
+                        ("horizon_step", "horizon_step"),
+                    ):
+                        item[f"{prefix}_shadow_{target}"] = value.get(source)
+                else:
+                    professional.update(collected)
+                professional["actual_inference"] = True
+                item["specialist_inference_active"] = True
+                item["specialist_response_applied"] = False
+                item["shadow_result_collected"] = True
+                # Keep baseline side, return distribution and permissions intact.
+                item["fallback_reason"] = (
+                    "specialist_timeseries_shadow_only" if field else "specialist_sentiment_shadow_only"
+                )
+                chain = item.get("specialist_model_chain")
+                if isinstance(chain, dict):
+                    item["specialist_model_chain"] = {**chain, "actual_inference": True}
 
     @staticmethod
     def _consume_background_task(task: asyncio.Task[Any]) -> None:

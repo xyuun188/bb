@@ -7958,3 +7958,23 @@ on the mean. A favorable historical test is not a guarantee of future profit.
   exam, or live readiness was established. The remaining profitability
   blocker requires fresh, valid, mature fee-after evidence and the existing
   governed promotion flow; elapsed waiting alone does not clear it.
+
+### Specialist Result Retrieval And Causal Market Facts (2026-11-08)
+
+- Fixed a runtime loss of professional shadow evidence: the quant API now
+  retains the exact shadow request key and completion timestamp, limits one
+  in-flight job per specialist kind, and exposes an authenticated,
+  read-only `/shadow/results` lookup. The local client polls only the exact
+  requests already submitted within its existing batch deadline; it never
+  resubmits or promotes the result into live routing. Expired, failed, or
+  mismatched results remain non-actionable.
+- Fixed two data-integrity paths without weakening causal validation. Fee and
+  order-book requests retry once when an exchange timestamp is ahead of the
+  local receipt clock; a persistent future timestamp is rejected and is not
+  cached. Incomplete order books are explicitly unavailable. Historical
+  timestamps are not rewritten.
+- Focused regression suites passed: 20 receipt-clock tests, 63 local-client
+  tests, 115 quant API deployment-service tests, 37 shadow-backtest tests;
+  Ruff and Python compilation passed. This repairs observability and input
+  integrity only. It does not establish positive fee-after profitability,
+  authorize entries, or enable live trading.

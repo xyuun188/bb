@@ -32,6 +32,21 @@ def test_market_label_horizons_match_the_versioned_training_contract() -> None:
     assert SHADOW_BACKTEST_HORIZONS_MINUTES == (5, 15, 60, 240)
 
 
+def test_compact_specialist_results_preserve_request_and_completion_provenance():
+    provenance = {
+        "shadow_cache_key": "a" * 64,
+        "shadow_completed_at": "2026-11-08T07:00:00+00:00",
+        "shadow_result_collected": True,
+    }
+    compact = shadow_backtest_module._compact_professional_shadow({
+        **provenance, "actual_inference": True, "baseline_response": True,
+        "primary_shadow_result": {**provenance, "actual_inference": True},
+    })
+    for key, value in provenance.items():
+        assert compact[key] == value
+        assert compact["primary_shadow_result"][key] == value
+
+
 def test_shadow_path_labels_capture_mfe_mae_and_stop_events() -> None:
     labels = shadow_path_labels(
         entry_price=100.0,

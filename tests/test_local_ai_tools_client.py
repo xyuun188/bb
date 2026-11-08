@@ -55,6 +55,91 @@ def local_tools_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "mismatched", "expired", "failed", "pending"])
+async def test_pending_specialist_result_is_collected_within_original_batch_budget(
+    local_tools_settings, monkeypatch, outcome,
+) -> None:
+    client = LocalAIToolsClient()
+    key = "a" * 64
+    calls = []
+
+    async def post(path, payload, request_timeout=None):
+        calls.append(path)
+        if path == "/shadow/results":
+            assert payload["keys"] == [key]
+            assert 0 < request_timeout <= 0.5
+            await asyncio.sleep(0.02 if outcome != "pending" else 0.1)
+            return {"results": {key: {
+                "shadow_cache_key": "b" * 64 if outcome == "mismatched" else key,
+                "status": outcome if outcome in {"pending", "expired"} else "completed",
+                "available": outcome != "failed", "actual_inference": outcome != "failed",
+                "best_side": "short", "expected_return_pct": -0.3,
+                "model": "timesfm", "shadow_completed_at": datetime.now(UTC).isoformat(),
+            }}}
+        result = {"available": True, "best_side": "long", "execution_permission": False}
+        if path == "/timeseries/predict":
+            result.update({
+                "return_distribution_inputs": [_distribution_input("long", 0.4, -0.1)],
+                "professional_model_shadow": {
+                    "baseline_response": True, "actual_inference": False,
+                    "primary_shadow_result": {
+                        "status": "shadow_pending", "actual_inference": False,
+                        "shadow_cache_key": key,
+                    },
+                },
+            })
+        return result
+
+    monkeypatch.setattr(client, "_post", post)
+    started = monotonic()
+    result = await client.enrich_with_context({"symbol": "BTC/USDT"})
+    assert monotonic() - started < 0.8
+    item = result["time_series_prediction"]
+    assert "/shadow/results" in calls
+    assert item["side"] == "long"
+    assert item["execution_permission"] is False
+    assert item["return_distribution_inputs"][0]["raw_expected_return_pct"] == 0.4
+    shadow = item["professional_model_shadow"]
+    assert shadow["baseline_response"] is True
+    assert shadow["actual_inference"] is (outcome == "completed")
+    if outcome == "completed":
+        assert item["specialist_response_applied"] is False
+        assert shadow["primary_shadow_result"]["shadow_result_collected"] is True
+        assert item["timesfm_shadow_side"] == "short"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_shadow_collection_drains_http_task(local_tools_settings, monkeypatch):
+    client = LocalAIToolsClient()
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def post(*args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(client, "_post", post)
+    task = asyncio.create_task(client._collect_shadow_results(
+        [("sentiment_analysis", "/sentiment/deep/analyze")],
+        [{"professional_model_shadow": {
+            "status": "shadow_pending", "shadow_cache_key": "c" * 64,
+        }}],
+        deadline=monotonic() + 0.4,
+    ))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(cancelled.wait(), 0.2)
+    await asyncio.sleep(0)
+    assert not client._background_tasks
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_circuit_breaker_opens_after_total_failures(
     local_tools_settings: None,
     monkeypatch: pytest.MonkeyPatch,

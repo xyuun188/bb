@@ -8240,11 +8240,18 @@ class OKXExecutor(AbstractExecutor):
         """Read the current account-level SWAP taker fee from OKX."""
 
         exchange = await self._get_ccxt()
-        response = await exchange.privateGetAccountFeeRates({"instType": "SWAP"})
-        received_at = datetime.now(UTC).isoformat()
-        rows = response.get("data") if isinstance(response, dict) else []
-        row = rows[0] if isinstance(rows, list) and rows else {}
-        row = row if isinstance(row, dict) else {}
+        for attempt in range(2):
+            response = await exchange.privateGetAccountFeeRates({"instType": "SWAP"})
+            receipt = datetime.now(UTC)
+            rows = response.get("data") if isinstance(response, dict) else []
+            row = rows[0] if isinstance(rows, list) and rows else {}
+            row = row if isinstance(row, dict) else {}
+            observed_at_ms = self._safe_float(row.get("ts"), 0.0)
+            if observed_at_ms <= receipt.timestamp() * 1000:
+                break
+            if attempt:
+                raise ValueError("account_fee_source_after_receipt")
+        received_at = receipt.isoformat()
         taker_rate = 0.0
         taker_field = ""
         for field_name in ("takerU", "taker", "takerUSDC"):
@@ -8253,7 +8260,6 @@ class OKXExecutor(AbstractExecutor):
                 taker_rate = value
                 taker_field = field_name
                 break
-        observed_at_ms = self._safe_float(row.get("ts"), 0.0)
         source_observed_at = (
             datetime.fromtimestamp(observed_at_ms / 1000.0, tz=UTC).isoformat()
             if observed_at_ms > 0

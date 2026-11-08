@@ -173,6 +173,9 @@ _SHADOW_PROFESSIONAL_KEYS = (
     "baseline_response",
     "activation_blocker",
     "promotion_flow",
+    "shadow_cache_key",
+    "shadow_completed_at",
+    "shadow_result_collected",
 )
 
 
@@ -311,6 +314,9 @@ def _compact_professional_shadow(value: Any) -> dict[str, Any]:
             "horizon_step",
             "sequence_length",
             "prediction_count",
+            "shadow_cache_key",
+            "shadow_completed_at",
+            "shadow_result_collected",
         ):
             item = _compact_shadow_value(result.get(key))
             if item is not None:

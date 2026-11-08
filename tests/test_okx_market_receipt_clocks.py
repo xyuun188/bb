@@ -374,3 +374,63 @@ async def test_fee_receipt_and_source_observation_keep_separate_identities(
     assert result["fee_rate_observed_at"] == (source_at or completed_at.isoformat())
     assert result["policy_provenance"]["generated_at"] == completed_at.isoformat()
     assert result["policy_provenance"]["source_observed_at"] == source_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persistent", [False, True])
+async def test_future_fee_clock_retries_actual_request_or_fails_closed(
+    receipt_clock, persistent,
+) -> None:
+    source_ms = int(receipt_clock.current.timestamp() * 1000) + 10
+    calls = 0
+
+    class FeeExchange:
+        async def privateGetAccountFeeRates(self, params):
+            nonlocal calls
+            calls += 1
+            if calls == 2 and not persistent:
+                receipt_clock.current += timedelta(milliseconds=20)
+            return {"data": [{"takerU": "-0.0005", "ts": str(source_ms)}]}
+
+    executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+    executor._exchange = FeeExchange()
+    if persistent:
+        with pytest.raises(ValueError, match="account_fee_source_after_receipt"):
+            await executor.fetch_account_fee_snapshot()
+    else:
+        result = await executor.fetch_account_fee_snapshot()
+        assert result["account_fee_received_at"] == receipt_clock.current.isoformat()
+        assert result["account_fee_source_observed_at"] == datetime.fromtimestamp(
+            source_ms / 1000, UTC,
+        ).isoformat()
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_state", ["recovers", "future", "missing"])
+async def test_orderbook_retries_future_clock_without_caching_invalid_facts(
+    monkeypatch, receipt_clock, source_state,
+) -> None:
+    client = OKXRestClient()
+    source_ms = int(receipt_clock.current.timestamp() * 1000) + 10
+    calls = 0
+
+    async def fetch(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2 and source_state == "recovers":
+            receipt_clock.current += timedelta(milliseconds=20)
+        return {
+            "timestamp": source_ms if source_state != "missing" else None,
+            "bids": [[100.0, 2.0]], "asks": [[100.1, 3.0]],
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fetch)
+    result = await client.fetch_order_book_metrics("BTC/USDT", contract_spec=CONTRACT_SPEC)
+    assert calls == (1 if source_state == "missing" else 2)
+    assert result["orderbook_data_available"] is (source_state == "recovers")
+    assert result["orderbook_fact"]["received_at"] == receipt_clock.current.isoformat()
+    assert result["orderbook_fact"]["source_timestamp_ms"] == (
+        0 if source_state == "missing" else source_ms
+    )
+    assert bool(client._orderbook_cache) is (source_state == "recovers")
