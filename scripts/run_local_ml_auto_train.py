@@ -16,15 +16,22 @@ from typing import Any
 def _limit_training_process_memory() -> None:
     """Prevent model fitting from exhausting memory reserved for trading."""
 
+    for variable in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ.setdefault(variable, "1")
     if os.name == "nt":
         return
     try:
         import resource
 
         configured = int(
-            os.environ.get("LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES", "2147483648")
+            os.environ.get("LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES", "8589934592")
         )
-        limit = max(configured, 1024 * 1024 * 1024)
+        limit = max(configured, 4 * 1024 * 1024 * 1024)
         resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
     except (ImportError, OSError, ValueError):
         return

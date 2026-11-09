@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -2845,6 +2846,25 @@ def _reduced_training_frame(frame: pd.DataFrame, fraction: float) -> pd.DataFram
     return ordered.tail(target).reset_index(drop=True)
 
 
+async def load_primary_horizon_training_rows() -> list[Any]:
+    """Load only the horizon that the model actually fits.
+
+    Training fits a single horizon, so leaving other horizons inside the
+    sampling budget would shrink the usable window to a fraction of the
+    intended size.  Adapters that predate the horizon scoping argument keep
+    working unchanged.
+    """
+
+    loader = ml_training_dataset.load_shadow_training_rows
+    try:
+        parameters = inspect.signature(loader).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "horizons" in parameters:
+        return await loader(horizons=(PRIMARY_PREDICTION_HORIZON_MINUTES,))
+    return await loader()
+
+
 def train_from_frame_with_resource_recovery(
     frame: pd.DataFrame,
     **kwargs: Any,
@@ -3641,7 +3661,7 @@ class MLSignalService:
                     self._last_train_result = result
                     return result
 
-                trigger_rows = await ml_training_dataset.load_shadow_training_rows()
+                trigger_rows = await load_primary_horizon_training_rows()
                 trade_samples = (
                     await ml_training_dataset.load_authoritative_trade_training_samples()
                 )
@@ -3809,7 +3829,7 @@ class MLSignalService:
                 quarantine_result = await self._quarantine_dirty_training_samples()
                 completed_count = await self._completed_shadow_sample_count()
                 new_samples = max(completed_count - last_completed_count, 0)
-                rows = await ml_training_dataset.load_shadow_training_rows()
+                rows = await load_primary_horizon_training_rows()
                 quality_state = shadow_training_quality_report(rows)
                 frame = build_training_frame(rows)
                 partition = decision_group_partition(frame)

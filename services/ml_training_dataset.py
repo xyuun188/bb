@@ -165,22 +165,44 @@ def select_shadow_training_rows(rows: list[Any]) -> list[Any]:
     return [row for row in recent if shadow_is_trainable_trade_opportunity(row)]
 
 
-def shadow_training_candidate_filters(epoch_start: datetime) -> tuple[Any, ...]:
+def shadow_training_candidate_filters(
+    epoch_start: datetime,
+    *,
+    horizons: tuple[int, ...] | None = None,
+) -> tuple[Any, ...]:
+    candidate_horizons = (
+        SHADOW_LABEL_HORIZONS_MINUTES
+        if horizons is None
+        else tuple(int(value) for value in horizons)
+    )
     return (
         ShadowBacktest.status == "completed",
         ShadowBacktest.created_at >= epoch_start,
         ShadowBacktest.label_version == SHADOW_LABEL_VERSION,
-        ShadowBacktest.horizon_minutes.in_(SHADOW_LABEL_HORIZONS_MINUTES),
+        ShadowBacktest.horizon_minutes.in_(candidate_horizons),
         ShadowBacktest.long_return_pct.is_not(None),
         ShadowBacktest.short_return_pct.is_not(None),
     )
 
 
-async def load_shadow_training_rows() -> list[Any]:
-    """Load a time-stratified, resource-bounded clean training window."""
+async def load_shadow_training_rows(
+    *,
+    horizons: tuple[int, ...] | None = None,
+) -> list[Any]:
+    """Load a time-stratified, resource-bounded clean training window.
+
+    ``horizons`` scopes both selection and the row budget.  Model fitting uses
+    only the primary horizon, so sharing the budget with misfit horizons would
+    shrink the usable training window to a quarter of its intended size.
+    """
 
     epoch_start = load_training_data_start()
-    base_filters = shadow_training_candidate_filters(epoch_start)
+    base_filters = shadow_training_candidate_filters(epoch_start, horizons=horizons)
+    horizon_count = (
+        len(SHADOW_LABEL_HORIZONS_MINUTES)
+        if horizons is None
+        else max(len(tuple(horizons)), 1)
+    )
     columns = shadow_training_columns()
     async with get_read_session_ctx() as session:
         group_key = func.coalesce(
@@ -263,17 +285,10 @@ async def load_shadow_training_rows() -> list[Any]:
                 group_key.in_(selected_group_keys),
             )
             .order_by(ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc())
-            .limit(
-                LOCAL_ML_TRAINING_MAX_DECISION_GROUPS
-                * len(SHADOW_LABEL_HORIZONS_MINUTES)
-                + 1
-            )
+            .limit(LOCAL_ML_TRAINING_MAX_DECISION_GROUPS * horizon_count + 1)
         )
         selected_ids = [int(row[0]) for row in identity_result.all()]
-        sample_row_budget = (
-            LOCAL_ML_TRAINING_MAX_DECISION_GROUPS
-            * len(SHADOW_LABEL_HORIZONS_MINUTES)
-        )
+        sample_row_budget = LOCAL_ML_TRAINING_MAX_DECISION_GROUPS * horizon_count
         if len(selected_ids) > sample_row_budget:
             raise RuntimeError("local_ml_training_sample_row_budget_exceeded")
 

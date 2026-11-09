@@ -229,6 +229,8 @@ print(result_prefix + json.dumps(compact_payload, ensure_ascii=False, sort_keys=
         f"PID_FILE={_remote_quote(pid_file)}; echo \"$$\" > \"$PID_FILE\"; "
         "cleanup_training_pid() { rm -f \"$PID_FILE\"; }; "
         "trap cleanup_training_pid EXIT; trap 'exit 130' INT; trap 'exit 143' TERM HUP; "
+        "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1; "
+        "export LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES=\"${LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES:-8589934592}\"; "
         "PYBIN=python3; "
         "if [ -x .venv/bin/python ]; then PYBIN=.venv/bin/python; "
         "elif [ -x venv/bin/python ]; then PYBIN=venv/bin/python; fi; "

@@ -4104,3 +4104,42 @@ def test_ml_signal_predict_blocks_profit_signal_until_readiness_allows_live_infl
     assert prediction["profit_signal"] is False
     assert prediction["predictions"][0]["ml_prediction_eligible"] is False
     assert prediction["predictions"][0]["profit_signal"] is False
+
+
+@pytest.mark.asyncio
+async def test_load_shadow_training_rows_scopes_budget_to_requested_horizons(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    base_time = datetime(2026, 6, 28, 3, 0, tzinfo=UTC)
+    primary = SHADOW_LABEL_HORIZONS_MINUTES[-1]
+    rows = [
+        _db_shadow_row(20_000 + idx, base_time - timedelta(minutes=idx))
+        for idx in range(3)
+    ]
+    for offset, row in enumerate(rows):
+        if offset >= 2:
+            row.horizon_minutes = SHADOW_LABEL_HORIZONS_MINUTES[0]
+            continue
+        row.horizon_minutes = primary
+        due_at = row.due_at
+        row.feature_snapshot["training_label_contract"] = _clean_training_label_contract(
+            row.id,
+            due_at,
+            decision_id=row.decision_id,
+            horizon_minutes=primary,
+            long_return_pct=float(row.long_return_pct or 0.0),
+            short_return_pct=float(row.short_return_pct or 0.0),
+            best_action=str(row.best_action or "hold"),
+        )
+    async with get_session_ctx() as session:
+        session.add_all(rows)
+
+    try:
+        selected = await load_shadow_training_rows(horizons=(primary,))
+    finally:
+        await close_db()
+
+    assert {row.horizon_minutes for row in selected} == {primary}
+    assert len(selected) == 2
