@@ -21,6 +21,7 @@ from services.shadow_backtest_service import (
     SHADOW_SAMPLE_RECOVERY_MAX_BATCH,
     ShadowBacktestService,
     _bounded_task_gather,
+    compact_local_ml_shadow,
     shadow_fee_after_outcome,
     shadow_path_labels,
     side_label,
@@ -30,6 +31,32 @@ from tests.feature_availability_fixtures import seal_synthetic_feature_availabil
 
 def test_market_label_horizons_match_the_versioned_training_contract() -> None:
     assert SHADOW_BACKTEST_HORIZONS_MINUTES == (5, 15, 60, 240)
+
+
+def test_local_ml_shadow_uses_the_canonical_fee_after_field() -> None:
+    shadow = compact_local_ml_shadow(
+        {
+            "available": True,
+            "model_version": "local-ml-v7",
+            "primary_horizon_minutes": 10,
+            "predictions": [
+                {
+                    "horizon_minutes": 10,
+                    "best_side": "short",
+                    "fee_after_side_selection": {
+                        "short": {
+                            "objective_net_return_pct": 0.31,
+                            "expected_net_return_pct": 0.42,
+                        }
+                    },
+                }
+            ],
+        }
+    )
+
+    short = shadow["predictions"][0]["short"]
+    assert short["objective_net_return_pct"] == pytest.approx(0.31)
+    assert short["expected_net_return_pct"] == pytest.approx(0.42)
 
 
 def test_compact_specialist_results_preserve_request_and_completion_provenance():
@@ -541,6 +568,102 @@ async def test_shadow_backtest_service_captures_local_ai_tools_shadow_evidence()
     }
     assert "raw_huge_payload" not in timeseries
     assert "raw_predictions" not in timeseries["professional_model_shadow"]["shadow_result"]
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_service_freezes_local_ml_decision_time_prediction() -> None:
+    repo = _FakeRepo()
+    feature_vector = SimpleNamespace(current_price=100.0, close=99.0)
+    ml_signal_context = {
+        "available": True,
+        "status": "learning_only",
+        "readiness_state": "learning_only",
+        "model_version": "local-ml-v7",
+        "primary_horizon_minutes": 10,
+        "predictions": [
+            {
+                "horizon_minutes": 10,
+                "best_side": "short",
+                "return_distribution_contract": {
+                    "long": {"objective_expected_return_pct": -0.2},
+                    "short": {"objective_expected_return_pct": 0.4},
+                },
+                "fee_after_side_selection": {
+                    "long": {"objective_net_return_pct": -0.3},
+                    "short": {"objective_net_return_pct": 0.3},
+                },
+                "paper_prediction_eligible": True,
+                "profit_signal": False,
+                "actual_trade_calibration_ready": False,
+            }
+        ],
+        "raw_huge_payload": list(range(1000)),
+    }
+
+    await _service(repo).create(
+        123,
+        _decision(),
+        feature_vector,
+        "paper",
+        ml_signal_context=ml_signal_context,
+    )
+
+    shadow = repo.created[0]["feature_snapshot"]["local_ml_shadow"]
+    assert shadow["version"] == "2026-11-09.local-ml-shadow.v1"
+    assert shadow["model_version"] == "local-ml-v7"
+    assert shadow["primary_horizon_minutes"] == 10
+    assert shadow["best_side"] == "short"
+    assert shadow["production_permission"] is False
+    assert shadow["predictions"][0]["short"]["objective_net_return_pct"] == pytest.approx(
+        0.3
+    )
+    assert "raw_huge_payload" not in shadow
+
+
+@pytest.mark.asyncio
+async def test_shadow_recovery_backfills_local_ml_from_persisted_decision() -> None:
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=789,
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        action="long",
+        confidence=0.8,
+        reasoning="local ml recovery",
+        position_size_pct=0.05,
+        suggested_leverage=1.0,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.04,
+        is_paper=True,
+        created_at=datetime.now(UTC),
+        raw_llm_response={
+            "ml_signal": {
+                "available": True,
+                "model_version": "local-ml-v7",
+                "primary_horizon_minutes": 10,
+                "predictions": [
+                    {
+                        "horizon_minutes": 10,
+                        "best_side": "long",
+                        "fee_after_side_selection": {
+                            "long": {"objective_net_return_pct": 0.2}
+                        },
+                    }
+                ],
+            }
+        },
+        feature_snapshot={"current_price": 100.0},
+    )
+
+    async def finder(**_kwargs: Any) -> list[Any]:
+        return [row]
+
+    repo.get_market_decisions_missing_shadow_samples = finder  # type: ignore[attr-defined]
+    await _service(repo).recover_missing_market_samples(limit=10)
+
+    shadow = repo.created[0]["feature_snapshot"]["local_ml_shadow"]
+    assert shadow["model_version"] == "local-ml-v7"
+    assert shadow["best_side"] == "long"
 
 
 @pytest.mark.asyncio

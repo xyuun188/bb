@@ -39,6 +39,7 @@ logger = structlog.get_logger(__name__)
 SHADOW_BACKTEST_HORIZONS_MINUTES = SHADOW_LABEL_HORIZONS_MINUTES
 SHADOW_LEVERAGE_SCENARIOS = (1, 2, 3, 5, 10)
 SHADOW_LEVERAGE_COUNTERFACTUAL_VERSION = "2026-07-22.shadow-leverage-counterfactual.v1"
+LOCAL_ML_SHADOW_VERSION = "2026-11-09.local-ml-shadow.v1"
 # Shadow maintenance is deliberately bounded: it must make progress without
 # competing with the trading loop for the exchange client or event-loop time.
 SHADOW_RESULT_FACT_CONCURRENCY = 8
@@ -535,6 +536,119 @@ def compact_shadow_leverage_counterfactuals(
     return compact
 
 
+def _compact_local_ml_side(
+    prediction: dict[str, Any],
+    side: str,
+) -> dict[str, Any]:
+    fee_after = prediction.get("fee_after_side_selection")
+    fee_after = fee_after if isinstance(fee_after, dict) else {}
+    side_fee_after = fee_after.get(side)
+    side_fee_after = side_fee_after if isinstance(side_fee_after, dict) else {}
+    multitask = prediction.get("multitask_prediction")
+    multitask = multitask if isinstance(multitask, dict) else {}
+    side_multitask = multitask.get(side)
+    side_multitask = side_multitask if isinstance(side_multitask, dict) else {}
+    contracts = prediction.get("return_distribution_contract")
+    contracts = contracts if isinstance(contracts, dict) else {}
+    side_contract = contracts.get(side)
+    side_contract = side_contract if isinstance(side_contract, dict) else {}
+    return {
+        "expected_net_return_pct": _safe_shadow_number(
+            side_fee_after.get("expected_net_return_pct")
+        ),
+        "objective_net_return_pct": _safe_shadow_number(
+            side_fee_after.get("objective_net_return_pct")
+        ),
+        "lower_quantile_net_return_pct": _safe_shadow_number(
+            side_fee_after.get("lower_quantile_net_return_pct")
+        ),
+        "raw_expected_return_pct": _safe_shadow_number(
+            side_contract.get("raw_expected_return_pct")
+        ),
+        "objective_expected_return_pct": _safe_shadow_number(
+            side_contract.get("objective_expected_return_pct")
+        ),
+        "lower_quantile_return_pct": _safe_shadow_number(
+            side_contract.get("lower_quantile_return_pct")
+        ),
+        "expected_execution_cost_pct": _safe_shadow_number(
+            side_multitask.get("expected_execution_cost_pct")
+        ),
+        "loss_probability": _safe_shadow_number(side_multitask.get("loss_probability")),
+        "tail_loss_probability": _safe_shadow_number(
+            side_multitask.get("tail_loss_probability")
+        ),
+        "expected_mfe_pct": _safe_shadow_number(side_multitask.get("expected_mfe_pct")),
+        "expected_mae_pct": _safe_shadow_number(side_multitask.get("expected_mae_pct")),
+    }
+
+
+def compact_local_ml_shadow(ml_signal_context: dict[str, Any] | None) -> dict[str, Any]:
+    """Persist the decision-time local ML forecast without the full model payload."""
+
+    signal = ml_signal_context if isinstance(ml_signal_context, dict) else {}
+    if not signal:
+        return {}
+    predictions = signal.get("predictions")
+    predictions = predictions if isinstance(predictions, list) else []
+    compact_predictions: list[dict[str, Any]] = []
+    for raw in predictions[:8]:
+        if not isinstance(raw, dict):
+            continue
+        horizon = _safe_shadow_number(raw.get("horizon_minutes"))
+        best_side = str(raw.get("best_side") or "").strip().lower()
+        if best_side not in {"long", "short"}:
+            best_side = ""
+        compact_predictions.append(
+            {
+                "horizon_minutes": horizon,
+                "best_side": best_side,
+                "long": _compact_local_ml_side(raw, "long"),
+                "short": _compact_local_ml_side(raw, "short"),
+                "profit_edge_pct": _safe_shadow_number(raw.get("profit_edge_pct")),
+                "profit_quality_score": _safe_shadow_number(
+                    raw.get("profit_quality_score")
+                ),
+                "profit_signal": raw.get("profit_signal") is True,
+                "risk_score": _safe_shadow_number(raw.get("risk_score")),
+                "paper_prediction_eligible": raw.get("paper_prediction_eligible") is True,
+                "ml_prediction_eligible": raw.get("ml_prediction_eligible") is True,
+                "actual_trade_calibration_ready": (
+                    raw.get("actual_trade_calibration_ready") is True
+                ),
+            }
+        )
+    primary = next(
+        (
+            row
+            for row in compact_predictions
+            if row.get("horizon_minutes")
+            == _safe_shadow_number(signal.get("primary_horizon_minutes"))
+        ),
+        compact_predictions[0] if compact_predictions else {},
+    )
+    snapshot = {
+        "version": LOCAL_ML_SHADOW_VERSION,
+        "captured_at": datetime.now(UTC).isoformat(),
+        "available": signal.get("available") is True,
+        "actual_inference": bool(
+            signal.get("available") is True and compact_predictions
+        ),
+        "status": str(signal.get("status") or "")[:80],
+        "readiness_state": str(signal.get("readiness_state") or "")[:80],
+        "route_mode": str(signal.get("route_mode") or "")[:60],
+        "model_version": str(signal.get("model_version") or "")[:160],
+        "primary_horizon_minutes": _safe_shadow_number(
+            signal.get("primary_horizon_minutes")
+        ),
+        "best_side": str(primary.get("best_side") or ""),
+        "predictions": compact_predictions,
+        "production_permission": False,
+        "evidence_scope": "shadow_observation_and_training_only",
+    }
+    return snapshot
+
+
 @dataclass(slots=True)
 class ShadowBacktestService:
     """Record delayed market outcomes for shadow training and evaluation."""
@@ -560,6 +674,7 @@ class ShadowBacktestService:
         execution_mode: str,
         analysis_type: str = "market",
         local_ai_tools_context: dict[str, Any] | None = None,
+        ml_signal_context: dict[str, Any] | None = None,
     ) -> bool:
         """Record pending shadow samples for market-analysis decisions."""
         if analysis_type != "market":
@@ -595,6 +710,15 @@ class ShadowBacktestService:
                     if isinstance(decision.raw_response, dict)
                     else {}
                 )
+                ml_signal = (
+                    ml_signal_context
+                    if isinstance(ml_signal_context, dict)
+                    else raw_response.get("ml_signal")
+                    or raw_response.get("local_ml_signal")
+                )
+                local_ml_shadow = compact_local_ml_shadow(ml_signal)
+                if local_ml_shadow:
+                    feature_snapshot["local_ml_shadow"] = local_ml_shadow
                 shadow_action, shadow_source = _model_shadow_action(
                     raw_response,
                     primary_action=decision.action.value,

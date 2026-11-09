@@ -118,12 +118,17 @@ async def main():
                                     "model_name",
                                     "provider_model",
                                     "decision_eligible",
+                                    "paper_eligible",
+                                    "production_eligible",
+                                    "observation_only",
+                                    "eligibility_reason",
                                     "training_aggregate_eligible",
                                     "raw_expected_return_pct",
                                     "objective_expected_return_pct",
                                     "expected_net_return_pct",
                                     "horizon_minutes",
                                     "loss_probability",
+                                    "model_strategy_side_authorization",
                                     "return_distribution_contract",
                                 )
                                 if key in item
@@ -134,6 +139,19 @@ async def main():
                     }}
                     for side, side_data in direction_competition_raw.items()
                     if isinstance(side_data, dict) and side in {{"long", "short"}}
+                }}
+                direction_competition_summary = {{
+                    key: direction_competition_raw.get(key)
+                    for key in (
+                        "selected_horizon_minutes",
+                        "authorized_prediction_horizon_minutes",
+                        "authorized_prediction_horizon_source",
+                        "horizon_cohort_selection",
+                        "training_horizon_cohort_selection",
+                        "continuous_model_weighting",
+                        "aggregate_blockers",
+                    )
+                    if key in direction_competition_raw
                 }}
                 funnel = {{
                     key: funnel_raw.get(key)
@@ -231,6 +249,7 @@ async def main():
                         "entry_permission": entry_permission,
                         "independent_direction_support": direction_support,
                         "direction_competition": direction_competition,
+                        "direction_competition_summary": direction_competition_summary,
                     }},
                     "sizing": {{
                         key: sizing.get(key)
@@ -305,7 +324,7 @@ asyncio.run(main())
     )
     ssh = connect_remote_ssh(ROOT, timeout=25)
     try:
-        safe_print(run_remote_text(ssh, command, timeout=180, max_output_chars=30_000))
+        safe_print(run_remote_text(ssh, command, timeout=180, max_output_chars=200_000))
     finally:
         ssh.close()
 

@@ -35,6 +35,10 @@ def _safe_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def _safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
     if isinstance(row, dict):
         return row.get(key, default)
@@ -65,6 +69,69 @@ def _features(row: Any) -> dict[str, Any]:
 def _local_shadow(row: Any) -> dict[str, Any]:
     value = _features(row).get("local_ai_tools_shadow") or {}
     return value if isinstance(value, dict) else {}
+
+
+def _local_ml_shadow(row: Any) -> dict[str, Any]:
+    value = _features(row).get("local_ml_shadow") or {}
+    return value if isinstance(value, dict) else {}
+
+
+def _local_ml_prediction_for_row(
+    row: Any,
+    shadow: dict[str, Any],
+) -> dict[str, Any]:
+    """Return only the prediction whose native horizon produced this row."""
+
+    horizon = _safe_float(_row_get(row, "horizon_minutes"), None)
+    predictions = shadow.get("predictions")
+    predictions = predictions if isinstance(predictions, list) else []
+    if horizon is None:
+        return {}
+    for prediction in predictions:
+        if not isinstance(prediction, dict):
+            continue
+        if _safe_float(prediction.get("horizon_minutes"), None) == horizon:
+            return prediction
+    return {}
+
+
+def _local_ml_shadow_candidate(
+    row: Any,
+    shadow: dict[str, Any],
+) -> dict[str, Any]:
+    prediction = _local_ml_prediction_for_row(row, shadow)
+    if not prediction:
+        return {}
+    side = _safe_str(prediction.get("best_side")).lower()
+    side_payload = _safe_dict(prediction.get(side))
+    expected = _safe_float(
+        side_payload.get("objective_net_return_pct"),
+        _safe_float(
+            side_payload.get("expected_net_return_pct"),
+            _safe_float(side_payload.get("objective_expected_return_pct"), None),
+        ),
+    )
+    actual_inference = bool(
+        shadow.get("available") is True
+        and side in {"long", "short"}
+        and expected is not None
+    )
+    return {
+        "tool": "local_ml",
+        "model": _safe_str(shadow.get("model_version")) or "local_ml_profit_model",
+        "direction": side,
+        "expected_return_pct": expected,
+        "actual_inference": actual_inference,
+        "sequence_length": 0,
+        "legacy_mixed_shadow": False,
+        "fallback_reason": (
+            ""
+            if actual_inference
+            else _safe_str(shadow.get("status"))
+            or _safe_str(shadow.get("readiness_state"))
+            or "local_ml_prediction_unavailable"
+        ),
+    }
 
 
 def _cost_complete_shadow_return(
@@ -755,6 +822,7 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
     return {
         "tool": metric["tool"],
         "model": metric["model"],
+        "shadow_training_only": metric["tool"] == "local_ml",
         "sample_count": int(metric.get("sample_count") or 0),
         "actual_inference_count": int(metric.get("actual_inference_count") or 0),
         "fallback_count": int(metric.get("fallback_count") or 0),
@@ -860,6 +928,113 @@ def _finalize_metric(metric: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _record_shadow_candidate(
+    metric: dict[str, Any],
+    row: Any,
+    *,
+    tool_name: str,
+    model_name: str,
+    candidate: dict[str, Any],
+    actual_side: str,
+    symbol: str,
+    accumulator: SpecialistShadowEvaluationAccumulator,
+) -> None:
+    """Settle one decision-time candidate without reusing another source's PnL."""
+
+    metric["sample_count"] += 1
+    if symbol:
+        metric["symbols"][symbol] += 1
+    if not candidate.get("actual_inference"):
+        _record_fallback(metric, candidate, source="shadow")
+        _remember_shadow_event(
+            metric,
+            {
+                "evidence_source": "shadow_counterfactual",
+                "shadow_backtest_id": _row_get(row, "id"),
+                "decision_id": _row_get(row, "decision_id"),
+                "symbol": symbol,
+                "actual_inference": False,
+                "fallback_reason": _safe_str(candidate.get("fallback_reason"))
+                or "specialist_inference_unavailable",
+                "created_at": _iso_row_datetime(row, "created_at"),
+                "label_timestamp": _iso_row_datetime(row, "due_at"),
+                "market_regime": _market_regime(row),
+            },
+        )
+        return
+    legacy_mixed_shadow = bool(candidate.get("legacy_mixed_shadow"))
+    if legacy_mixed_shadow:
+        metric["legacy_mixed_shadow_count"] += 1
+        metric["legacy_quarantined_count"] += 1
+        return
+    metric["actual_inference_count"] += 1
+    predicted_side = _safe_str(candidate.get("direction")).lower()
+    gross_return = _actual_return_for_side(row, predicted_side)
+    if predicted_side not in {"long", "short"} or gross_return is None:
+        return
+    cost_complete_return = _cost_complete_shadow_return(
+        row,
+        side=predicted_side,
+        gross_return_pct=float(gross_return),
+    )
+    if cost_complete_return is None:
+        accumulator.skipped_reasons["shadow_execution_cost_incomplete"] += 1
+        return
+    actual_return, execution_cost = cost_complete_return
+    metric["direction_count"] += 1
+    metric["realized_return_sum_pct"] += actual_return
+    if actual_return > 0:
+        metric["realized_gross_profit_pct"] += actual_return
+    elif actual_return < 0:
+        metric["realized_gross_loss_pct"] += abs(actual_return)
+    if actual_side == predicted_side:
+        metric["direction_hit_count"] += 1
+    elif actual_return < 0:
+        metric["false_signal_count"] += 1
+    _update_return_extrema(
+        metric,
+        actual_return,
+        worst_key="worst_realized_return_pct",
+        best_key="best_realized_return_pct",
+    )
+    _remember_worst_sample(
+        metric,
+        _compact_worst_sample(
+            row,
+            tool_name=tool_name,
+            model_name=model_name,
+            symbol=symbol,
+            predicted_side=predicted_side,
+            actual_side=actual_side,
+            actual_return=actual_return,
+            expected_return=_safe_float(candidate.get("expected_return_pct"), None),
+            sequence_length=0,
+            legacy_mixed_shadow=False,
+        ),
+    )
+    _remember_shadow_event(
+        metric,
+        {
+            "evidence_source": "shadow_counterfactual_after_cost",
+            "shadow_backtest_id": _row_get(row, "id"),
+            "decision_id": _row_get(row, "decision_id"),
+            "symbol": symbol,
+            "predicted_side": predicted_side,
+            "actual_best_side": actual_side,
+            "gross_return_pct": round(float(gross_return), 6),
+            "execution_cost": execution_cost,
+            "net_return_after_all_cost_pct": round(actual_return, 6),
+            "created_at": _iso_row_datetime(row, "created_at"),
+            "label_timestamp": _iso_row_datetime(row, "due_at"),
+            "market_regime": _market_regime(row),
+        },
+    )
+    expected = _safe_float(candidate.get("expected_return_pct"), None)
+    if expected is not None:
+        metric["expected_return_sum_pct"] += expected
+        metric["expected_return_count"] += 1
+
+
 class SpecialistShadowEvaluationAccumulator:
     def __init__(self) -> None:
         self.metrics: dict[tuple[str, str], dict[str, Any]] = {}
@@ -877,6 +1052,9 @@ class SpecialistShadowEvaluationAccumulator:
             self.skipped_reasons["missing_realized_returns"] += 1
             return
         self.completed_count += 1
+        local_ml = _local_ml_shadow(row)
+        if local_ml:
+            self._add_local_ml_row(row, local_ml)
         local_shadow = _local_shadow(row)
         if not local_shadow:
             self.skipped_reasons["missing_local_ai_tools_shadow"] += 1
@@ -1006,6 +1184,31 @@ class SpecialistShadowEvaluationAccumulator:
                     metric["signal_score_count"] += 1
         if has_eligible_specialist:
             self.eligible_count += 1
+
+    def _add_local_ml_row(self, row: Any, tool: dict[str, Any]) -> None:
+        """Settle local ML's decision-time side against the matching horizon."""
+
+        candidate = _local_ml_shadow_candidate(row, tool)
+        if not candidate:
+            self.skipped_reasons["local_ml_prediction_horizon_missing"] += 1
+            return
+        model_name = _safe_str(candidate.get("model")) or "local_ml_profit_model"
+        metric = self.metrics.setdefault(
+            ("local_ml", model_name),
+            _empty_metric("local_ml", model_name),
+        )
+        actual_side = _actual_best_side(row)
+        symbol = _safe_str(_row_get(row, "symbol")) or _safe_str(_features(row).get("symbol"))
+        _record_shadow_candidate(
+            metric,
+            row,
+            tool_name="local_ml",
+            model_name=model_name,
+            candidate=candidate,
+            actual_side=actual_side,
+            symbol=symbol,
+            accumulator=self,
+        )
 
 
 def summarize_specialist_shadow_evaluation(

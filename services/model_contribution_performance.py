@@ -56,6 +56,10 @@ def _safe_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def _safe_str(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -102,6 +106,7 @@ def _empty_bucket(label: str) -> dict[str, Any]:
         "state": "not_observed",
         "reason": "尚无可归因的权威平仓结果。",
         "_pnl_samples": [],
+        "_trade_fact_ids": set(),
     }
 
 
@@ -388,16 +393,38 @@ class ModelContributionPerformanceService:
             raw = _safe_dict(getattr(matched_decision, "raw_llm_response", None))
             opportunity = _safe_dict(raw.get("opportunity_score"))
             pnl = float(getattr(pos, "realized_pnl", 0.0) or 0.0)
+            trade_fact_id = (
+                _safe_str(getattr(pos, "entry_exchange_order_id", ""))
+                or _safe_str(getattr(pos, "id", ""))
+                or f"{self._position_side(pos)}:{getattr(pos, 'created_at', '')}"
+            )
             for source in self.contribution_sources(
                 opportunity,
                 raw,
                 self._position_side(pos),
                 mode=selected_mode,
             ):
-                self._add_sample(stats[source], pnl)
+                self._add_sample(stats[source], pnl, trade_fact_id=trade_fact_id)
 
         for bucket in stats.values():
             self._finalize_bucket(bucket)
+        shared_counts: dict[str, int] = {}
+        for bucket in stats.values():
+            for fact_id in bucket.get("trade_fact_ids") or []:
+                shared_counts[fact_id] = shared_counts.get(fact_id, 0) + 1
+        for bucket in stats.values():
+            fact_ids = list(bucket.get("trade_fact_ids") or [])
+            shared = sum(1 for fact_id in fact_ids if shared_counts.get(fact_id, 0) > 1)
+            bucket["trade_fact_count"] = len(fact_ids)
+            bucket["shared_trade_fact_count"] = shared
+            bucket["independent_trade_fact_count"] = max(len(fact_ids) - shared, 0)
+            bucket["evidence_provenance"] = (
+                "no_actual_trade_fact"
+                if not fact_ids
+                else "shared_actual_pnl_across_sources"
+                if shared
+                else "source_specific_actual_pnl"
+            )
         return stats
 
     def build_lineage_diagnostics(
@@ -562,9 +589,16 @@ class ModelContributionPerformanceService:
         return "short" if str(getattr(position, "side", "") or "").lower() == "short" else "long"
 
     @staticmethod
-    def _add_sample(bucket: dict[str, Any], pnl: float) -> None:
+    def _add_sample(
+        bucket: dict[str, Any],
+        pnl: float,
+        *,
+        trade_fact_id: str | None = None,
+    ) -> None:
         bucket["count"] = int(bucket.get("count") or 0) + 1
         bucket.setdefault("_pnl_samples", []).append(float(pnl))
+        if trade_fact_id:
+            bucket.setdefault("_trade_fact_ids", set()).add(str(trade_fact_id))
         bucket["pnl"] = float(bucket.get("pnl") or 0.0) + pnl
         if pnl >= 0:
             bucket["wins"] = int(bucket.get("wins") or 0) + 1
@@ -580,6 +614,7 @@ class ModelContributionPerformanceService:
         loss = float(bucket.get("loss") or 0.0)
         pnl = float(bucket.get("pnl") or 0.0)
         samples = [float(value) for value in bucket.pop("_pnl_samples", [])]
+        bucket["trade_fact_ids"] = sorted(bucket.pop("_trade_fact_ids", set()))
         if count <= 0:
             return
         win_rate = int(bucket.get("wins") or 0) / count

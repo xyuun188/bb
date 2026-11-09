@@ -31,6 +31,7 @@ QUANT_CONTRIBUTION_KEYS = {
     "sentiment": "sentiment_model",
 }
 QUANT_SPECIALIST_TOOLS = {
+    "local_ml": "local_ml",
     "server_profit": "profit_prediction",
     "timeseries": "time_series_prediction",
     "sentiment": "sentiment_analysis",
@@ -152,7 +153,7 @@ def _return_evidence(
 
 
 def _actual_evidence(bucket: dict[str, Any], *, source: str) -> dict[str, Any]:
-    return _return_evidence(
+    evidence = _return_evidence(
         sample_count=bucket.get("count"),
         average_return=bucket.get("avg_pnl"),
         return_lcb=bucket.get("pnl_lcb_usdt"),
@@ -163,6 +164,21 @@ def _actual_evidence(bucket: dict[str, Any], *, source: str) -> dict[str, Any]:
         max_drawdown=bucket.get("max_drawdown_usdt"),
         source=source,
     )
+    shared = max(int(_finite(bucket.get("shared_trade_fact_count")) or 0), 0)
+    trade_fact_count = max(int(_finite(bucket.get("trade_fact_count")) or 0), 0)
+    evidence["shared_trade_fact_count"] = shared
+    evidence["trade_fact_count"] = trade_fact_count
+    evidence["independent_trade_fact_count"] = max(trade_fact_count - shared, 0)
+    # Aggregated PnL without fact provenance is not independent evidence.
+    # A quant source that only reuses another source's authoritative trade
+    # facts has attribution, not independent proof of its own edge.
+    evidence["independent_evidence"] = bool(
+        evidence.get("available") is True
+        and trade_fact_count > 0
+        and shared == 0
+        and trade_fact_count == int(evidence.get("sample_count") or 0)
+    )
+    return evidence
 
 
 def _specialist_evidence(
@@ -326,11 +342,15 @@ def _paper_execution_quality_permission(
 ) -> dict[str, Any]:
     """Allow paper execution only after fee-after evidence beats break-even."""
 
+    actual_usable = bool(
+        actual.get("available") is True
+        and actual.get("independent_evidence") is not False
+    )
     authority = (
-        actual
-        if actual.get("available") is True
-        else shadow
+        shadow
         if shadow.get("available") is True
+        else actual
+        if actual_usable
         else {}
     )
     source = str(authority.get("source") or "")
@@ -345,7 +365,11 @@ def _paper_execution_quality_permission(
     )
     reasons: list[str] = []
     if not authority:
-        reasons.append("fee_after_return_quality_evidence_missing")
+        reasons.append(
+            "shared_actual_trade_facts_not_independent_evidence"
+            if actual.get("available") is True and actual_usable is False
+            else "fee_after_return_quality_evidence_missing"
+        )
     else:
         if average is None or average <= 0.0:
             reasons.append("average_fee_after_return_not_positive")

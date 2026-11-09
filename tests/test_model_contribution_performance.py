@@ -68,6 +68,26 @@ def test_model_contribution_is_read_only_for_current_return_sources() -> None:
     assert stats["expert_alignment"]["count"] == 0
 
 
+def test_shared_closed_trade_facts_are_marked_as_not_independent() -> None:
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    positions = [_position(i, 3.0, created_at=now) for i in range(5)]
+    orders = [_order(i, i + 1, created_at=now) for i in range(5)]
+    decisions = {i + 1: _decision(i + 1, _current_raw()) for i in range(5)}
+
+    stats = ModelContributionPerformanceService().build_stats(
+        positions,
+        orders,
+        decisions,
+    )
+
+    for source in ("ml_profit_model", "server_profit_model", "timeseries_model"):
+        bucket = stats[source]
+        assert bucket["trade_fact_count"] == 5
+        assert bucket["shared_trade_fact_count"] == 5
+        assert bucket["independent_trade_fact_count"] == 0
+        assert bucket["evidence_provenance"] == "shared_actual_pnl_across_sources"
+
+
 def test_unobserved_model_contribution_does_not_invent_profit_factor() -> None:
     stats = ModelContributionPerformanceService().build_stats([], [], {})
 

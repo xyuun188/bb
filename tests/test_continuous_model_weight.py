@@ -143,9 +143,17 @@ def test_negative_quant_quality_is_observable_but_cannot_authorize_paper_executi
 
 
 def test_positive_authoritative_quant_quality_can_authorize_paper_execution() -> None:
+    bucket = _bucket([5.0, 4.0, 3.0] * 10)
+    bucket.update(
+        {
+            "trade_fact_count": 30,
+            "shared_trade_fact_count": 0,
+            "independent_trade_fact_count": 30,
+        }
+    )
     report = _build(
         ContinuousModelWeightPolicy(),
-        contribution={"timeseries_model": _bucket([5.0, 4.0, 3.0] * 10)},
+        contribution={"timeseries_model": bucket},
     )
 
     timeseries = report["quant_source_weights"]["timeseries"]
@@ -153,6 +161,21 @@ def test_positive_authoritative_quant_quality_can_authorize_paper_execution() ->
     assert timeseries["paper_execution_blockers"] == []
     assert timeseries["paper_execution_evidence_source"] == (
         "authoritative_trade:timeseries_model"
+    )
+
+
+def test_legacy_aggregate_without_trade_fact_provenance_cannot_authorize_execution() -> None:
+    report = _build(
+        ContinuousModelWeightPolicy(),
+        contribution={"timeseries_model": _bucket([5.0, 4.0, 3.0] * 10)},
+    )
+
+    timeseries = report["quant_source_weights"]["timeseries"]
+    assert timeseries["actual_fee_after_return"]["available"] is True
+    assert timeseries["actual_fee_after_return"]["independent_evidence"] is False
+    assert timeseries["paper_execution_permission"] is False
+    assert timeseries["paper_execution_reason"] == (
+        "shared_actual_trade_facts_not_independent_evidence"
     )
 
 
@@ -165,6 +188,50 @@ def test_cold_start_quant_source_requires_shadow_evidence_before_execution() -> 
         "fee_after_return_quality_evidence_missing"
     )
     assert server_profit["cold_start"] is True
+
+
+def test_shared_actual_trade_facts_cannot_authorize_paper_execution() -> None:
+    bucket = _bucket([5.0, 4.0, 3.0] * 10)
+    bucket.update(
+        {
+            "trade_fact_count": 30,
+            "shared_trade_fact_count": 30,
+            "independent_trade_fact_count": 0,
+        }
+    )
+
+    report = _build(
+        ContinuousModelWeightPolicy(),
+        contribution={"timeseries_model": bucket},
+    )
+
+    timeseries = report["quant_source_weights"]["timeseries"]
+    assert timeseries["actual_fee_after_return"]["available"] is True
+    assert timeseries["actual_fee_after_return"]["independent_evidence"] is False
+    assert timeseries["paper_execution_permission"] is False
+    assert timeseries["paper_execution_reason"] == (
+        "shared_actual_trade_facts_not_independent_evidence"
+    )
+
+
+def test_independent_actual_trade_facts_still_authorize_paper_execution() -> None:
+    bucket = _bucket([5.0, 4.0, 3.0] * 10)
+    bucket.update(
+        {
+            "trade_fact_count": 30,
+            "shared_trade_fact_count": 0,
+            "independent_trade_fact_count": 30,
+        }
+    )
+
+    report = _build(
+        ContinuousModelWeightPolicy(),
+        contribution={"timeseries_model": bucket},
+    )
+
+    timeseries = report["quant_source_weights"]["timeseries"]
+    assert timeseries["actual_fee_after_return"]["independent_evidence"] is True
+    assert timeseries["paper_execution_permission"] is True
 
 
 def test_new_model_starts_low_but_remains_observable() -> None:

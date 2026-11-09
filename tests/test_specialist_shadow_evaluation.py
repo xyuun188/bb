@@ -244,6 +244,72 @@ def test_specialist_shadow_evaluation_skips_non_specialist_heuristic_shadow() ->
     assert report["skipped_reasons"]["profit_prediction_non_specialist_shadow"] == 1
 
 
+def test_local_ml_shadow_settles_its_own_decision_time_prediction() -> None:
+    row = _row(predicted_side="long", realized=0.42)
+    row.feature_snapshot["local_ml_shadow"] = {
+        "version": "2026-11-09.local-ml-shadow.v1",
+        "available": True,
+        "actual_inference": True,
+        "model_version": "local-ml-v7",
+        "primary_horizon_minutes": 10,
+        "status": "learning_only",
+        "readiness_state": "learning_only",
+        "predictions": [
+            {
+                "horizon_minutes": 10,
+                "best_side": "long",
+                "long": {
+                    "objective_net_return_pct": 0.25,
+                },
+                "short": {
+                    "objective_net_return_pct": -0.20,
+                },
+            }
+        ],
+    }
+
+    report = summarize_specialist_shadow_evaluation([row])
+
+    local = next(item for item in report["models"] if item["tool"] == "local_ml")
+    assert local["model"] == "local-ml-v7"
+    assert local["shadow_training_only"] is True
+    assert local["direction_count"] == 1
+    assert local["actual_inference_count"] == 1
+    assert local["avg_shadow_return_after_all_cost_pct"] > 0.0
+    assert local["promotion_ready"] is False
+
+
+def test_local_ml_shadow_does_not_settle_other_model_shadow_sides() -> None:
+    row = _row(predicted_side="short", realized=0.42)
+    row.feature_snapshot["local_ml_shadow"] = {
+        "version": "2026-11-09.local-ml-shadow.v1",
+        "available": True,
+        "actual_inference": True,
+        "model_version": "local-ml-v7",
+        "primary_horizon_minutes": 10,
+        "predictions": [
+            {
+                "horizon_minutes": 10,
+                "best_side": "long",
+                "long": {"objective_net_return_pct": 0.25},
+                "short": {"objective_net_return_pct": -0.20},
+            }
+        ],
+    }
+
+    report = summarize_specialist_shadow_evaluation([row])
+
+    local = next(item for item in report["models"] if item["tool"] == "local_ml")
+    timeseries = next(
+        item for item in report["models"] if item["tool"] == "time_series_prediction"
+    )
+    assert local["direction_count"] == 1
+    assert timeseries["direction_count"] == 1
+    assert local["avg_shadow_return_after_all_cost_pct"] != timeseries[
+        "avg_shadow_return_after_all_cost_pct"
+    ]
+
+
 def test_specialist_shadow_evaluation_reports_timesfm_challenger_metrics() -> None:
     report = summarize_specialist_shadow_evaluation(
         [

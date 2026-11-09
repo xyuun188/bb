@@ -2974,6 +2974,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         feature_vector: Any,
         model_mode: str,
         local_ai_tools_context: dict[str, Any] | None,
+        ml_signal_context: dict[str, Any] | None = None,
     ) -> bool:
         """Queue one delayed label and return immediately to the market round."""
 
@@ -2988,6 +2989,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "execution_mode": model_mode,
             "analysis_type": "market",
             "local_ai_tools_context": local_ai_tools_context,
+            "ml_signal_context": ml_signal_context,
         }
         try:
             queue.put_nowait(payload)
@@ -12453,6 +12455,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                         feature_vector=fv,
                         model_mode=model_mode,
                         local_ai_tools_context=local_ai_tools_context,
+                        ml_signal_context=ml_signal_context,
                     )
                     self.market_decision_result_recorder.append_result(
                         results=results,
@@ -12645,6 +12648,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     feature_vector=fv,
                     model_mode=model_mode,
                     local_ai_tools_context=local_ai_tools_context,
+                    ml_signal_context=ml_signal_context,
                 )
 
                 if decision.is_hold:
