@@ -50,6 +50,46 @@ TRAINING_FEATURE_REQUIRED_CONTRACT_KEYS = (
     "training_label_contract",
     "training_market_fact_contract",
 )
+SPECIALIST_SHADOW_FEATURE_KEYS = (
+    "local_ai_tools_shadow",
+    "local_ml_shadow",
+)
+SPECIALIST_SHADOW_TOOL_KEYS = (
+    "profit_prediction",
+    "time_series_prediction",
+    "sentiment_analysis",
+)
+SPECIALIST_SHADOW_TOOL_FIELDS = (
+    "available",
+    "status",
+    "actual_inference",
+    "model",
+    "model_version",
+    "primary_model",
+    "challenger_model",
+    "best_side",
+    "side",
+    "direction",
+    "expected_return_pct",
+    "expected_move_pct",
+    "confidence",
+    "fallback_reason",
+    "specialist_inference_active",
+)
+SPECIALIST_SHADOW_RESULT_FIELDS = (
+    "model",
+    "available",
+    "actual_inference",
+    "reason",
+    "expected_return_pct",
+    "expected_move_pct",
+    "best_side",
+    "direction",
+    "confidence",
+    "horizon_step",
+    "sequence_length",
+    "status",
+)
 _TRAINING_MARKET_FACT_CONTRACT_KEYS = (
     "version",
     "status",
@@ -217,6 +257,137 @@ def _compact_training_market_fact_contract(value: object) -> dict[str, Any]:
     return compact
 
 
+def _project_shadow_evidence(value: Any) -> Any:
+    """Bound specialist evidence without losing the fields used for scoring."""
+
+    if isinstance(value, dict):
+        return {
+            key: _project_shadow_evidence(child)
+            for key, child in value.items()
+            if child is not None
+        }
+    if isinstance(value, list):
+        return [_project_shadow_evidence(child) for child in value]
+    if isinstance(value, str):
+        return value[:TRAINING_FEATURE_MAX_STRING_CHARS]
+    return value
+
+
+def compact_specialist_shadow_features(features: dict[str, Any]) -> dict[str, Any]:
+    """Keep decision-time specialist evidence even when the full payload is large.
+
+    The raw shadow context can exceed the per-object budget because it embeds
+    full specialist responses. Training evaluation only needs the decision,
+    inference provenance and expected return fields, so project to those keys.
+    """
+
+    compact: dict[str, Any] = {}
+    local_ml = features.get("local_ml_shadow")
+    if isinstance(local_ml, dict):
+        ml_compact: dict[str, Any] = {}
+        for key in (
+            "version",
+            "available",
+            "actual_inference",
+            "status",
+            "readiness_state",
+            "route_mode",
+            "model_version",
+            "primary_horizon_minutes",
+        ):
+            if local_ml.get(key) is not None:
+                ml_compact[key] = _project_shadow_evidence(local_ml.get(key))
+        predictions = local_ml.get("predictions")
+        if isinstance(predictions, list):
+            rows = []
+            for prediction in predictions[:8]:
+                if not isinstance(prediction, dict):
+                    continue
+                row: dict[str, Any] = {}
+                for key in (
+                    "horizon_minutes",
+                    "best_side",
+                    "profit_edge_pct",
+                    "profit_quality_score",
+                    "profit_signal",
+                    "risk_score",
+                    "paper_prediction_eligible",
+                    "ml_prediction_eligible",
+                    "actual_trade_calibration_ready",
+                ):
+                    if prediction.get(key) is not None:
+                        row[key] = _project_shadow_evidence(prediction.get(key))
+                for side in ("long", "short"):
+                    side_payload = prediction.get(side)
+                    if not isinstance(side_payload, dict):
+                        continue
+                    side_compact = {
+                        key: _project_shadow_evidence(side_payload.get(key))
+                        for key in (
+                            "objective_net_return_pct",
+                            "expected_net_return_pct",
+                            "objective_expected_return_pct",
+                        )
+                        if side_payload.get(key) is not None
+                    }
+                    if side_compact:
+                        row[side] = side_compact
+                if row:
+                    rows.append(row)
+            if rows:
+                ml_compact["predictions"] = rows
+        if ml_compact:
+            compact["local_ml_shadow"] = ml_compact
+
+    tools = features.get("local_ai_tools_shadow")
+    if isinstance(tools, dict):
+        tools_compact: dict[str, Any] = {}
+        if tools.get("status") is not None:
+            tools_compact["status"] = _project_shadow_evidence(tools.get("status"))
+        if tools.get("captured_at") is not None:
+            tools_compact["captured_at"] = _project_shadow_evidence(
+                tools.get("captured_at")
+            )
+        for tool_name in SPECIALIST_SHADOW_TOOL_KEYS:
+            tool = tools.get(tool_name)
+            if not isinstance(tool, dict):
+                continue
+            item = {
+                key: _project_shadow_evidence(tool.get(key))
+                for key in SPECIALIST_SHADOW_TOOL_FIELDS
+                if tool.get(key) is not None
+            }
+            professional = tool.get("professional_model_shadow")
+            if isinstance(professional, dict):
+                professional_compact: dict[str, Any] = {}
+                for key in (
+                    "kind",
+                    "model",
+                    "actual_inference",
+                    "primary_model",
+                    "challenger_model",
+                    "shadow_result_collected",
+                ):
+                    if professional.get(key) is not None:
+                        professional_compact[key] = _project_shadow_evidence(
+                            professional.get(key)
+                        )
+                shadow_result = professional.get("shadow_result")
+                if isinstance(shadow_result, dict):
+                    professional_compact["shadow_result"] = {
+                        key: _project_shadow_evidence(shadow_result.get(key))
+                        for key in SPECIALIST_SHADOW_RESULT_FIELDS
+                        if shadow_result.get(key) is not None
+                    }
+                if professional_compact:
+                    item["professional_model_shadow"] = professional_compact
+            if item:
+                tools_compact[tool_name] = item
+        if tools_compact:
+            compact["local_ai_tools_shadow"] = tools_compact
+    return compact
+
+
 def _parse_compact_observation_window(value: Any) -> Any:
     if not isinstance(value, str):
         return deepcopy(value)
@@ -317,6 +488,10 @@ def compact_training_feature_snapshot(value: object) -> dict[str, Any]:
         if training_feature_storage_bytes(candidate) > TRAINING_FEATURE_SNAPSHOT_MAX_BYTES:
             return {"training_feature_compaction_error": "required_contract_snapshot_budget_exceeded"}
         compact = candidate
+    for key, shadow_value in compact_specialist_shadow_features(value).items():
+        candidate = {**compact, key: shadow_value}
+        if training_feature_storage_bytes(candidate) <= TRAINING_FEATURE_SNAPSHOT_MAX_BYTES:
+            compact = candidate
     # Optional diagnostics are useful only when they fit beside the sealed
     # training inputs.  Keep a deterministic prefix and drop the rest rather
     # than rejecting an otherwise valid frozen sample.
@@ -829,6 +1004,11 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                 END IF;
                 compact := candidate;
             END IF;
+            candidate := compact || bb_compact_specialist_shadow(raw);
+            IF bb_training_feature_storage_bytes(candidate)
+                <= {TRAINING_FEATURE_SNAPSHOT_MAX_BYTES} THEN
+                compact := candidate;
+            END IF;
             FOR optional_item IN
                 SELECT entry.key, entry.value
                 FROM jsonb_each(raw) AS entry(key, value)
@@ -865,4 +1045,191 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
         END;
         $compact_features$;
     """
-    return storage_sql, normalize_sql, market_fact_sql, market_fact_contract_sql, compact_sql
+    shadow_sql = """
+        CREATE OR REPLACE FUNCTION bb_compact_specialist_shadow(input_value JSONB)
+        RETURNS JSONB
+        LANGUAGE plpgsql IMMUTABLE
+        AS $compact_specialist_shadow$
+        DECLARE
+            source JSONB := CASE WHEN jsonb_typeof(input_value) = 'object'
+                                 THEN input_value ELSE '{}'::JSONB END;
+            result JSONB := '{}'::JSONB;
+            ml JSONB := COALESCE(source->'local_ml_shadow', '{}'::JSONB);
+            tools JSONB := COALESCE(source->'local_ai_tools_shadow', '{}'::JSONB);
+            ml_compact JSONB := '{}'::JSONB;
+            tools_compact JSONB := '{}'::JSONB;
+            prediction JSONB;
+            compact_prediction JSONB;
+            predictions JSONB := '[]'::JSONB;
+            tool_item RECORD;
+            tool_compact JSONB;
+        BEGIN
+            IF jsonb_typeof(ml) = 'object' THEN
+                ml_compact := jsonb_strip_nulls(jsonb_build_object(
+                    'version', ml->'version',
+                    'available', ml->'available',
+                    'actual_inference', ml->'actual_inference',
+                    'status', ml->'status',
+                    'readiness_state', ml->'readiness_state',
+                    'route_mode', ml->'route_mode',
+                    'model_version', ml->'model_version',
+                    'primary_horizon_minutes', ml->'primary_horizon_minutes'
+                ));
+                IF jsonb_typeof(ml->'predictions') = 'array' THEN
+                    FOR prediction IN
+                        SELECT value FROM jsonb_array_elements(ml->'predictions')
+                        WITH ORDINALITY AS entry(value, ordinality)
+                        ORDER BY entry.ordinality
+                        LIMIT 8
+                    LOOP
+                        compact_prediction := jsonb_strip_nulls(jsonb_build_object(
+                            'horizon_minutes', prediction->'horizon_minutes',
+                            'best_side', prediction->'best_side',
+                            'profit_edge_pct', prediction->'profit_edge_pct',
+                            'profit_quality_score', prediction->'profit_quality_score',
+                            'profit_signal', prediction->'profit_signal',
+                            'risk_score', prediction->'risk_score',
+                            'paper_prediction_eligible', prediction->'paper_prediction_eligible',
+                            'ml_prediction_eligible', prediction->'ml_prediction_eligible',
+                            'actual_trade_calibration_ready',
+                                prediction->'actual_trade_calibration_ready',
+                            'long', jsonb_strip_nulls(jsonb_build_object(
+                                'objective_net_return_pct',
+                                    prediction->'long'->'objective_net_return_pct',
+                                'expected_net_return_pct',
+                                    prediction->'long'->'expected_net_return_pct',
+                                'objective_expected_return_pct',
+                                    prediction->'long'->'objective_expected_return_pct'
+                            )),
+                            'short', jsonb_strip_nulls(jsonb_build_object(
+                                'objective_net_return_pct',
+                                    prediction->'short'->'objective_net_return_pct',
+                                'expected_net_return_pct',
+                                    prediction->'short'->'expected_net_return_pct',
+                                'objective_expected_return_pct',
+                                    prediction->'short'->'objective_expected_return_pct'
+                            ))
+                        ));
+                        IF compact_prediction <> '{}'::JSONB THEN
+                            predictions := predictions || jsonb_build_array(compact_prediction);
+                        END IF;
+                    END LOOP;
+                    IF predictions <> '[]'::JSONB THEN
+                        ml_compact := ml_compact || jsonb_build_object('predictions', predictions);
+                    END IF;
+                END IF;
+                IF ml_compact <> '{}'::JSONB THEN
+                    result := result || jsonb_build_object('local_ml_shadow', ml_compact);
+                END IF;
+            END IF;
+            IF jsonb_typeof(tools) = 'object' THEN
+                tools_compact := jsonb_strip_nulls(jsonb_build_object(
+                    'status', tools->'status',
+                    'captured_at', tools->'captured_at'
+                ));
+                FOR tool_item IN
+                    SELECT entry.key, entry.value
+                    FROM jsonb_each(tools) AS entry(key, value)
+                    WHERE entry.key IN (
+                        'profit_prediction',
+                        'time_series_prediction',
+                        'sentiment_analysis'
+                    )
+                LOOP
+                    IF jsonb_typeof(tool_item.value) = 'object' THEN
+                        tool_compact := jsonb_strip_nulls(jsonb_build_object(
+                            'available', tool_item.value->'available',
+                            'status', tool_item.value->'status',
+                            'actual_inference', tool_item.value->'actual_inference',
+                            'model', tool_item.value->'model',
+                            'model_version', tool_item.value->'model_version',
+                            'primary_model', tool_item.value->'primary_model',
+                            'challenger_model', tool_item.value->'challenger_model',
+                            'best_side', tool_item.value->'best_side',
+                            'side', tool_item.value->'side',
+                            'direction', tool_item.value->'direction',
+                            'expected_return_pct', tool_item.value->'expected_return_pct',
+                            'expected_move_pct', tool_item.value->'expected_move_pct',
+                            'confidence', tool_item.value->'confidence',
+                            'fallback_reason', tool_item.value->'fallback_reason',
+                            'specialist_inference_active',
+                                tool_item.value->'specialist_inference_active',
+                            'professional_model_shadow',
+                                jsonb_strip_nulls(jsonb_build_object(
+                                    'kind',
+                                        tool_item.value->'professional_model_shadow'->'kind',
+                                    'model',
+                                        tool_item.value->'professional_model_shadow'->'model',
+                                    'actual_inference',
+                                        tool_item.value->'professional_model_shadow'->'actual_inference',
+                                    'primary_model',
+                                        tool_item.value->'professional_model_shadow'->'primary_model',
+                                    'challenger_model',
+                                        tool_item.value->'professional_model_shadow'->'challenger_model',
+                                    'shadow_result_collected',
+                                        tool_item.value->'professional_model_shadow'->'shadow_result_collected',
+                                    'shadow_result',
+                                        jsonb_strip_nulls(jsonb_build_object(
+                                            'model',
+                                                tool_item.value->'professional_model_shadow'
+                                                    ->'shadow_result'->'model',
+                                            'available',
+                                                tool_item.value->'professional_model_shadow'
+                                                    ->'shadow_result'->'available',
+                                            'actual_inference',
+                                                tool_item.value->'professional_model_shadow'
+                                                    ->'shadow_result'->'actual_inference',
+                                            'reason',
+                                                tool_item.value->'professional_model_shadow'
+                                                    ->'shadow_result'->'reason',
+                                            'expected_return_pct',
+                                                tool_item.value->'professional_model_shadow'
+                                                    ->'shadow_result'->'expected_return_pct',
+                                            'expected_move_pct',
+                                                tool_item.value->'professional_model_shadow'
+                                                    ->'shadow_result'->'expected_move_pct',
+                                            'best_side',
+                                                tool_item.value->'professional_model_shadow'
+                                                    ->'shadow_result'->'best_side',
+                                            'direction',
+                                                tool_item.value->'professional_model_shadow'
+                                                    ->'shadow_result'->'direction',
+                                            'confidence',
+                                                tool_item.value->'professional_model_shadow'
+                                                    ->'shadow_result'->'confidence',
+                                            'horizon_step',
+                                                tool_item.value->'professional_model_shadow'
+                                                    ->'shadow_result'->'horizon_step',
+                                            'sequence_length',
+                                                tool_item.value->'professional_model_shadow'
+                                                    ->'shadow_result'->'sequence_length',
+                                            'status',
+                                                tool_item.value->'professional_model_shadow'
+                                                    ->'shadow_result'->'status'
+                                        ))
+                                ))
+                        ));
+                        IF tool_compact <> '{}'::JSONB THEN
+                            tools_compact := tools_compact
+                                || jsonb_build_object(tool_item.key, tool_compact);
+                        END IF;
+                    END IF;
+                END LOOP;
+                IF tools_compact <> '{}'::JSONB THEN
+                    result := result || jsonb_build_object(
+                        'local_ai_tools_shadow', tools_compact
+                    );
+                END IF;
+            END IF;
+            RETURN result;
+        END;
+        $compact_specialist_shadow$;
+    """
+    return (
+        storage_sql,
+        normalize_sql,
+        market_fact_sql,
+        market_fact_contract_sql,
+        shadow_sql,
+        compact_sql,
+    )

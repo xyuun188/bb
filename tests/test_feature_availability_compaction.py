@@ -879,6 +879,84 @@ def test_verbose_market_fact_recompaction_keeps_storage_fingerprint() -> None:
     assert _compact_training_feature_snapshot(compacted) == compacted
 
 
+def _specialist_shadow_payload() -> dict[str, object]:
+    return {
+        "market_fact": _trainable_shadow_sample()["features"]["market_fact"],
+        "local_ai_tools_shadow": {
+            "status": "ok",
+            "captured_at": "2026-11-09T13:00:00+00:00",
+            "time_series_prediction": {
+                "available": True,
+                "actual_inference": True,
+                "best_side": "long",
+                "expected_return_pct": 1.25,
+                "professional_model_shadow": {
+                    "kind": "timeseries",
+                    "actual_inference": True,
+                    "shadow_result_collected": True,
+                    "shadow_result": {
+                        "model": "google/timesfm-2.5-200m-pytorch",
+                        "available": True,
+                        "actual_inference": True,
+                        "expected_return_pct": 1.25,
+                        "best_side": "long",
+                        "sequence_length": 240,
+                        "status": "completed",
+                    },
+                },
+                "debug_payload": "x" * 40000,
+            },
+        },
+        "local_ml_shadow": {
+            "version": "2026-11-09.local-ml-shadow.v1",
+            "available": True,
+            "actual_inference": True,
+            "model_version": "model-v2",
+            "primary_horizon_minutes": 240,
+            "predictions": [
+                {
+                    "horizon_minutes": 240,
+                    "best_side": "long",
+                    "long": {"objective_net_return_pct": 1.1},
+                    "short": {"objective_net_return_pct": -0.4},
+                    "debug_payload": "y" * 40000,
+                }
+            ],
+        },
+    }
+
+
+def test_specialist_shadow_survives_compaction_without_full_payload() -> None:
+    features = _specialist_shadow_payload()
+
+    compacted = _compact_training_feature_snapshot(features)
+
+    assert "training_feature_compaction_error" not in compacted
+    assert training_feature_storage_bytes(compacted) <= TRAINING_FEATURE_SNAPSHOT_MAX_BYTES
+    tools = compacted["local_ai_tools_shadow"]
+    result = tools["time_series_prediction"]["professional_model_shadow"]["shadow_result"]
+    assert result["actual_inference"] is True
+    assert result["expected_return_pct"] == 1.25
+    assert "debug_payload" not in tools["time_series_prediction"]
+    ml = compacted["local_ml_shadow"]
+    assert ml["predictions"][0]["long"]["objective_net_return_pct"] == 1.1
+    assert "debug_payload" not in ml["predictions"][0]
+    assert _compact_training_feature_snapshot(features) == compacted
+
+
+def test_postgres_compaction_retains_specialist_shadow_projection() -> None:
+    functions = postgres_training_feature_snapshot_functions()
+    shadow_sql = next(
+        sql for sql in functions if "bb_compact_specialist_shadow" in sql
+    )
+    compact_sql = functions[-1]
+
+    assert "local_ai_tools_shadow" in shadow_sql
+    assert "local_ml_shadow" in shadow_sql
+    assert "'professional_model_shadow'" in shadow_sql
+    assert "bb_compact_specialist_shadow(raw)" in compact_sql
+
+
 def test_optional_diagnostics_are_dropped_when_they_exceed_snapshot_budget() -> None:
     features = _trainable_shadow_sample()["features"]
     features.update(
