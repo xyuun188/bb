@@ -439,7 +439,16 @@ def test_paper_mixed_horizons_select_highest_weight_native_cohort() -> None:
     context = _context(
         ml=_governed_ml(0.8, -0.2),
         tools={"profit_prediction": server},
-        strategy={"execution_mode": "paper"},
+        strategy={
+            "execution_mode": "paper",
+            "continuous_model_weights": {
+                "applied": True,
+                "quant_source_weights": {
+                    "server_profit": {"effective_multiplier": 1.5},
+                    "local_ml": {"effective_multiplier": 1.0},
+                },
+            },
+        },
     )
 
     assert context["enabled"] is True
