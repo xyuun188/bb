@@ -230,6 +230,20 @@ class Settings(BaseSettings):
     okx_live_api_secret: str = ""
     okx_live_passphrase: str = ""
     okx_proxy: str = ""
+    # Entry execution policy. Post-only entries rest at the touch; when the
+    # wait expires the unfilled remainder falls back to a market order so a
+    # passive miss can never strand an unprotected position or silently drop
+    # the entry. This only changes the entry fee leg; the decision gate is
+    # untouched and stays fail-closed.
+    okx_entry_post_only_enabled: bool = True
+    # Bound the passive wait: long enough to catch a touch fill, short enough
+    # that a miss cannot materially delay the entry.
+    okx_entry_post_only_timeout_seconds: float = 4.0
+    okx_entry_post_only_poll_seconds: float = 0.5
+    # Measured share of post-only entries that fill before the wait expires.
+    # The cost model credits maker fees only by this rate, so a zero prior
+    # keeps every estimate on the conservative taker basis.
+    okx_entry_post_only_fill_probability: float = 0.0
 
     # --- AI API (OpenAI-compatible) ---
     # Per-model AI configurations (list of dicts from AI_MODELS env var)

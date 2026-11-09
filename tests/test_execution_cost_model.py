@@ -170,3 +170,70 @@ def test_account_fee_facts_are_attached_to_live_feature_snapshot() -> None:
     assert snapshot["taker_fee_rate"] == pytest.approx(0.0004)
     assert snapshot["fee_policy_provenance"]["source"] == "okx_account_trade_fee_swap"
     assert execution_cost_estimate(snapshot).production_eligible is True
+
+
+def test_maker_rate_is_attached_to_the_feature_snapshot() -> None:
+    feature = FeatureVector(
+        symbol="BTC/USDT",
+        spread_pct=0.01,
+        orderbook_bid_depth=10_000.0,
+        orderbook_ask_depth=9_000.0,
+    )
+
+    attach_execution_cost_facts(
+        feature,
+        {"taker_fee_rate": 0.0005, "maker_fee_rate": 0.0002, "exit_fee_rate": 0.0005},
+    )
+
+    snapshot = feature.to_dict()
+    assert snapshot["maker_fee_rate"] == pytest.approx(0.0002)
+
+
+def test_entry_leg_stays_on_the_taker_basis_without_a_measured_fill_rate() -> None:
+    # Post-only is armed, but no verified maker fill rate exists yet: the entry
+    # leg must still be priced at the taker rate.
+    estimate = execution_cost_estimate(
+        {
+            "spread_pct": 0.01,
+            "taker_fee_rate": 0.0005,
+            "maker_fee_rate": 0.0002,
+            "entry_execution_style": "post_only_with_market_fallback",
+            "post_only_fill_probability": 0.0,
+        }
+    )
+
+    assert estimate.fee_pct == pytest.approx(0.1)
+    assert "taker_entry_no_measured_maker_fill_rate" in estimate.policy_provenance["source"]
+    assert estimate.production_eligible is True
+
+
+def test_entry_leg_credits_the_maker_rate_by_the_measured_fill_rate() -> None:
+    estimate = execution_cost_estimate(
+        {
+            "spread_pct": 0.01,
+            "taker_fee_rate": 0.0005,
+            "maker_fee_rate": 0.0002,
+            "entry_execution_style": "post_only_with_market_fallback",
+            "post_only_fill_probability": 0.5,
+        }
+    )
+
+    # entry: 0.5*0.02 + 0.5*0.05 = 0.035 ; exit: 0.05 -> 0.085
+    assert estimate.fee_pct == pytest.approx(0.085)
+    assert "post_only_measured_maker_share" in estimate.policy_provenance["source"]
+
+
+def test_maker_rate_is_ignored_for_a_plain_taker_entry() -> None:
+    estimate = execution_cost_estimate(
+        {
+            "spread_pct": 0.01,
+            "taker_fee_rate": 0.0005,
+            "maker_fee_rate": 0.0002,
+            "entry_execution_style": "market",
+            "post_only_fill_probability": 1.0,
+        }
+    )
+
+    # A market entry never earns the maker rate, whatever the prior says.
+    assert estimate.fee_pct == pytest.approx(0.1)
+    assert "snapshot_exchange_fee_rates.taker_entry+" in estimate.policy_provenance["source"]

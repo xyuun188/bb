@@ -42,6 +42,12 @@ from services.entry_profit_risk_sizing import (
     select_okx_leverage_tier,
     uplift_profit_risk_sizing_to_exchange_minimum,
 )
+from services.entry_post_only import (
+    FILL_FULL,
+    classify_passive_fill,
+    plan_entry_post_only,
+    post_only_execution_fact,
+)
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.normal_paper_trade import normal_paper_order_identity_reasons
 from services.okx_balance_snapshot import finite_balance_value
@@ -958,6 +964,7 @@ class OKXExecutor(AbstractExecutor):
         protection_submit_requested_at: datetime | None = None
         protection_submission: dict[str, Any] = {}
         attached_protection_recovery: dict[str, Any] = {}
+        post_only_fact: dict[str, Any] = {}
 
         try:
             okx_symbol = await self._resolve_swap_symbol(decision.symbol)
@@ -2090,13 +2097,24 @@ class OKXExecutor(AbstractExecutor):
             try:
                 if decision.is_entry and params.get("attachAlgoOrds"):
                     protection_submit_requested_at = datetime.now(UTC)
-                order = await self._create_order_with_client_recovery(
-                    ccxt,
-                    okx_symbol,
-                    side,
-                    order_quantity,
-                    params,
-                )
+                if decision.is_entry:
+                    order, post_only_fact = await self._place_entry_with_post_only(
+                        ccxt,
+                        okx_symbol=okx_symbol,
+                        side=side,
+                        quantity=order_quantity,
+                        params=params,
+                        market=market,
+                        ticker=ticker,
+                    )
+                else:
+                    order = await self._create_order_with_client_recovery(
+                        ccxt,
+                        okx_symbol,
+                        side,
+                        order_quantity,
+                        params,
+                    )
             except ExchangeAPIError as e:
                 if decision.is_entry:
                     error_text = safe_error_text(e)
@@ -2253,6 +2271,22 @@ class OKXExecutor(AbstractExecutor):
             if decision.is_entry:
                 order = await self._finalize_partial_entry_order(ccxt, order, okx_symbol)
                 finalization = order.get("entry_partial_fill_finalization")
+                passive_leg = order.get("post_only_passive_order")
+                passive_leg = passive_leg if isinstance(passive_leg, dict) else {}
+                passive_filled = self._safe_float(passive_leg.get("filled"), 0.0)
+                if passive_filled > 0 and not isinstance(finalization, dict):
+                    # A partial maker fill followed by a market remainder
+                    # leaves the maker portion uncovered by the attached
+                    # protection on the fallback order. Cover it explicitly.
+                    passive_protection = await self._ensure_partial_entry_protection(
+                        decision=decision,
+                        params=params,
+                        filled_contracts=passive_filled,
+                    )
+                    order = {
+                        **order,
+                        "post_only_passive_protection": passive_protection,
+                    }
                 recovered_filled_contracts = self._safe_float(order.get("filled"), 0.0)
                 if isinstance(finalization, dict):
                     recovered_filled_contracts = max(
@@ -2662,6 +2696,11 @@ class OKXExecutor(AbstractExecutor):
                         else {}
                     ),
                     **({"leverage_check": leverage_check} if decision.is_entry else {}),
+                    **(
+                        {"post_only_entry": post_only_fact}
+                        if decision.is_entry and post_only_fact
+                        else {}
+                    ),
                     **(
                         {
                             "exit_tracking": True,
@@ -4205,6 +4244,9 @@ class OKXExecutor(AbstractExecutor):
         side: str,
         quantity: float,
         params: dict[str, Any],
+        *,
+        order_type: str = "market",
+        price: float | None = None,
     ) -> dict[str, Any]:
         """Submit once logically and recover an ambiguous OKX response by ``clOrdId``."""
 
@@ -4212,10 +4254,10 @@ class OKXExecutor(AbstractExecutor):
             return await self._with_retry(
                 ccxt.create_order,
                 symbol,
-                "market",
+                order_type,
                 side,
                 quantity,
-                None,
+                price,
                 params,
             )
         except ExchangeAPIError as submit_error:
@@ -4237,10 +4279,10 @@ class OKXExecutor(AbstractExecutor):
                     return await self._with_retry(
                         ccxt.create_order,
                         symbol,
-                        "market",
+                        order_type,
                         side,
                         quantity,
-                        None,
+                        price,
                         params,
                     )
                 except Exception as refresh_error:
@@ -4295,6 +4337,351 @@ class OKXExecutor(AbstractExecutor):
                 )
                 return self._native_order_detail_to_execution_order(row, symbol=symbol)
             raise submit_error
+
+    def _passive_limit_price(
+        self,
+        ccxt: Any,
+        okx_symbol: str,
+        *,
+        side: str,
+        price: float,
+        market: dict[str, Any] | None = None,
+    ) -> float:
+        """Align a passive touch price without crossing the spread.
+
+        A buy joins the bid and must round down; a sell joins the ask and must
+        round up.  Crossing here would either be rejected by OKX (post only)
+        or silently pay taker fees.
+        """
+
+        value = self._safe_float(price, 0.0)
+        if value <= 0.0:
+            return 0.0
+        rounding = ROUND_FLOOR if str(side).lower() in {"buy", "long"} else ROUND_CEILING
+        tick = (
+            self._market_info_float(market or {}, "tickSz", "price_tick")
+            if isinstance(market, dict)
+            else 0.0
+        )
+        if tick > 0.0:
+            units = Decimal(str(value)) / Decimal(str(tick))
+            return float(units.to_integral_value(rounding=rounding) * Decimal(str(tick)))
+        try:
+            text = str(ccxt.price_to_precision(okx_symbol, value))
+        except Exception as exc:
+            logger.debug(
+                "OKX passive price precision failed",
+                symbol=okx_symbol,
+                price=value,
+                error=safe_error_text(exc),
+            )
+            return value
+        try:
+            parsed = Decimal(text)
+        except (InvalidOperation, ValueError):
+            return value
+        # ccxt rounds to the nearest tick; the caller re-checks the resulting
+        # price against the touch so a rounded-up buy cannot cross the ask.
+        return float(parsed) if parsed > 0 else value
+
+    async def _place_entry_with_post_only(
+        self,
+        ccxt: Any,
+        *,
+        okx_symbol: str,
+        side: str,
+        quantity: float,
+        params: dict[str, Any],
+        market: dict[str, Any] | None,
+        ticker: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Rest a post-only entry, then market-fill the unfilled remainder."""
+
+        timeout_seconds = getattr(settings, "okx_entry_post_only_timeout_seconds", 6.0)
+        poll_seconds = max(
+            self._safe_float(
+                getattr(settings, "okx_entry_post_only_poll_seconds", 0.5),
+                0.5,
+            ),
+            0.1,
+        )
+        plan = plan_entry_post_only(
+            enabled=getattr(settings, "okx_entry_post_only_enabled", False),
+            side=side,
+            bid=ticker.get("bid"),
+            ask=ticker.get("ask"),
+            timeout_seconds=timeout_seconds,
+        )
+        if not plan.get("eligible"):
+            order = await self._create_order_with_client_recovery(
+                ccxt,
+                okx_symbol,
+                side,
+                quantity,
+                params,
+            )
+            return order, post_only_execution_fact(plan=plan, outcome="not_attempted")
+
+        passive_price = self._passive_limit_price(
+            ccxt,
+            okx_symbol,
+            side=side,
+            price=self._safe_float(plan.get("price"), 0.0),
+            market=market,
+        )
+        best_bid = self._safe_float(ticker.get("bid"), 0.0)
+        best_ask = self._safe_float(ticker.get("ask"), 0.0)
+        crossing = bool(
+            best_bid > 0
+            and best_ask > 0
+            and (
+                (str(side).lower() in {"buy", "long"} and passive_price >= best_ask)
+                or (str(side).lower() in {"sell", "short"} and passive_price <= best_bid)
+            )
+        )
+        if passive_price <= 0 or crossing:
+            order = await self._create_order_with_client_recovery(
+                ccxt,
+                okx_symbol,
+                side,
+                quantity,
+                params,
+            )
+            return order, post_only_execution_fact(
+                plan={**plan, "eligible": False, "reason": "post_only_price_would_cross"},
+                outcome="not_attempted",
+            )
+        plan = {**plan, "price": passive_price}
+
+        passive_params = dict(params)
+        client_order_id = str(passive_params.get("clOrdId") or "").strip()
+        if client_order_id:
+            # The market fallback must keep the canonical decision id, so the
+            # passive leg gets its own unique client id.
+            passive_params["clOrdId"] = f"{client_order_id[:31]}P"
+        try:
+            passive_order = await self._create_order_with_client_recovery(
+                ccxt,
+                okx_symbol,
+                side,
+                quantity,
+                passive_params,
+                order_type="post_only",
+                price=passive_price,
+            )
+        except ExchangeAPIError as exc:
+            error_text = safe_error_text(exc)
+            rejection_code = self._exchange_error_code(exc, error_text)
+            if rejection_code == "51016" or "post only" in error_text.lower():
+                logger.info(
+                    "OKX rejected post-only entry at the touch; using market fallback",
+                    symbol=okx_symbol,
+                    side=side,
+                    error=error_text,
+                )
+                order = await self._create_order_with_client_recovery(
+                    ccxt,
+                    okx_symbol,
+                    side,
+                    quantity,
+                    params,
+                )
+                return order, post_only_execution_fact(
+                    plan=plan,
+                    outcome="rejected",
+                    fallback_reason=f"post_only_rejected_{rejection_code or 'unknown'}",
+                    taker_fill_contracts=quantity,
+                )
+            raise
+
+        deadline = time.monotonic() + self._safe_float(plan.get("timeout_seconds"), 6.0)
+        order_id = str(passive_order.get("id") or "").strip()
+        passive_finalization: dict[str, Any] | None = None
+        # The submit response carries the attached-protection acknowledgement;
+        # the native detail row does not. Preserve it across every poll so the
+        # protection fact is not lost when the passive leg fills.
+        initial_info = (
+            dict(passive_order.get("info"))
+            if isinstance(passive_order.get("info"), dict)
+            else {}
+        )
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_seconds)
+            if not order_id:
+                break
+            try:
+                detail = await self._fetch_native_order_detail(ccxt, order_id, okx_symbol)
+            except Exception as exc:
+                logger.debug(
+                    "post-only entry poll failed",
+                    symbol=okx_symbol,
+                    order_id=order_id,
+                    error=safe_error_text(exc),
+                )
+                continue
+            if detail:
+                # OKX can report a smaller cumulative fill on a later poll;
+                # the fill size for one order is monotonic, so never let a
+                # stale detail shrink it.
+                filled_before = self._safe_float(passive_order.get("filled"), 0.0)
+                passive_order = {**passive_order, **detail}
+                passive_order["filled"] = max(
+                    filled_before,
+                    self._safe_float(detail.get("filled"), 0.0),
+                )
+                merged_info = (
+                    dict(passive_order.get("info"))
+                    if isinstance(passive_order.get("info"), dict)
+                    else {}
+                )
+                for key, value in initial_info.items():
+                    merged_info.setdefault(key, value)
+                passive_order["info"] = merged_info
+            filled = self._safe_float(passive_order.get("filled"), 0.0)
+            if classify_passive_fill(
+                filled_contracts=filled, requested_contracts=quantity
+            ) == FILL_FULL:
+                return passive_order, post_only_execution_fact(
+                    plan=plan,
+                    outcome="filled",
+                    maker_fill_contracts=filled,
+                    post_only_order_id=order_id,
+                )
+            status = self._order_status_from_ccxt(
+                passive_order.get("status")
+                or (passive_order.get("info") or {}).get("state")
+            )
+            if status in {OrderStatus.CANCELLED, OrderStatus.REJECTED}:
+                break
+
+        filled = self._safe_float(passive_order.get("filled"), 0.0)
+        filled = min(max(filled, 0.0), quantity)
+        remaining = max(quantity - filled, 0.0)
+        fallback_reason = "post_only_timeout"
+        if remaining <= max(quantity * 1e-9, 1e-12):
+            return passive_order, post_only_execution_fact(
+                plan=plan,
+                outcome="filled",
+                maker_fill_contracts=filled,
+                post_only_order_id=order_id,
+            )
+        if order_id:
+            try:
+                if filled > 0:
+                    passive_order = await self._finalize_partial_entry_order(
+                        ccxt,
+                        passive_order,
+                        okx_symbol,
+                    )
+                    passive_finalization = passive_order.get(
+                        "entry_partial_fill_finalization"
+                    )
+                else:
+                    await self._cancel_order_native(ccxt, order_id, okx_symbol)
+                fallback_reason = (
+                    "post_only_partial_timeout" if filled > 0 else "post_only_timeout"
+                )
+            except Exception as exc:
+                # Without a terminal passive order a market fallback could
+                # double-fill the entry.  Surface the error instead.
+                raise OrderPlacementError(
+                    "post-only entry could not be cancelled before market fallback: "
+                    + safe_error_text(exc, limit=160)
+                ) from exc
+            refreshed_filled = self._safe_float(passive_order.get("filled"), filled)
+            filled = min(max(max(filled, refreshed_filled), 0.0), quantity)
+            remaining = max(quantity - filled, 0.0)
+            if remaining <= max(quantity * 1e-9, 1e-12):
+                return passive_order, post_only_execution_fact(
+                    plan=plan,
+                    outcome="filled_after_cancel",
+                    maker_fill_contracts=filled,
+                    post_only_order_id=order_id,
+                )
+
+        market_order = await self._create_order_with_client_recovery(
+            ccxt,
+            okx_symbol,
+            side,
+            remaining,
+            params,
+        )
+        # The submit response only acknowledges the market leg; confirm the
+        # real fill before reporting a total, exactly as the plain market path
+        # does. Reporting the requested size instead would fake a fill.
+        try:
+            market_order = await self._confirm_market_order(ccxt, market_order, okx_symbol)
+        except Exception as exc:
+            logger.warning(
+                "post-only market fallback confirmation failed",
+                symbol=okx_symbol,
+                order_id=market_order.get("id"),
+                error=safe_error_text(exc),
+            )
+        market_filled = self._safe_float(market_order.get("filled"), 0.0)
+        total_filled = min(filled + max(market_filled, 0.0), quantity)
+        passive_avg = self._safe_float(
+            passive_order.get("average") or passive_order.get("price"),
+            0.0,
+        )
+        market_avg = self._safe_float(
+            market_order.get("average") or market_order.get("price"),
+            0.0,
+        )
+        weighted_avg = (
+            (
+                (filled * passive_avg if passive_avg > 0 else 0.0)
+                + (market_filled * market_avg if market_avg > 0 else 0.0)
+            )
+            / (filled + market_filled)
+            if (filled + market_filled) > 0
+            else market_avg
+        )
+        passive_fee = self._safe_float(
+            (passive_order.get("fee") or {}).get("cost")
+            if isinstance(passive_order.get("fee"), dict)
+            else 0.0,
+            0.0,
+        )
+        market_fee = self._safe_float(
+            (market_order.get("fee") or {}).get("cost")
+            if isinstance(market_order.get("fee"), dict)
+            else 0.0,
+            0.0,
+        )
+        merged = {
+            **market_order,
+            # Report the full entry size, not just the fallback leg, so the
+            # caller's fill accounting sees the real order shape.
+            "amount": quantity,
+            "filled": total_filled,
+            "average": weighted_avg,
+            "fee": {"cost": passive_fee + market_fee},
+            "post_only_maker_fill_contracts": filled,
+            "post_only_taker_fill_contracts": max(market_filled, 0.0),
+            # Keep the passive leg's terminal proof so the caller can attach
+            # standalone protection for the maker portion as well.
+            "post_only_passive_order": {
+                "id": order_id or None,
+                "filled": filled,
+                "average": passive_avg or None,
+                "entry_partial_fill_finalization": passive_finalization,
+            },
+        }
+        if total_filled + max(quantity * 1e-9, 1e-12) >= quantity:
+            merged["status"] = "filled"
+        else:
+            merged["status"] = str(
+                market_order.get("status") or merged.get("status") or "open"
+            )
+        return merged, post_only_execution_fact(
+            plan=plan,
+            outcome="partial_then_market_fallback" if filled > 0 else "market_fallback",
+            fallback_reason=fallback_reason,
+            maker_fill_contracts=filled,
+            taker_fill_contracts=max(market_filled, 0.0),
+            post_only_order_id=order_id,
+        )
 
     def _native_order_detail_to_execution_order(
         self,
@@ -7976,6 +8363,7 @@ class OKXExecutor(AbstractExecutor):
             "volume_24h_contracts": volume_24h_contracts,
             "volume_24h_base": volume_24h_base,
             "taker_fee_rate": fee.get("taker_fee_rate"),
+            "maker_fee_rate": fee.get("maker_fee_rate"),
             "entry_fee_rate": fee.get("entry_fee_rate"),
             "exit_fee_rate": fee.get("exit_fee_rate"),
             "fee_rate_source": fee.get("fee_rate_source"),
@@ -8237,7 +8625,7 @@ class OKXExecutor(AbstractExecutor):
             raise
 
     async def fetch_account_fee_snapshot(self) -> dict[str, Any]:
-        """Read the current account-level SWAP taker fee from OKX."""
+        """Read the current account-level SWAP maker and taker fees from OKX."""
 
         exchange = await self._get_ccxt()
         for attempt in range(2):
@@ -8260,6 +8648,17 @@ class OKXExecutor(AbstractExecutor):
                 taker_rate = value
                 taker_field = field_name
                 break
+        # OKX reports maker fees as a negative rate because the account is
+        # credited. The cost model needs the magnitude, matching the taker
+        # convention already used across the stack.
+        maker_rate = 0.0
+        maker_field = ""
+        for field_name in ("makerU", "maker", "makerUSDC"):
+            value = abs(self._safe_float(row.get(field_name), 0.0))
+            if value > 0:
+                maker_rate = value
+                maker_field = field_name
+                break
         source_observed_at = (
             datetime.fromtimestamp(observed_at_ms / 1000.0, tz=UTC).isoformat()
             if observed_at_ms > 0
@@ -8268,12 +8667,35 @@ class OKXExecutor(AbstractExecutor):
         fallback_reason = "" if taker_rate > 0 else "okx_swap_taker_fee_missing"
         return {
             "taker_fee_rate": taker_rate if taker_rate > 0 else None,
+            "maker_fee_rate": maker_rate if maker_rate > 0 else None,
             "entry_fee_rate": taker_rate if taker_rate > 0 else None,
             "exit_fee_rate": taker_rate if taker_rate > 0 else None,
             "fee_rate_source": (
                 f"okx_account_trade_fee.{taker_field}"
                 if taker_field
                 else "okx_account_trade_fee.missing"
+            ),
+            "maker_fee_rate_source": (
+                f"okx_account_trade_fee.{maker_field}"
+                if maker_field
+                else "okx_account_trade_fee.maker_missing"
+            ),
+            # Publish the entry-leg policy with the fee facts so the decision
+            # cost model prices the execution the executor will actually use.
+            "entry_execution_style": (
+                "post_only_with_market_fallback"
+                if bool(getattr(settings, "okx_entry_post_only_enabled", False))
+                else "market"
+            ),
+            "post_only_fill_probability": min(
+                max(
+                    self._safe_float(
+                        getattr(settings, "okx_entry_post_only_fill_probability", 0.0),
+                        0.0,
+                    ),
+                    0.0,
+                ),
+                1.0,
             ),
             "fee_rate_observed_at": source_observed_at or received_at,
             "account_fee_received_at": received_at,
@@ -8284,8 +8706,9 @@ class OKXExecutor(AbstractExecutor):
                 "sample_count": int(taker_rate > 0),
                 "generated_at": received_at,
                 "source_observed_at": source_observed_at,
-                "strategy_version": "2026-07-13.okx-account-fee-snapshot.v1",
+                "strategy_version": "2026-11-09.okx-account-fee-snapshot.v2",
                 "fallback_reason": fallback_reason,
+                "maker_fee_rate_available": maker_rate > 0,
             },
         }
 

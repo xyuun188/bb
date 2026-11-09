@@ -9,6 +9,7 @@ from typing import Any
 
 EXECUTION_COST_FACT_FIELDS = (
     "taker_fee_rate",
+    "maker_fee_rate",
     "entry_fee_rate",
     "exit_fee_rate",
     "round_trip_fee_pct",
@@ -16,6 +17,10 @@ EXECUTION_COST_FACT_FIELDS = (
     "fee_rate_observed_at",
     "account_fee_received_at",
     "account_fee_source_observed_at",
+    # The entry-leg policy travels with the fee facts so the cost model prices
+    # the same execution the executor will actually use.
+    "entry_execution_style",
+    "post_only_fill_probability",
 )
 
 
@@ -483,19 +488,51 @@ def _orderbook_market_impact(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def entry_fee_rate(snapshot: dict[str, Any]) -> tuple[float, str]:
+    """Return the fee rate the entry leg is expected to pay.
+
+    A post-only entry only earns the maker rate for the share of orders that
+    actually rest and fill; the rest pay taker (plus slippage). The fill rate
+    is an explicit measured input, so with no measured evidence the entry leg
+    stays on the taker basis and the model cannot invent a maker discount.
+    """
+
+    taker_rate = _normalized_fee_rate(
+        snapshot.get("taker_fee_rate", snapshot.get("fee_rate"))
+    )
+    # An explicit entry rate outranks the account taker rate, matching the
+    # historical precedence. It is still the basis a maker fill improves on.
+    explicit_entry = _normalized_fee_rate(snapshot.get("entry_fee_rate"))
+    base_entry = explicit_entry if explicit_entry > 0 else taker_rate
+    if base_entry <= 0:
+        return 0.0, "missing_exchange_fee_rate"
+    if snapshot.get("entry_execution_style") != "post_only_with_market_fallback":
+        return base_entry, "taker_entry"
+    maker_rate = _normalized_fee_rate(snapshot.get("maker_fee_rate"))
+    if maker_rate <= 0:
+        return base_entry, "taker_entry_maker_rate_missing"
+    probability = _safe_float(snapshot.get("post_only_fill_probability"), 0.0)
+    if probability <= 0.0:
+        return base_entry, "taker_entry_no_measured_maker_fill_rate"
+    probability = min(max(probability, 0.0), 1.0)
+    blended = probability * maker_rate + (1.0 - probability) * base_entry
+    return blended, "post_only_measured_maker_share"
+
+
 def round_trip_fee_pct(snapshot: dict[str, Any]) -> tuple[float, str]:
     explicit = _safe_float(snapshot.get("round_trip_fee_pct"), 0.0)
     if explicit > 0:
         return explicit, "snapshot_round_trip_fee_pct"
-    entry_rate = _normalized_fee_rate(
-        snapshot.get("entry_fee_rate", snapshot.get("taker_fee_rate", snapshot.get("fee_rate")))
-    )
     exit_rate = _normalized_fee_rate(
         snapshot.get("exit_fee_rate", snapshot.get("taker_fee_rate", snapshot.get("fee_rate")))
     )
+    entry_rate, entry_source = entry_fee_rate(snapshot)
     if entry_rate <= 0 or exit_rate <= 0:
         return 0.0, "missing_exchange_fee_rate"
-    return round((entry_rate + exit_rate) * 100.0, 6), "snapshot_exchange_fee_rates"
+    return (
+        round((entry_rate + exit_rate) * 100.0, 6),
+        f"snapshot_exchange_fee_rates.{entry_source}",
+    )
 
 
 def _normalized_fee_rate(value: Any) -> float:
