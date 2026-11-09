@@ -48,9 +48,11 @@ def test_standardized_return_distribution_keeps_raw_and_objective_separate() -> 
     assert contract["raw_expected_return_pct"] == 0.8
     assert contract["lower_quantile_return_pct"] == 0.4
     assert contract["dispersion_pct"] == 0.2
-    assert contract["uncertainty_penalty_pct"] == pytest.approx(0.4)
+    # Only dispersion is charged; the 0.8 -> 0.4 tail gap is priced by the
+    # explicit tail term and gated separately, never double-counted here.
+    assert contract["uncertainty_penalty_pct"] == pytest.approx(0.2)
     assert contract["tail_loss_penalty_pct"] == pytest.approx(0.05)
-    assert contract["objective_expected_return_pct"] == pytest.approx(0.35)
+    assert contract["objective_expected_return_pct"] == pytest.approx(0.55)
 
 
 def test_paper_cost_learning_keeps_negative_outcomes_out_of_mean_and_cost_deducted_once() -> None:
@@ -106,6 +108,52 @@ def test_lower_quantile_above_raw_expected_is_blocked_not_clamped() -> None:
         risk_adjusted_expected_return(
             expected_return_pct=0.46,
             lower_quantile_return_pct=0.496,
+            tail_loss_probability=0.1,
+            tail_loss_scale_pct=0.5,
+        )
+
+
+def test_objective_keeps_positive_mean_when_quantile_gap_exceeds_dispersion() -> None:
+    """Regression: the objective must not collapse to the lower quantile.
+
+    With a 0.8% mean, a 0.4% lower quantile and only 0.2% dispersion, the old
+    ``max(expected - lower, dispersion)`` penalty made the objective equal
+    ``lower - tail``.  Any trade whose mean was positive but whose quantile
+    gap was wide then became unscoreable, which is exactly the deadlock seen
+    in production.
+    """
+
+    contract = _distribution()
+    assert contract["raw_expected_return_pct"] > 0.0
+    assert contract["lower_quantile_return_pct"] < 0.0 or (
+        contract["lower_quantile_return_pct"]
+        < contract["raw_expected_return_pct"]
+    )
+    assert contract["objective_expected_return_pct"] > 0.0
+    assert contract["objective_expected_return_pct"] > (
+        contract["lower_quantile_return_pct"]
+        - contract["tail_loss_penalty_pct"]
+    )
+
+    direct = risk_adjusted_expected_return(
+        expected_return_pct=0.8,
+        lower_quantile_return_pct=0.4,
+        dispersion_pct=0.2,
+        tail_loss_probability=0.1,
+        tail_loss_scale_pct=0.5,
+    )
+    assert direct["uncertainty_penalty_pct"] == pytest.approx(0.2)
+    assert direct["objective_net_return_pct"] == pytest.approx(
+        contract["objective_expected_return_pct"]
+    )
+
+
+def test_negative_dispersion_is_rejected_by_risk_adjustment() -> None:
+    with pytest.raises(ValueError, match="return_dispersion_negative"):
+        risk_adjusted_expected_return(
+            expected_return_pct=0.8,
+            lower_quantile_return_pct=0.4,
+            dispersion_pct=-0.01,
             tail_loss_probability=0.1,
             tail_loss_scale_pct=0.5,
         )
@@ -171,7 +219,12 @@ def test_return_distribution_quantile_and_uncertainty_properties(
     assert contract["production_eligible"] is True
     assert contract["lower_quantile_return_pct"] <= contract["raw_expected_return_pct"]
     assert contract["uncertainty_penalty_pct"] >= 0.0
-    if distance > 0.0 or dispersion > 0.0:
+    # The objective must keep the expected mean, not collapse to the lower
+    # quantile: that degeneration required a near-95% win rate.
+    assert contract["objective_expected_return_pct"] == pytest.approx(
+        expected - dispersion - 0.1 * 0.5
+    )
+    if dispersion > 0.0:
         assert contract["uncertainty_penalty_pct"] > 0.0
 
 

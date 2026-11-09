@@ -4,10 +4,25 @@ from typing import Any
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from config.settings import settings
 from core.exceptions import ExchangeAPIError
 from core.symbols import okx_inst_id_from_symbol
 from executor.base_executor import OrderStatus
 from executor.okx_executor import OKXExecutor
+
+
+@pytest.fixture(autouse=True)
+def _market_entry_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep these pending-order guards on the plain market path.
+
+    Post-only entries have their own fill-ledger tests in
+    ``tests/test_okx_executor_post_only_entry.py``.  These tests count submits
+    and native confirmations for a single market order, so the default-enabled
+    post-only wrapper would add a passive submit and a passive poll to every
+    expectation asserted here.
+    """
+
+    monkeypatch.setattr(settings, "okx_entry_post_only_enabled", False, raising=False)
 
 
 def _entry_decision(symbol: str = "HOME/USDT") -> DecisionOutput:

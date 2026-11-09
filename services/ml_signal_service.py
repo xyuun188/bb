@@ -728,6 +728,7 @@ def _fee_after_prediction_objective(
 ) -> dict[str, float]:
     expected = _safe_float(prediction.get("expected_net_return_pct"), float("nan"))
     lower = _safe_float(prediction.get("return_q10"), float("nan"))
+    upper = _safe_float(prediction.get("return_q90"), float("nan"))
     tail_probability = _safe_float(prediction.get("tail_loss_probability"), 0.0)
     if not all(math.isfinite(value) for value in (expected, lower, tail_probability)):
         return {
@@ -737,9 +738,18 @@ def _fee_after_prediction_objective(
             "tail_loss_penalty_pct": float("nan"),
             "objective_net_return_pct": float("nan"),
         }
+    # Dispersion is the only uncertainty penalty, matching the standardized
+    # contract.  For a Gaussian, q90 - q10 = 2.563 sigma; when the upper
+    # quantile is absent, infer sigma from the mean-to-q10 distance instead of
+    # failing the objective (a NaN here would block every such entry).
+    if math.isfinite(upper) and upper >= lower:
+        dispersion = max((upper - lower) / 2.563103131, 0.0)
+    else:
+        dispersion = max((expected - lower) / 1.281551566, 0.0)
     return risk_adjusted_expected_return(
         expected_return_pct=expected,
         lower_quantile_return_pct=min(lower, expected),
+        dispersion_pct=dispersion,
         tail_loss_probability=tail_probability,
         tail_loss_scale_pct=tail_loss_scale_pct,
     )

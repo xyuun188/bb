@@ -28,6 +28,10 @@ from services.local_ai_training_contract import (
 
 RETURN_DISTRIBUTION_CONTRACT_VERSION = "2026-07-15.standardized-return-distribution.v1"
 RETURN_DISTRIBUTION_INPUT_VERSION = "2026-07-15.model-return-distribution-input.v1"
+# The risk penalty changed but the training objective/label did not, so this
+# is versioned separately.  Bumping ``RETURN_OBJECTIVE_VERSION`` would
+# invalidate every already-sealed model artifact.
+RISK_PENALTY_VERSION = "2026-11-09.dispersion-only-uncertainty.v1"
 PAPER_RETURN_COMBINATION_VERSION = "2026-07-27.paper-current-cost-return-combination.v1"
 HOLDOUT_RETURN_METRIC_CONTRACT_VERSION = "2026-08-16.fee-after-holdout-metrics.v1"
 HOLDOUT_REALIZED_RETURN_BASIS = (
@@ -150,7 +154,12 @@ def standardized_return_distribution(
         assert dispersion is not None
         assert tail_probability is not None
         assert tail_scale is not None
-        uncertainty_penalty = max(expected - lower, dispersion, 0.0)
+        # Only prediction dispersion is charged as uncertainty.  The left-tail
+        # quantile is already priced by ``tail_penalty`` below and is gated
+        # separately by the entry contract; subtracting ``expected - lower``
+        # here as well collapsed the objective to ``lower - tail`` whenever the
+        # quantile gap exceeded the dispersion, which is the normal case.
+        uncertainty_penalty = max(dispersion, 0.0)
         tail_penalty = tail_probability * tail_scale
         objective_expected = expected - uncertainty_penalty - tail_penalty
 
@@ -162,6 +171,7 @@ def standardized_return_distribution(
         "return_semantics": return_semantics,
         "source_authority": source_authority,
         "objective_version": objective_version,
+        "risk_penalty_version": RISK_PENALTY_VERSION,
         "label_version": label_version,
         "cost_model_version": cost_model_version,
         "profit_supervision_version": profit_supervision_version,
@@ -907,16 +917,25 @@ def risk_adjusted_expected_return(
     *,
     expected_return_pct: float,
     lower_quantile_return_pct: float,
+    dispersion_pct: float | None = None,
     tail_loss_probability: float | None,
     tail_loss_scale_pct: float,
 ) -> dict[str, float]:
-    """Apply model-disagreement and left-tail penalties to expected return."""
+    """Apply dispersion and left-tail penalties to expected return.
+
+    This must stay algebraically identical to
+    ``standardized_return_distribution``: the uncertainty penalty is the
+    prediction dispersion only.  Using ``expected - lower`` here would remove
+    the mean from the objective and implicitly demand a near-95% win rate.
+    """
 
     expected = float(expected_return_pct)
     lower = float(lower_quantile_return_pct)
     if lower > expected:
         raise ValueError("lower_quantile_above_raw_expected")
-    uncertainty_penalty = expected - lower
+    if dispersion_pct is not None and float(dispersion_pct) < 0:
+        raise ValueError("return_dispersion_negative")
+    uncertainty_penalty = max(float(dispersion_pct or 0.0), 0.0)
     tail_probability = float(tail_loss_probability or 0.0)
     if not 0.0 <= tail_probability <= 1.0:
         raise ValueError("tail_loss_probability_out_of_bounds")

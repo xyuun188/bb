@@ -97,6 +97,7 @@ def risk_adjusted_expected_scores(
 
     gross_expected = np.asarray(market_distribution["expected"], dtype=float)
     gross_lower = np.asarray(market_distribution["lower_quantile"], dtype=float)
+    gross_std = np.asarray(market_distribution["std"], dtype=float)
     cost_expected = np.maximum(
         np.asarray(cost_distribution["expected"], dtype=float),
         0.0,
@@ -112,6 +113,9 @@ def risk_adjusted_expected_scores(
             risk_adjusted_expected_return(
                 expected_return_pct=float(expected_net[index]),
                 lower_quantile_return_pct=float(lower_net[index]),
+                dispersion_pct=float(
+                    gross_std[index]
+                ),
                 tail_loss_probability=float(tail_loss_scores[index]),
                 tail_loss_scale_pct=tail_loss_scale_pct,
             )["objective_net_return_pct"]
