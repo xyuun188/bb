@@ -840,12 +840,18 @@ async def test_shadow_repair_advances_bounded_window_and_checkpoint(
     assert "id > :last_id AND id <= :upper_id" in window
     assert "training_market_fact_contract" in predicate
     assert "training_label_contract" in predicate
-    assert "training_feature_snapshot_version < 1" in predicate
+    assert "training_feature_snapshot_version" in predicate
+    assert "< :target_version" in predicate
+    assert "local_ai_tools_shadow" in predicate
+    assert "local_ml_shadow" in predicate
+    assert "NOT COALESCE(" in predicate
     assert conn.parameters[-1] == {
         "repair_key": session_module._SHADOW_TRAINING_REPAIR_KEY,
         "last_id": batch[1],
         "completed": completed,
     }
+    repair_parameters = conn.parameters[-2]
+    assert repair_parameters["target_version"] == TRAINING_FEATURE_SNAPSHOT_VERSION
     assert any("statement_timeout = '5s'" in sql for sql in conn.statements)
     assert any("lock_timeout = '1s'" in sql for sql in conn.statements)
 

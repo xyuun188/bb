@@ -36,7 +36,11 @@ _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 _session_gate: asyncio.Semaphore | None = None
 _session_gate_limit: int | None = None
 logger = structlog.get_logger(__name__)
-_SHADOW_TRAINING_REPAIR_KEY = "2026-11-05.shadow-training-provenance.v1"
+# A version bump must re-project every stored snapshot, so the repair key is
+# derived from the target compaction version instead of a frozen date string.
+_SHADOW_TRAINING_REPAIR_KEY = (
+    f"shadow-training-provenance.v{TRAINING_FEATURE_SNAPSHOT_VERSION}"
+)
 
 
 def _session_gate_capacity() -> int:
@@ -1801,6 +1805,31 @@ async def _repair_shadow_training_snapshot_batch(
                   AND (
                     scanned.training_feature_snapshot_version < 1
                     OR (
+                        scanned.training_feature_snapshot_version
+                            < :target_version
+                        AND scanned.feature_snapshot IS NOT NULL
+                        AND (
+                            (
+                                (scanned.feature_snapshot::JSONB)
+                                    ? 'local_ai_tools_shadow'
+                                AND NOT COALESCE(
+                                    (scanned.training_feature_snapshot)
+                                        ? 'local_ai_tools_shadow',
+                                    FALSE
+                                )
+                            )
+                            OR (
+                                (scanned.feature_snapshot::JSONB)
+                                    ? 'local_ml_shadow'
+                                AND NOT COALESCE(
+                                    (scanned.training_feature_snapshot)
+                                        ? 'local_ml_shadow',
+                                    FALSE
+                                )
+                            )
+                        )
+                    )
+                    OR (
                         scanned.feature_snapshot IS NOT NULL
                         AND (
                             CASE WHEN COALESCE(scanned.training_feature_snapshot, '{}'::JSONB)
@@ -1821,7 +1850,12 @@ async def _repair_shadow_training_snapshot_batch(
                    (SELECT COUNT(*) FROM repaired)
             FROM scanned
         """),
-        {"last_id": last_id, "upper_id": upper_id, "batch_size": batch_size},
+        {
+            "last_id": last_id,
+            "upper_id": upper_id,
+            "batch_size": batch_size,
+            "target_version": TRAINING_FEATURE_SNAPSHOT_VERSION,
+        },
     )
     scanned, next_id, repaired = result.fetchall()[0]
     completed = scanned < batch_size or next_id >= upper_id

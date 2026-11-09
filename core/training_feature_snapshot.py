@@ -15,7 +15,7 @@ from typing import Any
 from core.feature_availability import FROZEN_FEATURE_FIELDS, availability_fingerprint
 from core.market_facts import compact_market_fact, compact_market_fact_contract
 
-TRAINING_FEATURE_SNAPSHOT_VERSION = 5
+TRAINING_FEATURE_SNAPSHOT_VERSION = 6
 FROZEN_TRAINING_FEATURE_MAX_BYTES = 96 * 1024
 TRAINING_FEATURE_SNAPSHOT_MAX_BYTES = 128 * 1024
 TRAINING_FEATURE_OBJECT_MAX_BYTES = 16 * 1024
