@@ -482,7 +482,12 @@ def paper_strategy_authorization(
     model_version = str(model_signal.get("model_version") or "")
     champion_version = str(champion.get("model_version") or "")
     if not model_version or model_version != champion_version:
-        return {**result, "reason": "paper_strategy_model_version_mismatch"}
+        return {
+            **result,
+            "reason": "paper_strategy_model_version_mismatch",
+            "signal_model_version": model_version or None,
+            "champion_model_version": champion_version or None,
+        }
     lifecycle = str(model_signal.get("artifact_lifecycle") or "").lower()
     if lifecycle not in {"candidate", "shadow", "canary", "active"}:
         return {**result, "reason": "paper_strategy_model_lifecycle_ineligible"}

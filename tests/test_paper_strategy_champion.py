@@ -394,6 +394,69 @@ async def test_live_mode_never_activates_trained_strategy() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_version_change_without_validated_strategy_retires_stale_champion(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'stale.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(StrategyProfileSnapshot.__table__.create)
+    service = PaperStrategyChampionService()
+
+    async with sessions.begin() as session:
+        initial = await service.reconcile(
+            mode="paper",
+            blueprint=_blueprint("v1"),
+            candidates=[_candidate("side_long")],
+            session=session,
+        )
+    assert initial["active"] is True
+
+    # A new artifact with no accepted strategy evidence must not leave the old
+    # version's paper permission active. The old champion cannot match the
+    # current model version and would otherwise block every local ML signal.
+    async with sessions.begin() as session:
+        retired = await service.reconcile(
+            mode="paper",
+            blueprint=_blueprint("v2"),
+            candidates=[],
+            session=session,
+        )
+    assert retired["active"] is False
+    assert retired["transition"] == "stale_model_champion_retired"
+    assert retired["retired_model_version"] == "v1"
+    assert retired["reason"] == (
+        "model_version_changed_without_validated_strategy_improvement"
+    )
+
+    async with sessions() as session:
+        active_rows = list(
+            (
+                await session.execute(
+                    select(StrategyProfileSnapshot).where(
+                        StrategyProfileSnapshot.is_active.is_(True)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        previous = (
+            await session.execute(
+                select(StrategyProfileSnapshot).where(
+                    StrategyProfileSnapshot.profile_id == initial["profile_id"]
+                )
+            )
+        ).scalar_one()
+    assert active_rows == []
+    assert previous.status == "rolled_back"
+    assert previous.scheduler_reason == (
+        "model_version_changed_without_validated_strategy_improvement"
+    )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_legacy_active_profile_is_not_treated_as_model_strategy_champion(
     tmp_path: Path,
 ) -> None:

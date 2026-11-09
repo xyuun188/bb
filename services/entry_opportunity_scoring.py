@@ -500,12 +500,14 @@ class EntryOpportunityScoringPolicy:
         if execution_scope == "paper":
             normal_paper_trade = safe_dict(raw.get("normal_paper_trade"))
             direction_competition = safe_dict(raw.get("direction_competition"))
+            model_signal = safe_dict(raw.get("ml_signal"))
             preferred_horizon = next(
                 (
                     horizon
                     for value in (
                         normal_paper_trade.get("prediction_horizon_minutes"),
                         direction_competition.get("selected_horizon_minutes"),
+                        model_signal.get("primary_horizon_minutes"),
                     )
                     if (horizon := _finite(value)) is not None and horizon > 0.0
                 ),

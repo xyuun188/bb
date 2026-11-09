@@ -452,16 +452,19 @@ def test_paper_mixed_horizons_select_highest_weight_native_cohort() -> None:
     )
 
     assert context["enabled"] is True
-    assert context["preferred_side"] == "short"
-    assert context["selected_horizon_minutes"] == 10
+    assert context["preferred_side"] == "long"
+    assert context["selected_horizon_minutes"] == 30
     assert context["decision_source_count"] == 2
     assert context["aggregate_blockers"] == []
-    assert context["horizon_cohort_selection"]["selected_sources"] == ["server_profit"]
+    assert context["horizon_cohort_selection"]["selection_reason"] == (
+        "authorized_prediction_horizon"
+    )
+    assert context["horizon_cohort_selection"]["selected_sources"] == ["local_ml"]
     server_rows = [
         item
         for side in ("long", "short")
         for item in context[side]["evidence"]
-        if item["source"] == "local_ml"
+        if item["source"] == "server_profit"
     ]
     assert all(item["decision_eligible"] is False for item in server_rows)
     assert all(
@@ -470,7 +473,7 @@ def test_paper_mixed_horizons_select_highest_weight_native_cohort() -> None:
     )
 
 
-def test_high_weight_long_horizon_selects_native_model_cohort() -> None:
+def test_high_weight_tool_horizon_cannot_displace_authorized_model_horizon() -> None:
     server = _paper_payload(0.0, 0.7)
     for side in ("long", "short"):
         server["return_distribution_contract"][side]["horizon_minutes"] = 60
@@ -500,18 +503,18 @@ def test_high_weight_long_horizon_selects_native_model_cohort() -> None:
 
     assert context["enabled"] is True
     assert context["preferred_side"] == "short"
-    assert context["selected_horizon_minutes"] == 60
-    assert context["funding_projection"]["selected_horizon_minutes"] == 60
-    assert context["funding_projection"]["long"]["horizon_minutes"] == 60
-    assert context["funding_projection"]["short"]["horizon_minutes"] == 60
-    assert context["training_long"]["horizon_minutes"] == 60
-    assert context["training_short"]["horizon_minutes"] == 60
-    assert context["horizon_cohort_selection"]["selected_sources"] == ["server_profit"]
+    assert context["selected_horizon_minutes"] == 30
+    assert context["funding_projection"]["selected_horizon_minutes"] == 30
+    assert context["funding_projection"]["long"]["horizon_minutes"] == 30
+    assert context["funding_projection"]["short"]["horizon_minutes"] == 30
+    assert context["training_long"]["horizon_minutes"] == 30
+    assert context["training_short"]["horizon_minutes"] == 30
+    assert context["horizon_cohort_selection"]["selected_sources"] == ["local_ml"]
     assert context["authorized_prediction_horizon_minutes"] == 30
     assert context["authorized_prediction_horizon_source"] == "local_ml_primary_horizon"
 
 
-def test_unavailable_local_ml_horizon_does_not_hide_native_tool_cohort() -> None:
+def test_unavailable_authorized_horizon_fails_closed_for_paper_execution() -> None:
     ml = _governed_ml(0.8, -0.2)
     ml["primary_horizon_minutes"] = 5
     server = _paper_payload(0.0, 0.7)
@@ -533,10 +536,10 @@ def test_unavailable_local_ml_horizon_does_not_hide_native_tool_cohort() -> None
         },
     )
 
-    assert context["preferred_side"] == "short"
-    assert context["decision_source_count"] == 2
-    assert context["selected_horizon_minutes"] == 240
-    assert context["aggregate_blockers"] == []
+    assert context["preferred_side"] == "neutral"
+    assert context["decision_source_count"] == 0
+    assert context["selected_horizon_minutes"] is None
+    assert "paper_prediction_horizon_unavailable" in context["aggregate_blockers"]
 
 
 def test_model_blueprint_only_blocks_its_owned_local_ml_short() -> None:

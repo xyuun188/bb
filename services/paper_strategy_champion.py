@@ -469,11 +469,24 @@ class PaperStrategyChampionService:
                 "comparison": comparison,
                 "challenger_count": len(trained_candidates),
             }
+        # A champion is permanently bound to the artifact version that was
+        # evaluated. Once the runtime model changes, keeping that old row
+        # active would leave a paper permission that can never match the new
+        # signal. Retire it and fall back to the base strategy until the new
+        # artifact has complete, strictly better strategy evidence.
+        champion_row.is_active = False
+        champion_row.status = "rolled_back"
+        champion_row.scheduler_reason = (
+            "model_version_changed_without_validated_strategy_improvement"
+        )
+        await session.flush()
         return {
-            **champion,
-            "transition": "model_strategy_rejected_and_rollback_required",
-            "model_rollback_required": True,
-            "model_rollback_target_version": champion.get("model_version"),
+            **self._inactive(
+                "model_version_changed_without_validated_strategy_improvement"
+            ),
+            "transition": "stale_model_champion_retired",
+            "retired_profile_id": champion.get("profile_id"),
+            "retired_model_version": champion.get("model_version"),
             "challenger_count": len(trained_candidates),
         }
 

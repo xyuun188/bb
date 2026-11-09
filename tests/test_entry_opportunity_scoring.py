@@ -863,6 +863,41 @@ def test_paper_scoring_keeps_direction_competition_selected_native_horizon() -> 
     ]
 
 
+def test_paper_scoring_keeps_model_primary_horizon_when_upstream_selection_missing() -> None:
+    decision = _decision()
+    decision.raw_response["ml_signal"] = {"primary_horizon_minutes": 240}
+    profit = _paper_payload(side="short", long_return=-0.2, short_return=1.2)
+    timeseries = _paper_payload(side="long", long_return=0.5, short_return=-0.2)
+    for side in ("long", "short"):
+        profit["return_distribution_contract"][side]["horizon_minutes"] = 240
+        timeseries["return_distribution_contract"][side]["horizon_minutes"] = 5
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": profit,
+        "time_series_prediction": timeseries,
+    }
+    strategy = {
+        "execution_mode": "paper",
+        "continuous_model_weights": {
+            "applied": True,
+            "quant_source_weights": {
+                "server_profit": {"effective_multiplier": 1.4},
+                "timeseries": {"effective_multiplier": 0.1},
+            },
+        },
+    }
+
+    _scorer().score_candidate(decision, strategy)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert opportunity["selected_horizon_minutes"] == 240
+    assert opportunity["horizon_cohort_selection"]["selection_reason"] == (
+        "authorized_prediction_horizon"
+    )
+    assert opportunity["horizon_cohort_selection"]["selected_sources"] == [
+        "server_profit"
+    ]
+
+
 def test_shadow_server_models_remain_blocked_in_live_scoring() -> None:
     decision = _decision()
     decision.raw_response["ml_signal"] = {}
@@ -976,6 +1011,68 @@ def test_paper_strategy_cannot_authorize_same_model_in_live_mode() -> None:
     assert opportunity["production_eligible"] is False
     assert component["production_eligible"] is False
     assert component["paper_strategy_authorization"]["eligible"] is False
+
+
+def test_stale_paper_champion_version_does_not_authorize_current_model_signal() -> None:
+    decision = _decision()
+    decision.raw_response["local_ai_tools"] = {}
+    signal = decision.raw_response["ml_signal"]
+    signal.update(
+        {
+            "route_mode": "paper_analysis",
+            "live_ml_ready": False,
+            "artifact_lifecycle": "canary",
+            "model_version": "model-v2",
+            "paper_canary_authorized": False,
+            "paper_canary": {
+                "authorized": False,
+                "execution_scope": "paper_only",
+                "eligible_sides": [],
+            },
+            "prediction_quality": {
+                "contract_complete": False,
+                "paper_eligible": False,
+                "production_eligible": False,
+                "anomalous": False,
+            },
+            "strategy_blueprint": {
+                "model_version": "model-v2",
+                "paper_execution_eligible": True,
+                "paper_training_sides": ["long"],
+                "paper_execution_sides": ["long"],
+                "production_eligible_sides": [],
+                "live_execution_permission": False,
+            },
+            "influence_policy": {
+                "long": {"enabled": False},
+                "short": {"enabled": False},
+            },
+        }
+    )
+    strategy = {
+        "execution_mode": "paper",
+        "paper_strategy_champion": {
+            "active": True,
+            "execution_scope": "paper_only",
+            "paper_execution_permission": True,
+            "live_execution_permission": False,
+            "model_version": "model-v1",
+            "selector": {"side": "long"},
+        },
+    }
+
+    _scorer().score_candidate(decision, strategy)
+
+    opportunity = decision.raw_response["opportunity_score"]
+    component = opportunity["expected_net_breakdown"]["components"][0]
+    authorization = component["paper_strategy_authorization"]
+    # The blueprint and the current distribution can still carry training
+    # observation evidence. The stale champion must not add execution
+    # authorization, but it must not suppress a separately valid model path.
+    assert authorization["eligible"] is False
+    assert authorization["reason"] == "paper_strategy_model_version_mismatch"
+    assert authorization["signal_model_version"] == "model-v2"
+    assert authorization["champion_model_version"] == "model-v1"
 
 
 def test_runtime_recovery_predictions_have_zero_production_weight() -> None:
