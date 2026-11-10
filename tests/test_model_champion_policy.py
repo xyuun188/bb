@@ -1,3 +1,5 @@
+import pytest
+
 from services.model_champion_policy import compare_candidate_to_champion
 
 
@@ -221,114 +223,151 @@ def test_active_candidate_requires_market_regime_stability() -> None:
     assert "active_candidate_cross_section_unstable" in report["blocking_reasons"]
 
 
-def test_unprofitable_champion_can_be_replaced_by_clearly_better_candidate() -> None:
-    # The live deadlock: the incumbent is losing money (profit factor 0.66,
-    # negative average) yet blocks a candidate that improves every primary
-    # metric, because its own tail metrics are marginally better.
+def _directional_metadata() -> tuple[dict, dict]:
     champion = _metadata(
-        avg=-0.52,
-        lcb=-1.30,
-        profit_factor=0.66,
-        cvar=-7.89,
-        drawdown=39.31,
+        avg=-1.0101, lcb=-1.8260, profit_factor=0.3664, cvar=-9.3241, drawdown=58.3329
     )
-    challenger = _metadata(
-        avg=0.97,
-        lcb=-0.50,
-        profit_factor=1.56,
-        cvar=-9.41,
-        drawdown=40.48,
+    champion["oos_return_evaluation"]["short"] = _metadata(
+        avg=-0.0371, lcb=-0.7743, profit_factor=0.9613, cvar=-6.4525, drawdown=20.2953
+    )["oos_return_evaluation"]["short"]
+    candidate = _metadata(
+        avg=1.7550, lcb=0.4815, profit_factor=2.5740, cvar=-6.7702, drawdown=30.9365
     )
+    candidate["oos_return_evaluation"]["short"] = _metadata(
+        avg=-0.8088, lcb=-1.9869, profit_factor=0.5941, cvar=-12.3683, drawdown=77.8838
+    )["oos_return_evaluation"]["short"]
+    return champion, candidate
+
+
+def test_canary_compares_authorized_side_without_pooling_disabled_direction() -> None:
+    champion, candidate = _directional_metadata()
 
     report = compare_candidate_to_champion(
-        challenger,
+        candidate,
         champion,
         candidate_stage="canary",
         champion_stage="canary",
+        candidate_enabled_sides=["long"],
     )
 
     assert report["accepted"] is True
-    assert report["reason"] == "unhealthy_champion_controlled_takeover"
-    assert report["unhealthy_champion_takeover"] is True
+    assert report["reason"] == "challenger_quality_improved"
+    assert report["comparison_sides"] == ["long"]
+    assert report["candidate_metrics"]["return_lcb_pct"] == 0.4815
+    assert report["champion_metrics"]["max_drawdown_pct"] == 58.3329
 
 
-def test_unprofitable_champion_still_blocks_a_worse_candidate() -> None:
-    champion = _metadata(
-        avg=-0.52,
-        lcb=-1.30,
-        profit_factor=0.66,
-        cvar=-7.89,
-        drawdown=39.31,
-    )
-    challenger = _metadata(
-        avg=0.20,
-        lcb=-0.90,
-        profit_factor=0.95,
-        cvar=-7.90,
-        drawdown=39.40,
-    )
+def test_authorized_losing_side_cannot_hide_behind_other_side_improvement() -> None:
+    champion, candidate = _directional_metadata()
 
     report = compare_candidate_to_champion(
-        challenger,
+        candidate,
         champion,
         candidate_stage="canary",
         champion_stage="canary",
+        candidate_enabled_sides=["short"],
     )
 
     assert report["accepted"] is False
-    assert "takeover_candidate_profit_factor_not_above_one" in report["blocking_reasons"]
-    assert "takeover_candidate_avg_return_not_positive" not in report["blocking_reasons"]
+    assert report["comparison_sides"] == ["short"]
+    assert "candidate_cvar_materially_worsened" in report["blocking_reasons"]
+    assert "candidate_max_drawdown_materially_worsened" in report["blocking_reasons"]
 
 
-def test_unprofitable_champion_blocks_catastrophic_tail_regression() -> None:
-    champion = _metadata(
-        avg=-0.52,
-        lcb=-1.30,
-        profit_factor=0.66,
-        cvar=-7.89,
-        drawdown=39.31,
-    )
-    challenger = _metadata(
-        avg=1.20,
-        lcb=-0.40,
-        profit_factor=1.70,
-        cvar=-14.00,
-        drawdown=56.00,
-    )
+def test_unprofitable_champion_does_not_widen_tail_tolerance() -> None:
+    champion, candidate = _directional_metadata()
 
     report = compare_candidate_to_champion(
-        challenger,
-        champion,
-        candidate_stage="canary",
-        champion_stage="canary",
+        candidate, champion, candidate_stage="canary", champion_stage="canary"
     )
 
     assert report["accepted"] is False
-    assert "takeover_cvar_catastrophically_worsened" in report["blocking_reasons"]
-    assert (
-        "takeover_max_drawdown_catastrophically_worsened"
-        in report["blocking_reasons"]
+    assert report["comparison_sides"] == ["long", "short"]
+    assert "candidate_max_drawdown_materially_worsened" in report["blocking_reasons"]
+
+
+def test_shadow_model_can_still_improve_without_claiming_profitability() -> None:
+    report = compare_candidate_to_champion(
+        _metadata(avg=-0.10, lcb=-0.20, profit_factor=0.90),
+        _metadata(avg=-0.20, lcb=-0.30, profit_factor=0.80),
+        candidate_stage="shadow",
+        champion_stage="shadow",
     )
 
+    assert report["accepted"] is True
+    assert report["reason"] == "challenger_quality_improved"
 
-def test_healthy_champion_is_not_displaced_without_real_improvement() -> None:
-    # A profitable champion is only displaced by real improvement, and never by
-    # the unhealthy-champion takeover path.
-    champion = _metadata()
-    no_improvement = compare_candidate_to_champion(
+
+@pytest.mark.parametrize("sides", [[], ["neutral"], ["long", "unknown"]])
+def test_invalid_canary_side_scope_is_rejected(sides: list[str]) -> None:
+    report = compare_candidate_to_champion(
         _metadata(),
-        champion,
+        _metadata(),
         candidate_stage="canary",
         champion_stage="canary",
+        candidate_enabled_sides=sides,
     )
-    tail_worse = compare_candidate_to_champion(
-        _metadata(avg=0.35, lcb=0.15, profit_factor=1.50, cvar=-0.40, drawdown=0.35),
+
+    assert report["accepted"] is False
+    assert report["blocking_reasons"] == ["candidate_enabled_sides_invalid"]
+
+
+@pytest.mark.parametrize("stage", ["active", "live"])
+def test_active_model_cannot_skip_short_side_by_declaring_long_only(stage: str) -> None:
+    champion, candidate = _directional_metadata()
+
+    report = compare_candidate_to_champion(
+        candidate,
         champion,
+        candidate_stage=stage,
+        champion_stage=stage,
+        candidate_enabled_sides=["long"],
+    )
+
+    assert report["accepted"] is False
+    assert report["comparison_sides"] == ["long", "short"]
+    assert "candidate_max_drawdown_worsened" in report["blocking_reasons"]
+
+
+@pytest.mark.parametrize("stage", ["active", "live"])
+def test_training_contract_refresh_cannot_bypass_active_champion_quality(stage: str) -> None:
+    report = compare_candidate_to_champion(
+        _metadata(avg=-0.10, lcb=-0.20, profit_factor=0.70),
+        _metadata(training_data_version="old-training-contract"),
+        candidate_stage=stage,
+        champion_stage=stage,
+    )
+
+    assert report["accepted"] is False
+    assert report["reason"] == "active_champion_retained"
+    assert "candidate_return_lcb_not_positive" in report["blocking_reasons"]
+
+
+@pytest.mark.parametrize("stage", ["active", "live"])
+def test_live_alias_requires_the_same_stability_as_active(stage: str) -> None:
+    candidate = _metadata()
+    candidate["walk_forward_report"]["folds"] = []
+    report = compare_candidate_to_champion(
+        candidate,
+        _metadata(),
+        candidate_stage=stage,
+        champion_stage="canary",
+    )
+
+    assert report["accepted"] is False
+    assert report["blocking_reasons"] == ["active_candidate_cross_section_unstable"]
+
+
+@pytest.mark.parametrize("missing_side", ["long", "short"])
+def test_both_side_comparison_rejects_missing_direction_evidence(missing_side: str) -> None:
+    candidate = _metadata(avg=0.35)
+    del candidate["oos_return_evaluation"][missing_side]
+    report = compare_candidate_to_champion(
+        candidate,
+        _metadata(),
         candidate_stage="canary",
         champion_stage="canary",
     )
 
-    assert no_improvement["accepted"] is False
-    assert no_improvement.get("unhealthy_champion_takeover") is not True
-    assert tail_worse["accepted"] is False
-    assert "candidate_cvar_materially_worsened" in tail_worse["blocking_reasons"]
+    assert report["accepted"] is False
+    assert "champion_comparison_metric_missing:avg_return_pct" in report["blocking_reasons"]

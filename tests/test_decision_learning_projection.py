@@ -13,6 +13,21 @@ from services.decision_learning_projection import (
 )
 
 
+@pytest.fixture
+async def projection_database(tmp_path, monkeypatch):
+    import db.session as session_module
+
+    await session_module.close_db()
+    monkeypatch.setattr(
+        session_module.settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{(tmp_path / 'projection.db').as_posix()}",
+    )
+    await session_module.init_db()
+    yield
+    await session_module.close_db()
+
+
 def test_restore_downside_preserves_original_contract_and_zero() -> None:
     source = {
         "normal_paper_trade": {"authorized": True, "contract_fingerprint": "original"},
@@ -71,6 +86,7 @@ def test_restore_execution_risk_projection_reads_nested_audit_inputs() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("projection_database")
 async def test_backfill_uses_bounded_batches_and_is_idempotent(monkeypatch) -> None:
     from datetime import UTC, datetime, timedelta
 
@@ -138,6 +154,7 @@ async def test_backfill_uses_bounded_batches_and_is_idempotent(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("projection_database")
 async def test_execution_risk_backfill_preserves_prior_downside_projection() -> None:
     from datetime import UTC, datetime
 

@@ -283,6 +283,49 @@ def test_primary_horizon_fit_ignores_contradicting_short_horizon_labels() -> Non
         )
 
 
+def test_walk_forward_scores_apply_the_same_dispersion_penalty_as_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    train = _training_frame(30)
+    validation = _training_frame(2)
+    models = [
+        SimpleNamespace(fit=lambda *_args, **_kwargs: None),
+        SimpleNamespace(fit=lambda *_args, **_kwargs: None),
+    ]
+    market_model, cost_model = models
+    monkeypatch.setattr(ml_signal_module, "_make_regressor", lambda _target: models.pop(0))
+    monkeypatch.setattr(
+        ml_signal_module,
+        "_make_classifier",
+        lambda _target: SimpleNamespace(fit=lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setattr(
+        ml_signal_module, "_positive_proba", lambda *_args: np.array([0.0, 0.0])
+    )
+
+    def distribution(model, _features):
+        if model is market_model:
+            return {
+                "expected": np.array([2.0, 1.0]),
+                "lower_quantile": np.array([-1.0, 0.8]),
+                "std": np.array([3.0, 0.1]),
+            }
+        assert model is cost_model
+        return {
+            "expected": np.array([0.1, 0.1]),
+            "upper_quantile": np.array([0.2, 0.2]),
+        }
+
+    monkeypatch.setattr(ml_signal_module, "regression_prediction_distribution", distribution)
+
+    scores, _policy = ml_signal_module._walk_forward_side_scores(
+        train, validation, side="long"
+    )
+
+    assert scores.tolist() == pytest.approx([-1.1, 0.8])
+    assert int(np.argmax(scores)) == 1
+
+
 def test_holdout_metrics_bind_to_primary_horizon_only() -> None:
     primary = ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES
     other = 5 if primary != 5 else 15
@@ -2090,8 +2133,10 @@ async def test_ml_signal_auto_train_waits_for_mature_partition_without_artifact(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("paper_enabled_sides", [["long"], ["short"], ["long", "short"]])
 async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate_is_degraded(
     monkeypatch: pytest.MonkeyPatch,
+    paper_enabled_sides: list[str],
 ) -> None:
     service = MLSignalService()
     calls: list[bool] = []
@@ -2117,10 +2162,14 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
 
     def train_frame(_frame: pd.DataFrame, **kwargs: object) -> dict[str, object]:
         calls.append(bool(kwargs.get("persist_artifact")))
-        return _ml_training_metadata(
+        metadata = _ml_training_metadata(
             artifact_persisted=bool(kwargs["persist_artifact"]),
             ready=False,
         )
+        for side in ("long", "short"):
+            if side not in paper_enabled_sides:
+                metadata["metrics"][f"top_{side}_avg_return_pct"] = -0.20
+        return metadata
 
     service._completed_shadow_sample_count = completed_shadow_sample_count  # type: ignore[method-assign]
     service._current_metadata = lambda: {  # type: ignore[method-assign]
@@ -2163,6 +2212,8 @@ async def test_ml_signal_auto_train_persists_latest_artifact_even_when_candidate
     assert result["live_ml_ready"] is False
     assert result["artifact_activation_stage"] == "canary"
     assert result["paper_canary_authorized"] is True
+    assert result["paper_canary"]["eligible_sides"] == paper_enabled_sides
+    assert result["champion_comparison"]["comparison_sides"] == paper_enabled_sides
     assert [item["activation_stage"] for item in promotion_evidence] == [
         "shadow",
         "canary",

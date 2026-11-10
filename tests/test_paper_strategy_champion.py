@@ -222,6 +222,54 @@ def test_authorized_paper_canary_bootstraps_without_production_profitability() -
     )["authorization_basis"] == "paper_bootstrap_canary"
 
 
+@pytest.mark.parametrize("stage", ["shadow", "canary"])
+@pytest.mark.parametrize("compared_sides", [["long"], ["short"]])
+def test_canary_replacement_executes_only_the_compared_sides(
+    stage: str, compared_sides: list[str]
+) -> None:
+    blueprint = build_model_strategy_blueprint(
+        metadata={
+            "artifact_version": "side-scoped-canary",
+            "trained_at": "2026-11-10T00:00:00+00:00",
+            "test_count": 120,
+            "oos_return_evaluation": {
+                side: {
+                    "avg_return_pct": 0.4,
+                    "return_lcb_pct": 0.2,
+                    "profit_factor": 1.5,
+                }
+                for side in ("long", "short")
+            },
+        },
+        readiness={
+            "paper_canary": {
+                "authorized": True,
+                "execution_scope": "paper_only",
+                "eligible_sides": compared_sides,
+            }
+        },
+        activation={
+            "activation_stage": stage,
+            "champion_comparison": {
+                "accepted": True,
+                "candidate_stage": "canary",
+                "comparison_sides": compared_sides,
+            },
+        },
+    )
+
+    assert blueprint["paper_training_sides"] == ["long", "short"]
+    assert blueprint["paper_execution_sides"] == compared_sides
+    assert blueprint["live_execution_permission"] is False
+    for side in ("long", "short"):
+        permission = model_strategy_side_authorization(
+            {"model_version": "side-scoped-canary", "strategy_blueprint": blueprint},
+            execution_scope="paper",
+            side=side,
+        )
+        assert permission["eligible"] is (side in compared_sides)
+
+
 def test_activation_manifest_paper_canary_restores_runtime_blueprint_side() -> None:
     """Runtime metadata rebuilds must preserve the atomic canary permission."""
 

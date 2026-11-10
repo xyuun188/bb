@@ -84,7 +84,7 @@ def main() -> int:
         safe_print(output)
         raise SystemExit("online Phase 3 audit did not return JSON") from exc
     safe_print(json.dumps(payload, ensure_ascii=False, indent=None if args.json_indent <= 0 else args.json_indent, sort_keys=True))
-    return 0 if payload.get("status") != "blocked" else 2
+    return 2 if payload.get("status") in {"blocked", "no_go", "missing", "unavailable"} else 0
 
 
 if __name__ == "__main__":

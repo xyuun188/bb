@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-MODEL_CHAMPION_POLICY_VERSION = "2026-07-19.fee-after-champion.v1"
+MODEL_CHAMPION_POLICY_VERSION = "2026-11-10.authorized-side-champion.v2"
 
 _STAGE_RANK = {
     "shadow": 0,
@@ -16,22 +16,6 @@ _STAGE_RANK = {
 _PRIMARY_TOLERANCE_PCT = 1e-9
 _TAIL_TOLERANCE_PCT = 0.05
 _MIN_ACTIVE_WALK_FORWARD_FOLDS = 2
-# A champion that is already unprofitable must not be able to hold its place
-# forever on marginally better tail metrics.  When the incumbent's fee-after
-# evidence is negative, a candidate may replace it on a controlled takeover:
-# every primary metric must be strictly and materially better, the candidate
-# must be absolutely profitable, and the tail must not deteriorate beyond a
-# widened (but still finite) budget.
-#
-# Tail tolerance is scaled to the incumbent's own risk magnitude rather than a
-# fixed percentage, because a losing champion's tail is itself the artefact
-# under review: a fixed band either blocks genuine progress (champion CVaR is
-# already deep) or admits a real regression (champion tail is shallow).
-_UNHEALTHY_CHAMPION_PROFIT_FACTOR_CEILING = 1.0
-_UNHEALTHY_CHAMPION_AVG_RETURN_CEILING_PCT = 0.0
-_TAKEOVER_PRIMARY_MARGIN_PCT = 0.05
-_TAKEOVER_TAIL_RELATIVE_TOLERANCE = 0.25
-_TAKEOVER_TAIL_ABSOLUTE_FLOOR_PCT = 0.50
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -62,10 +46,16 @@ def _average(values: list[float | None]) -> float | None:
     return sum(finite) / len(finite) if finite else None
 
 
-def _aggregate(metadata: dict[str, Any]) -> dict[str, float | None]:
-    sides = [_side_metrics(metadata, side) for side in ("long", "short")]
+def _aggregate(
+    metadata: dict[str, Any], sides: tuple[str, ...]
+) -> dict[str, float | None]:
+    metrics = [_side_metrics(metadata, side) for side in sides]
     return {
-        key: _average([side[key] for side in sides])
+        key: (
+            _average([side[key] for side in metrics])
+            if all(side[key] is not None for side in metrics)
+            else None
+        )
         for key in (
             "avg_return_pct",
             "return_lcb_pct",
@@ -85,68 +75,6 @@ def _training_data_version(metadata: dict[str, Any] | None) -> str:
         or quality.get("data_quality_version")
         or ""
     ).strip()
-
-
-def _unhealthy_champion(aggregate: dict[str, float | None]) -> bool:
-    """Report whether the incumbent's own fee-after evidence is non-profitable."""
-
-    profit_factor = aggregate.get("profit_factor")
-    avg_return = aggregate.get("avg_return_pct")
-    if profit_factor is None or avg_return is None:
-        return False
-    return bool(
-        profit_factor <= _UNHEALTHY_CHAMPION_PROFIT_FACTOR_CEILING
-        or avg_return <= _UNHEALTHY_CHAMPION_AVG_RETURN_CEILING_PCT
-    )
-
-
-def _controlled_takeover_blockers(
-    candidate_values: dict[str, float],
-    champion_values: dict[str, float],
-) -> list[str]:
-    """Blockers for replacing an unprofitable champion without relaxing quality.
-
-    The incumbent cannot hold its place on tail metrics alone, but the
-    replacement still has to be a genuine improvement rather than a lateral
-    move, so every primary metric must clear a material margin and the
-    candidate must be absolutely profitable.
-    """
-
-    def _tail_budget(champion_value: float) -> float:
-        return max(
-            abs(champion_value) * _TAKEOVER_TAIL_RELATIVE_TOLERANCE,
-            _TAKEOVER_TAIL_ABSOLUTE_FLOOR_PCT,
-        )
-
-    blockers: list[str] = []
-    if (
-        candidate_values["profit_factor"]
-        <= champion_values["profit_factor"] + _TAKEOVER_PRIMARY_MARGIN_PCT
-    ):
-        blockers.append("takeover_profit_factor_not_improved")
-    if (
-        candidate_values["avg_return_pct"]
-        <= champion_values["avg_return_pct"] + _TAKEOVER_PRIMARY_MARGIN_PCT
-    ):
-        blockers.append("takeover_avg_return_not_improved")
-    if candidate_values["return_lcb_pct"] <= champion_values["return_lcb_pct"]:
-        blockers.append("takeover_return_lcb_not_improved")
-    if candidate_values["profit_factor"] <= 1.0:
-        blockers.append("takeover_candidate_profit_factor_not_above_one")
-    if candidate_values["avg_return_pct"] <= 0.0:
-        blockers.append("takeover_candidate_avg_return_not_positive")
-    if (
-        candidate_values["cvar_10_pct"]
-        < champion_values["cvar_10_pct"] - _tail_budget(champion_values["cvar_10_pct"])
-    ):
-        blockers.append("takeover_cvar_catastrophically_worsened")
-    if (
-        candidate_values["max_drawdown_pct"]
-        > champion_values["max_drawdown_pct"]
-        + _tail_budget(champion_values["max_drawdown_pct"])
-    ):
-        blockers.append("takeover_max_drawdown_catastrophically_worsened")
-    return blockers
 
 
 def _stable_both_sides(metadata: dict[str, Any]) -> bool:
@@ -183,11 +111,16 @@ def compare_candidate_to_champion(
     *,
     candidate_stage: str,
     champion_stage: str | None,
+    candidate_enabled_sides: list[str] | None = None,
 ) -> dict[str, Any]:
     """Accept lifecycle progress, but require strict improvement over an active champion."""
 
     candidate_stage = str(candidate_stage or "shadow").lower()
     champion_stage = str(champion_stage or "").lower()
+    if candidate_stage == "live":
+        candidate_stage = "active"
+    if champion_stage == "live":
+        champion_stage = "active"
     report: dict[str, Any] = {
         "version": MODEL_CHAMPION_POLICY_VERSION,
         "candidate_stage": candidate_stage,
@@ -203,6 +136,17 @@ def compare_candidate_to_champion(
     if candidate_stage not in _STAGE_RANK:
         report["blocking_reasons"] = ["candidate_stage_invalid"]
         return report
+    comparison_sides = ("long", "short")
+    if candidate_stage == "canary" and candidate_enabled_sides is not None:
+        if not candidate_enabled_sides or any(
+            side not in comparison_sides for side in candidate_enabled_sides
+        ):
+            report["blocking_reasons"] = ["candidate_enabled_sides_invalid"]
+            return report
+        comparison_sides = tuple(
+            side for side in comparison_sides if side in candidate_enabled_sides
+        )
+    report["comparison_sides"] = list(comparison_sides)
     if not champion:
         return {
             **report,
@@ -244,15 +188,17 @@ def compare_candidate_to_champion(
             "reason": "governed_lifecycle_upgrade",
         }
 
-    if training_contract_refresh:
+    if training_contract_refresh and champion_rank < _STAGE_RANK["active"]:
         return {
             **report,
             "accepted": True,
             "reason": "training_data_contract_refresh",
         }
 
-    candidate_aggregate = _aggregate(candidate)
-    champion_aggregate = _aggregate(champion)
+    # Compare both artifacts on the sides the canary can actually execute.
+    # An unauthorized direction must not veto an improving authorized side.
+    candidate_aggregate = _aggregate(candidate, comparison_sides)
+    champion_aggregate = _aggregate(champion, comparison_sides)
     report["candidate_metrics"] = candidate_aggregate
     report["champion_metrics"] = champion_aggregate
     report["metric_deltas"] = {
@@ -301,25 +247,6 @@ def compare_candidate_to_champion(
         report["accepted"] = not blockers
         report["reason"] = (
             "strict_fee_after_improvement" if not blockers else "active_champion_retained"
-        )
-        return report
-
-    # An unprofitable incumbent must not be able to hold its place on marginal
-    # tail metrics alone.  The takeover path keeps every primary-metric and
-    # absolute-profitability requirement, so it cannot promote a weaker model;
-    # it only removes the deadlock where a losing champion blocks all progress.
-    if _unhealthy_champion(champion_aggregate):
-        takeover_blockers = _controlled_takeover_blockers(
-            candidate_values,
-            champion_values,
-        )
-        report["unhealthy_champion_takeover"] = True
-        report["blocking_reasons"] = takeover_blockers
-        report["accepted"] = not takeover_blockers
-        report["reason"] = (
-            "unhealthy_champion_controlled_takeover"
-            if not takeover_blockers
-            else "champion_retained"
         )
         return report
 

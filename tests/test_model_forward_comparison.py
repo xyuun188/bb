@@ -189,6 +189,9 @@ async def test_forward_comparison_uses_same_projected_rows_and_serializable_inve
     import json
 
     import services.model_forward_comparison as comparison
+    monkeypatch.setattr(
+        comparison, "load_training_data_start", lambda: datetime(2026, 10, 19, tzinfo=UTC)
+    )
 
     registry = SimpleNamespace(
         resolve_current=lambda **kwargs: SimpleNamespace(

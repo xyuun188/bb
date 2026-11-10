@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts import run_online_phase3_go_no_go as online_cli
 from scripts import run_phase3_go_no_go_report as report_cli
 
 
@@ -59,6 +60,53 @@ def test_phase3_go_no_go_report_writes_latest(tmp_path) -> None:
     assert latest_path.exists()
     payload = json.loads(latest_path.read_text(encoding="utf-8"))
     assert payload["report_artifacts"] == artifacts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["blocked", "no_go", "missing", "unavailable"])
+async def test_fail_on_blocked_recognizes_current_and_legacy_gate_statuses(
+    monkeypatch, capsys, status: str
+) -> None:
+    async def collect_report():
+        return {"status": status, "read_only": True}
+
+    monkeypatch.setattr(report_cli, "collect_phase3_go_no_go_report", collect_report)
+    monkeypatch.setattr(
+        report_cli,
+        "parse_args",
+        lambda: SimpleNamespace(
+            json_indent=0,
+            output_dir=None,
+            stdout_only=True,
+            fail_on_blocked=True,
+        ),
+    )
+
+    assert await report_cli._main() == 2
+    assert json.loads(capsys.readouterr().out)["status"] == status
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code"),
+    [("no_go", 2), ("blocked", 2), ("missing", 2), ("unavailable", 2), ("go", 0)],
+)
+def test_online_gate_wrapper_reports_rejection_in_exit_code(
+    monkeypatch, capsys, status: str, exit_code: int
+) -> None:
+    monkeypatch.setattr(
+        online_cli, "parse_args", lambda: SimpleNamespace(timeout=60, json_indent=0)
+    )
+    monkeypatch.setattr(
+        online_cli, "connect_remote_ssh", lambda *_args, **_kwargs: SimpleNamespace(close=lambda: None)
+    )
+    monkeypatch.setattr(
+        online_cli,
+        "run_remote_text",
+        lambda *_args, **_kwargs: json.dumps({"status": status, "read_only": True}),
+    )
+
+    assert online_cli.main() == exit_code
+    assert json.loads(capsys.readouterr().out)["status"] == status
 
 
 @pytest.mark.asyncio

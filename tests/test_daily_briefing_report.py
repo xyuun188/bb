@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "services" / "daily_briefing.py"
 
@@ -95,3 +97,31 @@ def test_render_text_survives_model_error() -> None:
 
     assert "读取失败" in text
     assert "无阻塞记录" in text
+
+
+def test_model_status_distinguishes_running_artifact_from_rejected_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.ml_signal_service import MLSignalService
+
+    module = _load_module()
+    monkeypatch.setattr(
+        MLSignalService,
+        "status_metadata",
+        lambda _self: {
+            "artifact_version": "running-champion",
+            "latest_training": {
+                "artifact_version": "rejected-candidate",
+                "champion_retained": True,
+                "sample_cursor": {"shadow": 1300, "trade": 107},
+            },
+        },
+    )
+
+    model = module._model_status()
+    text = module.render_text({"model": model})
+
+    assert model["artifact_version"] == "running-champion"
+    assert model["latest_training_version"] == "rejected-candidate"
+    assert "运行版本：running-champion" in text
+    assert "最近候选：rejected-candidate（未替换运行模型）" in text

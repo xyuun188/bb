@@ -1,7 +1,7 @@
 from typing import Any
 
 DECISION_GROUP_PARTITION_VERSION = "2026-11-05.result-availability-purged-holdout.v2"
-WALK_FORWARD_REPORT_VERSION = "2026-11-08.primary-horizon-isolated-walk-forward.v3"
+WALK_FORWARD_REPORT_VERSION = "2026-11-10.runtime-aligned-walk-forward.v4"
 PRIMARY_PREDICTION_HORIZON_MINUTES = 240
 TRAINING_HORIZON_POLICY = "fit_primary_horizon_only"
 LOCAL_ML_AUTO_TRAIN_RESULT_PREFIX = "BB_LOCAL_ML_AUTO_TRAIN_RESULT_JSON="

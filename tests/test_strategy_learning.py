@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -291,6 +292,11 @@ async def test_background_champion_reconciles_only_complete_current_model_eviden
 async def test_feedback_reuses_inflight_outcome_read_for_same_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        strategy_learning_module,
+        "load_training_epoch_start",
+        lambda: datetime(2026, 7, 1, tzinfo=UTC),
+    )
     class FakeResult:
         def all(self) -> list[Any]:
             return []
@@ -343,6 +349,11 @@ async def test_feedback_reuses_inflight_outcome_read_for_same_window(
 
 @pytest.mark.asyncio
 async def test_runtime_and_report_outcome_reads_do_not_cancel_each_other(monkeypatch) -> None:
+    monkeypatch.setattr(
+        strategy_learning_module,
+        "load_training_epoch_start",
+        lambda: datetime(2026, 7, 1, tzinfo=UTC),
+    )
     started = []
     completed = []
     release = asyncio.Event()
@@ -393,6 +404,11 @@ async def test_runtime_and_report_outcome_reads_do_not_cancel_each_other(monkeyp
 async def test_realtime_strategy_context_uses_compact_outcomes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        strategy_learning_module,
+        "load_training_epoch_start",
+        lambda: datetime(2026, 7, 1, tzinfo=UTC),
+    )
     observed: list[bool] = []
 
     async def empty_outcomes(**kwargs: Any) -> list[dict[str, Any]]:
@@ -416,7 +432,10 @@ async def test_realtime_strategy_context_uses_compact_outcomes(
 
     monkeypatch.setattr(strategy_learning_module, "load_authoritative_trade_outcomes", empty_outcomes)
     monkeypatch.setattr(strategy_learning_module, "get_read_session_ctx", lambda: FakeContext())
-    service = StrategyLearningService()
+    service = StrategyLearningService(
+        routing_store=SimpleNamespace(persist=AsyncMock(return_value={"persisted": True})),
+        champion_service=SimpleNamespace(current=AsyncMock(return_value={})),
+    )
     await service.apply_to_strategy_context(
         mode="paper",
         strategy_context={},

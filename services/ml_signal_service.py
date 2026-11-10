@@ -139,6 +139,7 @@ def _training_source_code_version() -> str:
         Path(__file__).with_name("ml_training_dataset.py"),
         Path(__file__).with_name("ml_readiness.py"),
         Path(__file__).with_name("ml_training_contract.py"),
+        Path(__file__).with_name("ml_prediction_contract.py"),
         Path(__file__).with_name("return_objective.py"),
         Path(__file__).with_name("model_artifact_registry.py"),
         Path(__file__).with_name("trading_params.py"),
@@ -1325,10 +1326,11 @@ def _walk_forward_side_scores(
     market_model.fit(x_train, train[return_column], model__sample_weight=weights)
     cost_model.fit(x_train, train[cost_column], model__sample_weight=weights)
     tail_model.fit(x_train, tail_labels, model__sample_weight=weights)
-    scores = (
-        np.asarray(market_model.predict(x_validation), dtype=float)
-        - np.asarray(cost_model.predict(x_validation), dtype=float)
-        - _positive_proba(tail_model, x_validation) * tail_scale
+    scores = risk_adjusted_expected_scores(
+        regression_prediction_distribution(market_model, x_validation),
+        regression_prediction_distribution(cost_model, x_validation),
+        _positive_proba(tail_model, x_validation),
+        tail_loss_scale_pct=tail_scale,
     )
     return scores, {
         **tail_policy.to_dict(),
@@ -1618,6 +1620,8 @@ def _walk_forward_return_report(
         "fitted_horizons": [primary_horizon_minutes],
         "source_horizons": source_horizons,
         "unfitted_horizon_diagnostics": unfitted_horizon_diagnostics,
+        "score_basis": HOLDOUT_SCORE_BASIS,
+        "prediction_score_policy": "shared_training_holdout_and_runtime_risk_objective",
     }
     if primary_frame.empty:
         return {
@@ -3989,6 +3993,13 @@ class MLSignalService:
                     champion_manifest,
                     candidate_stage=activation_stage,
                     champion_stage=champion_stage,
+                    candidate_enabled_sides=(
+                        live_enabled_sides
+                        if production_authorized
+                        else list(paper_canary.get("eligible_sides") or [])
+                    )
+                    if activation_stage == "canary"
+                    else None,
                 )
                 if champion_eligibility_errors:
                     champion_comparison = {

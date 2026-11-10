@@ -240,7 +240,12 @@ async def _main() -> int:
                     "message": safe_error_text(exc, limit=240),
                 }
     print(json.dumps(report, ensure_ascii=False, indent=indent, sort_keys=True))
-    if args.fail_on_blocked and report.get("status") == "blocked":
+    if args.fail_on_blocked and report.get("status") in {
+        "blocked",
+        "no_go",
+        "missing",
+        "unavailable",
+    }:
         return 2
     return 0
 

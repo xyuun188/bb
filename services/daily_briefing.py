@@ -56,7 +56,9 @@ def _model_status() -> dict[str, Any]:
             "lifecycle": metadata.get("artifact_lifecycle"),
             "readiness": metadata.get("readiness_state"),
             "trained_at": metadata.get("trained_at"),
-            "artifact_version": latest.get("artifact_version"),
+            "artifact_version": metadata.get("artifact_version"),
+            "latest_training_version": latest.get("artifact_version"),
+            "champion_retained": latest.get("champion_retained"),
             "shadow_samples": cursor.get("shadow"),
             "trade_samples": cursor.get("trade"),
             "paper_trading_permission": metadata.get("paper_trading_permission"),
@@ -170,11 +172,15 @@ def render_text(report: dict[str, Any]) -> str:
         lines.append(f"读取失败：{model['error']}")
     else:
         lines.append(f"生命周期：{model.get('lifecycle') or '未知'}")
-        lines.append(f"训练版本：{model.get('artifact_version') or '未知'}")
+        lines.append(f"运行版本：{model.get('artifact_version') or '未知'}")
+        latest_version = model.get("latest_training_version")
+        if latest_version and latest_version != model.get("artifact_version"):
+            retained = "（未替换运行模型）" if model.get("champion_retained") else ""
+            lines.append(f"最近候选：{latest_version}{retained}")
         lines.append(f"纸面执行权限：{model.get('paper_model_eligible')}")
         lines.append(f"实盘权限：{model.get('live_ml_ready')}")
-        lines.append(f"已训练影子样本：{model.get('shadow_samples')}")
-        lines.append(f"已训练成交样本：{model.get('trade_samples')}")
+        lines.append(f"最近训练影子样本：{model.get('shadow_samples')}")
+        lines.append(f"最近训练成交样本：{model.get('trade_samples')}")
         if model.get("message"):
             lines.append(f"说明：{model['message']}")
     lines.append("")

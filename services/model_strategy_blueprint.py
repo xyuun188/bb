@@ -7,7 +7,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-09-21.paper-training-permission.v4"
+MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-11-10.compared-canary-sides.v5"
 MODEL_STRATEGY_BLUEPRINT_OWNER_SOURCE = "local_ml"
 
 
@@ -134,6 +134,19 @@ def build_model_strategy_blueprint(
         | set(paper_bootstrap_sides)
         | set(paper_training_sides)
     )
+    champion_comparison = _safe_dict(active.get("champion_comparison"))
+    if (
+        stage in {"shadow", "canary"}
+        and champion_comparison.get("candidate_stage") == "canary"
+        and "comparison_sides" in champion_comparison
+    ):
+        # Side-scoped replacement cannot grant execution to an unexamined side.
+        compared_sides = set(_safe_list(champion_comparison.get("comparison_sides")))
+        paper_execution_sides = [
+            side
+            for side in paper_execution_sides
+            if champion_comparison.get("accepted") is True and side in compared_sides
+        ]
     paper_execution_eligible = bool(
         artifact_complete
         and paper_execution_sides
@@ -149,7 +162,6 @@ def build_model_strategy_blueprint(
     primary_horizon = int(model.get("primary_prediction_horizon_minutes") or 0)
     if primary_horizon <= 0:
         primary_horizon = artifact_horizons[0] if artifact_horizons else 10
-    champion_comparison = _safe_dict(active.get("champion_comparison"))
     model_quality = {
         side: {
             key: _safe_dict(oos_evaluation.get(side)).get(key)
