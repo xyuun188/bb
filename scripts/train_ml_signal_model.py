@@ -32,13 +32,13 @@ from services.ml_signal_service import (
     LOCAL_ML_TRAINING_SCHEDULER_ID,
     MODEL_TRAINING_STATE_STORE,
     build_training_frame,
+    load_primary_horizon_training_rows,
     shadow_training_quality_report,
     train_from_frame,
 )
 from services.ml_training_dataset import (
     count_shadow_training_rows,
     load_authoritative_trade_training_samples,
-    load_shadow_training_rows,
 )
 from services.model_training_state import LOCAL_ML_MODEL_IDS
 from services.okx_training_gate import okx_training_refresh_gate
@@ -73,7 +73,7 @@ async def run_training(
     elif not skip_quarantine:
         quarantine_result = await quarantine_dirty_shadow_samples()
 
-    rows = await load_shadow_training_rows()
+    rows = await load_primary_horizon_training_rows()
     quality_state = shadow_training_quality_report(rows)
     frame = build_training_frame(rows)
     trade_samples = await load_authoritative_trade_training_samples()

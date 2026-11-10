@@ -7,8 +7,11 @@ from math import sqrt
 from types import SimpleNamespace
 from typing import Any
 
-from services.execution_cost_model import execution_cost_estimate
-from services.profit_supervision import shadow_fee_after_return_labels
+from services.execution_cost_model import execution_cost_estimate, funding_cost_estimate
+from services.profit_supervision import (
+    PROFIT_SUPERVISION_VERSION,
+    shadow_fee_after_return_labels,
+)
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.training_epoch import load_training_epoch_start
 
@@ -142,43 +145,32 @@ def _cost_complete_shadow_return(
 ) -> tuple[float, dict[str, Any]] | None:
     features = _features(row)
     execution_cost = execution_cost_estimate(features)
-    funding_rate = _safe_float(features.get("funding_rate"), None)
-    funding_interval_minutes = _safe_float(
-        features.get("funding_interval_minutes"),
-        None,
-    )
-    if funding_interval_minutes is None:
-        funding_interval_hours = _safe_float(features.get("funding_interval_hours"), None)
-        if funding_interval_hours is not None:
-            funding_interval_minutes = funding_interval_hours * 60.0
     horizon_minutes = max(
         _safe_float(_row_get(row, "horizon_minutes"), 0.0) or 0.0,
         0.0,
     )
+    funding = funding_cost_estimate(
+        features, side=side, horizon_minutes=horizon_minutes,
+    )
     if (
         not execution_cost.production_eligible
-        or funding_rate is None
-        or funding_interval_minutes is None
-        or funding_interval_minutes <= 0
+        or not funding.production_eligible
+        or funding.signed_cashflow_pct is None
         or horizon_minutes <= 0
     ):
         return None
-    funding_drag = funding_rate * 100.0 * horizon_minutes / funding_interval_minutes
     net_return = (
         gross_return_pct
         - execution_cost.fee_pct
         - execution_cost.slippage_pct
-        - funding_drag
-        if side == "long"
-        else gross_return_pct
-        - execution_cost.fee_pct
-        - execution_cost.slippage_pct
-        + funding_drag
+        + funding.signed_cashflow_pct
     )
     return net_return, {
         **execution_cost.to_dict(),
-        "funding_drag_pct": round(funding_drag, 8),
-        "funding_interval_minutes": round(funding_interval_minutes, 8),
+        "funding_drag_pct": round(-funding.signed_cashflow_pct, 8),
+        "funding_interval_minutes": funding.funding_interval_minutes,
+        "funding_cost": funding.to_dict(),
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
         "horizon_minutes": round(horizon_minutes, 8),
     }
 

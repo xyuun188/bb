@@ -441,3 +441,49 @@ race. Regression tests cover delayed cancellation, unavailable order details,
 new fills during cancellation and full completion before fallback. This
 execution fix does not supply a profitable policy or a complete maker-fill,
 real-exit-cost portfolio simulation.
+
+### Explicit Linear Comparison
+
+The initial `standardized-linear` run still inherited production's
+sample-count switch to random forests above 250 rows. That report is retained
+as an incorrectly specified preprocessing experiment, not evidence about a
+linear model. Policy v2 pins Ridge alpha 1 and LogisticRegression C 1 at every
+sample count, and records this choice before fitting. Production remains
+unchanged.
+
+The replacement report
+`online-replay-weights-standardized-linear-development-v3-explicit-linear-v2-20261110T132746Z.json`
+uses exactly the v5 frozen snapshot above:
+
+| Features / Weights | Capacity Selections | Mean Net Return | Profit Factor |
+| --- | ---: | ---: | ---: |
+| Existing / outcome emphasis | 95 | -0.096714% | 0.887152 |
+| Existing / natural | 95 | -0.000113% | 0.999855 |
+| Market only / outcome emphasis | 94 | -0.158611% | 0.821297 |
+| Market only / natural | 94 | -0.046087% | 0.940837 |
+
+All four fail. The strongest aggregate is approximately break-even, has
+naive LCB -0.538100%, fails early folds and lacks the registered calendar-day
+coverage. It cannot be selected for deployment or described as profitable.
+Do not keep searching this same inspected window for a favorable threshold.
+
+The post-index preflight completed with 15,141 frame rows and 107 authoritative
+trade samples. It still shared its sampling budget across horizons, unlike
+the production worker; the CLI now uses the worker's existing
+`load_primary_horizon_training_rows` entry point. Its earlier metrics are
+therefore diagnostic, not a matched candidate acceptance.
+
+The formal local-ML rebuild activated paper-canary artifact
+`20261110T164730783478Z-e7acffc3` (2,366 fitted rows), with live disabled.
+The independent quant API rebuilt v5 evidence but retained its shadow
+champion after rejecting the challenger. Six-hour briefing still reported
+1,500 holds and zero actual entries. New decisions did use the new local-ML
+artifact, primary 240-minute horizon, and complete funding projections;
+paper authorization alone does not imply a qualifying current signal.
+
+Post-deployment tracing found a further duplicate continuous-accrual formula
+in specialist shadow evaluation. It now uses the same direction-aware
+settlement function and records the supervision version. Missing funding
+availability, future observations and missing schedules cannot supply complete
+specialist cost evidence. Regression cases compare long/short specialist
+returns directly with training labels, with and without a settlement.

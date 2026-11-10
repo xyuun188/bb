@@ -108,6 +108,14 @@ one or leaked into decision-time features.
 - Diagnostic and manual training use the scheduler's bounded 30-second
   statement / 15-second idle-transaction budgets. API read budgets stay at
   their existing defaults.
+- The diagnostic CLI uses the production primary-horizon loader, so other
+  horizons no longer consume its fitting-window budget.
+- Specialist shadow evaluation uses the same settlement-aware funding
+  calculation as training and entry. Its former duplicate continuous formula
+  could otherwise distort the quality evidence used for entry.
+- The explicit standardized linear comparison now pins its estimator family
+  at all sample counts. All four registered candidates failed; the best mean
+  was approximately break-even and its confidence bound remained negative.
 
 Use the existing online index utility for deployment or rollback:
 

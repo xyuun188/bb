@@ -1856,7 +1856,8 @@ async def test_train_ml_signal_script_defaults_to_preflight_without_persist(
     async def forbidden_quarantine(**_kwargs: object) -> dict[str, object]:
         raise AssertionError("dry-run must not quarantine or mutate training rows")
 
-    async def load_rows() -> list[object]:
+    async def load_rows(*, horizons: tuple[int, ...]) -> list[object]:
+        assert horizons == (ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES,)
         return [object()]
 
     def quality_report(_rows: list[object]) -> dict[str, object]:
@@ -1878,7 +1879,7 @@ async def test_train_ml_signal_script_defaults_to_preflight_without_persist(
     monkeypatch.setattr(
         train_ml_signal_script, "quarantine_dirty_shadow_samples", forbidden_quarantine
     )
-    monkeypatch.setattr(train_ml_signal_script, "load_shadow_training_rows", load_rows)
+    monkeypatch.setattr(ml_training_dataset, "load_shadow_training_rows", load_rows)
     monkeypatch.setattr(train_ml_signal_script, "shadow_training_quality_report", quality_report)
     monkeypatch.setattr(train_ml_signal_script, "build_training_frame", build_frame)
     monkeypatch.setattr(train_ml_signal_script, "count_shadow_training_rows", count_rows)
@@ -1972,7 +1973,7 @@ async def test_train_ml_signal_script_confirmed_rebuild_can_persist(
         },
     )
     monkeypatch.setattr(train_ml_signal_script, "quarantine_dirty_shadow_samples", quarantine)
-    monkeypatch.setattr(train_ml_signal_script, "load_shadow_training_rows", load_rows)
+    monkeypatch.setattr(train_ml_signal_script, "load_primary_horizon_training_rows", load_rows)
     monkeypatch.setattr(train_ml_signal_script, "shadow_training_quality_report", quality_report)
     monkeypatch.setattr(train_ml_signal_script, "build_training_frame", build_frame)
     monkeypatch.setattr(train_ml_signal_script, "count_shadow_training_rows", count_rows)

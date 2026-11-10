@@ -154,12 +154,61 @@ def _row(
             "spread_pct": 0.02,
             "taker_fee_rate": 0.0004,
             "funding_rate": 0.0001,
+            "funding_data_available": True,
             "funding_interval_hours": 8.0,
             "local_ai_tools_shadow": local_shadow,
         },
         due_at=now,
         created_at=now,
     )
+
+
+@pytest.mark.parametrize(("side", "cashflow"), (("long", -0.01), ("short", 0.01)))
+@pytest.mark.parametrize("crosses_settlement", (False, True))
+def test_specialist_funding_matches_training_settlement_schedule(side, cashflow, crosses_settlement):
+    row = _row(predicted_side=side, realized=0.42)
+    decision_at = datetime(2026, 11, 10, 7, tzinfo=UTC)
+    row.horizon_minutes = 240
+    row.feature_snapshot.update({
+        "feature_timestamp": (decision_at + timedelta(hours=1)).isoformat(),
+        "original_decision_timestamp": decision_at.isoformat(),
+        "funding_rate_observed_at": decision_at.isoformat(),
+        "next_funding_time": (decision_at + timedelta(hours=1 if crosses_settlement else 5)).isoformat(),
+    })
+    result = specialist_evaluation._cost_complete_shadow_return(
+        row, side=side, gross_return_pct=0.42,
+    )
+    assert result is not None
+    net, costs = result
+    expected_funding = cashflow if crosses_settlement else 0.0
+    assert costs["funding_drag_pct"] == pytest.approx(-expected_funding)
+    assert net == pytest.approx(0.42 - costs["fee_pct"] - costs["slippage_pct"] + expected_funding)
+    labels = specialist_evaluation.shadow_fee_after_return_labels(
+        specialist_evaluation._shadow_quality_payload(row)
+    )
+    assert net == pytest.approx(labels[f"{side}_net_return_after_all_cost_pct"])
+
+
+@pytest.mark.parametrize("invalid", ("unavailable", "future_observation", "missing_schedule"))
+def test_specialist_rejects_incomplete_funding_evidence(invalid):
+    row = _row()
+    decision_at = datetime(2026, 11, 10, 7, tzinfo=UTC)
+    row.feature_snapshot.update({
+        "timestamp": decision_at.isoformat(),
+        "funding_rate_observed_at": decision_at.isoformat(),
+        "next_funding_time": (decision_at + timedelta(hours=1)).isoformat(),
+    })
+    if invalid == "unavailable":
+        row.feature_snapshot["funding_data_available"] = False
+    elif invalid == "future_observation":
+        row.feature_snapshot["funding_rate_observed_at"] = (
+            decision_at + timedelta(minutes=1)
+        ).isoformat()
+    else:
+        row.feature_snapshot.pop("next_funding_time")
+    assert specialist_evaluation._cost_complete_shadow_return(
+        row, side="long", gross_return_pct=0.42,
+    ) is None
 
 
 def _authoritative_sample(
@@ -395,6 +444,9 @@ def test_specialist_shadow_report_supports_incremental_row_accumulation() -> Non
         for model in report["models"]:
             for shadow_event in model["shadow_events"]:
                 shadow_event["execution_cost"]["policy_provenance"].pop("generated_at")
+                shadow_event["execution_cost"]["funding_cost"]["policy_provenance"].pop(
+                    "generated_at"
+                )
     assert actual == expected
 
 
