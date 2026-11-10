@@ -401,6 +401,21 @@ class EntryDirectionCompetitionPolicy:
             ),
             execution_scope=execution_scope,
         )
+        for rows in evidence.values():
+            for item in rows:
+                if (
+                    not item.get("available")
+                    or not item.get("return_distribution_contract")
+                    or item.get("loss_probability") is not None
+                ):
+                    continue
+                item.update(
+                    decision_eligible=False,
+                    paper_eligible=False,
+                    production_eligible=False,
+                    observation_only=True,
+                    eligibility_reason="ordinary_loss_probability_missing",
+                )
         evidence_sources = sorted(
             {
                 str(item.get("source") or "")

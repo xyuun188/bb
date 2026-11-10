@@ -2769,23 +2769,29 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
         },
     }
     module.load_bundle = lambda: bundle
-    module.regression_prediction_distribution = lambda model, _x: {
-        "expected": 0.4 if model is long_model else 0.2,
-        "median": 0.4 if model is long_model else 0.2,
-        "lower_bound": 0.1 if model is long_model else 0.05,
-        "upper_bound": 0.5 if model is long_model else 0.3,
-        "std": 0.03,
-        "spread": 0.08,
-        "sample_count": 260,
-        "distribution_ready": True,
-        "source_authority": "extra_trees_empirical_distribution",
-    }
+    inference_horizons = []
+
+    def distribution(model, x):
+        inference_horizons.append(x[0][module.FEATURE_KEYS.index("horizon_minutes")])
+        return {
+            "expected": 0.4 if model is long_model else 0.2,
+            "median": 0.4 if model is long_model else 0.2,
+            "lower_bound": 0.1 if model is long_model else 0.05,
+            "upper_bound": 0.5 if model is long_model else 0.3,
+            "std": 0.03,
+            "spread": 0.08,
+            "sample_count": 260,
+            "distribution_ready": True,
+            "source_authority": "extra_trees_empirical_distribution",
+        }
+
+    module.regression_prediction_distribution = distribution
     module.predict_proba_positive = lambda model, _x: 0.95 if model is long_loss_model else 0.85
 
     payload = module.profit_predict(
         module.FeatureRequest(
             symbol="BTC/USDT",
-            features={"symbol": "BTC/USDT", "current_price": 100.0},
+            features={"symbol": "BTC/USDT", "current_price": 100.0, "horizon_minutes": 5},
         )
     )
 
@@ -2798,6 +2804,10 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
         module.RETURN_DISTRIBUTION_INPUT_VERSION
     )
     long_input = payload["return_distribution_inputs"]["long"]
+    assert payload["horizon_minutes"] == module.PRIMARY_PREDICTION_HORIZON_MINUTES
+    assert long_input["horizon_minutes"] == payload["horizon_minutes"]
+    assert inference_horizons
+    assert set(inference_horizons) == {float(payload["horizon_minutes"])}
     assert long_input["raw_expected_return_pct"] == 0.4
     assert long_input["median_return_pct"] == 0.4
     assert long_input["lower_quantile_return_pct"] == 0.1

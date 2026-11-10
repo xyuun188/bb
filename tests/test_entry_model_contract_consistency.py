@@ -122,6 +122,63 @@ def test_opportunity_keeps_ordinary_and_tail_probabilities_separate() -> None:
     assert opportunity["tail_risk_score"] == pytest.approx(0.2)
 
 
+@pytest.mark.parametrize("scope", ["paper", "live"])
+def test_tail_only_tools_do_not_dilute_a_complete_execution_prediction(scope: str) -> None:
+    from tests.test_entry_direction_competition import _context, _governed_ml, _governed_payload
+    from tests.test_entry_opportunity_scoring import _decision, _scorer
+
+    tail_only = _governed_payload(100.0, -100.0)
+    tail_only.pop("long_loss_probability")
+    tail_only.pop("short_loss_probability")
+    context = _context(
+        ml=_governed_ml(0.6, -0.4),
+        tools={"time_series_prediction": tail_only},
+        strategy={"execution_mode": scope},
+    )
+    assert context["preferred_side"] == "long"
+    assert context["long"]["raw_expected_return_pct"] == pytest.approx(0.6)
+    observation = next(row for row in context["long"]["evidence"] if row["source"] == "timeseries")
+    assert observation["observation_only"] is True
+    assert observation["decision_eligible"] is False
+    assert observation["eligibility_reason"] == "ordinary_loss_probability_missing"
+
+    decision = _decision()
+    decision.raw_response["local_ai_tools"] = {}
+    scorer = _scorer()
+    scorer.score_candidate(decision, {"execution_mode": scope})
+    baseline = deepcopy(decision.raw_response["opportunity_score"])
+    decision.raw_response["local_ai_tools"] = {"time_series_prediction": tail_only}
+    scorer.score_candidate(decision, {"execution_mode": scope})
+    scored = decision.raw_response["opportunity_score"]
+    for field in ("expected_net_return_pct", "return_lcb_pct", "loss_probability"):
+        assert scored[field] == pytest.approx(baseline[field])
+    observation = next(
+        row for row in scored["expected_net_breakdown"]["components"] if row["key"] == "timeseries"
+    )
+    assert observation["decision_eligible"] is False
+    assert observation["observation_only"] is True
+
+
+@pytest.mark.parametrize("scope", ["paper", "live"])
+def test_tail_only_tool_cannot_authorize_entry_on_its_own(scope: str) -> None:
+    from tests.test_entry_direction_competition import _context, _governed_payload
+    from tests.test_entry_opportunity_scoring import _decision, _scorer
+
+    tail_only = _governed_payload(100.0, -100.0)
+    tail_only.pop("long_loss_probability")
+    tail_only.pop("short_loss_probability")
+    context = _context(
+        tools={"time_series_prediction": tail_only}, strategy={"execution_mode": scope},
+    )
+    assert context["preferred_side"] == "neutral"
+    assert context["decision_source_count"] == 0
+    decision = _decision()
+    decision.raw_response["ml_signal"] = {}
+    decision.raw_response["local_ai_tools"] = {"time_series_prediction": tail_only}
+    _scorer().score_candidate(decision, {"execution_mode": scope})
+    assert decision.raw_response["opportunity_score"]["expected_net_return_pct"] is None
+
+
 def test_reconciliation_rejects_high_ordinary_loss_despite_low_tail_probability() -> None:
     from services.normal_paper_trade import (
         build_normal_paper_trade_contract,

@@ -6654,9 +6654,12 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
     bundle = load_bundle()
     if bundle:
         try:
-            x = [model_x(features)]
             metadata = bundle.get("metadata") or {}
-            horizon_minutes = int(feature_row(features)["horizon_minutes"])
+            horizon_minutes = int(
+                metadata.get("primary_prediction_horizon_minutes")
+                or PRIMARY_PREDICTION_HORIZON_MINUTES
+            )
+            x = [model_x(features, horizon_minutes=horizon_minutes)]
             long_distribution = regression_prediction_distribution(bundle["long_return_model"], x)
             short_distribution = regression_prediction_distribution(bundle["short_return_model"], x)
             long_cost_distribution = _cost_distribution_for_inference(
@@ -6752,7 +6755,7 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                 "model": "local-profit-trained-v2",
                 "symbol": req.symbol,
                 "best_side": best_side,
-                "horizon_minutes": int(feature_row(features)["horizon_minutes"]),
+                "horizon_minutes": horizon_minutes,
                 "profit_edge_pct": round(edge, 4),
                 "profit_quality_score": round(quality, 4),
                 "return_semantics": "gross_market_opportunity_before_execution",

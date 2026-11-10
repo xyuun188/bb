@@ -458,6 +458,20 @@ class EntryOpportunityScoringPolicy:
                 direction_authorization=model_direction_authorizations["timeseries"],
             ),
         ]
+        for component in components:
+            if (
+                not component.get("available")
+                or not component.get("return_distribution_contract")
+                or component.get("loss_probability") is not None
+            ):
+                continue
+            component.update(
+                decision_eligible=False,
+                paper_eligible=False,
+                production_eligible=False,
+                observation_only=True,
+                eligibility_reason="ordinary_loss_probability_missing",
+            )
         # Direction support is the single owner of which quantitative families
         # may authorize this side.  The opportunity scorer must price the same
         # selected families; otherwise an excluded negative family is silently
@@ -493,7 +507,9 @@ class EntryOpportunityScoringPolicy:
             component for component in components if component["decision_eligible"]
         ]
         claimed_components = [
-            component for component in components if component["decision_claimed"]
+            component for component in components
+            if component["decision_claimed"]
+            and component.get("eligibility_reason") != "ordinary_loss_probability_missing"
         ]
         quant_multipliers = _paper_quant_multipliers(strategy)
         horizon_selection: dict[str, Any] = {}
