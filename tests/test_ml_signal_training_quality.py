@@ -1253,6 +1253,17 @@ def test_build_training_frame_retains_original_quality_and_cost_evidence() -> No
     ] is True
 
 
+def test_training_replay_uses_recomputed_fee_after_side_without_mutating_raw_label() -> None:
+    row = _shadow_row(1, best_action="long")
+    row.long_return_pct = 0.01
+    row.short_return_pct = -0.01
+    # This is an old sealed outcome's optimal side. The current derived cost
+    # policy can change it; original audit evidence must remain intact.
+    frame = build_training_frame([row])
+    assert frame.iloc[0]["best_action"] == "hold"
+    assert row.best_action == "long"
+
+
 def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:
     primary = ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES
     frame = _training_frame(120)

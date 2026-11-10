@@ -2124,7 +2124,7 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                 ),
                 "decision_action": str(getattr(row, "decision_action", "") or ""),
                 "decision_confidence": _safe_float(getattr(row, "decision_confidence", 0.0)),
-                "best_action": str(getattr(row, "best_action", "") or ""),
+                "best_action": str(quality_sample.get("best_action_after_all_cost") or "hold"),
                 "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
                 "raw_long_return_pct": _safe_float(raw_long_return),
                 "raw_short_return_pct": _safe_float(raw_short_return),
