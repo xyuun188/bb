@@ -231,6 +231,8 @@ print(result_prefix + json.dumps(compact_payload, ensure_ascii=False, sort_keys=
         "trap cleanup_training_pid EXIT; trap 'exit 130' INT; trap 'exit 143' TERM HUP; "
         "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1; "
         "export LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES=\"${LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES:-8589934592}\"; "
+        "export BB_TRAINING_READ_STATEMENT_TIMEOUT_MS=30000; "
+        "export BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS=15000; "
         "PYBIN=python3; "
         "if [ -x .venv/bin/python ]; then PYBIN=.venv/bin/python; "
         "elif [ -x venv/bin/python ]; then PYBIN=venv/bin/python; fi; "

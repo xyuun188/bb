@@ -207,3 +207,19 @@ def test_standardized_experiment_fits_scale_only_on_training_features(monkeypatc
     registered = research.protocol(preprocessing="standardized_linear")
     assert registered["preprocessing"] == "standardized_linear"
     assert registered["promotion_authorized"] is False
+
+
+@pytest.mark.parametrize("sample_count", (40, 300))
+def test_linear_research_keeps_estimator_family_across_sample_counts(sample_count):
+    from sklearn.linear_model import LogisticRegression, Ridge
+
+    y = pd.Series(np.arange(sample_count) % 2)
+    classifier = research._research_model(
+        y, classification=True, preprocessing="standardized_linear",
+    )
+    regressor = research._research_model(
+        y, classification=False, preprocessing="standardized_linear",
+    )
+    assert isinstance(classifier.named_steps["model"], LogisticRegression)
+    assert isinstance(regressor.named_steps["model"], Ridge)
+    assert regressor.named_steps["model"].alpha == 1.0

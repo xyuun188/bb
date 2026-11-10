@@ -1,6 +1,6 @@
 # Profitability Execution Plan
 
-Updated: 2026-11-09, Asia/Shanghai.
+Updated: 2026-11-11, Asia/Shanghai.
 
 Status: ACTIVE. Profitability acceptance has not passed.
 
@@ -13,13 +13,17 @@ anything written there.
 
 ## Current Decision
 
-The trading loop is not silently stalled. New entries are blocked because the
-governed profitability and independent-return gates are not satisfied. The
-latest known model state before the primary-horizon rebuild was shadow-only,
-with fee-after `profit_factor` below `1.0` and a negative lower confidence
-bound. Do not force trades, shorten the primary horizon, mix horizons, or relax
-the positive-LCB, profit-factor, disjoint-exam, or live-readiness gates to
-manufacture entries.
+Profitability acceptance remains incomplete. There were also concrete
+engineering defects: shadow funding labels used continuous accrual across
+non-settlement periods, passive entry fallback could race an unconfirmed
+cancellation, and the training dataset lookup timed out. These have separate
+fixes and must not be conflated with an unprofitable strategy.
+
+The current funding supervision policy is
+`2026-11-10.scheduled-shadow-funding.v5`; v4 artifacts are incompatible.
+Rebuild both model branches before interpreting their readiness. Do not force
+trades, shorten the primary horizon, mix horizons, or relax the positive-LCB,
+profit-factor, disjoint-exam, or live-readiness gates to manufacture entries.
 
 ## Primary-Horizon Training Contract
 
@@ -77,6 +81,44 @@ that a retired service is active.
 
 There is no defensible time-to-profit estimate. The system is ready to collect
 more evidence, not proven profitable.
+
+The five remediation items are not all accepted: development separation and
+recipe comparison exist, but there is no qualifying replacement, completed
+fresh independent exam, complete maker-fill/exit-cost portfolio replay, or
+qualified strategy's paper entry-to-settlement acceptance. Shadow costs still
+project the round trip from entry-time market facts. The separately saved
+settlement observation is not an actual exit fill and must not be presented as
+one or leaked into decision-time features.
+
+## November 11 Remediation
+
+- Funding projections count settlements in `(decision_time, exit_time]`.
+  Original decision time takes precedence; missing/invalid timing and future
+  observations cannot supply complete production cost evidence. Truly legacy
+  snapshots without clocks keep explicitly degraded projection metadata.
+- Replay outcome emphasis uses the recomputed fee-after optimal side; stored
+  historical audit labels remain unchanged.
+- Market fallback requires the passive order's confirmed terminal state and
+  final cumulative fill. An unavailable order ID/detail or active original
+  order blocks fallback rather than risking duplicate exposure.
+- Training group counts no longer compute a window sort just to count groups.
+  A partial covering index excludes history-only observations before sampling.
+  The online count of 52,428 eligible groups took 0.333 seconds, compared with
+  the previous 30-second timeout.
+- Diagnostic and manual training use the scheduler's bounded 30-second
+  statement / 15-second idle-transaction budgets. API read budgets stay at
+  their existing defaults.
+
+Use the existing online index utility for deployment or rollback:
+
+```bash
+python scripts/ensure_online_reconciliation_indexes.py --scope training --apply
+python scripts/ensure_online_reconciliation_indexes.py --scope training --rollback --apply
+```
+
+These operations use concurrent index creation/drop, short lock waits, bounded
+maintenance resources, and recovery of an invalid index left by an interrupted
+concurrent build. They do not delete samples.
 
 ## Horizon Economics Finding (2026-11-09)
 

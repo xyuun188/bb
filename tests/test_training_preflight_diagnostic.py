@@ -124,6 +124,8 @@ def test_preflight_worker_limits_resources_and_runtime(
     assert "--property=TimeoutStopSec=30" in command
     assert "--setenv=DATABASE_POOL_SIZE=2" in command
     assert "--setenv=LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES=8589934592" in command
+    assert "--setenv=BB_TRAINING_READ_STATEMENT_TIMEOUT_MS=30000" in command
+    assert "--setenv=BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS=15000" in command
     assert kwargs["timeout"] > 3600
 
 

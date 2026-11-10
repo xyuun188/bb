@@ -389,3 +389,55 @@ Scheduling checkpoints now prefer parsed UTC completion time, with cumulative
 cursors as tie breakers. A smaller bounded fitting window cannot hide a newer
 completed attempt. This updates scheduling/status only, not the serving
 champion or its trading permissions.
+
+## Scheduled Funding and Training Recovery, November 11
+
+The v5 supervision policy projects funding only at scheduled settlements in
+`(decision_time, decision_time + horizon]`. An audit of 42 older four-hour
+development samples found 37 differences from continuous accrual, including
+36 samples without a settlement. The largest absolute discrepancy was
+0.038213272 percentage points. This is a verified labeling defect, not evidence
+that correcting funding alone makes the strategy profitable.
+
+The recomputed optimal side is now also used by replay outcome weighting.
+Stored historical best-action labels remain untouched for audit. Old v4 model
+evidence cannot be reused as v5 evidence.
+
+The corrected frozen development report is
+`online-replay-weights-development-v3-scheduled-funding-v5-20261110T132746Z.json`.
+It uses 3,376 rows, 1,216 decision groups, 851 primary-horizon samples and
+425 purged validation opportunities over the same fixed cutoff. Corrected
+cost eligibility changes the usable rows; do not describe this as a paired
+comparison against the older v4 dataset.
+
+The new base input fingerprint is
+`c14d8ef7b1ed7c00d4887d8b93ee02e2f53e3ff365748ad3ddf238367a406330`;
+the replay-metadata fingerprint is
+`1f4620aa51c784e21325b777111cf39ab408c2fd9f6288937faee539a782e2ee`.
+
+| Weights, Either Feature Set | Capacity Selections | Mean Net Return | Profit Factor |
+| --- | ---: | ---: | ---: |
+| Existing outcome emphasis | 5 | -4.704003% | 0.094512 |
+| Natural | 6 | -4.421130% | 0.084707 |
+
+All four policies fail. The existing and market-only feature sets select the
+same trades within each weight arm in this sample. A separately preregistered
+standardized-linear comparison uses the exact corrected snapshot, fits each
+scaler inside its purged training fold, and cannot change production settings.
+The calendar-block diagnostic jointly resamples symbols by two-day UTC blocks;
+fewer than 16 selected calendar days is insufficient evidence. Neither the
+naive nor the block result is an independent exam or actual portfolio PnL.
+
+The training preflight also exposed a lookup timeout: the old query scanned
+large compacted JSON histories and sorted every group to count it. Online
+concurrent creation of `idx_shadow_backtests_executable_training` completed
+successfully. The equivalent eligible-group count completed in 0.333 seconds
+with 52,428 groups after previously exceeding 30 seconds. The loader count
+uses distinct identities without the extra window sort, and operator training
+now uses the same bounded read timeouts as the scheduler.
+
+Execution recovery separately fixes the zero/partial-fill cancel-versus-market
+race. Regression tests cover delayed cancellation, unavailable order details,
+new fills during cancellation and full completion before fallback. This
+execution fix does not supply a profitable policy or a complete maker-fill,
+real-exit-cost portfolio simulation.

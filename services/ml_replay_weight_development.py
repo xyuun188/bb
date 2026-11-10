@@ -6,6 +6,10 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.dummy import DummyClassifier, DummyRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from services.dynamic_policy_values import empirical_policy_value
@@ -35,7 +39,7 @@ from services.ml_signal_service import (
     _positive_proba,
 )
 
-POLICY_VERSION = "2026-11-10.paired-replay-weight-development.v1"
+POLICY_VERSION = "2026-11-11.explicit-linear-replay-development.v2"
 WEIGHT_POLICIES = ("outcome_emphasis", "natural")
 PREPROCESSING_POLICIES = ("existing", "standardized_linear")
 
@@ -57,6 +61,12 @@ def protocol(
             "standard scaler fitted only on each purged training fold; "
             "validation features transformed without refit; production unchanged"
             if preprocessing == "standardized_linear" else "existing production inputs"
+        ),
+        "estimator_policy": (
+            "Ridge alpha=1 and LogisticRegression C=1 max_iter=1000 seed=42; "
+            "constant-label dummy only; no sample-count model switching"
+            if preprocessing == "standardized_linear" else
+            "existing production sample-count estimator selection"
         ),
         "candidates": [
             {"id": f"{features}-{weights}", "feature_policy": features, "weight_policy": weights}
@@ -82,6 +92,19 @@ def protocol(
         "exam_policy": "development only; prospective decisions after registration remain unexamined",
         "promotion_authorized": False,
     }
+
+
+def _research_model(y: pd.Series, *, classification: bool, preprocessing: str) -> Pipeline:
+    if preprocessing != "standardized_linear":
+        return _make_classifier(y) if classification else _make_regressor(y)
+    if int(y.nunique()) < 2:
+        estimator = DummyClassifier(strategy="prior") if classification else DummyRegressor()
+    else:
+        estimator = (
+            LogisticRegression(C=1.0, max_iter=1000, random_state=42)
+            if classification else Ridge(alpha=1.0)
+        )
+    return Pipeline([("imputer", SimpleImputer(strategy="median")), ("model", estimator)])
 
 
 def _paired_predictions(
@@ -118,7 +141,9 @@ def _paired_predictions(
         policy: {"net": {}, "score": {}} for policy in WEIGHT_POLICIES
     }
     for side in ("long", "short"):
-        tail = _make_classifier(train[f"{side}_tail_loss"])
+        tail = _research_model(
+            train[f"{side}_tail_loss"], classification=True, preprocessing=preprocessing,
+        )
         tail.fit(
             x_train, train[f"{side}_tail_loss"],
             model__sample_weight=frames["natural"]["probability_sample_weight"],
@@ -127,7 +152,9 @@ def _paired_predictions(
         for policy in WEIGHT_POLICIES:
             distributions = []
             for column in (f"{side}_return_pct", f"{side}_execution_cost_pct"):
-                model = _make_regressor(train[column])
+                model = _research_model(
+                    train[column], classification=False, preprocessing=preprocessing,
+                )
                 model.fit(x_train, train[column], model__sample_weight=frames[policy]["sample_weight"])
                 distributions.append(regression_prediction_distribution(model, x_validation))
             market, cost = distributions

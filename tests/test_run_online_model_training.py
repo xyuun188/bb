@@ -66,6 +66,8 @@ def test_online_training_command_terminates_before_ssh_timeout() -> None:
     )
 
     assert "timeout --signal=INT --kill-after=30s 7140s $PYBIN -" in command
+    assert "export BB_TRAINING_READ_STATEMENT_TIMEOUT_MS=30000;" in command
+    assert "export BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS=15000;" in command
     assert "contextlib.redirect_stdout(captured_stdout)" in command
     assert 'compact_payload["full_result_chars"]' in command
     assert '"message"' in command

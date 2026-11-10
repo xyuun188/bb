@@ -41,6 +41,16 @@ logger = structlog.get_logger(__name__)
 _SHADOW_TRAINING_REPAIR_KEY = (
     f"shadow-training-provenance.v{TRAINING_FEATURE_SNAPSHOT_VERSION}"
 )
+SHADOW_EXECUTABLE_TRAINING_INDEX_NAME = "idx_shadow_backtests_executable_training"
+SHADOW_EXECUTABLE_TRAINING_INDEX_DDL = (
+    f"CREATE INDEX IF NOT EXISTS {SHADOW_EXECUTABLE_TRAINING_INDEX_NAME} "
+    "ON shadow_backtests (label_version, horizon_minutes, created_at DESC, id DESC) "
+    "INCLUDE (decision_id) "
+    "WHERE status = 'completed' "
+    "AND long_return_pct IS NOT NULL AND short_return_pct IS NOT NULL "
+    "AND ((training_feature_snapshot->>'historical_market_path_only')::boolean IS NULL "
+    "OR (training_feature_snapshot->>'historical_market_path_only')::boolean IS FALSE)"
+)
 
 
 def _session_gate_capacity() -> int:
@@ -779,6 +789,8 @@ async def _ensure_trade_fact_indexes(conn: Any) -> None:
         for name, ddl in index_ddls:
             if name not in index_names:
                 await conn.execute(text(ddl))
+        if SHADOW_EXECUTABLE_TRAINING_INDEX_NAME not in index_names:
+            await conn.execute(text(SHADOW_EXECUTABLE_TRAINING_INDEX_DDL))
         return
     for _name, ddl in index_ddls:
         # SQLite remains a local/test backend and may intentionally contain

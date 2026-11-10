@@ -253,7 +253,7 @@ async def load_shadow_training_rows(
             .subquery()
         )
         group_count_result = await session.execute(
-            select(func.count()).select_from(group_heads)
+            select(func.count(func.distinct(group_key))).where(*base_filters)
         )
         group_count = int(group_count_result.scalar_one() or 0)
         if group_count > LOCAL_ML_TRAINING_MAX_DECISION_GROUPS:

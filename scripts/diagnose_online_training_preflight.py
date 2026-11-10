@@ -120,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
         "--setenv=OPENBLAS_NUM_THREADS=1",
         "--setenv=MKL_NUM_THREADS=1",
         "--setenv=LOCAL_ML_TRAINING_MEMORY_LIMIT_BYTES=8589934592",
+        "--setenv=BB_TRAINING_READ_STATEMENT_TIMEOUT_MS=30000",
+        "--setenv=BB_TRAINING_IDLE_TRANSACTION_TIMEOUT_MS=15000",
         "--setenv=DATABASE_POOL_SIZE=2",
         "--setenv=DATABASE_MAX_OVERFLOW=0",
         "/data/bb/app/.venv/bin/python",
