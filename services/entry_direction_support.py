@@ -68,12 +68,16 @@ def _weight(value: Any) -> float:
     return parsed if parsed is not None and parsed > 0.0 else 1.0
 
 
-def _weighted_mean(rows: list[dict[str, Any]], key: str) -> float | None:
+def _weighted_mean(
+    rows: list[dict[str, Any]], key: str, *, require_complete: bool = False,
+) -> float | None:
     values = [
         (_float(item.get(key)), _weight(item.get("continuous_weight_multiplier")))
         for item in rows
     ]
     eligible = [(value, weight) for value, weight in values if value is not None]
+    if require_complete and len(eligible) != len(values):
+        return None
     total_weight = sum(weight for _, weight in eligible)
     if total_weight <= 0.0:
         return None
@@ -116,14 +120,13 @@ def _quant_family_summaries(
                     "resolved_loss_probability": (
                         item.get("loss_probability")
                         if _float(item.get("loss_probability")) is not None
-                        else _dict(item.get("return_distribution_contract")).get(
-                            "tail_loss_probability"
-                        )
+                        else None
                     ),
                 }
                 for item in rows
             ],
             "resolved_loss_probability",
+            require_complete=True,
         )
         if raw_expected is None or objective_expected is None:
             continue
@@ -189,6 +192,7 @@ def summarize_paper_quantitative_evidence(
                     for item in rows
                 ],
                 "loss_probability",
+                require_complete=True,
             ),
         }
         for horizon, rows in sorted(by_horizon.items())
@@ -265,7 +269,7 @@ def summarize_paper_quantitative_evidence(
         "objective_net_return_pct": objective_net_return_pct,
         "loss_probability": (
             sum(loss_probabilities) / len(loss_probabilities)
-            if loss_probabilities
+            if loss_probabilities and len(loss_probabilities) == len(family_summaries)
             else None
         ),
         "prediction_horizon_minutes": _dict(selected_horizon).get(
@@ -480,6 +484,7 @@ def assess_directional_entry_support(
     effective_loss_probability = _weighted_mean(
         effective_families,
         "loss_probability",
+        require_complete=True,
     )
     quantitative_sources = sorted(
         {
@@ -601,7 +606,12 @@ def assess_directional_entry_support(
             "direction_support_quality_observation_loss_probability_too_high"
         )
     if not quant_families:
-        blockers.append("direction_support_quant_evidence_missing")
+        if not family_summaries:
+            blockers.append("direction_support_quant_evidence_missing")
+        elif expected_net_return_pct is None or expected_net_return_pct <= 0.0:
+            blockers.append("direction_support_expected_net_not_positive")
+        else:
+            blockers.append("direction_support_quant_family_conflict")
     if paper_scope and conflicting_families:
         blockers.append("direction_support_quant_family_conflict")
     if prediction_horizon_minutes is None or prediction_horizon_minutes <= 0.0:
@@ -722,7 +732,12 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
         elif support.get("paper_training_only") is not True:
             reasons.append("paper_training_scope_marker_missing")
     if not support.get("quant_evidence_families"):
-        reasons.append("direction_support_quant_evidence_missing")
+        if not support.get("quant_family_summaries"):
+            reasons.append("direction_support_quant_evidence_missing")
+        elif (_float(support.get("expected_net_return_pct")) or 0.0) <= 0.0:
+            reasons.append("direction_support_expected_net_not_positive")
+        else:
+            reasons.append("direction_support_quant_family_conflict")
     horizon = _float(support.get("prediction_horizon_minutes"))
     if horizon is None or horizon <= 0.0:
         reasons.append("direction_support_prediction_horizon_missing")

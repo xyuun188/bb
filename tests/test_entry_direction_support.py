@@ -17,6 +17,7 @@ def _row(source: str, *, raw: float = 0.4, objective: float = 0.2) -> dict:
         "raw_expected_return_pct": raw,
         "objective_expected_return_pct": objective,
         "horizon_minutes": 30,
+        "loss_probability": 0.3,
         "return_distribution_contract": {"tail_loss_probability": 0.3},
     }
 
@@ -611,12 +612,14 @@ def test_negative_lcb_quality_observation_does_not_leak_into_production_support(
 
     assert support["eligible"] is False
     assert support["quant_evidence_families"] == []
-    assert "direction_support_quant_evidence_missing" in support["blocking_reasons"]
+    assert "direction_support_quant_family_conflict" in support["blocking_reasons"]
+    assert "direction_support_quant_evidence_missing" not in support["blocking_reasons"]
     assert support["production_permission"] is False
 
 
 def test_quality_observation_still_rejects_high_loss_probability() -> None:
     long_row = _row("local_ml", raw=0.45, objective=-0.20)
+    long_row["loss_probability"] = 0.61
     long_row["return_distribution_contract"] = {"tail_loss_probability": 0.61}
     long_row["paper_return_quality_governance"] = {
         "paper_execution_permission": False,

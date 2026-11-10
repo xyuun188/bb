@@ -121,9 +121,9 @@ LOCAL_ML_TRAINING_SCHEDULER_ID = "local_ml_auto_train"
 AUTO_TRAIN_RETRY_INTERVAL_SECONDS = 5 * 60
 AUTO_TRAIN_LEASE_STALE_SECONDS = 2 * 60 * 60
 MIN_ACTIVE_WALK_FORWARD_FOLDS = 2
-FEATURE_CONTRACT_VERSION = "2026-07-27.global-point-in-time-features.v1"
-MULTITASK_PREDICTION_CONTRACT_VERSION = "2026-07-27.paper-multitask-prediction.v1"
-REPLAY_WEIGHT_POLICY_VERSION = "2026-07-27.recency-tail-hard-example.v1"
+FEATURE_CONTRACT_VERSION = "2026-11-10.pre-decision-market-features.v2"
+MULTITASK_PREDICTION_CONTRACT_VERSION = "2026-11-10.explicit-model-dispersion.v2"
+REPLAY_WEIGHT_POLICY_VERSION = "2026-11-10.separate-probability-replay-weights.v2"
 _TRAINING_CANDIDATE_CACHE: dict[
     int,
     tuple[dict[str, Any], dict[str, Any], str],
@@ -201,7 +201,6 @@ FEATURE_KEYS = [
     "direct_news_item_count",
     "market_news_item_count",
     "sequence_length",
-    "decision_confidence",
     "horizon_minutes",
     "regime_trending",
     "regime_volatile",
@@ -420,7 +419,6 @@ def _make_classifier(y: pd.Series) -> Pipeline:
         estimator = DummyClassifier(strategy="prior")
     elif len(y) < 250:
         estimator = LogisticRegression(
-            class_weight="balanced",
             max_iter=1000,
             random_state=42,
         )
@@ -429,7 +427,6 @@ def _make_classifier(y: pd.Series) -> Pipeline:
             n_estimators=220,
             max_depth=8,
             min_samples_leaf=RANDOM_FOREST_MIN_SAMPLES_LEAF,
-            class_weight="balanced_subsample",
             random_state=42,
             n_jobs=_adaptive_training_worker_count(),
         )
@@ -708,6 +705,7 @@ def _multitask_side_prediction(
         "return_q10": ordered_quantiles[0],
         "return_q50": ordered_quantiles[1],
         "return_q90": ordered_quantiles[2],
+        "dispersion_pct": return_contract.get("dispersion_pct"),
         "loss_probability": 1.0 - _clamp(win_probability),
         "tail_loss_probability": (
             _clamp(tail_loss_probability) if tail_loss_probability is not None else None
@@ -730,9 +728,11 @@ def _fee_after_prediction_objective(
 ) -> dict[str, float]:
     expected = _safe_float(prediction.get("expected_net_return_pct"), float("nan"))
     lower = _safe_float(prediction.get("return_q10"), float("nan"))
-    upper = _safe_float(prediction.get("return_q90"), float("nan"))
+    dispersion = _safe_float(prediction.get("dispersion_pct"), float("nan"))
     tail_probability = _safe_float(prediction.get("tail_loss_probability"), 0.0)
-    if not all(math.isfinite(value) for value in (expected, lower, tail_probability)):
+    if not all(
+        math.isfinite(value) for value in (expected, lower, dispersion, tail_probability)
+    ) or dispersion < 0.0:
         return {
             "expected_net_return_pct": float("nan"),
             "lower_quantile_net_return_pct": float("nan"),
@@ -740,14 +740,6 @@ def _fee_after_prediction_objective(
             "tail_loss_penalty_pct": float("nan"),
             "objective_net_return_pct": float("nan"),
         }
-    # Dispersion is the only uncertainty penalty, matching the standardized
-    # contract.  For a Gaussian, q90 - q10 = 2.563 sigma; when the upper
-    # quantile is absent, infer sigma from the mean-to-q10 distance instead of
-    # failing the objective (a NaN here would block every such entry).
-    if math.isfinite(upper) and upper >= lower:
-        dispersion = max((upper - lower) / 2.563103131, 0.0)
-    else:
-        dispersion = max((expected - lower) / 1.281551566, 0.0)
     return risk_adjusted_expected_return(
         expected_return_pct=expected,
         lower_quantile_return_pct=min(lower, expected),
@@ -1106,19 +1098,19 @@ def _apply_training_replay_weights(train: pd.DataFrame) -> tuple[pd.DataFrame, d
     recency = np.maximum(np.power(0.5, ages_days / half_life_days), minimum_recency)
     base = (
         pd.to_numeric(
-            weighted.get("sample_weight", pd.Series([1.0] * len(weighted))),
+            weighted.get("sample_weight", pd.Series(1.0, index=weighted.index)),
             errors="coerce",
         )
         .fillna(0.0)
         .clip(lower=0.0)
     )
-    tail = weighted.get("long_tail_loss", pd.Series([0] * len(weighted))).astype(
+    tail = weighted.get("long_tail_loss", pd.Series(0, index=weighted.index)).astype(
         bool
-    ) | weighted.get("short_tail_loss", pd.Series([0] * len(weighted))).astype(bool)
-    decision_action = weighted.get("decision_action", pd.Series([""] * len(weighted))).astype(str)
-    best_action = weighted.get("best_action", pd.Series([""] * len(weighted))).astype(str)
+    ) | weighted.get("short_tail_loss", pd.Series(0, index=weighted.index)).astype(bool)
+    decision_action = weighted.get("decision_action", pd.Series("", index=weighted.index)).astype(str)
+    best_action = weighted.get("best_action", pd.Series("", index=weighted.index)).astype(str)
     confidence = pd.to_numeric(
-        weighted.get("decision_confidence", pd.Series([0.0] * len(weighted))),
+        weighted.get("decision_confidence", pd.Series(0.0, index=weighted.index)),
         errors="coerce",
     ).fillna(0.0)
     hard_error = (confidence >= 0.7) & (decision_action != best_action)
@@ -1145,6 +1137,8 @@ def _apply_training_replay_weights(train: pd.DataFrame) -> tuple[pd.DataFrame, d
     )
     final_weights = (base * recency * multiplier).clip(lower=0.01, upper=2.0)
     weighted["sample_weight"] = final_weights
+    # Outcome-dependent replay emphasis must not change probability priors.
+    weighted["probability_sample_weight"] = (base * recency).clip(lower=0.01, upper=2.0)
     weighted["replay_recency_weight"] = recency
     weighted["replay_tail_emphasis"] = tail.astype(int)
     weighted["replay_hard_error_emphasis"] = hard_error.astype(int)
@@ -1155,6 +1149,7 @@ def _apply_training_replay_weights(train: pd.DataFrame) -> tuple[pd.DataFrame, d
     return weighted, {
         "version": REPLAY_WEIGHT_POLICY_VERSION,
         "validation_and_test_resampling": False,
+        "probability_weighting": "quality_and_recency_without_outcome_emphasis",
         "recency_half_life_days": half_life_days,
         "minimum_recency_weight": minimum_recency,
         "tail_multiplier": 1.25,
@@ -1305,6 +1300,22 @@ def _walk_forward_side_scores(
     *,
     side: str,
 ) -> tuple[np.ndarray, dict[str, Any]]:
+    train = train.copy()
+    # Rebuild both replay tail flags from this fold, never from the outer
+    # holdout's boundary, before applying the deployed training recipe.
+    for replay_side in ("long", "short"):
+        fold_net = train[f"{replay_side}_return_pct"].astype(float) - train[
+            f"{replay_side}_execution_cost_pct"
+        ].astype(float)
+        fold_policy = empirical_policy_value(
+            f"{replay_side}_tail_loss_boundary_pct",
+            fold_net[fold_net < 0].tolist(),
+            selector="lower_hinge",
+            observation_window="walk_forward_training_groups_only",
+        )
+        fold_boundary = float(fold_policy.value) if fold_policy.value is not None else 0.0
+        train[f"{replay_side}_tail_loss"] = (fold_net < fold_boundary).astype(int)
+    train, replay_manifest = _apply_training_replay_weights(train)
     x_train = train[FEATURE_KEYS]
     x_validation = validation[FEATURE_KEYS]
     weights = train.get("sample_weight", pd.Series([1.0] * len(train))).astype(float)
@@ -1325,7 +1336,11 @@ def _walk_forward_side_scores(
     tail_model = _make_classifier(tail_labels)
     market_model.fit(x_train, train[return_column], model__sample_weight=weights)
     cost_model.fit(x_train, train[cost_column], model__sample_weight=weights)
-    tail_model.fit(x_train, tail_labels, model__sample_weight=weights)
+    tail_model.fit(
+        x_train,
+        tail_labels,
+        model__sample_weight=train["probability_sample_weight"],
+    )
     scores = risk_adjusted_expected_scores(
         regression_prediction_distribution(market_model, x_validation),
         regression_prediction_distribution(cost_model, x_validation),
@@ -1336,6 +1351,7 @@ def _walk_forward_side_scores(
         **tail_policy.to_dict(),
         "scale_pct": tail_scale,
         "training_decision_group_count": int(train["decision_group"].nunique()),
+        "training_replay_weights": replay_manifest,
     }
 
 
@@ -2096,6 +2112,7 @@ def build_training_frame(rows: list[Any]) -> pd.DataFrame:
                     "news_shock" if feature_row["news_shock_present"] == 1.0 else "no_news_shock"
                 ),
                 "decision_action": str(getattr(row, "decision_action", "") or ""),
+                "decision_confidence": _safe_float(getattr(row, "decision_confidence", 0.0)),
                 "best_action": str(getattr(row, "best_action", "") or ""),
                 "missed_opportunity": bool(getattr(row, "missed_opportunity", False)),
                 "raw_long_return_pct": _safe_float(raw_long_return),
@@ -2442,6 +2459,7 @@ def train_from_frame(
     x_train = train[FEATURE_KEYS]
     x_test = test[FEATURE_KEYS]
     train_weights = train.get("sample_weight", pd.Series([1.0] * len(train))).astype(float)
+    probability_weights = train["probability_sample_weight"].astype(float)
 
     long_classifier = _make_classifier(train["long_win"])
     short_classifier = _make_classifier(train["short_win"])
@@ -2456,10 +2474,14 @@ def train_from_frame(
     short_mfe_regressor = _make_regressor(train["short_mfe_pct"])
     short_mae_regressor = _make_regressor(train["short_mae_pct"])
 
-    long_classifier.fit(x_train, train["long_win"], model__sample_weight=train_weights)
-    short_classifier.fit(x_train, train["short_win"], model__sample_weight=train_weights)
-    long_tail_classifier.fit(x_train, train["long_tail_loss"], model__sample_weight=train_weights)
-    short_tail_classifier.fit(x_train, train["short_tail_loss"], model__sample_weight=train_weights)
+    long_classifier.fit(x_train, train["long_win"], model__sample_weight=probability_weights)
+    short_classifier.fit(x_train, train["short_win"], model__sample_weight=probability_weights)
+    long_tail_classifier.fit(
+        x_train, train["long_tail_loss"], model__sample_weight=probability_weights,
+    )
+    short_tail_classifier.fit(
+        x_train, train["short_tail_loss"], model__sample_weight=probability_weights,
+    )
     long_regressor.fit(x_train, train["long_return_pct"], model__sample_weight=train_weights)
     short_regressor.fit(x_train, train["short_return_pct"], model__sample_weight=train_weights)
     long_cost_regressor.fit(

@@ -1213,7 +1213,14 @@ class EntryProfitRiskSizingPolicy:
         expected_loss_pct = max(_safe_float(distribution.get("tail_loss_penalty_pct"), 0.0), 0.0)
         if expected_loss_pct <= 0:
             expected_loss_pct = max(_safe_float(opportunity.get("expected_loss_pct"), 0.0), 0.0)
-        loss_probability = _clamp(_safe_float(distribution.get("tail_loss_probability"), 1.0))
+        loss_probability = _clamp(
+            _safe_float(
+                opportunity.get(
+                    "loss_probability", opportunity.get("server_profit_loss_probability")
+                ),
+                1.0,
+            )
+        )
         tail_risk = _clamp(_safe_float(opportunity.get("tail_risk_score"), loss_probability))
         profit_quality = max(_safe_float(opportunity.get("profit_quality_ratio"), 0.0), 0.0)
         source_count = _production_source_count(opportunity)
@@ -2321,8 +2328,11 @@ class EntryProfitRiskSizingPolicy:
         loss_probability = _clamp(
             _safe_float(
                 opportunity.get(
-                    "server_profit_loss_probability",
-                    normal_trade.get("loss_probability"),
+                    "loss_probability",
+                    opportunity.get(
+                        "server_profit_loss_probability",
+                        normal_trade.get("loss_probability"),
+                    ),
                 ),
                 1.0,
             )

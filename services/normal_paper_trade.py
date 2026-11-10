@@ -472,7 +472,12 @@ def select_normal_paper_trade_side(
         if objective_net is None:
             reasons.append("direction_support_objective_net_missing")
         if not support.get("quant_evidence_families"):
-            reasons.append("direction_support_quant_evidence_missing")
+            if not support.get("quant_family_summaries"):
+                reasons.append("direction_support_quant_evidence_missing")
+            elif expected_net is None or expected_net <= 0.0:
+                reasons.append("direction_support_expected_net_not_positive")
+            else:
+                reasons.append("direction_support_quant_family_conflict")
         if support.get("execution_cost_complete") is False:
             reasons.append("direction_support_execution_cost_incomplete")
         horizon = _float(support.get("prediction_horizon_minutes"), None)
@@ -898,12 +903,15 @@ def reconcile_normal_paper_trade_contract(
         contract.get("current_raw_expected_return_pct"),
         gross_expected,
     )
-    current_loss_probability = _float(
-        scored.get("server_profit_loss_probability"),
-        _float(contract.get("loss_probability"), None),
+    current_loss_probability = (
+        _float(scored.get("loss_probability"), None)
+        if "loss_probability" in scored
+        else _float(
+            scored.get("server_profit_loss_probability"),
+            _float(contract.get("loss_probability"), None),
+        )
     )
-    if current_loss_probability is not None:
-        contract["loss_probability"] = current_loss_probability
+    contract["loss_probability"] = current_loss_probability
     training_entry = selection_reason == "paper_training_entry"
     training_entry_eligible = bool(
         training_entry
@@ -913,7 +921,7 @@ def reconcile_normal_paper_trade_contract(
         and current_raw > 0.0
         and normal_paper_entry_return_ready(expected_net, return_lcb)
         and current_loss_probability is not None
-        and current_loss_probability <= (
+        and 0.0 <= current_loss_probability <= (
             NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
         )
     )
@@ -922,6 +930,10 @@ def reconcile_normal_paper_trade_contract(
         and _quality_permissions_ready(quality_permissions)
         and contract["current_edge_validated"]
         and normal_paper_entry_return_ready(expected_net, return_lcb)
+        and current_loss_probability is not None
+        and 0.0 <= current_loss_probability <= (
+            NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
+        )
     )
     entry_eligible = training_entry_eligible or validated_entry_eligible
     reconciliation_reason = (
@@ -933,6 +945,12 @@ def reconcile_normal_paper_trade_contract(
         if return_lcb is None
         else "current_execution_return_lcb_not_positive"
         if return_lcb <= 0.0
+        else "current_execution_loss_probability_missing"
+        if current_loss_probability is None
+        else "current_execution_loss_probability_invalid"
+        if not 0.0 <= current_loss_probability <= (
+            NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
+        )
         else None
     )
     contract["reconciliation"] = {

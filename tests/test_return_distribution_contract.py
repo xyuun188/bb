@@ -191,7 +191,7 @@ def test_cost_refresh_rebuilds_from_gross_and_updates_every_net_alias() -> None:
     assert repriced["median_return_pct"] == pytest.approx(-0.375)
     assert repriced["lower_quantile_return_pct"] == pytest.approx(-0.865)
     assert repriced["upper_quantile_return_pct"] == pytest.approx(0.535)
-    assert opportunity["return_lcb_pct"] == pytest.approx(-0.915)
+    assert opportunity["return_lcb_pct"] == pytest.approx(-0.618)
     repeated = reprice_execution_opportunity(
         opportunity, execution_cost=opportunity["execution_cost"]
     )

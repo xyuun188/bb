@@ -61,6 +61,8 @@ def _governed_payload(long_return: float, short_return: float) -> dict:
         },
         "long_market_expected_return_pct": long_return,
         "short_market_expected_return_pct": short_return,
+        "long_loss_probability": 0.2,
+        "short_loss_probability": 0.3,
     }
 
 

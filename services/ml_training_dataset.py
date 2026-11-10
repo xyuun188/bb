@@ -30,7 +30,7 @@ LOCAL_ML_TRAINING_MAX_DECISION_GROUPS = min(
     LOCAL_ML_TRAINING_HARD_MAX_DECISION_GROUPS,
 )
 LOCAL_ML_TRAINING_READ_PAGE_SIZE = 500
-SHADOW_SELECTION_POLICY_VERSION = "2026-11-05.artifact-bound-executable-shadow-view.v2"
+SHADOW_SELECTION_POLICY_VERSION = "2026-11-10.task-eligible-shadow-budget.v3"
 
 
 @dataclass(frozen=True)
@@ -169,19 +169,33 @@ def shadow_training_candidate_filters(
     epoch_start: datetime,
     *,
     horizons: tuple[int, ...] | None = None,
+    executable_features_only: bool = False,
 ) -> tuple[Any, ...]:
     candidate_horizons = (
         SHADOW_LABEL_HORIZONS_MINUTES
         if horizons is None
         else tuple(int(value) for value in horizons)
     )
-    return (
+    filters = (
         ShadowBacktest.status == "completed",
         ShadowBacktest.created_at >= epoch_start,
         ShadowBacktest.label_version == SHADOW_LABEL_VERSION,
         ShadowBacktest.horizon_minutes.in_(candidate_horizons),
         ShadowBacktest.long_return_pct.is_not(None),
         ShadowBacktest.short_return_pct.is_not(None),
+    )
+    if not executable_features_only:
+        return filters
+    return (
+        *filters,
+        or_(
+            ShadowBacktest.training_feature_snapshot[
+                "historical_market_path_only"
+            ].as_boolean().is_(None),
+            ShadowBacktest.training_feature_snapshot[
+                "historical_market_path_only"
+            ].as_boolean().is_(False),
+        ),
     )
 
 
@@ -197,7 +211,9 @@ async def load_shadow_training_rows(
     """
 
     epoch_start = load_training_data_start()
-    base_filters = shadow_training_candidate_filters(epoch_start, horizons=horizons)
+    base_filters = shadow_training_candidate_filters(
+        epoch_start, horizons=horizons, executable_features_only=True,
+    )
     horizon_count = (
         len(SHADOW_LABEL_HORIZONS_MINUTES)
         if horizons is None

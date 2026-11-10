@@ -22,6 +22,7 @@ from services.entry_signal_extraction import (
     safe_float,
     safe_list,
     signal_available,
+    signal_loss_probability,
     signal_paper_eligibility,
     signal_production_eligibility,
     signal_return_distribution,
@@ -267,7 +268,7 @@ class EntryOpportunityScoringPolicy:
             "lower_bound_return_pct": contract.get(
                 "lower_quantile_return_pct"
             ),
-            "loss_probability": contract.get("tail_loss_probability"),
+            "loss_probability": signal_loss_probability(signal, side),
             "horizon_minutes": contract.get("horizon_minutes"),
             "counterfactual_execution_cost_distribution": cost_distribution,
             "actual_trade_calibration": actual_calibration,
@@ -380,7 +381,7 @@ class EntryOpportunityScoringPolicy:
             "lower_bound_return_pct": contract.get(
                 "lower_quantile_return_pct"
             ),
-            "loss_probability": contract.get("tail_loss_probability"),
+            "loss_probability": signal_loss_probability(payload, side),
             "horizon_minutes": contract.get("horizon_minutes"),
             "counterfactual_execution_cost_distribution": safe_dict(
                 safe_dict(
@@ -875,10 +876,23 @@ class EntryOpportunityScoringPolicy:
             else None
         )
         score = return_lcb if return_lcb is not None else float("-inf")
-        loss_probability = _finite(
-            combination.get("tail_loss_probability")
+        probability_rows = [
+            (
+                _finite(component.get("loss_probability")),
+                quant_multipliers.get(str(component.get("key") or ""), 1.0),
+            )
+            for component in selected_components
+        ]
+        loss_probability = (
+            sum(float(value) * weight for value, weight in probability_rows)
+            / selected_weight_total
+            if combination_ready
+            and probability_rows
+            and selected_weight_total > 0.0
+            and all(value is not None for value, _weight in probability_rows)
+            else None
         )
-        tail_risk = loss_probability
+        tail_risk = _finite(combination.get("tail_loss_probability"))
         profit_quality = (
             return_lcb / max((expected_loss or 0.0) + (uncertainty or 0.0), 1e-12)
             if expected_net is not None
@@ -944,6 +958,9 @@ class EntryOpportunityScoringPolicy:
                 round(profit_quality, 8) if profit_quality is not None else None
             ),
             "server_profit_loss_probability": (
+                round(loss_probability, 8) if loss_probability is not None else None
+            ),
+            "loss_probability": (
                 round(loss_probability, 8) if loss_probability is not None else None
             ),
             "tail_risk_score": (

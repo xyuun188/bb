@@ -3599,6 +3599,33 @@ async def test_load_shadow_training_rows_sql_stratifies_capped_decision_groups(
 
 
 @pytest.mark.asyncio
+async def test_training_budget_excludes_history_only_rows_before_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    base_time = datetime(2026, 6, 28, 3, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        ml_training_dataset, "load_training_data_start",
+        lambda: base_time - timedelta(days=1),
+    )
+    monkeypatch.setattr(ml_training_dataset, "LOCAL_ML_TRAINING_MAX_DECISION_GROUPS", 2)
+    rows = [
+        _db_shadow_row(80_000 + index, base_time - timedelta(minutes=index))
+        for index in range(5)
+    ]
+    for index in (0, 2, 4):
+        rows[index].feature_snapshot["historical_market_path_only"] = True
+    async with get_session_ctx() as session:
+        session.add_all(rows)
+    try:
+        selected = await load_shadow_training_rows()
+    finally:
+        await close_db()
+    assert {row.id for row in selected} == {80_001, 80_003}
+
+
+@pytest.mark.asyncio
 async def test_load_shadow_training_rows_projects_only_training_and_quality_features(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

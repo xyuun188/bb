@@ -155,6 +155,7 @@ def _test_artifact_metadata(
         "cost_model_version": module.COST_MODEL_VERSION,
         "training_cost_policy": ("shadow_market_opportunity_plus_authoritative_okx_execution_cost"),
         "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
+        "feature_probability_contract_version": module.FEATURE_PROBABILITY_CONTRACT_VERSION,
         "time_split_policy": "independent_chronological_disjoint_decision_groups",
         "training_transport_report": {
             "version": LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
@@ -305,6 +306,38 @@ def test_local_ai_tools_training_bounds_large_forest_sizes() -> None:
 
     assert regressor.named_steps["model"].n_estimators <= 64
     assert classifier.named_steps["model"].n_estimators <= 64
+
+
+def test_quant_probability_classifier_preserves_natural_event_frequency() -> None:
+    module = ModuleType("local_ai_tools_probability_prior_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    labels = [0] * 90 + [1] * 10
+    model = module._make_classifier(labels)
+    model.fit([[0.0]] * 100, labels)
+    assert module.predict_proba_positive(model, [[0.0]]) == pytest.approx(0.1)
+    model.named_steps["model"].class_weight = "balanced"
+    assert module.math.isnan(module.predict_proba_positive(model, [[0.0]]))
+    assert module.math.isnan(module.predict_proba_positive(object(), [[0.0]]))
+
+
+def test_quant_features_exclude_final_decision_confidence() -> None:
+    module = ModuleType("local_ai_tools_pre_decision_features_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    assert "decision_confidence" not in module.FEATURE_KEYS
+    snapshot = {"current_price": 100.0, "rsi_14": 45.0}
+    assert module.model_x(snapshot) == module.model_x(
+        {**snapshot, "decision_confidence": 0.95}
+    )
+
+
+def test_quant_rejects_artifacts_from_the_old_probability_contract(tmp_path: Path) -> None:
+    module = ModuleType("local_ai_tools_old_probability_contract_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _persist_test_shadow_artifact(module, tmp_path)
+    module.FEATURE_PROBABILITY_CONTRACT_VERSION = "changed"
+    with pytest.raises(module.IncompatibleArtifactContractError, match="requires retraining"):
+        module._resolve_artifact_pointer(module.CURRENT_POINTER_PATH, role="current")
+    assert module.load_bundle() is None
 
 
 def test_local_ai_tools_memory_failure_is_structured_and_preserves_artifact(
@@ -2658,10 +2691,10 @@ def test_local_ai_tools_transformer_classifier_uses_bert_config_when_model_type_
 
 
 def test_local_ai_tools_generated_profit_contract_has_phase3_targets() -> None:
-    assert '"loss_probability": round(loss_prob, 4)' in SERVICE_CODE
+    assert '"tail_probability_event": "gross_market_return_below_training_lower_hinge"' in SERVICE_CODE
     assert '"profit_quality_score": round(quality, 4)' in SERVICE_CODE
-    assert '"long_loss_probability"' in SERVICE_CODE
-    assert '"short_loss_probability"' in SERVICE_CODE
+    assert '"long_tail_loss_probability"' in SERVICE_CODE
+    assert '"short_tail_loss_probability"' in SERVICE_CODE
     assert "long_loss_prob * 0.22" not in SERVICE_CODE
     assert "short_loss_prob * 0.22" not in SERVICE_CODE
     assert "long_profile_penalty" not in SERVICE_CODE
@@ -2757,7 +2790,10 @@ def test_trained_profit_prediction_does_not_apply_fixed_loss_or_profile_penaltie
     )
 
     assert payload["profit_quality_score"] == 0.1
-    assert payload["long_loss_probability"] == 0.95
+    assert payload["long_tail_loss_probability"] == 0.95
+    assert "long_loss_probability" not in payload
+    assert "short_loss_probability" not in payload
+    assert "loss_probability" not in payload
     assert payload["return_distribution_input_version"] == (
         module.RETURN_DISTRIBUTION_INPUT_VERSION
     )

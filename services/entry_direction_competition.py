@@ -8,6 +8,7 @@ from typing import Any
 from services.entry_signal_extraction import (
     first_tool_payload,
     signal_available,
+    signal_loss_probability,
     signal_paper_eligibility,
     signal_production_eligibility,
     signal_return_distribution,
@@ -712,7 +713,7 @@ class EntryDirectionCompetitionPolicy:
                     "expected_net_return_pct": side_multitask.get(
                         "expected_net_return_pct"
                     ),
-                    "loss_probability": side_multitask.get("loss_probability"),
+                    "loss_probability": signal_loss_probability(signal, side),
                     "tail_loss_probability": side_multitask.get(
                         "tail_loss_probability"
                     ),
@@ -783,6 +784,7 @@ class EntryDirectionCompetitionPolicy:
                     "objective_expected_return_pct": contract.get(
                         "objective_expected_return_pct"
                     ),
+                    "loss_probability": signal_loss_probability(payload, side),
                     "horizon_minutes": contract.get("horizon_minutes"),
                     "objective_version": contract.get("objective_version"),
                     "label_version": contract.get("label_version"),

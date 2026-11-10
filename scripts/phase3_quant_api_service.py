@@ -100,8 +100,9 @@ FEATURE_KEYS = [
     "price_vs_sma20", "price_vs_sma50", "funding_rate", "log_volume_24h",
     "log_open_interest_value", "orderbook_imbalance", "orderbook_depth_ratio",
     "news_sentiment_avg", "social_sentiment_avg", "social_mention_count",
-    "news_article_count", "decision_confidence", "horizon_minutes",
+    "news_article_count", "horizon_minutes",
 ]
+FEATURE_PROBABILITY_CONTRACT_VERSION = "2026-11-10.pre-decision-natural-prior.v2"
 SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_count", "news_article_count"]
 PROFIT_TRAINING_TARGET = "net_return_after_all_cost_pct"
 RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
@@ -229,6 +230,7 @@ _TRAIN_EXECUTOR: ProcessPoolExecutor | None = None
 _TRAIN_EXECUTOR_MANUAL_RECYCLE = False
 _STATUS_METADATA_KEYS = (
     "artifact_policy_id",
+    "feature_probability_contract_version",
     "phase",
     "trained_at",
     "source",
@@ -1467,7 +1469,6 @@ def feature_row(features: dict[str, Any], *, horizon_minutes: int | None = None)
         "social_sentiment_avg": f(features, "social_sentiment_avg"),
         "social_mention_count": f(features, "social_mention_count"),
         "news_article_count": f(features, "news_article_count"),
-        "decision_confidence": f(features, "decision_confidence"),
         "horizon_minutes": float(horizon_minutes if horizon_minutes is not None else f(features, "horizon_minutes", 10.0)),
     }
     return {key: float(values.get(key, 0.0)) for key in FEATURE_KEYS}
@@ -1570,7 +1571,6 @@ def _make_classifier(y: list[int]) -> Pipeline:
             ),
             max_depth=12,
             min_samples_leaf=_dynamic_min_samples_leaf(len(y)),
-            class_weight="balanced",
             random_state=42,
             n_jobs=_adaptive_training_worker_count(),
         )
@@ -1749,6 +1749,10 @@ def _resolve_artifact_pointer(
             raise IncompatibleArtifactContractError(
                 f"Local AI artifact {field} belongs to an incompatible contract."
             )
+    if metadata.get("feature_probability_contract_version") != FEATURE_PROBABILITY_CONTRACT_VERSION:
+        raise IncompatibleArtifactContractError(
+            "Local AI artifact feature/probability contract requires retraining."
+        )
     expected_report_hashes = _evaluation_report_hashes(metadata)
     if metadata.get("evaluation_report_hashes") != expected_report_hashes:
         raise ValueError("Local AI artifact evaluation report hash mismatch.")
@@ -2556,6 +2560,7 @@ def _load_bundle_unlocked() -> dict[str, Any] | None:
             or metadata.get("objective_version") != RETURN_OBJECTIVE_VERSION
             or metadata.get("label_version") != RETURN_LABEL_VERSION
             or metadata.get("profit_supervision_version") != PROFIT_SUPERVISION_VERSION
+            or metadata.get("feature_probability_contract_version") != FEATURE_PROBABILITY_CONTRACT_VERSION
             or not all(
                 key in candidate
                 for key in (
@@ -2935,14 +2940,18 @@ def _model_artifact_status() -> dict[str, Any]:
 
 def predict_proba_positive(model: Pipeline, x: list[list[float]]) -> float:
     try:
-        estimator = model.named_steps["model"]
+        named_steps = getattr(model, "named_steps", {})
+        estimator = named_steps.get("model", model)
+        if getattr(estimator, "class_weight", None) is not None:
+            return float("nan")
         proba = model.predict_proba(x)
         classes = list(getattr(estimator, "classes_", []))
         if 1 in classes:
-            return float(proba[0][classes.index(1)])
-        return 0.0
+            value = float(proba[0][classes.index(1)])
+            return value if math.isfinite(value) and 0.0 <= value <= 1.0 else float("nan")
+        return 0.0 if classes == [0] else float("nan")
     except Exception:
-        return 0.0
+        return float("nan")
 
 
 def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) -> dict[str, Any]:
@@ -4414,6 +4423,9 @@ def _shadow_payload(tool: str, payload: dict[str, Any]) -> dict[str, Any]:
         "side",
         "action",
         "loss_probability",
+        "tail_loss_probability",
+        "long_tail_loss_probability",
+        "short_tail_loss_probability",
         "profit_quality_score",
         "expected_move_pct",
         "confidence",
@@ -5948,6 +5960,7 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
         source_code_sha256 = source_digest.hexdigest()
     metadata = {
         "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
+        "feature_probability_contract_version": FEATURE_PROBABILITY_CONTRACT_VERSION,
         "phase": "phase3_model_factory",
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "source": req.source,
@@ -6700,7 +6713,6 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
             best_side = "long" if long_expected >= short_expected else "short"
             best_expected = long_expected if best_side == "long" else short_expected
             edge = abs(long_expected - short_expected)
-            loss_prob = long_loss_prob if best_side == "long" else short_loss_prob
             best_lower_bound = (
                 long_lower_bound if best_side == "long" else short_lower_bound
             )
@@ -6771,9 +6783,12 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                     "short": short_profile,
                     "source_authority": "okx_position_history",
                 },
-                "long_loss_probability": round(long_loss_prob, 4),
-                "short_loss_probability": round(short_loss_prob, 4),
-                "loss_probability": round(loss_prob, 4),
+                "long_tail_loss_probability": long_return_input["tail_loss_probability"],
+                "short_tail_loss_probability": short_return_input["tail_loss_probability"],
+                "tail_loss_probability": (
+                    long_return_input if best_side == "long" else short_return_input
+                )["tail_loss_probability"],
+                "tail_probability_event": "gross_market_return_below_training_lower_hinge",
                 "prediction_quality": {
                     "contract_complete": contract_ready,
                     "paper_eligible": contract_ready,

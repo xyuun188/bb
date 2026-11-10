@@ -32,7 +32,7 @@ RETURN_DISTRIBUTION_INPUT_VERSION = "2026-07-15.model-return-distribution-input.
 # is versioned separately.  Bumping ``RETURN_OBJECTIVE_VERSION`` would
 # invalidate every already-sealed model artifact.
 RISK_PENALTY_VERSION = "2026-11-09.dispersion-only-uncertainty.v1"
-PAPER_RETURN_COMBINATION_VERSION = "2026-07-27.paper-current-cost-return-combination.v1"
+PAPER_RETURN_COMBINATION_VERSION = "2026-11-10.consistent-model-dispersion.v2"
 HOLDOUT_RETURN_METRIC_CONTRACT_VERSION = "2026-08-16.fee-after-holdout-metrics.v1"
 HOLDOUT_REALIZED_RETURN_BASIS = (
     "gross_market_return_pct_minus_counterfactual_execution_cost_pct"
@@ -398,11 +398,7 @@ def _combine_execution_return_distribution(
         if validation.get("eligible") is True
     ]
     model_dispersion_values = [
-        max(
-            float(contract["dispersion_pct"]),
-            float(contract["raw_expected_return_pct"])
-            - float(contract["lower_quantile_return_pct"]),
-        )
+        float(contract["dispersion_pct"])
         for contract, validation in zip(contracts, validations, strict=False)
         if validation.get("eligible") is True
     ]
@@ -568,8 +564,12 @@ def _combine_execution_return_distribution(
         else None
     )
     net_lower = (
-        net_expected - total_dispersion
-        if net_expected is not None and total_dispersion is not None
+        min(
+            net_expected - total_dispersion,
+            min(gross_lower_values) + funding_cashflow - live_cost - slippage_tail_excess,
+            net_median if net_median is not None else net_expected,
+        )
+        if net_expected is not None and total_dispersion is not None and gross_lower_values
         else None
     )
     net_upper = (

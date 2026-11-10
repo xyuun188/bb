@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from math import isfinite
 from typing import Any
 
 from services.production_trade_gate import validate_production_trade_gate
@@ -212,6 +213,32 @@ def signal_return_distribution(
         if contract:
             return contract
     return {}
+
+
+def signal_loss_probability(payload: dict[str, Any] | None, side: str) -> float | None:
+    """Extract ordinary loss probability without substituting a tail event."""
+
+    if not isinstance(payload, dict) or side not in {"long", "short"}:
+        return None
+    for node in _signal_governance_nodes(payload):
+        predictions = safe_list(node.get("predictions"))
+        primary = safe_dict(predictions[0]) if predictions else node
+        task = safe_dict(safe_dict(primary.get("multitask_prediction")).get(side))
+        # Older tool bundles exposed a gross-tail event under ordinary-loss names.
+        legacy_tail_alias = node.get("model") == "local-profit-trained-v2"
+        candidates = (
+            task.get("loss_probability"),
+            None if legacy_tail_alias else node.get(f"{side}_loss_probability"),
+            None if legacy_tail_alias else primary.get(f"{side}_loss_probability"),
+        )
+        for value in candidates:
+            number = safe_float(value, float("nan"))
+            if isfinite(number) and 0.0 <= number <= 1.0:
+                return number
+        win = safe_float(primary.get(f"{side}_win_rate"), float("nan"))
+        if isfinite(win) and 0.0 <= win <= 1.0:
+            return 1.0 - win
+    return None
 
 
 def signal_return_distribution_eligibility(

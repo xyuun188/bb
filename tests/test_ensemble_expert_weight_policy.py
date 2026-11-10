@@ -107,6 +107,7 @@ def _return_context(**extra: object) -> dict[str, object]:
                     {
                         "source": "local_ml",
                         "decision_eligible": True,
+                        "loss_probability": 0.3,
                         "raw_expected_return_pct": 0.6,
                         "objective_expected_return_pct": 0.4,
                         "horizon_minutes": 30,
@@ -116,6 +117,7 @@ def _return_context(**extra: object) -> dict[str, object]:
                     {
                         "source": "server_profit",
                         "decision_eligible": True,
+                        "loss_probability": 0.3,
                         "raw_expected_return_pct": 0.6,
                         "objective_expected_return_pct": 0.4,
                         "horizon_minutes": 30,
@@ -229,6 +231,7 @@ def _paper_exploration_context(execution_mode: str = "paper") -> dict[str, objec
                         "source": "local_ml",
                         "decision_eligible": True,
                         "raw_expected_return_pct": 0.3,
+                        "loss_probability": 0.3,
                         "objective_expected_return_pct": -0.1,
                         "horizon_minutes": 30,
                         "return_distribution_contract": {
@@ -244,6 +247,7 @@ def _paper_exploration_context(execution_mode: str = "paper") -> dict[str, objec
                         "source": "local_ml",
                         "decision_eligible": True,
                         "raw_expected_return_pct": -0.2,
+                        "loss_probability": 0.4,
                         "objective_expected_return_pct": -0.4,
                         "horizon_minutes": 30,
                         "return_distribution_contract": {
@@ -293,6 +297,7 @@ def _training_evidence(
                 "source": source,
                 "side": side,
                 "decision_eligible": True,
+                "loss_probability": 0.3,
                 "raw_expected_return_pct": raw_return,
                 "objective_expected_return_pct": objective_return,
                 "horizon_minutes": horizon_minutes,
@@ -455,7 +460,8 @@ def test_negative_training_direction_stays_blocked_despite_expert_opposition() -
     assert decision.raw_response["entry_permission"]["granted"] is False
     support = decision.raw_response["paper_trade_selection"]["by_side"]["short"]
     assert support["strong_expert_opposition"] is False
-    assert "direction_support_quant_evidence_missing" in support["blocking_reasons"]
+    assert "direction_support_expected_net_not_positive" in support["blocking_reasons"]
+    assert "direction_support_quant_evidence_missing" not in support["blocking_reasons"]
 
 
 def test_negative_model_observation_remains_hold_without_sampling_order() -> None:
@@ -521,6 +527,7 @@ def _unpromoted_positive_net_context() -> dict[str, object]:
                         "side": "long",
                         "decision_eligible": True,
                         "raw_expected_return_pct": 0.5,
+                        "loss_probability": 0.3,
                         "objective_expected_return_pct": 0.25,
                         "horizon_minutes": 30,
                         "return_distribution_contract": {
@@ -533,6 +540,7 @@ def _unpromoted_positive_net_context() -> dict[str, object]:
                         "side": "long",
                         "decision_eligible": True,
                         "raw_expected_return_pct": 0.5,
+                        "loss_probability": 0.3,
                         "objective_expected_return_pct": 0.25,
                         "horizon_minutes": 30,
                         "return_distribution_contract": {
@@ -916,7 +924,8 @@ def test_unavailable_training_direction_stays_blocked_without_expert_veto() -> N
     assert decision.raw_response["entry_permission"]["granted"] is False
     support = decision.raw_response["paper_trade_selection"]["by_side"]["short"]
     assert support["strong_expert_opposition"] is False
-    assert "direction_support_quant_evidence_missing" in support["blocking_reasons"]
+    assert "direction_support_quant_family_conflict" in support["blocking_reasons"]
+    assert "direction_support_quant_evidence_missing" not in support["blocking_reasons"]
 
 
 def test_stable_continuous_strategy_route_disables_loss_tolerant_bootstrap() -> None:
