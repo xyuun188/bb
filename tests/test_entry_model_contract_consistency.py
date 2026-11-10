@@ -301,6 +301,23 @@ def test_probability_replay_weights_are_independent_of_future_error_emphasis() -
     )
 
 
+def test_replay_weights_never_resurrect_excluded_or_tiny_quality_weights() -> None:
+    from tests.test_ml_signal_training_quality import _training_frame
+
+    frame = _training_frame(40)
+    frame.index = np.arange(100, 140)
+    frame["sample_weight"] = 1.0
+    frame.loc[100, "sample_weight"] = 0.0
+    frame.loc[101, "sample_weight"] = 0.0001
+    frame["long_tail_loss"] = 1
+    for emphasis in (True, False):
+        weighted, manifest = ml._apply_training_replay_weights(frame, outcome_emphasis=emphasis)
+        assert weighted.loc[100, "sample_weight"] == 0.0
+        assert weighted.loc[100, "probability_sample_weight"] == 0.0
+        assert 0.0 < weighted.loc[101, "sample_weight"] < 0.001
+        assert manifest["zero_weight_sample_count"] == 1
+
+
 def test_walk_forward_rebuilds_fold_local_targets_before_replay_weighting() -> None:
     from tests.test_ml_signal_training_quality import _training_frame
 

@@ -169,6 +169,10 @@ def _development_input_sha256(development: pd.DataFrame) -> str:
         identity_columns.append("symbol")
     if "sample_weight" in development:
         identity_columns.append("sample_weight")
+    identity_columns.extend(
+        key for key in ("decision_action", "decision_confidence", "best_action", "market_regime")
+        if key in development
+    )
     return hashlib.sha256(
         json.dumps(
             development[list(dict.fromkeys(identity_columns))].to_dict("records"),

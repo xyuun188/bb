@@ -30,6 +30,7 @@ DEPENDENCIES = (
     "services/ml_development_snapshot.py",
     "services/ml_horizon_development.py",
     "services/liquidity_regime_development.py",
+    "services/ml_replay_weight_development.py",
     "services/ml_nested_development.py",
     "services/ml_signal_service.py",
     "services/ml_training_contract.py",
@@ -133,11 +134,17 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from config.settings import settings
 from db.session import close_db, get_read_session_ctx
 from scripts.audit_online_horizon_current_development import _build_development_statement
-from services.ml_development_snapshot import make_development_snapshot, snapshot_frame
+from services.ml_development_snapshot import (
+    REPLAY_METADATA_COLUMNS, load_development_snapshot, make_development_snapshot,
+    save_development_snapshot, snapshot_frame,
+)
+from services.ml_development_baselines import _development_input_sha256
 from services.ml_horizon_development import build_horizon_development_report
 from services.liquidity_regime_development import build_liquidity_regime_development_report
+from services.ml_replay_weight_development import build_replay_weight_development_report
 from services.ml_development_snapshot import InsufficientDevelopmentDataError
 from services.ml_signal_service import build_training_frame
 from services.ml_training_dataset import (
@@ -151,6 +158,7 @@ REVISION = __REVISION__
 FAMILY = __FAMILY__
 NATIVE_SOURCE = "shadow_entry_result_and_okx_native_1m_path"
 DEPENDENCIES = __DEPENDENCIES__
+EXPECTED_BASE_HASH = __EXPECTED_BASE_HASH__
 
 
 def _dependency_hashes():
@@ -255,18 +263,34 @@ async def main():
         limit=GROUP_LIMIT, since=since, cutoff=CUTOFF, revision=REVISION,
     )
     try:
-        async with get_read_session_ctx(
-            statement_timeout_ms=15000,
-            transaction_isolation="REPEATABLE READ READ ONLY",
-        ) as session:
-            result = await session.execute(statement)
-            rows = [
-                shadow_training_row_from_mapping(row)
-                for row in result.mappings()
-            ]
-        frame = build_training_frame(rows)
+        snapshot_path = settings.data_dir / "strategy_replay" / (
+            f"replay-weight-input-{REVISION}-{CUTOFF.strftime('%Y%m%dT%H%M%SZ')}-"
+            f"{GROUP_LIMIT}-{HOURS}.json"
+        )
+        reuse_snapshot = FAMILY == "replay_weights" and snapshot_path.exists()
+        rows = []
         try:
-            snapshot = make_development_snapshot(frame, cutoff=CUTOFF.isoformat())
+            if reuse_snapshot:
+                development, snapshot = load_development_snapshot(
+                    snapshot_path, cutoff=CUTOFF.isoformat(),
+                )
+                frame = development
+            else:
+                async with get_read_session_ctx(
+                    statement_timeout_ms=15000,
+                    transaction_isolation="REPEATABLE READ READ ONLY",
+                ) as session:
+                    result = await session.execute(statement)
+                    rows = [shadow_training_row_from_mapping(row) for row in result.mappings()]
+                frame = build_training_frame(rows)
+                snapshot = make_development_snapshot(
+                    frame, cutoff=CUTOFF.isoformat(),
+                    include_replay_metadata=FAMILY == "replay_weights",
+                )
+                if FAMILY == "replay_weights":
+                    development, snapshot = save_development_snapshot(snapshot, path=snapshot_path)
+                else:
+                    development = snapshot_frame(snapshot, cutoff=CUTOFF.isoformat())
         except InsufficientDevelopmentDataError as exc:
             snapshot = {}
             development = frame.iloc[0:0]
@@ -276,11 +300,15 @@ async def main():
                 "folds": [],
             }
         else:
-            development = snapshot_frame(snapshot, cutoff=CUTOFF.isoformat())
-            builder = (
-                build_liquidity_regime_development_report
-                if FAMILY == "liquidity_regime" else build_horizon_development_report
-            )
+            if EXPECTED_BASE_HASH and _development_input_sha256(
+                development.drop(columns=list(REPLAY_METADATA_COLUMNS), errors="ignore")
+            ) != EXPECTED_BASE_HASH:
+                raise RuntimeError("base development fingerprint changed; refusing paired comparison")
+            builder = {
+                "ridge": build_horizon_development_report,
+                "liquidity_regime": build_liquidity_regime_development_report,
+                "replay_weights": build_replay_weight_development_report,
+            }[FAMILY]
             research = builder(development, snapshot=snapshot)
         horizon_counts = Counter(
             str(int(value))
@@ -291,8 +319,7 @@ async def main():
         )
         report = {
             "experiment": (
-                "bounded-native-fee-after-horizon-current-development" if FAMILY == "ridge"
-                else "bounded-native-fee-after-liquidity-regime-current-development"
+                f"bounded-native-fee-after-{FAMILY}-current-development"
             ),
             "protocol_revision": REVISION,
             "generated_at": datetime.now(UTC).isoformat(),
@@ -310,6 +337,7 @@ async def main():
             },
             "input": {
                 "source_row_count": len(rows),
+                "source_rows_reloaded": not reuse_snapshot,
                 "training_frame_row_count": int(len(frame)),
                 "development_row_count": int(len(development)),
                 "decision_group_count": int(
@@ -337,7 +365,7 @@ async def main():
                 "snapshot_sha256": snapshot.get("snapshot_sha256"),
                 "dependency_sha256": _dependency_hashes(),
             },
-            "research": research if FAMILY == "liquidity_regime" else {
+            "research": research if FAMILY != "ridge" else {
                 "status": research.get("status"),
                 "reason": research.get("reason"),
                 "version": research.get("version"),
@@ -394,6 +422,7 @@ def _render_remote_script(
     cutoff: datetime,
     revision: str,
     family: str = "ridge",
+    expected_base_hash: str | None = None,
 ) -> str:
     return (
         REMOTE_SCRIPT.replace("__GROUP_LIMIT__", str(limit))
@@ -406,6 +435,7 @@ def _render_remote_script(
         .replace("__REVISION__", repr(revision))
         .replace("__FAMILY__", repr(family))
         .replace("__DEPENDENCIES__", repr(DEPENDENCIES))
+        .replace("__EXPECTED_BASE_HASH__", repr(expected_base_hash))
     )
 
 
@@ -417,6 +447,7 @@ def _build_remote_command(
     unit: str,
     revision: str,
     family: str = "ridge",
+    expected_base_hash: str | None = None,
 ) -> str:
     remote_script = _render_remote_script(
         limit=limit,
@@ -424,6 +455,7 @@ def _build_remote_command(
         cutoff=cutoff,
         revision=revision,
         family=family,
+        expected_base_hash=expected_base_hash,
     )
     encoded = base64.b64encode(remote_script.encode("utf-8")).decode("ascii")
     runner = f"import base64;exec(base64.b64decode({encoded!r}))"
@@ -471,6 +503,13 @@ def _validate_expected_input_hash(
         )
 
 
+def _validate_hash_argument(value: str | None) -> None:
+    if value is not None and (
+        len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError("expected input SHA256 must contain exactly 64 lowercase hexadecimal characters")
+
+
 def _parse_cutoff(value: str | None) -> datetime:
     cutoff = (
         datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -504,16 +543,19 @@ def main() -> None:
     parser.add_argument("--cutoff")
     parser.add_argument("--revision", choices=("v1", "v2", "v3"), default="v3")
     parser.add_argument("--expected-input-sha256")
-    parser.add_argument("--family", choices=("ridge", "liquidity_regime"), default="ridge")
+    parser.add_argument("--expected-base-input-sha256")
+    parser.add_argument("--family", choices=("ridge", "liquidity_regime", "replay_weights"), default="ridge")
     args = parser.parse_args()
+    _validate_hash_argument(args.expected_input_sha256)
+    _validate_hash_argument(args.expected_base_input_sha256)
     limit = max(1, min(int(args.limit), 2500))
     max_hours = 672 if args.revision == "v3" else 168
     default_hours = 672 if args.revision == "v3" else 24
     hours = max(1, min(int(args.hours or default_hours), max_hours))
     cutoff = _parse_cutoff(args.cutoff)
-    if args.family == "liquidity_regime" and (not args.cutoff or args.revision != "v3"):
-        raise ValueError("liquidity_regime requires explicit --cutoff and time-stratified v3 sampling")
-    name = "horizon" if args.family == "ridge" else "liquidity-regime"
+    if args.family != "ridge" and (not args.cutoff or args.revision != "v3"):
+        raise ValueError(f"{args.family} requires explicit --cutoff and time-stratified v3 sampling")
+    name = {"ridge": "horizon", "liquidity_regime": "liquidity-regime", "replay_weights": "replay-weights"}[args.family]
     unit = f"bb-{name}-dev-{args.revision}-{cutoff.strftime('%Y%m%dT%H%M%SZ')}"
     result_path = (
         ROOT
@@ -527,13 +569,17 @@ def main() -> None:
 
     expected_hashes = _local_dependency_hashes()
     registration = None
-    if args.family == "liquidity_regime":
-        from services.liquidity_regime_development import protocol
+    if args.family != "ridge":
+        if args.family == "replay_weights":
+            from services.ml_replay_weight_development import protocol
+        else:
+            from services.liquidity_regime_development import protocol
 
         registration = {
             "protocol": protocol(), "cutoff_exclusive": cutoff.isoformat(),
             "hours": hours, "decision_group_limit": limit, "sampling_revision": args.revision,
             "dependency_sha256": expected_hashes,
+            "expected_base_input_sha256": args.expected_base_input_sha256,
         }
         registration_path = result_path.with_suffix(".protocol.json")
         registration = _register_protocol(registration_path, registration)
@@ -571,7 +617,7 @@ def main() -> None:
         command = (
             "set -e\numask 077\n"
             "install -d -m 0700 /data/bb/app/tmp/codex-horizon-development\n"
-            f"{_build_remote_command(limit=limit, hours=hours, cutoff=cutoff, unit=unit, revision=args.revision, family=args.family)} "
+            f"{_build_remote_command(limit=limit, hours=hours, cutoff=cutoff, unit=unit, revision=args.revision, family=args.family, expected_base_hash=args.expected_base_input_sha256)} "
             f"> {shlex.quote(remote_result)}"
         )
         run_remote_text(
@@ -595,12 +641,18 @@ def main() -> None:
     _validate_expected_input_hash(report, args.expected_input_sha256)
     if registration is not None:
         report["registered_protocol"] = registration
+        if args.family == "replay_weights":
+            report["prospective_validation"] = {
+                "decision_start_inclusive": registration["registered_at"],
+                "status": "reserved_not_evaluated",
+                "independent_evidence_available": False,
+            }
     result_path.parent.mkdir(parents=True, exist_ok=True)
     result_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
-    if args.family == "liquidity_regime":
+    if args.family != "ridge":
         safe_print(json.dumps({
             "input": report["input"],
             "status": report["research"]["status"],

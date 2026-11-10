@@ -18,6 +18,8 @@ from services.ml_development_baselines import _development_input_sha256
 from services.ml_signal_service import FEATURE_KEYS, _decision_group_availability
 
 SNAPSHOT_VERSION = "2026-11-06.symbol-bound-frozen-development.v2"
+REPLAY_SNAPSHOT_VERSION = "2026-11-10.replay-metadata-frozen-development.v3"
+REPLAY_METADATA_COLUMNS = ("decision_action", "decision_confidence", "best_action", "market_regime")
 SNAPSHOT_FILENAME = "frozen_development_v2.json"
 SNAPSHOT_COLUMNS = list(dict.fromkeys([
     "id", "decision_group", "symbol", "decision_timestamp", "label_timestamp",
@@ -37,11 +39,24 @@ def _digest(payload: dict[str, Any]) -> str:
     ).encode("utf-8")).hexdigest()
 
 
-def _normalize(frame: pd.DataFrame) -> pd.DataFrame:
+def _normalize(frame: pd.DataFrame, *, include_replay_metadata: bool = False) -> pd.DataFrame:
     source = frame.copy()
     if "symbol" not in source:
         source["symbol"] = ""
-    result = source[SNAPSHOT_COLUMNS].copy()
+    columns = SNAPSHOT_COLUMNS.copy()
+    if include_replay_metadata:
+        missing = set(REPLAY_METADATA_COLUMNS) - set(source.columns)
+        if missing:
+            raise ValueError("replay snapshot requires training metadata: " + ", ".join(sorted(missing)))
+        columns.extend(REPLAY_METADATA_COLUMNS)
+    result = source[columns].copy()
+    string_columns = {"decision_group", "symbol", "decision_timestamp", "label_timestamp"}
+    if include_replay_metadata:
+        for column in ("decision_action", "best_action", "market_regime"):
+            if result[column].isna().any():
+                raise ValueError(f"missing replay metadata: {column}")
+            result[column] = result[column].astype(str)
+            string_columns.add(column)
     for column in ("decision_timestamp", "label_timestamp"):
         result[column] = pd.to_datetime(
             result[column].map(pd.Timestamp), utc=True, errors="raise"
@@ -56,10 +71,8 @@ def _normalize(frame: pd.DataFrame) -> pd.DataFrame:
     result["symbol"] = result["symbol"].map(
         lambda value: normalize_trading_symbol("" if pd.isna(value) else value)
     )
-    for column in SNAPSHOT_COLUMNS:
-        if column in (
-            "decision_group", "symbol", "decision_timestamp", "label_timestamp"
-        ):
+    for column in columns:
+        if column in string_columns:
             continue
         result[column] = pd.to_numeric(result[column], errors="raise").astype(float)
         if not np.isfinite(result[column]).all():
@@ -85,7 +98,7 @@ def _normalize(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_development_snapshot(
-    frame: pd.DataFrame, *, cutoff: str,
+    frame: pd.DataFrame, *, cutoff: str, include_replay_metadata: bool = False,
 ) -> dict[str, Any]:
     boundary = pd.Timestamp(cutoff)
     if boundary.tzinfo is None:
@@ -104,12 +117,12 @@ def make_development_snapshot(
     ]
     if eligible.empty:
         raise InsufficientDevelopmentDataError("no development rows before frozen cutoff")
-    development = _normalize(eligible)
+    development = _normalize(eligible, include_replay_metadata=include_replay_metadata)
     serializable = development.copy()
     for column in ("decision_timestamp", "label_timestamp"):
         serializable[column] = serializable[column].map(lambda value: value.isoformat())
     payload = {
-        "version": SNAPSHOT_VERSION,
+        "version": REPLAY_SNAPSHOT_VERSION if include_replay_metadata else SNAPSHOT_VERSION,
         "created_at": datetime.now(UTC).isoformat(),
         "development_cutoff": boundary.isoformat(),
         "cutoff_policy": "all_group_labels_strictly_before_earliest_exam_start",
@@ -127,13 +140,16 @@ def snapshot_frame(
     snapshot: dict[str, Any], *, cutoff: str,
 ) -> pd.DataFrame:
     payload = {key: value for key, value in snapshot.items() if key != "snapshot_sha256"}
-    if snapshot.get("version") != SNAPSHOT_VERSION or _digest(payload) != snapshot.get(
+    if snapshot.get("version") not in {SNAPSHOT_VERSION, REPLAY_SNAPSHOT_VERSION} or _digest(payload) != snapshot.get(
         "snapshot_sha256"
     ):
         raise ValueError("development snapshot integrity failure")
     if pd.Timestamp(snapshot["development_cutoff"]) != pd.Timestamp(cutoff):
         raise ValueError("frozen development cutoff cannot change")
-    development = _normalize(pd.DataFrame(snapshot["records"]))
+    development = _normalize(
+        pd.DataFrame(snapshot["records"]),
+        include_replay_metadata=snapshot["version"] == REPLAY_SNAPSHOT_VERSION,
+    )
     if _development_input_sha256(development) != snapshot["development_input_sha256"]:
         raise ValueError("development frame fingerprint mismatch")
     if (

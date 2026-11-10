@@ -123,7 +123,7 @@ AUTO_TRAIN_LEASE_STALE_SECONDS = 2 * 60 * 60
 MIN_ACTIVE_WALK_FORWARD_FOLDS = 2
 FEATURE_CONTRACT_VERSION = "2026-11-10.pre-decision-market-features.v2"
 MULTITASK_PREDICTION_CONTRACT_VERSION = "2026-11-10.signed-funding-cost.v3"
-REPLAY_WEIGHT_POLICY_VERSION = "2026-11-10.separate-probability-replay-weights.v2"
+REPLAY_WEIGHT_POLICY_VERSION = "2026-11-10.zero-preserving-replay-weights.v3"
 _TRAINING_CANDIDATE_CACHE: dict[
     int,
     tuple[dict[str, Any], dict[str, Any], str],
@@ -1080,7 +1080,9 @@ def _training_distribution_drift(
     }
 
 
-def _apply_training_replay_weights(train: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+def _apply_training_replay_weights(
+    train: pd.DataFrame, *, outcome_emphasis: bool = True,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     weighted = train.copy()
     if weighted.empty:
         return weighted, {
@@ -1136,10 +1138,14 @@ def _apply_training_replay_weights(train: pd.DataFrame) -> tuple[pd.DataFrame, d
         + hard_error.astype(float) * 0.25
         + cost_consumed_edge.astype(float) * 0.15
     )
-    final_weights = (base * recency * multiplier).clip(lower=0.01, upper=2.0)
+    natural_weights = (base * recency).clip(upper=2.0)
+    final_weights = (
+        (base * recency * multiplier).clip(upper=2.0)
+        if outcome_emphasis else natural_weights
+    )
     weighted["sample_weight"] = final_weights
     # Outcome-dependent replay emphasis must not change probability priors.
-    weighted["probability_sample_weight"] = (base * recency).clip(lower=0.01, upper=2.0)
+    weighted["probability_sample_weight"] = natural_weights
     weighted["replay_recency_weight"] = recency
     weighted["replay_tail_emphasis"] = tail.astype(int)
     weighted["replay_hard_error_emphasis"] = hard_error.astype(int)
@@ -1150,6 +1156,8 @@ def _apply_training_replay_weights(train: pd.DataFrame) -> tuple[pd.DataFrame, d
     return weighted, {
         "version": REPLAY_WEIGHT_POLICY_VERSION,
         "validation_and_test_resampling": False,
+        "outcome_emphasis": outcome_emphasis,
+        "zero_weight_sample_count": int(base.eq(0.0).sum()),
         "probability_weighting": "quality_and_recency_without_outcome_emphasis",
         "recency_half_life_days": half_life_days,
         "minimum_recency_weight": minimum_recency,

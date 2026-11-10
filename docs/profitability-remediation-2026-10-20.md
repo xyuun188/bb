@@ -328,3 +328,40 @@ training-quality, comparison, replay, governance, preflight, baseline and nested
 development group passed 156 tests. Ruff and whitespace checks passed.
 Normal split-service synchronization passed source-integrity/import checks,
 model-tunnel checks, OKX network checks and the Dashboard health check.
+
+## Paired Replay Weight Results, November 10
+
+The fixed comparison reused the November 10 13:27:46.951173 UTC development
+cutoff and the previous input fingerprint
+`acd01cb410d7cb0f7df65efe6d3ac91d18e1e7eee759a5cfd5463ebf5afb5e05`.
+Replay-aware snapshots additionally seal decision action, confidence, best
+action and market regime so training weights can be reproduced. These fields
+remain training metadata, never prediction features. Existing v2 snapshots
+remain readable and keep their original schema and fingerprints.
+
+Three purged expanding folds evaluated 177 four-hour opportunities from 355
+primary-horizon development rows. Four preregistered candidates paired the
+existing and market-only features with outcome-emphasized and natural
+regression weights. Probability weights were identical within each pair.
+
+| Features / Weights | Capacity Selections | Mean Net Return | Profit Factor |
+| --- | ---: | ---: | ---: |
+| Existing / outcome emphasis | 52 | -0.618418% | 0.372829 |
+| Existing / natural | 53 | -0.552795% | 0.394850 |
+| Market only / outcome emphasis | 53 | -0.495865% | 0.435206 |
+| Market only / natural | 51 | -0.525187% | 0.425059 |
+
+All four failed. Natural weights modestly reduced prediction error, but did
+not consistently improve selection and left rank correlations negative.
+The existing-feature control's long selections averaged -1.629819% net;
+short selections averaged +0.123276%, but their naive lower bound was
+-0.226265%. This attribution does not authorize a short-only strategy.
+Do not replace production regression weights using this failed comparison.
+
+The replay weight floor did incorrectly turn zero or tiny quality weights
+into positive mass of at least 0.01. The floor is removed in policy v3, with
+regression coverage for both regression and probability weights. This frozen
+sample contained zero zero-weight rows, so that bug does not explain its
+negative ranking. These remain development counterfactuals with native costs
+and a three-position capacity bound, not actual maker-fill or portfolio PnL.
+No candidate is promoted and no orders are authorized by these results.

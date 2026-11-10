@@ -124,6 +124,14 @@ def test_same_window_revision_requires_matching_input_fingerprint() -> None:
         raise AssertionError("changed samples must stop the comparison")
 
 
+@pytest.mark.parametrize("value", ("a" * 63, "g" * 64, "A" * 64, ""))
+def test_malformed_expected_hash_is_rejected_before_protocol_registration(value):
+    with pytest.raises(ValueError, match="exactly 64"):
+        audit._validate_hash_argument(value)
+    audit._validate_hash_argument("a" * 64)
+    audit._validate_hash_argument(None)
+
+
 def test_time_coverage_sampling_preserves_old_groups_and_all_horizons() -> None:
     cutoff = datetime(2026, 11, 5, tzinfo=UTC)
     since = cutoff - timedelta(hours=24)
@@ -206,7 +214,7 @@ def test_registration_is_immutable_and_preserves_original_timestamp(tmp_path):
     assert path.read_bytes() == original
 
 
-@pytest.mark.parametrize("family", ("ridge", "liquidity_regime"))
+@pytest.mark.parametrize("family", ("ridge", "liquidity_regime", "replay_weights"))
 def test_remote_empty_source_is_reported_without_evaluation(monkeypatch, capsys, family):
     from db import session as db_session
     from services import liquidity_regime_development, ml_horizon_development, ml_signal_service
@@ -244,3 +252,57 @@ def test_remote_empty_source_is_reported_without_evaluation(monkeypatch, capsys,
     assert report["input"]["source_row_count"] == 0
     assert report["input"]["decision_time_start"] is None
     assert report["safety"]["orders_submitted"] is False
+
+
+@pytest.mark.parametrize("matching_hash", (True, False))
+def test_replay_weight_audit_reuses_sealed_inputs_and_checks_identity_before_fitting(
+    monkeypatch, tmp_path, capsys, matching_hash,
+):
+    from config import settings as settings_module
+    from db import session as db_session
+    from services import ml_replay_weight_development as research
+    from services.ml_development_baselines import _development_input_sha256
+    from services.ml_development_snapshot import (
+        REPLAY_METADATA_COLUMNS,
+        save_development_snapshot,
+    )
+    from tests.test_ml_replay_weight_development import CUTOFF, _snapshot, _source
+
+    development, snapshot = _snapshot(_source())
+    cutoff = datetime.fromisoformat(CUTOFF)
+    path = tmp_path / "strategy_replay" / "replay-weight-input-v3-20260810T000000Z-2500-672.json"
+    save_development_snapshot(snapshot, path=path)
+    original_bytes = path.read_bytes()
+    monkeypatch.setattr(settings_module, "settings", SimpleNamespace(data_dir=tmp_path))
+
+    def forbidden_reload(**_kwargs):
+        raise AssertionError("sealed replay comparison must not reload current labels")
+
+    async def close():
+        pass
+
+    calls = []
+
+    def builder(frame, *, snapshot):
+        pd.testing.assert_frame_equal(frame, development)
+        calls.append(snapshot)
+        return {"status": "rejected", "folds": []}
+
+    monkeypatch.setattr(db_session, "get_read_session_ctx", forbidden_reload)
+    monkeypatch.setattr(db_session, "close_db", close)
+    monkeypatch.setattr(research, "build_replay_weight_development_report", builder)
+    expected = _development_input_sha256(development.drop(columns=list(REPLAY_METADATA_COLUMNS)))
+    rendered = audit._render_remote_script(
+        limit=2500, hours=672, cutoff=cutoff, revision="v3", family="replay_weights",
+        expected_base_hash=expected if matching_hash else "wrong",
+    )
+    if matching_hash:
+        exec(rendered, {})  # noqa: S102 - Exercise sealed-input reuse in the actual payload.
+        report = json.loads(capsys.readouterr().out)
+        assert report["input"]["source_rows_reloaded"] is False
+        assert calls == [snapshot]
+    else:
+        with pytest.raises(RuntimeError, match="fingerprint changed"):
+            exec(rendered, {})  # noqa: S102
+        assert not calls
+    assert path.read_bytes() == original_bytes
