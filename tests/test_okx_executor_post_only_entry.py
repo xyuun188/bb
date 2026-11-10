@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from config.settings import settings
-from core.exceptions import ExchangeAPIError
+from core.exceptions import ExchangeAPIError, OrderPlacementError
 from executor.base_executor import OrderStatus
 from executor.okx_executor import OKXExecutor
 
@@ -283,7 +283,7 @@ async def test_uncancellable_passive_order_never_submits_a_duplicate() -> None:
 
     executor._cancel_order_native = cancel_fails  # type: ignore[method-assign]
 
-    with pytest.raises(Exception):
+    with pytest.raises(OrderPlacementError, match="could not be cancelled"):
         await _place(executor, ccxt)
 
     assert [call["type"] for call in ccxt.create_order_calls] == ["post_only"]

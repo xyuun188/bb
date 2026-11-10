@@ -37,16 +37,16 @@ from core.symbols import (
 )
 from core.trading_mode import mode_manager
 from executor.base_executor import AbstractExecutor, ExecutionResult, OrderStatus
-from services.entry_profit_risk_sizing import (
-    reconcile_profit_risk_sizing,
-    select_okx_leverage_tier,
-    uplift_profit_risk_sizing_to_exchange_minimum,
-)
 from services.entry_post_only import (
     FILL_FULL,
     classify_passive_fill,
     plan_entry_post_only,
     post_only_execution_fact,
+)
+from services.entry_profit_risk_sizing import (
+    reconcile_profit_risk_sizing,
+    select_okx_leverage_tier,
+    uplift_profit_risk_sizing_to_exchange_minimum,
 )
 from services.exchange_position_state import parse_exchange_position_snapshot
 from services.normal_paper_trade import normal_paper_order_identity_reasons
