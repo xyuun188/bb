@@ -122,7 +122,7 @@ AUTO_TRAIN_RETRY_INTERVAL_SECONDS = 5 * 60
 AUTO_TRAIN_LEASE_STALE_SECONDS = 2 * 60 * 60
 MIN_ACTIVE_WALK_FORWARD_FOLDS = 2
 FEATURE_CONTRACT_VERSION = "2026-11-10.pre-decision-market-features.v2"
-MULTITASK_PREDICTION_CONTRACT_VERSION = "2026-11-10.explicit-model-dispersion.v2"
+MULTITASK_PREDICTION_CONTRACT_VERSION = "2026-11-10.signed-funding-cost.v3"
 REPLAY_WEIGHT_POLICY_VERSION = "2026-11-10.separate-probability-replay-weights.v2"
 _TRAINING_CANDIDATE_CACHE: dict[
     int,
@@ -688,9 +688,10 @@ def _multitask_side_prediction(
     gross_q10 = _safe_float(return_contract.get("lower_quantile_return_pct"), gross_expected)
     gross_q50 = _safe_float(return_contract.get("median_return_pct"), gross_expected)
     gross_q90 = _safe_float(return_contract.get("upper_quantile_return_pct"), gross_expected)
-    cost_expected = max(float(cost_distribution["expected"][0]), 0.0)
-    cost_q10 = max(float(cost_distribution["lower_quantile"][0]), 0.0)
-    cost_q90 = max(float(cost_distribution["upper_quantile"][0]), 0.0)
+    # Total execution cost includes funding income as a negative cost.
+    cost_expected = float(cost_distribution["expected"][0])
+    cost_q10 = min(float(cost_distribution["lower_quantile"][0]), cost_expected)
+    cost_q90 = max(float(cost_distribution["upper_quantile"][0]), cost_expected)
     ordered_quantiles = sorted(
         (
             gross_q10 - cost_q90,

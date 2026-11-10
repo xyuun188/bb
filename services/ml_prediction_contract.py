@@ -98,10 +98,8 @@ def risk_adjusted_expected_scores(
     gross_expected = np.asarray(market_distribution["expected"], dtype=float)
     gross_lower = np.asarray(market_distribution["lower_quantile"], dtype=float)
     gross_std = np.asarray(market_distribution["std"], dtype=float)
-    cost_expected = np.maximum(
-        np.asarray(cost_distribution["expected"], dtype=float),
-        0.0,
-    )
+    # These labels include signed funding, so income can exceed fees.
+    cost_expected = np.asarray(cost_distribution["expected"], dtype=float)
     cost_upper = np.maximum(
         np.asarray(cost_distribution["upper_quantile"], dtype=float),
         cost_expected,

@@ -329,6 +329,44 @@ def test_production_distribution_blocks_mismatched_model_contract_versions() -> 
     ]
 
 
+def test_production_accepts_signed_historical_cost_without_crediting_it_twice() -> None:
+    def combine(expected_cost: float) -> dict[str, object]:
+        return combine_production_return_distribution(
+            side="long", model_contracts=[_distribution()],
+            live_execution_cost_pct=0.1, live_slippage_pct=0.01,
+            current_funding_cashflow_pct=0.4,
+            counterfactual_cost_distributions=[{
+                "expected_pct": expected_cost,
+                "upper_tail_pct": expected_cost + 0.03,
+                "uncertainty_pct": 0.02,
+                "distribution_ready": True,
+                "source_authority": "shadow_counterfactual_live_microstructure",
+            }],
+            actual_trade_calibrations=[{
+                "source_authority": "okx_position_history", "side": "long",
+                "net_return_after_all_cost_pct": {
+                    "count": 12, "expected": 0.5, "lower_hinge": 0.4,
+                },
+                "slippage_pct": {
+                    "count": 12, "expected": 0.02, "upper_hinge": 0.03,
+                },
+            }],
+            profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+            source_authority="test",
+        )
+
+    signed, positive = combine(-0.3), combine(0.1)
+    assert signed["production_eligible"] is True
+    assert signed["raw_expected_return_pct"] == pytest.approx(1.08)
+    assert signed["raw_expected_return_pct"] == pytest.approx(
+        positive["raw_expected_return_pct"]
+    )
+    assert signed["objective_expected_return_pct"] == pytest.approx(
+        positive["objective_expected_return_pct"]
+    )
+    assert signed["transformations"]["cost_deduction_count"] == 1
+
+
 def test_paper_model_weights_change_central_return_without_weakening_tail_guard() -> None:
     contract = combine_production_return_distribution(
         side="long",

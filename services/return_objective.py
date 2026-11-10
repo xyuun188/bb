@@ -445,7 +445,6 @@ def _combine_execution_return_distribution(
                 expected_cost is None
                 or upper_cost is None
                 or uncertainty is None
-                or expected_cost < 0
                 or upper_cost < expected_cost
                 or uncertainty < 0
                 or row.get("distribution_ready") is not True

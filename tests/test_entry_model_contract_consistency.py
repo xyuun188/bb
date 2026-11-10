@@ -108,6 +108,61 @@ def test_ordinary_loss_probability_never_falls_back_to_tail_probability() -> Non
     assert signal_loss_probability(payload, "long") is None
 
 
+@pytest.mark.parametrize("cost_mean", [-0.3, 0.1])
+def test_signed_funding_cost_is_preserved_in_training_prediction_and_execution(
+    cost_mean: float,
+) -> None:
+    market = {
+        "expected": np.array([1.0]),
+        "median": np.array([1.0]),
+        "lower_quantile": np.array([0.6]),
+        "upper_quantile": np.array([1.4]),
+        "std": np.array([0.2]),
+    }
+    cost = {
+        "expected": np.array([cost_mean]),
+        "lower_quantile": np.array([cost_mean - 0.1]),
+        "upper_quantile": np.array([cost_mean + 0.1]),
+    }
+    gross = standardized_return_distribution(
+        side="short", horizon_minutes=240,
+        raw_expected_return_pct=1.0, median_return_pct=1.0,
+        lower_quantile_return_pct=0.6, upper_quantile_return_pct=1.4,
+        dispersion_pct=0.2, tail_loss_probability=0.1, tail_loss_scale_pct=0.5,
+        distribution_member_count=32,
+        return_semantics="gross_market_opportunity_before_execution",
+        source_authority="random_forest_tree_empirical_distribution",
+        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+    )
+    prediction = ml._multitask_side_prediction(
+        side="short", horizon_minutes=240,
+        model_version="test", calibration_version="test",
+        return_contract=gross, cost_distribution=cost,
+        win_probability=0.6, tail_loss_probability=0.1,
+        expected_mfe_pct=1.0, expected_mae_pct=0.5,
+    )
+    expected_score = 1.0 - cost_mean - 0.2 - 0.05
+    training_score = risk_adjusted_expected_scores(
+        market, cost, np.array([0.1]), tail_loss_scale_pct=0.5,
+    )[0]
+    execution = combine_paper_return_distribution(
+        side="short", model_contracts=[gross],
+        current_execution_cost_pct=0.1, current_slippage_pct=0.0,
+        current_funding_cashflow_pct=0.1 - cost_mean,
+        profit_supervision_version=PROFIT_SUPERVISION_VERSION,
+        source_authority="test",
+    )
+    assert prediction["expected_execution_cost_pct"] == pytest.approx(cost_mean)
+    assert prediction["expected_net_return_pct"] == pytest.approx(1.0 - cost_mean)
+    assert prediction["return_q10"] == pytest.approx(0.6 - cost_mean - 0.1)
+    assert training_score == pytest.approx(expected_score)
+    assert ml._fee_after_prediction_objective(
+        prediction, tail_loss_scale_pct=0.5,
+    )["objective_net_return_pct"] == pytest.approx(expected_score)
+    assert execution["paper_eligible"] is True
+    assert execution["objective_expected_return_pct"] == pytest.approx(expected_score)
+
+
 def test_opportunity_keeps_ordinary_and_tail_probabilities_separate() -> None:
     from tests.test_entry_opportunity_scoring import _decision, _scorer
 
