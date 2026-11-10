@@ -143,3 +143,34 @@ def test_report_rejects_changed_frozen_metadata():
     development.loc[0, "decision_confidence"] = 0.1
     with pytest.raises(ValueError, match="exact frozen"):
         research.build_replay_weight_development_report(development, snapshot=snapshot)
+
+
+def test_alternative_horizon_fits_only_its_own_mature_labels(monkeypatch):
+    source = _source()
+    alternative = source[source["horizon_minutes"] == 240].copy()
+    alternative["id"] += 10000
+    alternative["horizon_minutes"] = 60
+    alternative["label_timestamp"] = alternative["decision_timestamp"] + pd.Timedelta(minutes=60)
+    alternative["long_return_pct"] = 0.7
+    calls = []
+
+    def predict(train, validation, *, feature_policy):
+        assert train["horizon_minutes"].eq(60).all()
+        assert validation["horizon_minutes"].eq(60).all()
+        assert train["long_return_pct"].eq(0.7).all()
+        calls.append(feature_policy)
+        value = {task: {side: np.full(len(validation), -1.0) for side in ("long", "short")}
+                 for task in ("net", "score")}
+        return {policy: deepcopy(value) for policy in research.WEIGHT_POLICIES}, {}
+
+    monkeypatch.setattr(research, "_paired_predictions", predict)
+    development, snapshot = _snapshot(pd.concat([source, alternative]))
+    report = research.build_replay_weight_development_report(
+        development, snapshot=snapshot, horizon_minutes=60,
+    )
+    assert len(calls) == 6
+    assert report["protocol"]["horizon_minutes"] == 60
+    assert report["primary_sample_count"] == len(alternative)
+    assert report["promotion_authorized"] is False
+    with pytest.raises(ValueError, match="supports only"):
+        research.protocol(horizon_minutes=15)

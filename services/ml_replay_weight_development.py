@@ -37,11 +37,13 @@ POLICY_VERSION = "2026-11-10.paired-replay-weight-development.v1"
 WEIGHT_POLICIES = ("outcome_emphasis", "natural")
 
 
-def protocol() -> dict[str, Any]:
+def protocol(*, horizon_minutes: int = PRIMARY_PREDICTION_HORIZON_MINUTES) -> dict[str, Any]:
+    if horizon_minutes not in (60, PRIMARY_PREDICTION_HORIZON_MINUTES):
+        raise ValueError("paired recipe research supports only 60m and the production horizon")
     return {
         "version": POLICY_VERSION,
         "replay_weight_version": REPLAY_WEIGHT_POLICY_VERSION,
-        "horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
+        "horizon_minutes": horizon_minutes,
         "candidates": [
             {"id": f"{features}-{weights}", "feature_policy": features, "weight_policy": weights}
             for features in FEATURE_POLICIES for weights in WEIGHT_POLICIES
@@ -137,7 +139,9 @@ def _attribution(frame: pd.DataFrame, sides: np.ndarray) -> dict[str, Any]:
 
 def build_replay_weight_development_report(
     development: pd.DataFrame, *, snapshot: dict[str, Any],
+    horizon_minutes: int = PRIMARY_PREDICTION_HORIZON_MINUTES,
 ) -> dict[str, Any]:
+    registered = protocol(horizon_minutes=horizon_minutes)
     if snapshot.get("version") != REPLAY_SNAPSHOT_VERSION:
         raise ValueError("training-recipe comparison requires replay metadata snapshot")
     if _development_input_sha256(development) != snapshot["development_input_sha256"]:
@@ -145,12 +149,12 @@ def build_replay_weight_development_report(
     if not set(REPLAY_METADATA_COLUMNS).issubset(development.columns):
         raise ValueError("training-recipe comparison requires replay metadata")
     primary = development[
-        development["horizon_minutes"] == PRIMARY_PREDICTION_HORIZON_MINUTES
+        development["horizon_minutes"] == horizon_minutes
     ].copy()
     report: dict[str, Any] = {
         "status": "insufficient_development_data",
         "reason": "insufficient_purged_chronological_folds",
-        "protocol": protocol(),
+        "protocol": registered,
         "diagnostic_only": True,
         "exam_labels_evaluated": False,
         "artifact_persisted": False,
@@ -179,7 +183,7 @@ def build_replay_weight_development_report(
     ):
         return report
     predictions: dict[str, list[dict[str, Any]]] = {
-        candidate["id"]: [] for candidate in protocol()["candidates"]
+        candidate["id"]: [] for candidate in registered["candidates"]
     }
     for train, validation, boundary in folds:
         fold = {**boundary, "replay_manifests": {}}
@@ -192,7 +196,7 @@ def build_replay_weight_development_report(
     evaluation = pd.concat([validation for _, validation, _ in folds], ignore_index=True)
     report["evaluated_opportunity_count"] = len(evaluation)
     offsets = np.cumsum([0, *[len(validation) for _, validation, _ in folds]])
-    for candidate in protocol()["candidates"]:
+    for candidate in registered["candidates"]:
         chunks = predictions[candidate["id"]]
         combined = {
             task: {side: np.concatenate([chunk[task][side] for chunk in chunks])

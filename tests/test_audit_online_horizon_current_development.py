@@ -202,6 +202,18 @@ def test_liquidity_regime_remote_payload_selects_fixed_family():
     compile(rendered, "<liquidity-regime-audit>", "exec")
 
 
+def test_replay_comparison_passes_the_registered_horizon_to_the_remote_worker():
+    rendered = audit._render_remote_script(
+        limit=1001, hours=672,
+        cutoff=datetime(2026, 11, 10, 13, 27, tzinfo=UTC),
+        revision="v3", family="replay_weights", prediction_horizon_minutes=60,
+    )
+    assert "PREDICTION_HORIZON_MINUTES = 60" in rendered
+    assert '"horizon_minutes": PREDICTION_HORIZON_MINUTES' in rendered
+    assert "__PREDICTION_HORIZON_MINUTES__" not in rendered
+    compile(rendered, "<paired-horizon-audit>", "exec")
+
+
 def test_registration_is_immutable_and_preserves_original_timestamp(tmp_path):
     path = tmp_path / "protocol.json"
     registration = {"cutoff": "2026-11-07T15:30:00Z", "candidate_count": 8}
@@ -283,8 +295,9 @@ def test_replay_weight_audit_reuses_sealed_inputs_and_checks_identity_before_fit
 
     calls = []
 
-    def builder(frame, *, snapshot):
+    def builder(frame, *, snapshot, horizon_minutes):
         pd.testing.assert_frame_equal(frame, development)
+        assert horizon_minutes == 240
         calls.append(snapshot)
         return {"status": "rejected", "folds": []}
 

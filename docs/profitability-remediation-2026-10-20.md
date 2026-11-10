@@ -365,3 +365,11 @@ sample contained zero zero-weight rows, so that bug does not explain its
 negative ranking. These remain development counterfactuals with native costs
 and a three-position capacity bound, not actual maker-fill or portfolio PnL.
 No candidate is promoted and no orders are authorized by these results.
+
+A separately registered 60-minute model comparison reused the exact same
+replay snapshot and trained only native 60-minute labels. Its three purged
+folds evaluated 175 opportunities. The four capacity views selected 71-76
+observations with means from -0.255661% to -0.188103% and profit factors
+from 0.481243 to 0.588831. All four were rejected. Shortening the horizon
+alone therefore does not supply a qualified replacement either; do not
+change the production horizon or promote a development-only subgroup.

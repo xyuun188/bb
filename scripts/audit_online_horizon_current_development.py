@@ -159,6 +159,7 @@ FAMILY = __FAMILY__
 NATIVE_SOURCE = "shadow_entry_result_and_okx_native_1m_path"
 DEPENDENCIES = __DEPENDENCIES__
 EXPECTED_BASE_HASH = __EXPECTED_BASE_HASH__
+PREDICTION_HORIZON_MINUTES = __PREDICTION_HORIZON_MINUTES__
 
 
 def _dependency_hashes():
@@ -309,7 +310,8 @@ async def main():
                 "liquidity_regime": build_liquidity_regime_development_report,
                 "replay_weights": build_replay_weight_development_report,
             }[FAMILY]
-            research = builder(development, snapshot=snapshot)
+            kwargs = {"horizon_minutes": PREDICTION_HORIZON_MINUTES} if FAMILY == "replay_weights" else {}
+            research = builder(development, snapshot=snapshot, **kwargs)
         horizon_counts = Counter(
             str(int(value))
             for value in development["horizon_minutes"].tolist()
@@ -423,6 +425,7 @@ def _render_remote_script(
     revision: str,
     family: str = "ridge",
     expected_base_hash: str | None = None,
+    prediction_horizon_minutes: int = 240,
 ) -> str:
     return (
         REMOTE_SCRIPT.replace("__GROUP_LIMIT__", str(limit))
@@ -436,6 +439,7 @@ def _render_remote_script(
         .replace("__FAMILY__", repr(family))
         .replace("__DEPENDENCIES__", repr(DEPENDENCIES))
         .replace("__EXPECTED_BASE_HASH__", repr(expected_base_hash))
+        .replace("__PREDICTION_HORIZON_MINUTES__", str(prediction_horizon_minutes))
     )
 
 
@@ -448,6 +452,7 @@ def _build_remote_command(
     revision: str,
     family: str = "ridge",
     expected_base_hash: str | None = None,
+    prediction_horizon_minutes: int = 240,
 ) -> str:
     remote_script = _render_remote_script(
         limit=limit,
@@ -456,6 +461,7 @@ def _build_remote_command(
         revision=revision,
         family=family,
         expected_base_hash=expected_base_hash,
+        prediction_horizon_minutes=prediction_horizon_minutes,
     )
     encoded = base64.b64encode(remote_script.encode("utf-8")).decode("ascii")
     runner = f"import base64;exec(base64.b64decode({encoded!r}))"
@@ -544,10 +550,13 @@ def main() -> None:
     parser.add_argument("--revision", choices=("v1", "v2", "v3"), default="v3")
     parser.add_argument("--expected-input-sha256")
     parser.add_argument("--expected-base-input-sha256")
+    parser.add_argument("--prediction-horizon-minutes", type=int, choices=(60, 240), default=240)
     parser.add_argument("--family", choices=("ridge", "liquidity_regime", "replay_weights"), default="ridge")
     args = parser.parse_args()
     _validate_hash_argument(args.expected_input_sha256)
     _validate_hash_argument(args.expected_base_input_sha256)
+    if args.prediction_horizon_minutes != 240 and args.family != "replay_weights":
+        raise ValueError("--prediction-horizon-minutes applies only to replay_weights research")
     limit = max(1, min(int(args.limit), 2500))
     max_hours = 672 if args.revision == "v3" else 168
     default_hours = 672 if args.revision == "v3" else 24
@@ -556,6 +565,8 @@ def main() -> None:
     if args.family != "ridge" and (not args.cutoff or args.revision != "v3"):
         raise ValueError(f"{args.family} requires explicit --cutoff and time-stratified v3 sampling")
     name = {"ridge": "horizon", "liquidity_regime": "liquidity-regime", "replay_weights": "replay-weights"}[args.family]
+    if args.family == "replay_weights" and args.prediction_horizon_minutes != 240:
+        name += f"-{args.prediction_horizon_minutes}m"
     unit = f"bb-{name}-dev-{args.revision}-{cutoff.strftime('%Y%m%dT%H%M%SZ')}"
     result_path = (
         ROOT
@@ -576,7 +587,10 @@ def main() -> None:
             from services.liquidity_regime_development import protocol
 
         registration = {
-            "protocol": protocol(), "cutoff_exclusive": cutoff.isoformat(),
+            "protocol": (
+                protocol(horizon_minutes=args.prediction_horizon_minutes)
+                if args.family == "replay_weights" else protocol()
+            ), "cutoff_exclusive": cutoff.isoformat(),
             "hours": hours, "decision_group_limit": limit, "sampling_revision": args.revision,
             "dependency_sha256": expected_hashes,
             "expected_base_input_sha256": args.expected_base_input_sha256,
@@ -617,7 +631,7 @@ def main() -> None:
         command = (
             "set -e\numask 077\n"
             "install -d -m 0700 /data/bb/app/tmp/codex-horizon-development\n"
-            f"{_build_remote_command(limit=limit, hours=hours, cutoff=cutoff, unit=unit, revision=args.revision, family=args.family, expected_base_hash=args.expected_base_input_sha256)} "
+            f"{_build_remote_command(limit=limit, hours=hours, cutoff=cutoff, unit=unit, revision=args.revision, family=args.family, expected_base_hash=args.expected_base_input_sha256, prediction_horizon_minutes=args.prediction_horizon_minutes)} "
             f"> {shlex.quote(remote_result)}"
         )
         run_remote_text(
