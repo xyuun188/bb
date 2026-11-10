@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from services.execution_cost_model import execution_cost_estimate
+from services.execution_cost_model import execution_cost_estimate, funding_cost_estimate
 from services.profit_supervision import (
     COUNTERFACTUAL_EXECUTION_COST_TASK,
     MARKET_OPPORTUNITY_TASK,
@@ -88,6 +88,72 @@ def test_uncontradicted_executable_snapshot_still_has_cost_supervision(features)
     tasks = build_profit_supervision_contract(sample, kind="shadow")["tasks"]
     assert tasks[COUNTERFACTUAL_EXECUTION_COST_TASK]["eligible"] is True
     assert shadow_fee_after_return_labels(sample)["complete"] is True
+
+
+@pytest.mark.parametrize("rate", (0.001, -0.001))
+@pytest.mark.parametrize("horizon,count", ((30, 0), (60, 1), (600, 2)))
+def test_training_and_shadow_labels_use_same_scheduled_funding_as_entry(
+    features, rate, horizon, count,
+):
+    features.update({
+        "timestamp": "2026-08-17T00:00:00+00:00",
+        "original_decision_timestamp": "2026-08-17T00:00:00+00:00",
+        "next_funding_time": "2026-08-17T01:00:00+00:00",
+        "funding_rate_observed_at": "2026-08-17T00:00:00+00:00",
+        "funding_rate": rate,
+    })
+    sample = {
+        "features": features, "horizon_minutes": horizon, "sample_weight": 1.0,
+        "long_return_pct": 0.8, "short_return_pct": -0.8,
+    }
+    task = build_profit_supervision_contract(sample, kind="shadow")["tasks"][
+        COUNTERFACTUAL_EXECUTION_COST_TASK
+    ]
+    labels = shadow_fee_after_return_labels(sample)
+    outcome = shadow_fee_after_outcome(
+        SimpleNamespace(feature_snapshot=features, horizon_minutes=horizon),
+        long_return=0.008, short_return=-0.008,
+    )
+    funding = funding_cost_estimate(features, side="long", horizon_minutes=horizon)
+    assert funding.estimated_settlement_count == count
+    assert outcome["cost_complete"] is True
+    assert outcome["funding_return_long_pct"] == pytest.approx(-rate * 100 * count)
+    assert task["funding_drag_pct"] == pytest.approx(rate * 100 * count)
+    for side in ("long", "short"):
+        key = f"{side}_net_return_after_all_cost_pct"
+        assert outcome[key] == pytest.approx(labels[key])
+        assert labels[key] == pytest.approx(
+            sample[f"{side}_return_pct"] - task[f"{side}_total_cost_pct"]
+        )
+    # Receipt or replay time must not change a sealed decision's cost label.
+    features["timestamp"] = "2026-08-18T00:00:00+00:00"
+    repeated = shadow_fee_after_return_labels(sample)
+    assert repeated["long_net_return_after_all_cost_pct"] == labels[
+        "long_net_return_after_all_cost_pct"
+    ]
+
+
+@pytest.mark.parametrize("missing", (
+    "next_funding_time", "funding_rate_observed_at", "funding_data_available",
+))
+def test_timed_training_snapshots_cannot_fall_back_to_prorated_funding(features, missing):
+    features.update({
+        "timestamp": "2026-08-17T00:00:00+00:00",
+        "next_funding_time": "2026-08-17T01:00:00+00:00",
+        "funding_rate_observed_at": "2026-08-17T00:00:00+00:00",
+    })
+    features.pop(missing)
+    labels = shadow_fee_after_return_labels({
+        "features": features, "horizon_minutes": 240,
+        "long_return_pct": 0.8, "short_return_pct": -0.8,
+    })
+    assert labels["complete"] is False
+    outcome = shadow_fee_after_outcome(
+        SimpleNamespace(feature_snapshot=features, horizon_minutes=240),
+        long_return=0.008, short_return=-0.008,
+    )
+    assert outcome["cost_complete"] is False
+    assert outcome["long_net_return_after_all_cost_pct"] is None
 
 
 def test_rebuilt_historical_row_without_frozen_features_is_excluded_from_net_training(

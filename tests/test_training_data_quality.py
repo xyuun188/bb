@@ -176,6 +176,7 @@ def _add_test_component_availability(features: dict) -> None:
     features.setdefault("original_decision_timestamp", "2026-07-14T00:00:10+00:00")
     features.setdefault("funding_rate_observed_at", "2026-07-14T00:00:01+00:00")
     features.setdefault("funding_rate_received_at", "2026-07-14T00:00:02+00:00")
+    features.setdefault("next_funding_time", "2026-07-14T08:00:00+00:00")
     features.setdefault("account_fee_source_observed_at", "2026-07-14T00:00:01+00:00")
     features.setdefault("account_fee_received_at", "2026-07-14T00:00:02+00:00")
     features.setdefault("funding_data_available", True)

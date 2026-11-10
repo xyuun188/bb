@@ -26,6 +26,9 @@ class _FakeCCXT:
         # ordId -> {"type", "amount", "filled", "cancelled"}
         self.orders: dict[str, dict[str, Any]] = {}
         self._polled_post_only: str | None = None
+        self.fill_on_cancel = 0.0
+        self.cancel_delayed = False
+        self.cancel_detail_unavailable = False
 
     def price_to_precision(self, symbol: str, value: float) -> str:
         return f"{value:.1f}"
@@ -87,11 +90,16 @@ class _FakeCCXT:
         )
         if record["type"] == "post_only":
             # Each poll advances the resting order's cumulative fill.
-            record["filled"] = self.detail_sequence.pop(0) if self.detail_sequence else 0.0
+            if record["cancelled"]:
+                if self.cancel_detail_unavailable:
+                    raise ExchangeAPIError("order detail unavailable after cancel")
+                record["filled"] = max(record["filled"], self.fill_on_cancel)
+            else:
+                record["filled"] = self.detail_sequence.pop(0) if self.detail_sequence else 0.0
         filled = record["filled"]
         amount = record["amount"]
         if record["cancelled"]:
-            state = "canceled" if filled <= 0 else "partially_filled"
+            state = "live" if self.cancel_delayed else "canceled"
         elif filled >= amount and filled > 0:
             state = "filled"
         elif filled > 0:
@@ -314,3 +322,33 @@ async def test_exit_orders_still_use_a_plain_market_submission() -> None:
     assert [call["type"] for call in ccxt.create_order_calls] == ["market"]
     assert ccxt.create_order_calls[0]["params"]["reduceOnly"] is True
     assert executor._order_status_from_ccxt(order["status"]) == OrderStatus.FILLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_fill", (4.0, 10.0))
+async def test_cancel_race_reconciles_new_maker_fills_before_market_fallback(late_fill) -> None:
+    executor = _executor()
+    ccxt = _FakeCCXT()
+    ccxt.fill_on_cancel = late_fill
+    order, fact = await _place(executor, ccxt)
+    assert fact["maker_fill_contracts"] == pytest.approx(late_fill)
+    assert order["filled"] == pytest.approx(10.0)
+    assert sum(call["amount"] for call in ccxt.create_order_calls if call["type"] == "market") == (
+        pytest.approx(10.0 - late_fill)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_fill", (0.0, 4.0))
+@pytest.mark.parametrize("failure", ("delayed", "unavailable"))
+async def test_cancel_ack_without_terminal_proof_never_submits_fallback(
+    initial_fill, failure,
+) -> None:
+    executor = _executor()
+    ccxt = _FakeCCXT()
+    ccxt.detail_sequence = [initial_fill] * 20
+    ccxt.cancel_delayed = failure == "delayed"
+    ccxt.cancel_detail_unavailable = failure == "unavailable"
+    with pytest.raises(OrderPlacementError, match="could not be cancelled"):
+        await _place(executor, ccxt)
+    assert [call["type"] for call in ccxt.create_order_calls] == ["post_only"]

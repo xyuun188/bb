@@ -8,6 +8,11 @@ from core.feature_availability import COMPONENT_AVAILABILITY_VERSION, seal_featu
 def seal_synthetic_feature_availability(features: dict, *, decision_at: datetime) -> None:
     source_at = (decision_at - timedelta(seconds=9)).isoformat()
     receipt_at = (decision_at - timedelta(seconds=8)).isoformat()
+    if "funding_rate" in features:
+        features.setdefault("funding_data_available", True)
+        features.setdefault(
+            "next_funding_time", (decision_at + timedelta(hours=8)).isoformat(),
+        )
     features.update({
         "original_decision_timestamp": decision_at.isoformat(),
         "technical_availability": {

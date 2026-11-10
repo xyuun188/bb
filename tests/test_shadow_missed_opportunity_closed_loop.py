@@ -21,6 +21,7 @@ def test_missed_opportunities_are_return_observations_only() -> None:
                 "orderbook_ask_depth": 100_000.0,
                 "taker_fee_rate": 0.0004,
                 "funding_rate": 0.0,
+                "funding_data_available": True,
                 "funding_interval_minutes": 480.0,
             },
         )

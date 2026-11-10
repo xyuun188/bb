@@ -174,3 +174,36 @@ def test_alternative_horizon_fits_only_its_own_mature_labels(monkeypatch):
     assert report["promotion_authorized"] is False
     with pytest.raises(ValueError, match="supports only"):
         research.protocol(horizon_minutes=15)
+
+
+def test_standardized_experiment_fits_scale_only_on_training_features(monkeypatch):
+    from sklearn.preprocessing import StandardScaler
+
+    frame = _source().query("horizon_minutes == 240").head(50).copy()
+    train, validation = frame.iloc[:40].copy(), frame.iloc[40:].copy()
+    validation.loc[:, "returns_20"] = 1e6
+    observed = []
+    original = StandardScaler.fit
+
+    def fit(scaler, values, *args, **kwargs):
+        observed.append(values.copy())
+        return original(scaler, values, *args, **kwargs)
+
+    monkeypatch.setattr(StandardScaler, "fit", fit)
+    predictions, _ = research._paired_predictions(
+        train, validation, feature_policy="market_only", preprocessing="standardized_linear",
+    )
+    assert len(observed) == 1
+    assert observed[0].index.tolist() == train.index.tolist()
+    assert observed[0]["returns_20"].max() < 1e6
+    validation[["long_return_pct", "short_return_pct", "sample_weight"]] = 1e9
+    repeated, _ = research._paired_predictions(
+        train, validation, feature_policy="market_only", preprocessing="standardized_linear",
+    )
+    for policy in research.WEIGHT_POLICIES:
+        for task in ("net", "score"):
+            for side in ("long", "short"):
+                np.testing.assert_allclose(predictions[policy][task][side], repeated[policy][task][side])
+    registered = research.protocol(preprocessing="standardized_linear")
+    assert registered["preprocessing"] == "standardized_linear"
+    assert registered["promotion_authorized"] is False

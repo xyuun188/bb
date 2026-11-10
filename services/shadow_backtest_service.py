@@ -30,7 +30,11 @@ from core.training_contracts import (
 )
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
-from services.execution_cost_model import EXECUTION_COST_FACT_FIELDS, execution_cost_estimate
+from services.execution_cost_model import (
+    EXECUTION_COST_FACT_FIELDS,
+    execution_cost_estimate,
+    funding_cost_estimate,
+)
 from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
 from services.shadow_training_quarantine import quarantine_completed_shadow_row
 
@@ -411,30 +415,17 @@ def shadow_fee_after_outcome(
     snapshot = getattr(row, "feature_snapshot", None)
     features = snapshot if isinstance(snapshot, dict) else {}
     execution_cost = execution_cost_estimate(features)
-    funding_present = features.get("funding_data_available") is True
-    funding_rate = _safe_shadow_number(features.get("funding_rate")) if funding_present else None
-    funding_interval_minutes = _safe_shadow_number(features.get("funding_interval_minutes"))
-    if funding_interval_minutes is None:
-        funding_interval_hours = _safe_shadow_number(features.get("funding_interval_hours"))
-        funding_interval_minutes = (
-            funding_interval_hours * 60.0 if funding_interval_hours is not None else None
-        )
+    horizon_minutes = max(int(getattr(row, "horizon_minutes", 0) or 0), 0)
+    funding = funding_cost_estimate(features, side="long", horizon_minutes=horizon_minutes)
     cost_complete = bool(
         execution_cost.production_eligible
-        and funding_rate is not None
-        and funding_present
-        and funding_interval_minutes is not None
-        and funding_interval_minutes > 0
+        and funding.production_eligible
+        and funding.signed_cashflow_pct is not None
     )
-    horizon_minutes = max(int(getattr(row, "horizon_minutes", 0) or 0), 0)
-    funding_drag_long_pct = (
-        float(funding_rate or 0.0)
-        * 100.0
-        * horizon_minutes
-        / float(funding_interval_minutes or 1.0)
+    funding_return_long_pct = funding.signed_cashflow_pct
+    funding_return_short_pct = (
+        -funding_return_long_pct if funding_return_long_pct is not None else None
     )
-    funding_return_long_pct = -funding_drag_long_pct
-    funding_return_short_pct = funding_drag_long_pct
     gross_long_pct = long_return * 100.0
     gross_short_pct = short_return * 100.0
     long_net_pct = (
@@ -481,21 +472,17 @@ def shadow_fee_after_outcome(
             reason
             for condition, reason in (
                 (execution_cost.production_eligible, execution_cost.reason),
-                (funding_present, "funding_observation_missing"),
-                (
-                    funding_interval_minutes is not None
-                    and funding_interval_minutes > 0,
-                    "funding_interval_missing",
-                ),
+                (funding.production_eligible, funding.reason),
             )
             if not condition
         ],
         "cost_source": "dynamic_execution_estimate_from_shadow_snapshot",
         "fee_return_pct": execution_cost.fee_pct,
         "slippage_return_pct": execution_cost.slippage_pct,
-        "funding_return_long_pct": funding_return_long_pct if funding_present else None,
-        "funding_return_short_pct": funding_return_short_pct if funding_present else None,
-        "funding_interval_minutes": funding_interval_minutes,
+        "funding_return_long_pct": funding_return_long_pct,
+        "funding_return_short_pct": funding_return_short_pct,
+        "funding_interval_minutes": funding.funding_interval_minutes,
+        "funding_cost": funding.to_dict(),
         "long_net_return_after_all_cost_pct": long_net_pct,
         "short_net_return_after_all_cost_pct": short_net_pct,
         "leverage_counterfactuals": leverage_counterfactuals,

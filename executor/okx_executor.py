@@ -3984,6 +3984,8 @@ class OKXExecutor(AbstractExecutor):
         ccxt: Any,
         order: dict[str, Any],
         symbol: str,
+        *,
+        allow_unfilled: bool = False,
     ) -> dict[str, Any]:
         """Cancel an active entry residual and prove the partial fill is terminal."""
 
@@ -3996,7 +3998,7 @@ class OKXExecutor(AbstractExecutor):
         )
         if (
             not order_id
-            or filled_contracts <= 0
+            or (filled_contracts <= 0 and not allow_unfilled)
             or status not in {OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.PARTIAL}
         ):
             return order
@@ -4036,6 +4038,10 @@ class OKXExecutor(AbstractExecutor):
                 if not detail:
                     continue
                 refreshed = {**refreshed, **detail}
+                refreshed["info"] = {
+                    **info,
+                    **(refreshed.get("info") if isinstance(refreshed.get("info"), dict) else {}),
+                }
                 detail_info = (
                     refreshed.get("info") if isinstance(refreshed.get("info"), dict) else {}
                 )
@@ -4565,19 +4571,39 @@ class OKXExecutor(AbstractExecutor):
                 maker_fill_contracts=filled,
                 post_only_order_id=order_id,
             )
+        if not order_id:
+            raise OrderPlacementError(
+                "post-only entry has no order identity; cannot prove cancellation before fallback"
+            )
         if order_id:
             try:
-                if filled > 0:
+                passive_status = self._order_status_from_ccxt(
+                    passive_order.get("status")
+                    or (passive_order.get("info") or {}).get("state")
+                )
+                if passive_status not in {OrderStatus.CANCELLED, OrderStatus.REJECTED}:
                     passive_order = await self._finalize_partial_entry_order(
                         ccxt,
                         passive_order,
                         okx_symbol,
+                        allow_unfilled=True,
                     )
                     passive_finalization = passive_order.get(
                         "entry_partial_fill_finalization"
                     )
+                    if not isinstance(passive_finalization, dict) or (
+                        passive_finalization.get("terminal") is not True
+                    ):
+                        raise OrderPlacementError(
+                            "passive order terminal state is not confirmed"
+                        )
                 else:
-                    await self._cancel_order_native(ccxt, order_id, okx_symbol)
+                    passive_finalization = {
+                        "order_id": order_id,
+                        "terminal": True,
+                        "exchange_terminal_status": passive_status.value,
+                        "filled_contracts": filled,
+                    }
                 fallback_reason = (
                     "post_only_partial_timeout" if filled > 0 else "post_only_timeout"
                 )
@@ -4591,8 +4617,11 @@ class OKXExecutor(AbstractExecutor):
             refreshed_filled = self._safe_float(passive_order.get("filled"), filled)
             filled = min(max(max(filled, refreshed_filled), 0.0), quantity)
             remaining = max(quantity - filled, 0.0)
+            fallback_reason = (
+                "post_only_partial_timeout" if filled > 0 else "post_only_timeout"
+            )
             if remaining <= max(quantity * 1e-9, 1e-12):
-                return passive_order, post_only_execution_fact(
+                return {**passive_order, "status": "filled"}, post_only_execution_fact(
                     plan=plan,
                     outcome="filled_after_cancel",
                     maker_fill_contracts=filled,

@@ -35,6 +35,7 @@ def _shadow_sample(*, sample_id: int, decision_id: int, horizon: int) -> dict:
             "orderbook_ask_depth": 9_000.0,
             "taker_fee_rate": 0.0004,
             "funding_rate": 0.0001,
+            "funding_data_available": True,
             "funding_interval_minutes": 480,
         },
     }

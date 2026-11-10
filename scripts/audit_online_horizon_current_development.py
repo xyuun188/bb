@@ -6,6 +6,7 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import secrets
 import shlex
 import sys
@@ -31,11 +32,14 @@ DEPENDENCIES = (
     "services/ml_horizon_development.py",
     "services/liquidity_regime_development.py",
     "services/ml_replay_weight_development.py",
+    "services/ml_blocked_return_evidence.py",
     "services/ml_nested_development.py",
     "services/ml_signal_service.py",
     "services/ml_training_contract.py",
     "services/ml_training_dataset.py",
     "services/training_data_quality.py",
+    "services/profit_supervision.py",
+    "services/execution_cost_model.py",
 )
 
 NATIVE_SOURCE = "shadow_entry_result_and_okx_native_1m_path"
@@ -147,6 +151,7 @@ from services.liquidity_regime_development import build_liquidity_regime_develop
 from services.ml_replay_weight_development import build_replay_weight_development_report
 from services.ml_development_snapshot import InsufficientDevelopmentDataError
 from services.ml_signal_service import build_training_frame
+from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.ml_training_dataset import (
     shadow_training_row_from_mapping,
 )
@@ -160,6 +165,7 @@ NATIVE_SOURCE = "shadow_entry_result_and_okx_native_1m_path"
 DEPENDENCIES = __DEPENDENCIES__
 EXPECTED_BASE_HASH = __EXPECTED_BASE_HASH__
 PREDICTION_HORIZON_MINUTES = __PREDICTION_HORIZON_MINUTES__
+PREPROCESSING = __PREPROCESSING__
 
 
 def _dependency_hashes():
@@ -265,7 +271,7 @@ async def main():
     )
     try:
         snapshot_path = settings.data_dir / "strategy_replay" / (
-            f"replay-weight-input-{REVISION}-{CUTOFF.strftime('%Y%m%dT%H%M%SZ')}-"
+            f"replay-weight-input-{PROFIT_SUPERVISION_VERSION}-{REVISION}-{CUTOFF.strftime('%Y%m%dT%H%M%SZ')}-"
             f"{GROUP_LIMIT}-{HOURS}.json"
         )
         reuse_snapshot = FAMILY == "replay_weights" and snapshot_path.exists()
@@ -275,6 +281,8 @@ async def main():
                 development, snapshot = load_development_snapshot(
                     snapshot_path, cutoff=CUTOFF.isoformat(),
                 )
+                if snapshot.get("profit_supervision_version") != PROFIT_SUPERVISION_VERSION:
+                    raise RuntimeError("frozen development costs use an obsolete supervision policy")
                 frame = development
             else:
                 async with get_read_session_ctx(
@@ -310,7 +318,10 @@ async def main():
                 "liquidity_regime": build_liquidity_regime_development_report,
                 "replay_weights": build_replay_weight_development_report,
             }[FAMILY]
-            kwargs = {"horizon_minutes": PREDICTION_HORIZON_MINUTES} if FAMILY == "replay_weights" else {}
+            kwargs = {
+                "horizon_minutes": PREDICTION_HORIZON_MINUTES,
+                **({"preprocessing": PREPROCESSING} if PREPROCESSING != "existing" else {}),
+            } if FAMILY == "replay_weights" else {}
             research = builder(development, snapshot=snapshot, **kwargs)
         horizon_counts = Counter(
             str(int(value))
@@ -426,6 +437,7 @@ def _render_remote_script(
     family: str = "ridge",
     expected_base_hash: str | None = None,
     prediction_horizon_minutes: int = 240,
+    preprocessing: str = "existing",
 ) -> str:
     return (
         REMOTE_SCRIPT.replace("__GROUP_LIMIT__", str(limit))
@@ -440,6 +452,7 @@ def _render_remote_script(
         .replace("__DEPENDENCIES__", repr(DEPENDENCIES))
         .replace("__EXPECTED_BASE_HASH__", repr(expected_base_hash))
         .replace("__PREDICTION_HORIZON_MINUTES__", str(prediction_horizon_minutes))
+        .replace("__PREPROCESSING__", repr(preprocessing))
     )
 
 
@@ -453,6 +466,7 @@ def _build_remote_command(
     family: str = "ridge",
     expected_base_hash: str | None = None,
     prediction_horizon_minutes: int = 240,
+    preprocessing: str = "existing",
 ) -> str:
     remote_script = _render_remote_script(
         limit=limit,
@@ -462,6 +476,7 @@ def _build_remote_command(
         family=family,
         expected_base_hash=expected_base_hash,
         prediction_horizon_minutes=prediction_horizon_minutes,
+        preprocessing=preprocessing,
     )
     encoded = base64.b64encode(remote_script.encode("utf-8")).decode("ascii")
     runner = f"import base64;exec(base64.b64decode({encoded!r}))"
@@ -516,6 +531,12 @@ def _validate_hash_argument(value: str | None) -> None:
         raise ValueError("expected input SHA256 must contain exactly 64 lowercase hexadecimal characters")
 
 
+def _validate_run_label(value: str) -> str:
+    if value and re.fullmatch(r"[a-z][a-z0-9-]{0,39}", value) is None:
+        raise ValueError("run label must be 1-40 lowercase letters, digits or hyphens")
+    return f"-{value}" if value else ""
+
+
 def _parse_cutoff(value: str | None) -> datetime:
     cutoff = (
         datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -550,13 +571,18 @@ def main() -> None:
     parser.add_argument("--revision", choices=("v1", "v2", "v3"), default="v3")
     parser.add_argument("--expected-input-sha256")
     parser.add_argument("--expected-base-input-sha256")
+    parser.add_argument("--run-label", default="")
+    parser.add_argument("--preprocessing", choices=("existing", "standardized_linear"), default="existing")
     parser.add_argument("--prediction-horizon-minutes", type=int, choices=(60, 240), default=240)
     parser.add_argument("--family", choices=("ridge", "liquidity_regime", "replay_weights"), default="ridge")
     args = parser.parse_args()
+    run_suffix = _validate_run_label(args.run_label)
     _validate_hash_argument(args.expected_input_sha256)
     _validate_hash_argument(args.expected_base_input_sha256)
     if args.prediction_horizon_minutes != 240 and args.family != "replay_weights":
         raise ValueError("--prediction-horizon-minutes applies only to replay_weights research")
+    if args.preprocessing != "existing" and args.family != "replay_weights":
+        raise ValueError("--preprocessing applies only to replay_weights research")
     limit = max(1, min(int(args.limit), 2500))
     max_hours = 672 if args.revision == "v3" else 168
     default_hours = 672 if args.revision == "v3" else 24
@@ -567,12 +593,14 @@ def main() -> None:
     name = {"ridge": "horizon", "liquidity_regime": "liquidity-regime", "replay_weights": "replay-weights"}[args.family]
     if args.family == "replay_weights" and args.prediction_horizon_minutes != 240:
         name += f"-{args.prediction_horizon_minutes}m"
-    unit = f"bb-{name}-dev-{args.revision}-{cutoff.strftime('%Y%m%dT%H%M%SZ')}"
+    if args.preprocessing != "existing":
+        name += "-standardized-linear"
+    unit = f"bb-{name}-dev-{args.revision}{run_suffix}-{cutoff.strftime('%Y%m%dT%H%M%SZ')}"
     result_path = (
         ROOT
         / "data"
         / "profitability_remediation"
-        / f"online-{name}-development-{args.revision}-"
+        / f"online-{name}-development-{args.revision}{run_suffix}-"
         f"{cutoff.strftime('%Y%m%dT%H%M%SZ')}.json"
     )
     if result_path.exists():
@@ -588,7 +616,7 @@ def main() -> None:
 
         registration = {
             "protocol": (
-                protocol(horizon_minutes=args.prediction_horizon_minutes)
+                protocol(horizon_minutes=args.prediction_horizon_minutes, preprocessing=args.preprocessing)
                 if args.family == "replay_weights" else protocol()
             ), "cutoff_exclusive": cutoff.isoformat(),
             "hours": hours, "decision_group_limit": limit, "sampling_revision": args.revision,
@@ -631,7 +659,7 @@ def main() -> None:
         command = (
             "set -e\numask 077\n"
             "install -d -m 0700 /data/bb/app/tmp/codex-horizon-development\n"
-            f"{_build_remote_command(limit=limit, hours=hours, cutoff=cutoff, unit=unit, revision=args.revision, family=args.family, expected_base_hash=args.expected_base_input_sha256, prediction_horizon_minutes=args.prediction_horizon_minutes)} "
+            f"{_build_remote_command(limit=limit, hours=hours, cutoff=cutoff, unit=unit, revision=args.revision, family=args.family, expected_base_hash=args.expected_base_input_sha256, prediction_horizon_minutes=args.prediction_horizon_minutes, preprocessing=args.preprocessing)} "
             f"> {shlex.quote(remote_result)}"
         )
         run_remote_text(

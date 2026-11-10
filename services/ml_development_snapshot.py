@@ -16,6 +16,7 @@ import pandas as pd
 from core.symbols import normalize_trading_symbol
 from services.ml_development_baselines import _development_input_sha256
 from services.ml_signal_service import FEATURE_KEYS, _decision_group_availability
+from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 
 SNAPSHOT_VERSION = "2026-11-06.symbol-bound-frozen-development.v2"
 REPLAY_SNAPSHOT_VERSION = "2026-11-10.replay-metadata-frozen-development.v3"
@@ -125,6 +126,7 @@ def make_development_snapshot(
         "version": REPLAY_SNAPSHOT_VERSION if include_replay_metadata else SNAPSHOT_VERSION,
         "created_at": datetime.now(UTC).isoformat(),
         "development_cutoff": boundary.isoformat(),
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
         "cutoff_policy": "all_group_labels_strictly_before_earliest_exam_start",
         "source_frame_row_count": len(frame),
         "row_count": len(development),

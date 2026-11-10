@@ -21,11 +21,11 @@ from core.training_contracts import (
     AUTHORITATIVE_TRADE_OUTCOME_SOURCES,
     SHADOW_FEE_AFTER_LABEL_VERSION,
 )
-from services.execution_cost_model import execution_cost_estimate
+from services.execution_cost_model import execution_cost_estimate, funding_cost_estimate
 from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
-PROFIT_SUPERVISION_VERSION = "2026-10-22.separated-profit-component-availability.v4"
+PROFIT_SUPERVISION_VERSION = "2026-11-10.scheduled-shadow-funding.v5"
 MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
 COUNTERFACTUAL_EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
 AUTHORITATIVE_REALIZED_RETURN_TASK = "authoritative_realized_return_distribution"
@@ -130,17 +130,10 @@ def _shadow_cost_labels(sample: dict[str, Any]) -> dict[str, Any]:
     features = _safe_dict(sample.get("features"))
     horizon = _safe_int(sample.get("horizon_minutes") or features.get("horizon_minutes"))
     estimate = execution_cost_estimate(features)
-    funding_rate = _safe_float(features.get("funding_rate"))
-    funding_interval = _safe_float(features.get("funding_interval_minutes"))
-    if funding_interval is None:
-        interval_hours = _safe_float(features.get("funding_interval_hours"))
-        funding_interval = interval_hours * 60.0 if interval_hours is not None else None
+    funding = funding_cost_estimate(features, side="long", horizon_minutes=horizon)
     funding_drag = (
-        funding_rate * 100.0 * horizon / funding_interval
-        if funding_rate is not None
-        and funding_interval is not None
-        and funding_interval > 0
-        and horizon > 0
+        -funding.signed_cashflow_pct
+        if funding.production_eligible and funding.signed_cashflow_pct is not None
         else None
     )
     eligible = bool(
@@ -154,6 +147,7 @@ def _shadow_cost_labels(sample: dict[str, Any]) -> dict[str, Any]:
         "fee_pct": estimate.fee_pct if estimate.production_eligible else None,
         "slippage_pct": estimate.slippage_pct if estimate.production_eligible else None,
         "funding_drag_pct": funding_drag,
+        "funding_cost": funding.to_dict(),
         "long_total_cost_pct": common_cost + funding_drag if eligible else None,
         "short_total_cost_pct": common_cost - funding_drag if eligible else None,
         "cost_model": estimate.to_dict(),

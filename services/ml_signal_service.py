@@ -141,6 +141,8 @@ def _training_source_code_version() -> str:
         Path(__file__).with_name("ml_training_contract.py"),
         Path(__file__).with_name("ml_prediction_contract.py"),
         Path(__file__).with_name("return_objective.py"),
+        Path(__file__).with_name("profit_supervision.py"),
+        Path(__file__).with_name("execution_cost_model.py"),
         Path(__file__).with_name("model_artifact_registry.py"),
         Path(__file__).with_name("trading_params.py"),
     )

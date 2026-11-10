@@ -132,6 +132,14 @@ def test_malformed_expected_hash_is_rejected_before_protocol_registration(value)
     audit._validate_hash_argument(None)
 
 
+@pytest.mark.parametrize("label", ("../other", "UPPER", "a b", "a" * 41))
+def test_run_labels_cannot_escape_immutable_report_paths(label):
+    with pytest.raises(ValueError, match="run label"):
+        audit._validate_run_label(label)
+    assert audit._validate_run_label("scheduled-funding-v5") == "-scheduled-funding-v5"
+    assert audit._validate_run_label("") == ""
+
+
 def test_time_coverage_sampling_preserves_old_groups_and_all_horizons() -> None:
     cutoff = datetime(2026, 11, 5, tzinfo=UTC)
     since = cutoff - timedelta(hours=24)
@@ -282,7 +290,11 @@ def test_replay_weight_audit_reuses_sealed_inputs_and_checks_identity_before_fit
 
     development, snapshot = _snapshot(_source())
     cutoff = datetime.fromisoformat(CUTOFF)
-    path = tmp_path / "strategy_replay" / "replay-weight-input-v3-20260810T000000Z-2500-672.json"
+    from services.profit_supervision import PROFIT_SUPERVISION_VERSION
+
+    path = tmp_path / "strategy_replay" / (
+        f"replay-weight-input-{PROFIT_SUPERVISION_VERSION}-v3-20260810T000000Z-2500-672.json"
+    )
     save_development_snapshot(snapshot, path=path)
     original_bytes = path.read_bytes()
     monkeypatch.setattr(settings_module, "settings", SimpleNamespace(data_dir=tmp_path))

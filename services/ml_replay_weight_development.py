@@ -6,9 +6,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
 
 from services.dynamic_policy_values import empirical_policy_value
 from services.liquidity_regime_development import _rejections, capacity_sides
+from services.ml_blocked_return_evidence import blocked_return_evidence
 from services.ml_development_baselines import (
     _development_input_sha256,
     _evidence,
@@ -35,15 +37,27 @@ from services.ml_signal_service import (
 
 POLICY_VERSION = "2026-11-10.paired-replay-weight-development.v1"
 WEIGHT_POLICIES = ("outcome_emphasis", "natural")
+PREPROCESSING_POLICIES = ("existing", "standardized_linear")
 
 
-def protocol(*, horizon_minutes: int = PRIMARY_PREDICTION_HORIZON_MINUTES) -> dict[str, Any]:
+def protocol(
+    *, horizon_minutes: int = PRIMARY_PREDICTION_HORIZON_MINUTES,
+    preprocessing: str = "existing",
+) -> dict[str, Any]:
     if horizon_minutes not in (60, PRIMARY_PREDICTION_HORIZON_MINUTES):
         raise ValueError("paired recipe research supports only 60m and the production horizon")
+    if preprocessing not in PREPROCESSING_POLICIES:
+        raise ValueError("unknown registered preprocessing policy")
     return {
         "version": POLICY_VERSION,
         "replay_weight_version": REPLAY_WEIGHT_POLICY_VERSION,
         "horizon_minutes": horizon_minutes,
+        "preprocessing": preprocessing,
+        "preprocessing_policy": (
+            "standard scaler fitted only on each purged training fold; "
+            "validation features transformed without refit; production unchanged"
+            if preprocessing == "standardized_linear" else "existing production inputs"
+        ),
         "candidates": [
             {"id": f"{features}-{weights}", "feature_policy": features, "weight_policy": weights}
             for features in FEATURE_POLICIES for weights in WEIGHT_POLICIES
@@ -61,6 +75,10 @@ def protocol(*, horizon_minutes: int = PRIMARY_PREDICTION_HORIZON_MINUTES) -> di
             "in both opportunity and capacity views, aggregate and each fold"
         ),
         "rank_policy": "fixed top 20 percent diagnostic only; cannot authorize entry",
+        "uncertainty_policy": (
+            "report moving two-day UTC block-bootstrap 95% lower bound; all symbols "
+            "joint; minimum 16 selected calendar days; development only"
+        ),
         "exam_policy": "development only; prospective decisions after registration remain unexamined",
         "promotion_authorized": False,
     }
@@ -68,6 +86,7 @@ def protocol(*, horizon_minutes: int = PRIMARY_PREDICTION_HORIZON_MINUTES) -> di
 
 def _paired_predictions(
     train: pd.DataFrame, validation: pd.DataFrame, *, feature_policy: str,
+    preprocessing: str = "existing",
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     train = train.copy()
     boundaries = {}
@@ -87,6 +106,14 @@ def _paired_predictions(
         )
     features = list(FEATURE_POLICIES[feature_policy])
     x_train, x_validation = train[features], validation[features]
+    if preprocessing == "standardized_linear":
+        scaler = StandardScaler().fit(x_train)
+        x_train = pd.DataFrame(scaler.transform(x_train), columns=features, index=train.index)
+        x_validation = pd.DataFrame(
+            scaler.transform(x_validation), columns=features, index=validation.index,
+        )
+    elif preprocessing != "existing":
+        raise ValueError("unknown registered preprocessing policy")
     predictions: dict[str, dict[str, Any]] = {
         policy: {"net": {}, "score": {}} for policy in WEIGHT_POLICIES
     }
@@ -140,8 +167,9 @@ def _attribution(frame: pd.DataFrame, sides: np.ndarray) -> dict[str, Any]:
 def build_replay_weight_development_report(
     development: pd.DataFrame, *, snapshot: dict[str, Any],
     horizon_minutes: int = PRIMARY_PREDICTION_HORIZON_MINUTES,
+    preprocessing: str = "existing",
 ) -> dict[str, Any]:
-    registered = protocol(horizon_minutes=horizon_minutes)
+    registered = protocol(horizon_minutes=horizon_minutes, preprocessing=preprocessing)
     if snapshot.get("version") != REPLAY_SNAPSHOT_VERSION:
         raise ValueError("training-recipe comparison requires replay metadata snapshot")
     if _development_input_sha256(development) != snapshot["development_input_sha256"]:
@@ -188,7 +216,10 @@ def build_replay_weight_development_report(
     for train, validation, boundary in folds:
         fold = {**boundary, "replay_manifests": {}}
         for features in FEATURE_POLICIES:
-            paired, manifests = _paired_predictions(train, validation, feature_policy=features)
+            kwargs = {"preprocessing": preprocessing} if preprocessing != "existing" else {}
+            paired, manifests = _paired_predictions(
+                train, validation, feature_policy=features, **kwargs,
+            )
             fold["replay_manifests"][features] = manifests
             for policy in WEIGHT_POLICIES:
                 predictions[f"{features}-{policy}"].append(paired[policy])
@@ -207,6 +238,11 @@ def build_replay_weight_development_report(
         executable = capacity_sides(evaluation, sides)
         aggregate = _views(evaluation, sides, executable)
         rejections = [f"aggregate:{reason}" for reason in _rejections(aggregate)]
+        uncertainty = blocked_return_evidence(evaluation, executable)
+        if not uncertainty["ready"]:
+            rejections.append("capacity_calendar_block_evidence_insufficient")
+        elif uncertainty["return_lcb_pct"] <= 0:
+            rejections.append("capacity_calendar_block_lcb_nonpositive")
         per_fold = []
         for index, (_, validation, _) in enumerate(folds):
             selected = slice(offsets[index], offsets[index + 1])
@@ -219,6 +255,7 @@ def build_replay_weight_development_report(
             "development_qualified": not rejections,
             "rejection_reasons": rejections,
             "aggregate_evidence": aggregate,
+            "capacity_block_uncertainty": uncertainty,
             "per_fold": per_fold,
             "prediction_diagnostics": {
                 side: _prediction_diagnostics(

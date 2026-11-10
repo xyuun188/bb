@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime, timedelta
-from math import isfinite
+from datetime import UTC, datetime
+from math import floor, isfinite
 from typing import Any
 
 EXECUTION_COST_FACT_FIELDS = (
@@ -142,10 +142,14 @@ def funding_cost_estimate(
     observed_raw = str(snapshot.get("funding_rate_observed_at") or "").strip()
     next_funding = _parse_timestamp(next_funding_raw)
     observed_at = _parse_timestamp(observed_raw)
-    as_of = _parse_timestamp(
-        str(snapshot.get("timestamp") or snapshot.get("funding_as_of") or "")
-    ) or datetime.now(UTC)
-    legacy_projection = not bool(snapshot.get("timestamp") or snapshot.get("funding_as_of"))
+    as_of_raw = (
+        snapshot.get("original_decision_timestamp")
+        or snapshot.get("timestamp")
+        or snapshot.get("funding_as_of")
+    )
+    parsed_as_of = _parse_timestamp(str(as_of_raw or ""))
+    as_of = parsed_as_of or datetime.now(UTC)
+    legacy_projection = not bool(as_of_raw)
     if normalized_side not in {"long", "short"}:
         reason = "funding_side_invalid"
     elif snapshot.get("funding_data_available") is not True:
@@ -156,10 +160,14 @@ def funding_cost_estimate(
         reason = "funding_interval_missing"
     elif horizon is None or horizon <= 0.0:
         reason = "prediction_horizon_missing"
+    elif as_of_raw and parsed_as_of is None:
+        reason = "funding_as_of_invalid"
     elif not next_funding and not legacy_projection:
         reason = "next_funding_time_missing"
     elif not observed_at and not legacy_projection:
         reason = "funding_rate_observed_at_missing"
+    elif observed_at and observed_at > as_of and not legacy_projection:
+        reason = "funding_rate_observed_after_decision"
     elif observed_at and as_of > observed_at and not legacy_projection:
         max_age = max(interval * 2.0 if interval and interval > 0 else 480.0, 30.0)
         if (as_of - observed_at).total_seconds() > max_age * 60.0:
@@ -171,18 +179,23 @@ def funding_cost_estimate(
     settlement_count = 0
     if eligible and rate is not None and interval is not None and horizon is not None:
         if next_funding is not None:
-            end = as_of + timedelta(minutes=horizon)
-            cursor = next_funding
-            step = timedelta(minutes=interval)
-            while cursor <= end and settlement_count < 1000:
-                if cursor > as_of:
-                    settlement_count += 1
-                cursor += step
-            signed_impact = (
-                (-rate if normalized_side == "long" else rate)
-                * 100.0
-                * settlement_count
+            # Count (decision, exit] settlements directly. Iterating from an
+            # old next-funding timestamp can otherwise stall historical replay.
+            step_seconds = interval * 60.0
+            first = max(floor((as_of - next_funding).total_seconds() / step_seconds) + 1, 0)
+            last = floor(
+                ((as_of - next_funding).total_seconds() + horizon * 60.0) / step_seconds
             )
+            settlement_count = max(last - first + 1, 0)
+            if settlement_count > 1000:
+                eligible = False
+                reason = "funding_settlement_count_exceeds_limit"
+            else:
+                signed_impact = (
+                    (-rate if normalized_side == "long" else rate)
+                    * 100.0
+                    * settlement_count
+                )
         else:
             # Old stored/test snapshots predate next_funding_time. Keep their
             # result readable, but mark the method so production snapshots can
@@ -193,7 +206,8 @@ def funding_cost_estimate(
                 * horizon
                 / interval
             )
-        adverse_cost = max(-signed_impact, 0.0)
+        if signed_impact is not None:
+            adverse_cost = max(-signed_impact, 0.0)
 
     signed_impact = round(signed_impact, 10) if signed_impact is not None else None
     return FundingCostEstimate(
@@ -218,7 +232,7 @@ def funding_cost_estimate(
             "observation_window": "current_prediction_horizon",
             "sample_count": int(eligible),
             "generated_at": datetime.now(UTC).isoformat(),
-            "strategy_version": "2026-08-16.directional-funding-cost.v1",
+            "strategy_version": "2026-11-10.decision-clock-funding-settlements.v2",
             "fallback_reason": "" if eligible else reason,
             "funding_rate_observed_at": observed_raw,
             "income_credit_policy": "signed_cashflow_positive_income_negative_cost",
