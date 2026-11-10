@@ -5200,30 +5200,25 @@ class MLSignalService:
         challenger_trade_cursor = int(
             challenger_metadata.get("last_trained_completed_trade_sample_count") or 0
         )
-        current_group_cursor = int(
-            selected.get("last_trained_completed_shadow_decision_group_count") or 0
-        )
-        challenger_group_cursor = int(
-            challenger_metadata.get("last_trained_completed_shadow_decision_group_count") or 0
-        )
         current_raw_group_cursor = int(
             selected.get("last_trained_completed_shadow_raw_decision_group_count") or 0
         )
         challenger_raw_group_cursor = int(
             challenger_metadata.get("last_trained_completed_shadow_raw_decision_group_count") or 0
         )
+        # A capped, quality-filtered fitting window can shrink. The latest
+        # completed attempt owns the scheduling checkpoint, even when rejected.
+        unknown_time = datetime.min.replace(tzinfo=UTC)
         if (
-            challenger_group_cursor,
+            self._parse_datetime(challenger_metadata.get("trained_at")) or unknown_time,
             challenger_raw_group_cursor,
             challenger_cursor,
             challenger_trade_cursor,
-            str(challenger_metadata.get("trained_at") or ""),
         ) > (
-            current_group_cursor,
+            self._parse_datetime(selected.get("trained_at")) or unknown_time,
             current_raw_group_cursor,
             current_cursor,
             current_trade_cursor,
-            str(selected.get("trained_at") or ""),
         ):
             return challenger_metadata
         return selected

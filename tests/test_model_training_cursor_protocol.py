@@ -178,3 +178,52 @@ async def test_market_cursor_migration_does_not_compare_different_scopes(
         assert result["training_policy"]["trigger"] != "not_due"
     else:
         assert result["reason"] == "not_due"
+
+
+@pytest.mark.parametrize(
+    ("current_time", "challenger_time", "challenger_raw_count", "expected_challenger"),
+    [
+        ("2026-11-10T13:49:19Z", "2026-11-10T15:11:19Z", 57272, True),
+        ("2026-11-10T13:49:19Z", "2026-11-10T15:11:19Z", 50000, True),
+        ("2026-11-10T15:11:19Z", "2026-11-10T13:49:19Z", 60000, False),
+        ("2026-11-10T23:11:19+08:00", "2026-11-10T15:12:19Z", 57272, True),
+        (None, None, 57272, True),
+    ],
+)
+def test_ml_checkpoint_tracks_completed_attempt_time_when_fit_window_shrinks(
+    tmp_path, current_time, challenger_time, challenger_raw_count, expected_challenger,
+):
+    from services.ml_signal_service import MLSignalService
+    from services.model_artifact_registry import ResolvedModelArtifact
+    from services.model_training_state import LOCAL_ML_MODEL_IDS, ModelTrainingStateStore
+
+    current = {
+        "trained_at": current_time,
+        "last_trained_completed_shadow_decision_group_count": 5000,
+        "last_trained_completed_shadow_raw_decision_group_count": 56906,
+        "last_trained_completed_shadow_sample_count": 216547,
+        "last_trained_completed_trade_sample_count": 107,
+    }
+    rejected_metadata = {
+        "trained_at": challenger_time,
+        "last_trained_completed_shadow_decision_group_count": 4999,
+        "last_trained_completed_shadow_raw_decision_group_count": challenger_raw_count,
+        "last_trained_completed_shadow_sample_count": 217959,
+        "last_trained_completed_trade_sample_count": 107,
+    }
+    challenger = ResolvedModelArtifact(
+        model_id=LOCAL_ML_MODEL_IDS[0], version="rejected-newer-attempt",
+        model_path=tmp_path / "model.joblib", metadata_path=tmp_path / "metadata.json",
+        manifest_path=tmp_path / "manifest.json", sha256="a" * 64,
+        manifest=rejected_metadata, pointer_role="challenger", pointer_path=tmp_path / "challenger.json",
+    )
+    service = MLSignalService(
+        artifact_registry=SimpleNamespace(
+            model_root=tmp_path / "model_artifacts", resolve_challenger=lambda **_kwargs: challenger,
+        ),
+        training_state_store=ModelTrainingStateStore(tmp_path / "training-state.json"),
+    )
+    selected = service._training_cursor_metadata(current)
+    assert selected == (rejected_metadata if expected_challenger else current)
+    # Choosing a scheduling checkpoint never mutates the serving champion.
+    assert current["last_trained_completed_shadow_decision_group_count"] == 5000

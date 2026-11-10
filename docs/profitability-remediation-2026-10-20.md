@@ -373,3 +373,19 @@ observations with means from -0.255661% to -0.188103% and profit factors
 from 0.481243 to 0.588831. All four were rejected. Shortening the horizon
 alone therefore does not supply a qualified replacement either; do not
 change the production horizon or promote a development-only subgroup.
+
+The normal production-recipe rebuild produced challenger
+`20261110T151123502069Z-00dedb05` with 2,396 training and 2,500 holdout rows.
+Its short high-score mean was +0.207745% with PF 1.514349, but lower bound
+-0.210949%; long evidence remained negative. The existing champion comparison
+rejected the candidate for worse tail loss and drawdown, retaining
+`20261110T134923782757Z-9e8bceb3`. These are separate training windows, not
+the paired frozen-development experiment above.
+
+Acceptance also exposed a scheduling bug: the old fit window had 5,000 clean
+groups while the newer rejected candidate had 4,999, so lexicographic cursor
+selection ignored its newer 57,272 raw groups and 217,959 settled samples.
+Scheduling checkpoints now prefer parsed UTC completion time, with cumulative
+cursors as tie breakers. A smaller bounded fitting window cannot hide a newer
+completed attempt. This updates scheduling/status only, not the serving
+champion or its trading permissions.

@@ -2642,6 +2642,7 @@ async def test_rejected_challenger_contract_and_cursor_prevent_rapid_retraining(
         "data_quality_version": "old-contract",
     }
     current_metadata["last_trained_completed_shadow_decision_group_count"] = 1_000
+    current_metadata["trained_at"] = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
     challenger_metadata = _ml_training_metadata(
         artifact_persisted=True,
         ready=False,
