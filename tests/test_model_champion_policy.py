@@ -219,3 +219,116 @@ def test_active_candidate_requires_market_regime_stability() -> None:
 
     assert report["accepted"] is False
     assert "active_candidate_cross_section_unstable" in report["blocking_reasons"]
+
+
+def test_unprofitable_champion_can_be_replaced_by_clearly_better_candidate() -> None:
+    # The live deadlock: the incumbent is losing money (profit factor 0.66,
+    # negative average) yet blocks a candidate that improves every primary
+    # metric, because its own tail metrics are marginally better.
+    champion = _metadata(
+        avg=-0.52,
+        lcb=-1.30,
+        profit_factor=0.66,
+        cvar=-7.89,
+        drawdown=39.31,
+    )
+    challenger = _metadata(
+        avg=0.97,
+        lcb=-0.50,
+        profit_factor=1.56,
+        cvar=-9.41,
+        drawdown=40.48,
+    )
+
+    report = compare_candidate_to_champion(
+        challenger,
+        champion,
+        candidate_stage="canary",
+        champion_stage="canary",
+    )
+
+    assert report["accepted"] is True
+    assert report["reason"] == "unhealthy_champion_controlled_takeover"
+    assert report["unhealthy_champion_takeover"] is True
+
+
+def test_unprofitable_champion_still_blocks_a_worse_candidate() -> None:
+    champion = _metadata(
+        avg=-0.52,
+        lcb=-1.30,
+        profit_factor=0.66,
+        cvar=-7.89,
+        drawdown=39.31,
+    )
+    challenger = _metadata(
+        avg=0.20,
+        lcb=-0.90,
+        profit_factor=0.95,
+        cvar=-7.90,
+        drawdown=39.40,
+    )
+
+    report = compare_candidate_to_champion(
+        challenger,
+        champion,
+        candidate_stage="canary",
+        champion_stage="canary",
+    )
+
+    assert report["accepted"] is False
+    assert "takeover_candidate_profit_factor_not_above_one" in report["blocking_reasons"]
+    assert "takeover_candidate_avg_return_not_positive" not in report["blocking_reasons"]
+
+
+def test_unprofitable_champion_blocks_catastrophic_tail_regression() -> None:
+    champion = _metadata(
+        avg=-0.52,
+        lcb=-1.30,
+        profit_factor=0.66,
+        cvar=-7.89,
+        drawdown=39.31,
+    )
+    challenger = _metadata(
+        avg=1.20,
+        lcb=-0.40,
+        profit_factor=1.70,
+        cvar=-14.00,
+        drawdown=56.00,
+    )
+
+    report = compare_candidate_to_champion(
+        challenger,
+        champion,
+        candidate_stage="canary",
+        champion_stage="canary",
+    )
+
+    assert report["accepted"] is False
+    assert "takeover_cvar_catastrophically_worsened" in report["blocking_reasons"]
+    assert (
+        "takeover_max_drawdown_catastrophically_worsened"
+        in report["blocking_reasons"]
+    )
+
+
+def test_healthy_champion_is_not_displaced_without_real_improvement() -> None:
+    # A profitable champion is only displaced by real improvement, and never by
+    # the unhealthy-champion takeover path.
+    champion = _metadata()
+    no_improvement = compare_candidate_to_champion(
+        _metadata(),
+        champion,
+        candidate_stage="canary",
+        champion_stage="canary",
+    )
+    tail_worse = compare_candidate_to_champion(
+        _metadata(avg=0.35, lcb=0.15, profit_factor=1.50, cvar=-0.40, drawdown=0.35),
+        champion,
+        candidate_stage="canary",
+        champion_stage="canary",
+    )
+
+    assert no_improvement["accepted"] is False
+    assert no_improvement.get("unhealthy_champion_takeover") is not True
+    assert tail_worse["accepted"] is False
+    assert "candidate_cvar_materially_worsened" in tail_worse["blocking_reasons"]
