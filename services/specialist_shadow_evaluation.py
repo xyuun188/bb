@@ -238,9 +238,6 @@ def _authoritative_market_regime(sample: Any) -> str:
 
 
 def _actual_best_side(row: Any) -> str:
-    best = _safe_str(_row_get(row, "best_action")).lower()
-    if best in {"long", "short", "hold"}:
-        return best
     fee_after = shadow_fee_after_return_labels(_shadow_quality_payload(row))
     long_return = _safe_float(
         fee_after.get("long_net_return_after_all_cost_pct"), None

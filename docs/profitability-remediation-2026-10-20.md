@@ -487,3 +487,21 @@ settlement function and records the supervision version. Missing funding
 availability, future observations and missing schedules cannot supply complete
 specialist cost evidence. Regression cases compare long/short specialist
 returns directly with training labels, with and without a settlement.
+The specialist's correct-side diagnostic also recomputes current fee-after
+labels instead of trusting the stored old best-action label. Missing current
+cost evidence yields no correct-side label; the database audit label is not
+rewritten.
+
+The November 11 00:50 Beijing Go/No-Go result remained `no_go`: long high-score
+mean -0.404546%, PF 0.470552 and LCB -0.730347%. Short high-score holdout mean
+was +0.553334%, PF 3.992576 and LCB +0.249590%; those single-window diagnostics
+are not a completed independent promotion exam. The audit reported zero
+current contract violations, zero incomplete position-economics observations
+and zero executed dynamic-exit contract gaps.
+
+Eight fresh decisions at approximately 00:55-00:56 Beijing all completed
+analysis with valid primary-horizon and funding evidence, and all held. Some
+short signals had positive expected net return, but their contemporaneous
+return bounds were negative (for example expected +0.482444% versus lower
+bound -1.173319%). This does not establish an execution outage or authorize a
+weaker entry gate.

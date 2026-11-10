@@ -211,6 +211,14 @@ def test_specialist_rejects_incomplete_funding_evidence(invalid):
     ) is None
 
 
+def test_specialist_best_side_recomputes_current_costs_without_mutating_audit_label():
+    row = _row(best_action="short", predicted_side="long", realized=0.42)
+    assert specialist_evaluation._actual_best_side(row) == "long"
+    assert row.best_action == "short"
+    row.feature_snapshot["funding_data_available"] = False
+    assert specialist_evaluation._actual_best_side(row) == ""
+
+
 def _authoritative_sample(
     index: int,
     *,
