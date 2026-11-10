@@ -47,7 +47,17 @@ def test_required_audit_card_reuses_recent_completed_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     checked_at = datetime.now(UTC) - timedelta(seconds=15)
-    checked_at = datetime.now(UTC) - timedelta(seconds=15)
+    model_status = {
+        "artifact_version": "current-artifact",
+        "artifact_lifecycle": "shadow",
+        "available": True,
+        "live_ml_ready": False,
+    }
+    monkeypatch.setattr(
+        system_audit,
+        "MLSignalService",
+        lambda: SimpleNamespace(status_metadata=lambda: model_status),
+    )
     monkeypatch.setattr(
         system_audit,
         "_load_canonical_audit_snapshot",
@@ -60,7 +70,10 @@ def test_required_audit_card_reuses_recent_completed_snapshot(
                     {
                         "key": "model_training",
                         "status": "ok",
-                        "details": {"optimization_target": "fee_after_return"},
+                        "details": {
+                            "optimization_target": "fee_after_return",
+                            "local_ml_profit_quality": dict(model_status),
+                        },
                     }
                 ],
             },
@@ -74,6 +87,59 @@ def test_required_audit_card_reuses_recent_completed_snapshot(
     assert card["details"]["report_source"] == "persisted_audit"
     assert card["details"]["report_age_seconds"] >= 15
     assert card["details"][system_audit.REQUIRED_AUDIT_GENERATED_AT_KEY]
+
+
+@pytest.mark.parametrize(
+    "current_status",
+    [
+        {
+            "artifact_version": "replacement-artifact",
+            "artifact_lifecycle": "active",
+            "available": True,
+            "live_ml_ready": True,
+        },
+        {
+            "artifact_version": "previous-artifact",
+            "artifact_lifecycle": "shadow",
+            "available": True,
+            "live_ml_ready": False,
+        },
+        {"available": False},
+    ],
+)
+def test_required_model_audit_rejects_cache_after_artifact_or_permission_change(
+    monkeypatch: pytest.MonkeyPatch,
+    current_status: dict[str, Any],
+) -> None:
+    checked_at = datetime.now(UTC) - timedelta(seconds=15)
+    monkeypatch.setattr(
+        system_audit,
+        "_load_canonical_audit_snapshot",
+        lambda: (
+            checked_at,
+            {
+                "cards": [{
+                    "key": "model_training",
+                    "status": "ok",
+                    "details": {
+                        "local_ml_profit_quality": {
+                            "artifact_version": "previous-artifact",
+                            "artifact_lifecycle": "active",
+                            "available": True,
+                            "live_ml_ready": True,
+                        },
+                    },
+                }],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        system_audit,
+        "MLSignalService",
+        lambda: SimpleNamespace(status_metadata=lambda: current_status),
+    )
+
+    assert system_audit._cached_required_audit_card("model_training") is None
 
 
 def test_required_audit_card_expires_on_its_own_generation_time(

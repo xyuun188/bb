@@ -4215,6 +4215,7 @@ def _local_ml_profit_quality_details(
     return {
         "model_id": "local_ml_profit_quality",
         "artifact_version": status.get("artifact_version") or status.get("model_version"),
+        "artifact_lifecycle": status.get("artifact_lifecycle"),
         "available": bool(status.get("available")),
         "status": status.get("status"),
         "readiness_state": readiness.get("state") or status.get("readiness_state"),
@@ -6718,6 +6719,26 @@ def _cached_required_audit_card(key: str) -> dict[str, Any] | None:
     age_seconds = max((_now() - reference_at).total_seconds(), 0.0)
     if age_seconds > REQUIRED_AUDIT_SNAPSHOT_MAX_AGE_SECONDS:
         return None
+    if key == "model_training":
+        model_evidence = _safe_dict(
+            _safe_dict(card_sources).get("local_ml_profit_quality")
+        )
+        try:
+            current_model = MLSignalService().status_metadata()
+        except Exception:
+            return None
+        # A recent timestamp cannot make another artifact's profitability or
+        # activation evidence authoritative for the current model.
+        if (
+            current_model.get("available") is not True
+            or model_evidence.get("available") is not True
+            or not current_model.get("artifact_version")
+            or any(
+                model_evidence.get(field) != current_model.get(field)
+                for field in ("artifact_version", "artifact_lifecycle", "live_ml_ready")
+            )
+        ):
+            return None
     cached = copy.deepcopy(card)
     details = cached.setdefault("details", {})
     if isinstance(details, dict):

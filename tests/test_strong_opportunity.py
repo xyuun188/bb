@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from config.settings import settings
-from db.session import close_db, get_session_ctx, init_db
+from db.session import close_db, get_read_session_ctx, get_session_ctx, init_db
 from models.decision import AIDecision
+from services import strong_opportunity
 from services.strong_opportunity import StrongOpportunityService
 
 
@@ -85,5 +87,61 @@ async def test_positive_expectation_with_incomplete_cost_stays_observation_only(
         assert report["strong_candidate_count"] == 0
         assert report["near_miss_count"] == 1
         assert "live_execution_cost_incomplete" in report["near_misses"][0]["block_reasons"]
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_hold_window_does_not_load_payloads_or_older_entries(tmp_path, monkeypatch) -> None:
+    await _reset_db(tmp_path, monkeypatch)
+    queries = []
+
+    class RecordingSession:
+        def __init__(self, session):
+            self.session = session
+
+        async def execute(self, statement):
+            queries.append(str(statement))
+            return await self.session.execute(statement)
+
+    @asynccontextmanager
+    async def recording_session():
+        async with get_read_session_ctx() as session:
+            yield RecordingSession(session)
+
+    try:
+        now = datetime.now(UTC)
+        async with get_session_ctx() as session:
+            session.add_all([
+                AIDecision(
+                    model_name="ensemble_trader",
+                    symbol="BTC/USDT",
+                    action="long",
+                    confidence=0.2,
+                    raw_llm_response=_raw(),
+                    created_at=now - timedelta(hours=1),
+                ),
+                *[
+                    AIDecision(
+                        model_name="ensemble_trader",
+                        symbol="ETH/USDT",
+                        action="hold",
+                        confidence=0.2,
+                        raw_llm_response={"reasoning": "large transcript" * 1000},
+                        feature_snapshot={"unused": "large snapshot" * 1000},
+                        created_at=now - timedelta(minutes=minute),
+                    )
+                    for minute in (1, 2)
+                ],
+            ])
+        monkeypatch.setattr(strong_opportunity, "get_read_session_ctx", recording_session)
+        report = await StrongOpportunityService(limit=2).report()
+
+        assert report["checked_decisions"] == 2
+        assert report["entry_decisions"] == 0
+        assert report["strong_candidate_count"] == 0
+        assert len(queries) == 1
+        assert "raw_llm_response" not in queries[0]
+        assert "feature_snapshot" not in queries[0]
     finally:
         await close_db()

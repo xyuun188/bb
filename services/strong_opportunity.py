@@ -9,6 +9,7 @@ from math import isfinite
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.orm import load_only
 
 from core.symbols import normalize_trading_symbol
 from db.session import get_read_session_ctx
@@ -54,21 +55,51 @@ class StrongOpportunityService:
         self.limit = max(1, min(int(limit or DEFAULT_LIMIT), 5000))
 
     async def report(self) -> dict[str, Any]:
-        since = (datetime.now(UTC) - timedelta(hours=self.lookback_hours)).replace(tzinfo=None)
+        since = datetime.now(UTC) - timedelta(hours=self.lookback_hours)
         async with get_read_session_ctx() as session:
-            decisions = list(
+            headers = (
                 (
                     await session.execute(
-                        select(AIDecision)
+                        select(AIDecision.id, AIDecision.action)
                         .where(AIDecision.created_at >= since)
-                        .order_by(AIDecision.created_at.desc())
+                        .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
                         .limit(self.limit)
                     )
                 )
-                .scalars()
+                .mappings()
                 .all()
             )
-        entries = [row for row in decisions if str(row.action or "").lower() in ENTRY_ACTIONS]
+            entry_ids = [
+                row["id"]
+                for row in headers
+                if str(row["action"] or "").lower() in ENTRY_ACTIONS
+            ]
+            # Hold decisions can contain large model transcripts. Only entry
+            # candidates in the bounded window need contract payloads.
+            entries = []
+            if entry_ids:
+                entries = list(
+                    (
+                        await session.execute(
+                            select(AIDecision)
+                            .options(
+                                load_only(
+                                    AIDecision.id,
+                                    AIDecision.symbol,
+                                    AIDecision.action,
+                                    AIDecision.created_at,
+                                    AIDecision.was_executed,
+                                    AIDecision.raw_llm_response,
+                                    raiseload=True,
+                                )
+                            )
+                            .where(AIDecision.id.in_(entry_ids))
+                            .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
         candidates = [self._classify(row) for row in entries]
         strong = [row for row in candidates if row.strong_opportunity]
         near = [
@@ -87,7 +118,7 @@ class StrongOpportunityService:
             "can_force_open": False,
             "can_apply_live_sizing": False,
             "lookback_hours": self.lookback_hours,
-            "checked_decisions": len(decisions),
+            "checked_decisions": len(headers),
             "entry_decisions": len(entries),
             "strong_candidate_count": len(strong),
             "executed_strong_candidate_count": sum(row.executed for row in strong),
