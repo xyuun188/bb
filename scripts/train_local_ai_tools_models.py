@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 import httpx
-from sqlalchemy import case, func, select
+from sqlalchemy import BigInteger, case, cast, func, select
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -978,8 +978,9 @@ async def _load_shadow_samples(
                 return []
             # Stable integer priorities prevent a new completion from moving
             # every historical rank. Both operations use only raw identities.
+            identity_id = cast(ShadowBacktest.id, BigInteger)
             priority = (
-                (ShadowBacktest.id % _SHADOW_IDENTITY_MODULUS)
+                (identity_id % _SHADOW_IDENTITY_MODULUS)
                 * _SHADOW_IDENTITY_MULTIPLIER % _SHADOW_IDENTITY_MODULUS
             )
             stmt = (

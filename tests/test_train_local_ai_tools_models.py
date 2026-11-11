@@ -418,6 +418,7 @@ async def test_executable_shadow_loader_preserves_sample_after_new_completion(
 
     def sample(index: int) -> ShadowBacktest:
         return ShadowBacktest(
+            id=2_147_483_000 + index,
             decision_id=index + 1, model_name="ensemble_trader",
             execution_mode="paper", symbol=f"S{index}/USDT", status="completed",
             horizon_minutes=primary, created_at=start + timedelta(minutes=index),
