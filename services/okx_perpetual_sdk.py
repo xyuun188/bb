@@ -1659,12 +1659,14 @@ class OkxPerpetualSdkExchange:
         if not isinstance(row, Mapping):
             row = {}
         amount = _safe_float(row.get("oi"), 0.0)
-        value = _safe_float(row.get("oiCcy") or row.get("oiUsd"), 0.0)
+        value = _safe_float(row.get("oiUsd"), 0.0)
         return {
             "symbol": symbol_from_okx_inst_id(inst_id),
             "openInterestAmount": amount,
             "openInterest": amount,
             "openInterestValue": value,
+            "openInterestValueUnit": "USD" if value > 0 else "",
+            "timestamp": row.get("ts"),
             "info": dict(row),
         }
 

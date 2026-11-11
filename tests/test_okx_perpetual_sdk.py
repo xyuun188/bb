@@ -104,6 +104,34 @@ class _MarketApi:
         }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("usd", ["1398804918.13", None])
+async def test_sdk_open_interest_keeps_usd_separate_from_base_currency(usd) -> None:
+    class Api:
+        def get_open_interest(self, **kwargs):
+            assert kwargs == {"instType": "SWAP", "instId": "ETH-USDT-SWAP"}
+            return {
+                "code": "0",
+                "data": [{
+                    "instId": "ETH-USDT-SWAP",
+                    "oi": "6752227.33",
+                    "oiCcy": "675222.733",
+                    "oiUsd": usd,
+                    "ts": "1794411989666",
+                }],
+            }
+
+    exchange = OkxPerpetualSdkExchange("paper")
+    exchange._public_api = Api()
+
+    result = await exchange.fetch_open_interest("ETH/USDT")
+
+    assert result["openInterestAmount"] == pytest.approx(6752227.33)
+    assert result["openInterestValue"] == pytest.approx(float(usd) if usd else 0.0)
+    assert result["openInterestValueUnit"] == ("USD" if usd else "")
+    assert result["timestamp"] == "1794411989666"
+
+
 class _TradeApi:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []

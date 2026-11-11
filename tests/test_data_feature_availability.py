@@ -359,6 +359,8 @@ async def test_feature_vector_retains_detached_component_availability(
     async def derivatives(*_args, **_kwargs):
         return {
             "open_interest_contracts": 1000.0,
+            "open_interest_value": 100_000.0,
+            "open_interest_value_unit": "USD",
             "open_interest_received_at": RECEIVED_AT.isoformat(),
             "open_interest_observed_at": RECEIVED_AT.isoformat(),
         }
@@ -379,6 +381,8 @@ async def test_feature_vector_retains_detached_component_availability(
     assert vector.sentiment_availability["news_input_count"] == 1
     assert vector.sentiment_availability["news_received_at"] == RECEIVED_AT.isoformat()
     assert vector.open_interest_contracts == 1000.0
+    assert vector.open_interest_value == 100_000.0
+    assert vector.open_interest_value_unit == "USD"
     assert vector.open_interest_received_at == RECEIVED_AT.isoformat()
     assert vector.open_interest_observed_at == RECEIVED_AT.isoformat()
     vector.technical_availability["available_at"] = "mutated"
@@ -655,16 +659,37 @@ async def test_open_interest_records_real_receipt_and_preserves_missing_source_c
         receipt_clock.current = completed_at
         return {
             "openInterestAmount": 1000.0,
-            "openInterestValue": 100_000.0,
-            "info": {"ts": source_clock},
+            "openInterestValue": 100.0,
+            "info": {"oiCcy": "100", "oiUsd": "100000", "ts": source_clock},
         }
 
     monkeypatch.setattr(client, "_ccxt_call", fetch)
     result = await client.fetch_open_interest("BTC/USDT")
     assert result["open_interest_contracts"] == 1000.0
     assert result["open_interest_value"] == 100_000.0
+    assert result["open_interest_value_unit"] == "USD"
     assert result["open_interest_received_at"] == completed_at.isoformat()
     assert result["open_interest_observed_at"] == source_clock
+
+
+@pytest.mark.asyncio
+async def test_open_interest_never_uses_unverified_base_quantity_as_usd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OKXRestClient()
+
+    async def fetch(*_args, **_kwargs):
+        return {
+            "openInterestAmount": 1000.0,
+            "openInterestValue": 100.0,
+            "info": {"oiCcy": "100"},
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fetch)
+    result = await client.fetch_open_interest("BTC/USDT")
+    assert result["open_interest_contracts"] == 1000.0
+    assert result["open_interest_value"] == 0.0
+    assert result["open_interest_value_unit"] == ""
 
 
 @pytest.mark.asyncio
@@ -679,6 +704,7 @@ async def test_required_derivative_refresh_retains_original_optional_receipts(
         "funding_rate_received_at": RECEIVED_AT.isoformat(),
         "open_interest_contracts": 1000.0,
         "open_interest_value": 100_000.0,
+        "open_interest_value_unit": "USD",
         "open_interest_observed_at": (RECEIVED_AT - timedelta(seconds=2)).isoformat(),
         "open_interest_received_at": RECEIVED_AT.isoformat(),
     }

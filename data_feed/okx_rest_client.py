@@ -1141,15 +1141,19 @@ class OKXRestClient:
         contracts = self._safe_float(
             data.get("openInterestAmount") or data.get("openInterest") or info.get("oi")
         )
+        # oiCcy is base currency, not USD. Only carry a value whose unit is
+        # explicit; old adapters populated openInterestValue with oiCcy.
         value = self._safe_float(
-            data.get("openInterestValue")
-            or data.get("quoteVolume")
-            or info.get("oiCcy")
-            or info.get("oiUsd")
+            info.get("oiUsd")
+            if "oiUsd" in info
+            else data.get("openInterestValue")
+            if data.get("openInterestValueUnit") == "USD"
+            else None
         )
         return {
             "open_interest_contracts": contracts,
             "open_interest_value": value,
+            "open_interest_value_unit": "USD" if value > 0 else "",
             "open_interest_observed_at": data.get("timestamp") or info.get("ts"),
             "open_interest_received_at": received_at,
         }

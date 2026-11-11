@@ -102,7 +102,7 @@ FEATURE_KEYS = [
     "news_sentiment_avg", "social_sentiment_avg", "social_mention_count",
     "news_article_count", "horizon_minutes",
 ]
-FEATURE_PROBABILITY_CONTRACT_VERSION = "2026-11-10.pre-decision-natural-prior.v2"
+FEATURE_PROBABILITY_CONTRACT_VERSION = "2026-11-11.explicit-usd-open-interest.v3"
 SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_count", "news_article_count"]
 PROFIT_TRAINING_TARGET = "net_return_after_all_cost_pct"
 RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
@@ -1532,7 +1532,11 @@ def feature_row(features: dict[str, Any], *, horizon_minutes: int | None = None)
     ask_depth = f(features, "orderbook_ask_depth")
     total_depth = max(bid_depth + ask_depth, 1e-9)
     volume_24h = max(f(features, "volume_24h"), 0.0)
-    oi_value = max(f(features, "open_interest_value"), 0.0)
+    oi_value = (
+        max(f(features, "open_interest_value"), 0.0)
+        if features.get("open_interest_value_unit") == "USD"
+        else 0.0
+    )
     values = {
         "change_24h_pct": f(features, "change_24h_pct"),
         "spread_pct": f(features, "spread_pct"),

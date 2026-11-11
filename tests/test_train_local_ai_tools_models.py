@@ -43,6 +43,16 @@ def test_historical_shadow_governance_survives_training_compaction() -> None:
     )
 
 
+def test_open_interest_unit_survives_training_compaction_and_transport() -> None:
+    features = {
+        "open_interest_value": 100_000.0,
+        "open_interest_value_unit": "USD",
+    }
+    compact = train_script._compact_local_ai_tools_features(features)
+    assert compact == features
+    assert train_script._training_transport_features(compact) == features
+
+
 @pytest.fixture(autouse=True)
 def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(

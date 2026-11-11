@@ -1770,6 +1770,15 @@ def test_old_feature_contract_is_rejected_before_sklearn_prediction(tmp_path: Pa
     ]
 
 
+@pytest.mark.parametrize("unit,expected", [("USD", 5.0), ("BTC", 0.0), ("", 0.0), (None, 0.0)])
+def test_open_interest_feature_requires_explicit_usd_unit(unit, expected) -> None:
+    snapshot = {"open_interest_value": 99_999.0}
+    if unit is not None:
+        snapshot["open_interest_value_unit"] = unit
+    row = ml_signal_module._feature_row_from_snapshot(snapshot)
+    assert row["log_open_interest_value"] == pytest.approx(expected)
+
+
 def test_bundle_feature_columns_must_exactly_match_runtime_contract(tmp_path: Path) -> None:
     metadata = _with_return_objective({"artifact_version": "wrong-feature-columns"})
     service = _service_with_registered_bundle(

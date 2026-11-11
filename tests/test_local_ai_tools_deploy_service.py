@@ -334,6 +334,16 @@ def test_quant_features_exclude_final_decision_confidence() -> None:
     )
 
 
+@pytest.mark.parametrize("unit,expected", [("USD", 5.0), ("BTC", 0.0), ("", 0.0), (None, 0.0)])
+def test_quant_open_interest_feature_requires_explicit_usd_unit(unit, expected) -> None:
+    module = ModuleType("local_ai_tools_open_interest_unit_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    snapshot = {"open_interest_value": 99_999.0}
+    if unit is not None:
+        snapshot["open_interest_value_unit"] = unit
+    assert module.feature_row(snapshot)["log_open_interest_value"] == pytest.approx(expected)
+
+
 def test_quant_rejects_artifacts_from_the_old_probability_contract(tmp_path: Path) -> None:
     module = ModuleType("local_ai_tools_old_probability_contract_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)

@@ -124,7 +124,7 @@ LOCAL_ML_TRAINING_SCHEDULER_ID = "local_ml_auto_train"
 AUTO_TRAIN_RETRY_INTERVAL_SECONDS = 5 * 60
 AUTO_TRAIN_LEASE_STALE_SECONDS = 2 * 60 * 60
 MIN_ACTIVE_WALK_FORWARD_FOLDS = 2
-FEATURE_CONTRACT_VERSION = "2026-11-10.pre-decision-market-features.v2"
+FEATURE_CONTRACT_VERSION = "2026-11-11.explicit-usd-open-interest.v3"
 MULTITASK_PREDICTION_CONTRACT_VERSION = "2026-11-10.signed-funding-cost.v3"
 REPLAY_WEIGHT_POLICY_VERSION = "2026-11-10.zero-preserving-replay-weights.v3"
 _TRAINING_CANDIDATE_CACHE: dict[
@@ -378,7 +378,11 @@ def _feature_row_from_snapshot(
         ),
         "log_volume_24h": math.log10(max(_safe_float(snapshot.get("volume_24h")), 0.0) + 1.0),
         "log_open_interest_value": math.log10(
-            max(_safe_float(snapshot.get("open_interest_value")), 0.0) + 1.0
+            (
+                max(_safe_float(snapshot.get("open_interest_value")), 0.0)
+                if snapshot.get("open_interest_value_unit") == "USD"
+                else 0.0
+            ) + 1.0
         ),
         "orderbook_imbalance": _safe_float(snapshot.get("orderbook_imbalance")),
         "orderbook_depth_ratio": (bid_depth - ask_depth) / depth_total,

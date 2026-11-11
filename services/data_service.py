@@ -4723,6 +4723,7 @@ class DataService:
                 "funding_rate_received_at",
                 "open_interest_contracts",
                 "open_interest_value",
+                "open_interest_value_unit",
                 "open_interest_observed_at",
                 "open_interest_received_at",
             ):

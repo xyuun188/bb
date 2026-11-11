@@ -122,6 +122,7 @@ _LOCAL_AI_TOOLS_FEATURE_KEYS = {
     "round_trip_fee_pct",
     "volume_24h",
     "open_interest_value",
+    "open_interest_value_unit",
     "orderbook_imbalance",
     "orderbook_bid_depth",
     "orderbook_ask_depth",
@@ -300,7 +301,7 @@ def _compact_local_ai_tools_features(features: dict[str, Any]) -> dict[str, Any]
     for key in _LOCAL_AI_TOOLS_FEATURE_KEYS:
         if key not in features:
             continue
-        if key == "symbol":
+        if key in {"symbol", "open_interest_value_unit"}:
             symbol = str(features.get(key) or "").strip()
             if symbol:
                 compact[key] = symbol[:40]
@@ -401,7 +402,7 @@ def _training_transport_features(features: Any) -> dict[str, Any]:
         if key not in features:
             continue
         value = features.get(key)
-        if key == "symbol":
+        if key in {"symbol", "open_interest_value_unit"}:
             text = str(value or "").strip()
             if text:
                 compact[key] = text[:40]

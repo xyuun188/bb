@@ -146,6 +146,7 @@ class FeatureVector:
     fee_policy_provenance: dict[str, Any] = field(default_factory=dict)
     open_interest_contracts: float = 0.0
     open_interest_value: float = 0.0
+    open_interest_value_unit: str = ""
     open_interest_observed_at: str | None = None
     open_interest_received_at: str | None = None
     orderbook_bid_depth: float = 0.0
