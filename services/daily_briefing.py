@@ -177,7 +177,7 @@ def render_text(report: dict[str, Any]) -> str:
         if latest_version and latest_version != model.get("artifact_version"):
             retained = "（未替换运行模型）" if model.get("champion_retained") else ""
             lines.append(f"最近候选：{latest_version}{retained}")
-        lines.append(f"纸面执行权限：{model.get('paper_model_eligible')}")
+        lines.append(f"模型纸盘调用资格：{model.get('paper_model_eligible')}")
         lines.append(f"实盘权限：{model.get('live_ml_ready')}")
         lines.append(f"最近训练影子样本：{model.get('shadow_samples')}")
         lines.append(f"最近训练成交样本：{model.get('trade_samples')}")

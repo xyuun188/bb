@@ -200,6 +200,49 @@ These operations use concurrent index creation/drop, short lock waits, bounded
 maintenance resources, and recovery of an invalid index left by an interrupted
 concurrent build. They do not delete samples.
 
+## November 11 Post-Deployment Acceptance
+
+The `ad74bee3` deployment completed at 15:52 Beijing. The priority bounded
+repair then scanned 7,231 recent completed paper shadows, recompacted 5,070,
+restored 4,735 existing settlement-cost observations, and preserved the
+availability seals and raw source for all 5,070 updated rows. No settlement
+outcome or order record was rewritten.
+
+Twelve post-repair settlements across 5, 15, 60 and 240 minutes passed the
+storage and label checks: Python and PostgreSQL projections matched, a second
+compaction was idempotent, seals and observed exit costs were retained, and
+training labels agreed with both persisted labels and specialist evaluation.
+All were within the 128 KiB storage budget. This verifies data handling, not
+profitability or actual fills.
+
+Both training branches ran again using the repaired sample pool. The local-ML
+challenger `20261111T081327725052Z-bca1c670` and quant challenger
+`20261111T081704499285Z-f0138dc1` were rejected by their existing
+non-degradation gates; the prior champion artifacts remain active. The current
+canonical Go/No-Go check remains `no_go`: fee-after mean `-0.069554%`, profit
+factor `0.898108`, and return lower confidence bound `-0.489961%`. The short
+side alone has positive mean (`+0.244700%`) and PF (`1.775850`), but its lower
+bound remains negative (`-0.043182%`), so it does not qualify.
+
+At 16:25 Beijing, all three online services were active with zero restarts and
+no post-deployment unhandled SDK-finalizer or service errors. In the latest
+30-minute window, 144 decisions completed analysis, selected the authorized
+240-minute horizon, and had complete funding projections; all remained HOLD.
+The current blockers are negative fee/risk-adjusted direction evidence and
+historical quality gates, not a stopped decision loop. Server-profit and
+timeseries specialists expose a tail-loss event, not ordinary loss
+probability; they remain observation-only rather than substituting one event
+for the other.
+
+The daily briefing now labels `paper_model_eligible` as model paper-call
+eligibility, not an order-opening permission. Every decision still needs to
+pass the separate current-return, cost, and risk gates.
+
+Profitability acceptance is still open. There is no qualifying independent
+exam, complete passive-fill and concurrent-portfolio replay, or successful
+paper entry-to-settlement lifecycle. Do not respond to the absence of entries
+by forcing orders or weakening the return gates.
+
 ## Horizon Economics Finding (2026-11-09)
 
 A read-only study of all four source horizons measured fee-after net return by

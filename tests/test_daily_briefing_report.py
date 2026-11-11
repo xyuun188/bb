@@ -80,6 +80,8 @@ def test_render_text_reports_blockers_and_model_state() -> None:
     assert "实际开仓 0 次" in text
     assert "direction_support_expected_net_not_positive" in text
     assert "canary" in text
+    assert "模型纸盘调用资格：True" in text
+    assert "纸面执行权限" not in text
     assert "实盘权限：False" in text
     assert "窗口内完成 12 条" in text
 
