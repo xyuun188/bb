@@ -216,6 +216,7 @@ compact_payload = {{
         "paper_bootstrap",
         "paper_bootstrap_state",
         "artifact_activation_stage",
+        "champion_comparison",
     )
     if key in full_payload
 }}

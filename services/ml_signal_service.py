@@ -58,7 +58,10 @@ from services.ml_training_contract import (
     decision_group_partition_errors,
 )
 from services.model_artifact_registry import ModelArtifactRegistry, ResolvedModelArtifact
-from services.model_champion_policy import compare_candidate_to_champion
+from services.model_champion_policy import (
+    PAIRED_COMPARISON_VERSION,
+    compare_candidate_to_champion,
+)
 from services.model_strategy_blueprint import build_model_strategy_blueprint
 from services.model_training_state import (
     LOCAL_ML_MODEL_IDS,
@@ -1858,6 +1861,105 @@ def _champion_comparison_inputs(
         return None, None, sorted(set(eligibility_errors))
     stage = str(_safe_dict(current_artifact.activation_manifest).get("activation_stage") or "")
     return manifest, stage or None, []
+
+
+def _paired_artifact_return_evaluation(
+    frame: pd.DataFrame,
+    candidate: ResolvedModelArtifact | None,
+    champion: ResolvedModelArtifact,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "version": PAIRED_COMPARISON_VERSION,
+        "ready": False,
+        "source": "frozen_artifacts_on_common_unfitted_candidate_holdout",
+        "independent_profitability_exam": False,
+        "chronological_label_disjoint": False,
+        "sample_count": 0,
+    }
+    if candidate is None:
+        return {**report, "reason": "candidate_artifact_unavailable"}
+    artifacts = {"candidate": candidate, "champion": champion}
+    try:
+        cutoffs = []
+        for role, artifact in artifacts.items():
+            metadata = artifact.manifest
+            report[f"{role}_training_data_sha256"] = metadata.get("training_data_sha256")
+            report[f"{role}_model_sha256"] = artifact.sha256
+            partition = _safe_dict(metadata.get("decision_group_partition"))
+            cutoff = pd.to_datetime(partition.get("training_label_end"), utc=True)
+            if cutoff is None or pd.isna(cutoff):
+                raise ValueError("artifact_training_label_end_unavailable")
+            cutoffs.append(cutoff)
+        horizon = int(candidate.manifest["primary_prediction_horizon_minutes"])
+        if champion.manifest.get("primary_prediction_horizon_minutes") != horizon:
+            raise ValueError("paired_prediction_horizon_mismatch")
+        start = pd.to_datetime(
+            candidate.manifest["decision_group_partition"]["holdout_decision_start"],
+            utc=True,
+        )
+        if start is None or pd.isna(start):
+            raise ValueError("candidate_holdout_start_unavailable")
+        cutoff = max(cutoffs)
+        primary = frame[
+            pd.to_numeric(frame["horizon_minutes"], errors="coerce") == horizon
+        ]
+        _, bounds = _decision_group_availability(primary)
+        groups = {
+            group
+            for group, boundary in bounds.items()
+            if boundary["decision_start"] > cutoff and boundary["decision_start"] >= start
+        }
+        test = _chronological_frame(
+            primary[primary["decision_group"].astype(str).isin(groups)]
+        ).reset_index(drop=True)
+        report.update({
+            "sample_count": int(len(test)),
+            "decision_group_count": len(groups),
+            "horizon_minutes": horizon,
+            "training_label_end": cutoff.isoformat(),
+        })
+        if len(test) < MIN_TRAINING_SAMPLE_COUNT:
+            return {**report, "reason": "common_unfitted_holdout_too_small"}
+        report.update({
+            "evaluation_data_sha256": _training_data_sha256(test),
+            "evaluation_decision_start": min(
+                bounds[group]["decision_start"] for group in groups
+            ).isoformat(),
+            "evaluation_label_end": _fingerprint_value(test["label_timestamp"].max()),
+            "chronological_label_disjoint": True,
+        })
+        x = test[FEATURE_KEYS]
+        for role, artifact in artifacts.items():
+            bundle = load_trusted_joblib(
+                artifact.model_path,
+                trusted_root=artifact.model_path.parent,
+                expected_type=dict,
+            )
+            _configure_single_row_inference(bundle)
+            sides = {}
+            for side in ("long", "short"):
+                scores = risk_adjusted_expected_scores(
+                    regression_prediction_distribution(bundle[f"{side}_regressor"], x),
+                    regression_prediction_distribution(bundle[f"{side}_cost_regressor"], x),
+                    _positive_proba(bundle[f"{side}_tail_classifier"], x),
+                    tail_loss_scale_pct=float(
+                        artifact.manifest["tail_loss_scale_pct"][side]
+                    ),
+                )
+                if len(scores) != len(test) or not np.isfinite(scores).all():
+                    raise ValueError("paired_artifact_scores_invalid")
+                sides[side] = _return_evidence(
+                    _top_scored_return_rows(test, scores, side=side)
+                )
+            report[role] = sides
+        return {**report, "ready": True, "reason": "complete"}
+    except Exception as exc:
+        logger.warning("paired_artifact_evaluation_failed", error=safe_error_text(exc))
+        return {
+            **report,
+            "reason": "paired_artifact_evaluation_failed",
+            "error": safe_error_text(exc, limit=500),
+        }
 
 
 _REQUIRED_LOCAL_ML_BUNDLE_KEYS = (
@@ -4021,6 +4123,18 @@ class MLSignalService:
                     if isinstance(current_artifact, ResolvedModelArtifact)
                     else None
                 )
+                comparison_evaluation = None
+                if champion_manifest is not None:
+                    resolve_candidate = getattr(self.artifact_registry, "resolve_candidate", None)
+                    candidate_artifact = (
+                        resolve_candidate() if callable(resolve_candidate) else None
+                    )
+                    comparison_evaluation = await asyncio.to_thread(
+                        _paired_artifact_return_evaluation,
+                        frame,
+                        candidate_artifact,
+                        current_artifact,
+                    )
                 champion_comparison = compare_candidate_to_champion(
                     trained_metadata,
                     champion_manifest,
@@ -4033,6 +4147,7 @@ class MLSignalService:
                     )
                     if activation_stage == "canary"
                     else None,
+                    comparison_evaluation=comparison_evaluation,
                 )
                 if champion_eligibility_errors:
                     champion_comparison = {

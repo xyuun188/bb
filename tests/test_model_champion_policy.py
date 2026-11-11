@@ -1,6 +1,34 @@
 import pytest
 
-from services.model_champion_policy import compare_candidate_to_champion
+from services.model_champion_policy import (
+    PAIRED_COMPARISON_VERSION,
+)
+from services.model_champion_policy import (
+    compare_candidate_to_champion as _compare_candidate_to_champion,
+)
+
+
+def _paired_evaluation(candidate: dict, champion: dict) -> dict:
+    return {
+        "version": PAIRED_COMPARISON_VERSION,
+        "ready": True,
+        "sample_count": 100,
+        "chronological_label_disjoint": True,
+        "evaluation_data_sha256": "c" * 64,
+        "candidate_training_data_sha256": candidate["training_data_sha256"],
+        "champion_training_data_sha256": champion["training_data_sha256"],
+        "candidate": candidate["oos_return_evaluation"],
+        "champion": champion["oos_return_evaluation"],
+    }
+
+
+def compare_candidate_to_champion(candidate: dict, champion: dict, **kwargs: object) -> dict:
+    """Exercise metric policy with scores from a common evaluation fixture."""
+    return _compare_candidate_to_champion(
+        candidate, champion,
+        comparison_evaluation=_paired_evaluation(candidate, champion),
+        **kwargs,
+    )
 
 
 def _metadata(
@@ -371,3 +399,49 @@ def test_both_side_comparison_rejects_missing_direction_evidence(missing_side: s
 
     assert report["accepted"] is False
     assert "champion_comparison_metric_missing:avg_return_pct" in report["blocking_reasons"]
+
+
+def test_different_historical_reports_cannot_replace_common_evaluation() -> None:
+    report = _compare_candidate_to_champion(
+        _metadata(avg=10, lcb=9, profit_factor=20),
+        _metadata(),
+        candidate_stage="shadow",
+        champion_stage="shadow",
+    )
+    assert report["accepted"] is False
+    assert "common_unfitted_holdout_unavailable" in report["blocking_reasons"]
+
+
+def test_paired_results_override_stale_historical_metrics() -> None:
+    candidate, champion = _metadata(avg=-10), _metadata(avg=10)
+    evaluation = _paired_evaluation(_metadata(avg=0.4), _metadata(avg=0.3))
+    report = _compare_candidate_to_champion(
+        candidate, champion,
+        candidate_stage="shadow", champion_stage="shadow",
+        comparison_evaluation=evaluation,
+    )
+    assert report["accepted"] is True
+    assert report["candidate_metrics"]["avg_return_pct"] == 0.4
+    assert report["champion_metrics"]["avg_return_pct"] == 0.3
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("chronological_label_disjoint", False),
+        ("candidate_training_data_sha256", "wrong-candidate"),
+        ("champion_training_data_sha256", "wrong-champion"),
+        ("sample_count", 1),
+        ("evaluation_data_sha256", ""),
+    ],
+)
+def test_invalid_paired_evidence_preserves_champion(key: str, value: object) -> None:
+    candidate, champion = _metadata(avg=0.4), _metadata()
+    evaluation = {**_paired_evaluation(candidate, champion), key: value}
+    report = _compare_candidate_to_champion(
+        candidate, champion,
+        candidate_stage="canary", champion_stage="canary",
+        comparison_evaluation=evaluation,
+    )
+    assert report["accepted"] is False
+    assert report["reason"] == "paired_comparison_unavailable"

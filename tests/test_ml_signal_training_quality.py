@@ -1558,6 +1558,98 @@ def test_champion_missing_separated_cost_model_cannot_block_candidate(
     assert "artifact_model_component_missing:short_cost_regressor" in errors
 
 
+def _paired_test_artifact(
+    tmp_path: Path, frame: pd.DataFrame, *, role: str, sign: float, cutoff_index: int,
+) -> ResolvedModelArtifact:
+    root = tmp_path / role
+    root.mkdir()
+    metadata = {
+        "training_data_sha256": ("a" if role == "candidate" else "b") * 64,
+        "primary_prediction_horizon_minutes": 30,
+        "decision_group_partition": {
+            "training_label_end": frame.iloc[cutoff_index]["label_timestamp"],
+            "holdout_decision_start": (
+                pd.Timestamp(frame.iloc[40]["label_timestamp"]) - pd.Timedelta(minutes=30)
+            ).isoformat(),
+        },
+        "tail_loss_scale_pct": {"long": 0.1, "short": 0.1},
+    }
+    train = frame.iloc[:cutoff_index + 1]
+    x = train[FEATURE_KEYS]
+    bundle = {"metadata": metadata}
+    for side, direction in (("long", sign), ("short", -sign)):
+        market = ml_signal_module._make_regressor(train["returns_1"])
+        market.fit(x, train["returns_1"] * direction)
+        cost = ml_signal_module._make_regressor(pd.Series(0.08, index=train.index))
+        cost.fit(x, pd.Series(0.08, index=train.index))
+        tail = ml_signal_module._make_classifier(pd.Series(0, index=train.index))
+        tail.fit(x, pd.Series(0, index=train.index))
+        bundle.update({
+            f"{side}_regressor": market,
+            f"{side}_cost_regressor": cost,
+            f"{side}_tail_classifier": tail,
+        })
+    model_path = root / "model.joblib"
+    dump_trusted_joblib(bundle, model_path, trusted_root=root)
+    return ResolvedModelArtifact(
+        model_id="local_ml_profit_quality", version=role, model_path=model_path,
+        metadata_path=root / "metadata.json", manifest_path=root / "manifest.json",
+        manifest=metadata, sha256=metadata["training_data_sha256"],
+        pointer_role=role, pointer_path=root / "pointer.json",
+        activation_manifest={"activation_stage": "shadow"},
+    )
+
+
+def test_paired_comparison_scores_both_frozen_models_after_both_fit_cutoffs(
+    tmp_path: Path,
+) -> None:
+    frame = _training_frame()
+    frame["returns_1"] = np.linspace(-1, 1, len(frame))
+    frame["long_return_pct"] = frame["returns_1"]
+    frame["short_return_pct"] = -frame["returns_1"]
+    candidate = _paired_test_artifact(
+        tmp_path, frame, role="candidate", sign=1, cutoff_index=39,
+    )
+    champion = _paired_test_artifact(
+        tmp_path, frame, role="champion", sign=-1, cutoff_index=50,
+    )
+    report = ml_signal_module._paired_artifact_return_evaluation(frame, candidate, champion)
+
+    assert report["ready"] is True
+    assert report["sample_count"] == 29
+    assert report["chronological_label_disjoint"] is True
+    assert report["evaluation_decision_start"] > report["training_label_end"]
+    assert report["independent_profitability_exam"] is False
+    assert report["candidate"]["long"]["avg_return_pct"] > report["champion"]["long"][
+        "avg_return_pct"
+    ]
+    assert report["candidate"]["short"]["avg_return_pct"] > report["champion"]["short"][
+        "avg_return_pct"
+    ]
+    expected = (frame.iloc[-5:]["long_return_pct"] - 0.08).mean()
+    assert report["candidate"]["long"]["avg_return_pct"] == pytest.approx(expected)
+    repeated = ml_signal_module._paired_artifact_return_evaluation(
+        frame.iloc[::-1], candidate, champion,
+    )
+    assert repeated["evaluation_data_sha256"] == report["evaluation_data_sha256"]
+
+
+def test_paired_comparison_cannot_use_champion_training_rows(tmp_path: Path) -> None:
+    frame = _training_frame()
+    candidate = _paired_test_artifact(
+        tmp_path, frame, role="candidate", sign=1, cutoff_index=39,
+    )
+    champion = _paired_test_artifact(
+        tmp_path, frame, role="champion", sign=-1, cutoff_index=78,
+    )
+    report = ml_signal_module._paired_artifact_return_evaluation(frame, candidate, champion)
+
+    assert report["ready"] is False
+    assert report["reason"] == "common_unfitted_holdout_too_small"
+    assert report["sample_count"] == 1
+    assert "candidate" not in report
+
+
 def test_incompatible_registered_artifact_keeps_manifest_evidence_in_status(
     tmp_path: Path,
 ) -> None:

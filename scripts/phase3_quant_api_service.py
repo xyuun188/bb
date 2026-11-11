@@ -2107,9 +2107,117 @@ def _local_oos_aggregate(metadata: dict[str, Any]) -> dict[str, float | None]:
             if math.isfinite(value):
                 values[key].append(value)
     return {
-        key: sum(items) / len(items) if items else None
+        key: sum(items) / len(items) if len(items) == 2 else None
         for key, items in values.items()
     }
+
+
+def _paired_artifact_return_evaluation(
+    candidate_bundle: dict[str, Any],
+    champion: dict[str, Any],
+    holdout_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    report = {
+        "version": "2026-11-11.common-unfitted-holdout.v1",
+        "ready": False,
+        "independent_profitability_exam": False,
+        "return_semantics": "shadow_net_return_after_all_cost",
+        "sample_count": 0,
+    }
+    try:
+        champion_bundle = load_trusted_joblib_bundle(champion["model_path"])
+        bundles = {"candidate": candidate_bundle, "champion": champion_bundle}
+        cutoffs = []
+        for role, bundle in bundles.items():
+            metadata = bundle["metadata"]
+            if metadata.get("primary_prediction_horizon_minutes") != PRIMARY_PREDICTION_HORIZON_MINUTES:
+                raise ValueError("paired_prediction_horizon_mismatch")
+            # Legacy artifacts have no exact fit boundary. Their creation time
+            # safely excludes every observation that could have reached the fit.
+            cutoff = _parsed_timestamp(
+                metadata.get("comparison_fit_label_end") or metadata.get("trained_at")
+            )
+            if cutoff is None:
+                raise ValueError("artifact_training_label_end_unavailable")
+            cutoffs.append(cutoff)
+            report[f"{role}_training_data_sha256"] = metadata.get("training_data_sha256")
+        cutoff = max(cutoffs)
+        _, bounds = _decision_group_availability(holdout_rows)
+        groups = {
+            group for group, boundary in bounds.items()
+            if boundary["decision_start"] > cutoff
+        }
+        rows = _chronological_rows([
+            row for row in holdout_rows
+            if row["decision_group"] in groups
+            and int(row["horizon"]) == PRIMARY_PREDICTION_HORIZON_MINUTES
+            and all(
+                row.get(f"{side}_net_return") is not None
+                and math.isfinite(float(row[f"{side}_net_return"]))
+                for side in ("long", "short")
+            )
+        ])
+        report.update({
+            "sample_count": len(rows),
+            "decision_group_count": len({row["decision_group"] for row in rows}),
+            "training_label_end": cutoff.isoformat(),
+            "horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
+        })
+        if len(rows) < 16:
+            return {**report, "reason": "common_unfitted_holdout_too_small"}
+        report.update({
+            "evaluation_data_sha256": canonical_sha256(rows),
+            "evaluation_decision_start": min(
+                bounds[row["decision_group"]]["decision_start"] for row in rows
+            ).isoformat(),
+            "evaluation_label_end": rows[-1]["label_timestamp"],
+            "chronological_label_disjoint": True,
+        })
+        x = [row["x"] for row in rows]
+        for role, bundle in bundles.items():
+            sides = {}
+            for side in ("long", "short"):
+                market = np.asarray(bundle[f"{side}_return_model"].predict(x), dtype=float)
+                cost_model = bundle.get(f"{side}_cost_model")
+                if cost_model is None and bundle["metadata"].get("paper_bootstrap") is not True:
+                    raise ValueError("paired_artifact_cost_model_unavailable")
+                # Bootstrap artifacts have no historical cost fit; use the same
+                # locked decision-time cost inputs that downstream paper reprices.
+                cost = (
+                    np.asarray(cost_model.predict(x), dtype=float)
+                    if cost_model is not None else
+                    np.asarray([row[f"{side}_total_cost_pct"] for row in rows], dtype=float)
+                )
+                loss_model = bundle[f"{side}_loss_model"]
+                probabilities = np.asarray(loss_model.predict_proba(x), dtype=float)
+                classes = list(getattr(loss_model.named_steps["model"], "classes_", []))
+                tail = (
+                    probabilities[:, classes.index(1)]
+                    if 1 in classes else np.zeros(len(rows), dtype=float)
+                )
+                scale = float(bundle["metadata"]["tail_loss_scale_pct"][side])
+                scores = market - cost - tail * scale
+                if scores.shape != (len(rows),) or not np.isfinite(scores).all():
+                    raise ValueError("paired_artifact_scores_invalid")
+                scored_rows = [
+                    {
+                        "decision_group": row["decision_group"],
+                        "label_timestamp": row["label_timestamp"],
+                        "return_pct": float(row[f"{side}_net_return"]),
+                        "return_semantics": "shadow_net_return_after_all_cost",
+                        "score": float(scores[index]),
+                    }
+                    for index, row in enumerate(rows)
+                ]
+                sides[side] = _return_evidence(_select_top_return_rows(scored_rows))
+            report[role] = sides
+        return {**report, "ready": True, "reason": "complete"}
+    except Exception as exc:
+        return {
+            **report,
+            "reason": "paired_artifact_evaluation_failed",
+            "error": safe_error(exc, ERROR_TEXT_LIMIT),
+        }
 
 
 def _replaceable_current_artifact(
@@ -2131,9 +2239,11 @@ def _compare_candidate_to_current(
     candidate_metadata: dict[str, Any],
     *,
     candidate_stage: str,
+    candidate_bundle: dict[str, Any] | None = None,
+    holdout_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
-        "policy": "local_ai_tools_fee_after_champion_v1",
+        "policy": "local_ai_tools_paired_fee_after_champion_v2",
         "candidate_stage": candidate_stage,
         "accepted": False,
         "blocking_reasons": [],
@@ -2195,8 +2305,20 @@ def _compare_candidate_to_current(
             "reason": "governed_lifecycle_upgrade",
             "champion_version": current.get("version"),
         }
-    candidate = _local_oos_aggregate(candidate_metadata)
-    champion = _local_oos_aggregate(current.get("metadata") or {})
+    evaluation = (
+        _paired_artifact_return_evaluation(candidate_bundle, current, holdout_rows)
+        if candidate_bundle is not None and holdout_rows is not None else {}
+    )
+    report["comparison_evaluation"] = evaluation
+    if evaluation.get("ready") is not True:
+        return {
+            **report,
+            "reason": "paired_comparison_unavailable",
+            "blocking_reasons": ["common_unfitted_holdout_unavailable"],
+            "champion_version": current.get("version"),
+        }
+    candidate = _local_oos_aggregate({"oos_return_evaluation": evaluation.get("candidate")})
+    champion = _local_oos_aggregate({"oos_return_evaluation": evaluation.get("champion")})
     report["candidate_metrics"] = candidate
     report["champion_metrics"] = champion
     if any(candidate.get(key) is None or champion.get(key) is None for key in candidate):
@@ -6128,6 +6250,10 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
         "feature_probability_contract_version": FEATURE_PROBABILITY_CONTRACT_VERSION,
         "phase": "phase3_model_factory",
         "trained_at": datetime.now(timezone.utc).isoformat(),
+        "comparison_fit_label_end": max(
+            _parsed_timestamp(row["label_timestamp"])
+            for row in [*train_rows, *cost_train_rows]
+        ).isoformat(),
         "source": req.source,
         "shadow_sample_count": len(rows),
         "train_shadow_sample_count": len(train_rows),
@@ -6387,6 +6513,8 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
     champion_comparison = _compare_candidate_to_current(
         metadata,
         candidate_stage=activation_stage,
+        candidate_bundle=bundle,
+        holdout_rows=holdout_rows,
     )
     if champion_comparison.get("accepted") is not True:
         challenger = reject_candidate_artifact(champion_comparison)

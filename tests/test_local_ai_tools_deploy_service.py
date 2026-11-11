@@ -1789,10 +1789,20 @@ def test_local_ai_registry_rejects_regressive_active_challenger(
         _test_artifact_bundle(),
         challenger_metadata,
     )
+    monkeypatch.setattr(
+        module, "_paired_artifact_return_evaluation",
+        lambda *_args: {
+            "ready": True,
+            "candidate": challenger_metadata["oos_return_evaluation"],
+            "champion": champion["metadata"]["oos_return_evaluation"],
+        },
+    )
 
     comparison = module._compare_candidate_to_current(
         challenger_metadata,
         candidate_stage="active",
+        candidate_bundle={"metadata": challenger_metadata},
+        holdout_rows=[],
     )
     rejected = module.reject_candidate_artifact(comparison)
     champion_pointer_after = module.read_json_object(module.CURRENT_POINTER_PATH)
@@ -1847,10 +1857,20 @@ def test_local_ai_registry_accepts_strictly_improved_active_challenger(
         _test_artifact_bundle(),
         challenger_metadata,
     )
+    monkeypatch.setattr(
+        module, "_paired_artifact_return_evaluation",
+        lambda *_args: {
+            "ready": True,
+            "candidate": challenger_metadata["oos_return_evaluation"],
+            "champion": champion["metadata"]["oos_return_evaluation"],
+        },
+    )
 
     comparison = module._compare_candidate_to_current(
         challenger_metadata,
         candidate_stage="active",
+        candidate_bundle={"metadata": challenger_metadata},
+        holdout_rows=[],
     )
     assert comparison["accepted"] is True
     assert comparison["reason"] == "challenger_quality_improved"
@@ -1862,6 +1882,88 @@ def test_local_ai_registry_accepts_strictly_improved_active_challenger(
     assert current["version"] == candidate["version"]
     assert current["version"] != champion["version"]
     assert current["activation_manifest"]["activation_stage"] == "active"
+
+
+def test_local_ai_comparison_requires_common_unfitted_evidence(tmp_path: Path) -> None:
+    module = ModuleType("local_ai_tools_paired_evidence_required_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _persist_test_shadow_artifact(module, tmp_path)
+    report = module._compare_candidate_to_current(
+        _test_artifact_metadata(module), candidate_stage="shadow",
+    )
+    assert report["accepted"] is False
+    assert report["reason"] == "paired_comparison_unavailable"
+
+
+def test_local_ai_paired_comparison_uses_locked_costs_and_both_fit_boundaries(
+    tmp_path: Path,
+) -> None:
+    from sklearn.dummy import DummyClassifier, DummyRegressor
+
+    module = ModuleType("local_ai_tools_paired_artifact_evaluation_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _configure_local_ai_registry(module, tmp_path)
+    start = datetime(2026, 7, 14, tzinfo=UTC)
+    rows = [
+        {
+            "id": index, "decision_group": f"group-{index}", "symbol": "BTC/USDT",
+            "horizon": 240, "x": [float(index % 20)],
+            "decision_timestamp": (start + timedelta(hours=index * 5)).isoformat(),
+            "label_timestamp": (start + timedelta(hours=index * 5 + 4)).isoformat(),
+            "long_total_cost_pct": 0.08, "short_total_cost_pct": 0.08,
+            "long_net_return": float(index % 20) / 10 - 1.08,
+            "short_net_return": 0.92 - float(index % 20) / 10,
+        }
+        for index in range(80)
+    ]
+
+    def bundle(sign: float, cutoff: int) -> dict:
+        train = rows[:cutoff + 1]
+        x = [row["x"] for row in train]
+        result = {
+            "metadata": {
+                "training_data_sha256": ("a" if sign > 0 else "b") * 64,
+                "primary_prediction_horizon_minutes": 240,
+                "comparison_fit_label_end": rows[cutoff]["label_timestamp"],
+                "tail_loss_scale_pct": {"long": 0.1, "short": 0.1},
+            },
+        }
+        for side, direction in (("long", sign), ("short", -sign)):
+            model = module.Pipeline([("model", module.Ridge())])
+            model.fit(x, [direction * row["x"][0] for row in train])
+            cost = DummyRegressor().fit(x, [0.08] * len(train))
+            tail = module.Pipeline([("model", DummyClassifier())])
+            tail.fit(x, [0] * len(train))
+            result.update({
+                f"{side}_return_model": model, f"{side}_cost_model": cost,
+                f"{side}_loss_model": tail,
+            })
+        return result
+
+    candidate = bundle(1, 39)
+    champion = bundle(-1, 50)
+    model_path = module.VERSIONS_ROOT / "champion" / "model.joblib"
+    module.dump_trusted_joblib_bundle(champion, model_path)
+    report = module._paired_artifact_return_evaluation(
+        candidate, {"model_path": model_path}, rows[40:],
+    )
+    assert report["ready"] is True
+    assert report["sample_count"] == 29
+    assert report["evaluation_decision_start"] > report["training_label_end"]
+    assert report["independent_profitability_exam"] is False
+    assert report["candidate"]["long"]["avg_return_pct"] > report["champion"]["long"][
+        "avg_return_pct"
+    ]
+    expected = sorted(row["long_net_return"] for row in rows[51:])[-5:]
+    assert report["candidate"]["long"]["avg_return_pct"] == pytest.approx(
+        sum(expected) / len(expected)
+    )
+    candidate["metadata"]["comparison_fit_label_end"] = rows[78]["label_timestamp"]
+    unavailable = module._paired_artifact_return_evaluation(
+        candidate, {"model_path": model_path}, rows[40:],
+    )
+    assert unavailable["ready"] is False
+    assert unavailable["sample_count"] == 1
 
 
 def test_local_ai_registry_replaces_only_incompatible_champion_contract(

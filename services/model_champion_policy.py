@@ -5,7 +5,10 @@ from __future__ import annotations
 import math
 from typing import Any
 
-MODEL_CHAMPION_POLICY_VERSION = "2026-11-10.authorized-side-champion.v2"
+from services.ml_training_contract import MIN_TRAINING_SAMPLE_COUNT
+
+MODEL_CHAMPION_POLICY_VERSION = "2026-11-11.paired-artifact-champion.v3"
+PAIRED_COMPARISON_VERSION = "2026-11-11.common-unfitted-holdout.v1"
 
 _STAGE_RANK = {
     "shadow": 0,
@@ -112,6 +115,7 @@ def compare_candidate_to_champion(
     candidate_stage: str,
     champion_stage: str | None,
     candidate_enabled_sides: list[str] | None = None,
+    comparison_evaluation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Accept lifecycle progress, but require strict improvement over an active champion."""
 
@@ -195,10 +199,36 @@ def compare_candidate_to_champion(
             "reason": "training_data_contract_refresh",
         }
 
-    # Compare both artifacts on the sides the canary can actually execute.
-    # An unauthorized direction must not veto an improving authorized side.
-    candidate_aggregate = _aggregate(candidate, comparison_sides)
-    champion_aggregate = _aggregate(champion, comparison_sides)
+    # Historical walk-forward reports evaluate different fits and market windows.
+    # Replacement must compare the frozen artifacts on one common unseen window.
+    evaluation = _dict(comparison_evaluation)
+    fingerprint = str(evaluation.get("evaluation_data_sha256") or "")
+    paired_errors = []
+    if (
+        evaluation.get("version") != PAIRED_COMPARISON_VERSION
+        or evaluation.get("ready") is not True
+        or evaluation.get("chronological_label_disjoint") is not True
+        or (_float(evaluation.get("sample_count")) or 0) < MIN_TRAINING_SAMPLE_COUNT
+        or len(fingerprint) != 64
+        or any(char not in "0123456789abcdef" for char in fingerprint)
+    ):
+        paired_errors.append("common_unfitted_holdout_unavailable")
+    for role, metadata in (("candidate", candidate), ("champion", champion)):
+        expected = str(metadata.get("training_data_sha256") or "")
+        if not expected or evaluation.get(f"{role}_training_data_sha256") != expected:
+            paired_errors.append(f"paired_{role}_training_identity_mismatch")
+    if paired_errors:
+        report["reason"] = "paired_comparison_unavailable"
+        report["blocking_reasons"] = paired_errors
+        report["comparison_evaluation"] = evaluation
+        return report
+    report["comparison_evaluation"] = evaluation
+    candidate_aggregate = _aggregate(
+        {"oos_return_evaluation": evaluation.get("candidate")}, comparison_sides
+    )
+    champion_aggregate = _aggregate(
+        {"oos_return_evaluation": evaluation.get("champion")}, comparison_sides
+    )
     report["candidate_metrics"] = candidate_aggregate
     report["champion_metrics"] = champion_aggregate
     report["metric_deltas"] = {
