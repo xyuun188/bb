@@ -388,6 +388,69 @@ async def test_executable_shadow_budget_excludes_unfitted_horizons_before_sampli
     assert {sample["horizon_minutes"] for sample in research} == {5, 15, 60, primary}
 
 
+def test_stable_shadow_identity_sample_keeps_history_when_new_rows_complete() -> None:
+    rows = [{"id": index, "short_return_pct": index % 3 - 1} for index in range(1, 50000)]
+    selected = train_script._stable_identity_shadow_rows(rows, 512)
+    expanded = train_script._stable_identity_shadow_rows(
+        [*rows, {"id": 50000, "short_return_pct": 1000.0}], 512
+    )
+    assert len(selected) == len(expanded) == 512
+    before_ids = {row["id"] for row in selected}
+    after_ids = {row["id"] for row in expanded}
+    assert len(before_ids - after_ids) <= 2
+    assert selected[0]["id"] == expanded[0]["id"] == 1
+    assert expanded[-1]["id"] == 50000
+    changed_outcomes = [{**row, "short_return_pct": -999.0} for row in reversed(rows)]
+    assert [
+        row["id"] for row in train_script._stable_identity_shadow_rows(changed_outcomes, 512)
+    ] == [row["id"] for row in selected]
+
+
+@pytest.mark.asyncio
+async def test_executable_shadow_loader_preserves_sample_after_new_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    start = PHASE3_CLEAN_START_UTC + timedelta(minutes=5)
+    primary = train_script.PRIMARY_PREDICTION_HORIZON_MINUTES
+    monkeypatch.setattr(train_script, "_EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER", 2)
+
+    def sample(index: int) -> ShadowBacktest:
+        return ShadowBacktest(
+            decision_id=index + 1, model_name="ensemble_trader",
+            execution_mode="paper", symbol=f"S{index}/USDT", status="completed",
+            horizon_minutes=primary, created_at=start + timedelta(minutes=index),
+            due_at=start + timedelta(minutes=index + primary),
+            long_return_pct=-0.2 if index % 2 else 0.2,
+            short_return_pct=0.2 if index % 2 else -0.2,
+            feature_snapshot={
+                "current_price": 100.0,
+                "training_market_fact_contract": {
+                    "version": MARKET_FACT_CONTRACT_VERSION, "status": "clean",
+                    "violation_count": 0, "native_instrument_identity_verified": True,
+                    "same_contract_price_path_verified": True,
+                    "executable_market_fact_verified": True,
+                },
+            },
+        )
+    async with get_session_ctx() as session:
+        session.add_all([sample(index) for index in range(200)])
+        await session.commit()
+    try:
+        before = await train_script._load_shadow_samples(sample_budget=16)
+        async with get_session_ctx() as session:
+            session.add(sample(200))
+            await session.commit()
+        after = await train_script._load_shadow_samples(sample_budget=16)
+        assert len(before) == len(after) == 16
+        assert len({row["id"] for row in before} - {row["id"] for row in after}) <= 2
+        assert before[0]["decision_id"] == after[0]["decision_id"] == 1
+        assert after[-1]["decision_id"] == 201
+    finally:
+        await close_db()
+
+
 @pytest.mark.asyncio
 async def test_recent_comparison_loader_bounds_raw_identities_without_quality_refill(
     monkeypatch: pytest.MonkeyPatch,

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -85,6 +85,8 @@ _REMOTE_TRAINING_TRANSPORT_VERSION = LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
 _REMOTE_TRAINING_MAX_SHADOW_SAMPLES = 512
 _REMOTE_COMPARISON_MAX_SHADOW_SAMPLES = 512
 _EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER = 8
+_SHADOW_IDENTITY_MODULUS = 2_147_483_647
+_SHADOW_IDENTITY_MULTIPLIER = 2_654_435_761
 _REMOTE_TRAINING_MAX_TRADE_SAMPLES = 128
 _REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES = 32
 _REMOTE_TRAINING_MAX_SEQUENCE_LENGTH = 128
@@ -453,6 +455,27 @@ def _evenly_spaced_rows(
     last_index = len(rows) - 1
     indices = [round(index * last_index / (target - 1)) for index in range(target)]
     return [rows[index] for index in indices]
+
+
+def _stable_identity_shadow_rows(
+    rows: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Keep history endpoints and a bounded, outcome-independent identity sample."""
+
+    ordered = sorted(rows, key=lambda row: int(row["id"]))
+    target = max(int(limit), 2)
+    if len(ordered) <= target:
+        return ordered
+    interior = sorted(
+        ordered[1:-1],
+        key=lambda row: (
+            (int(row["id"]) % _SHADOW_IDENTITY_MODULUS)
+            * _SHADOW_IDENTITY_MULTIPLIER % _SHADOW_IDENTITY_MODULUS,
+            int(row["id"]),
+        ),
+    )[:target - 2]
+    return sorted([ordered[0], *interior, ordered[-1]], key=lambda row: int(row["id"]))
 
 
 def _transport_sample(sample: dict[str, Any], *, kind: str) -> dict[str, Any]:
@@ -944,6 +967,35 @@ async def _load_shadow_samples(
         _EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER
         if executable_only and not recent_only else 1
     )
+    if requested_limit and executable_only and not recent_only:
+        async with _training_read_session_ctx() as session:
+            bounds = await session.execute(
+                select(func.min(ShadowBacktest.id), func.max(ShadowBacktest.id))
+                .where(*filters)
+            )
+            first_id, last_id = bounds.one()
+            if first_id is None or last_id is None:
+                return []
+            # Stable integer priorities prevent a new completion from moving
+            # every historical rank. Both operations use only raw identities.
+            priority = (
+                (ShadowBacktest.id % _SHADOW_IDENTITY_MODULUS)
+                * _SHADOW_IDENTITY_MULTIPLIER % _SHADOW_IDENTITY_MODULUS
+            )
+            stmt = (
+                select(*_shadow_sample_columns())
+                .where(*filters, ShadowBacktest.id <= last_id)
+                .order_by(
+                    case((ShadowBacktest.id.in_((first_id, last_id)), 0), else_=1),
+                    priority,
+                    ShadowBacktest.id,
+                )
+                .limit(candidate_limit)
+            )
+            result = await session.stream(stmt)
+            async for row in result.mappings():
+                append_sample(_shadow_sample_from_mapping(row))
+        return _stable_identity_shadow_rows(samples, requested_limit)
     if requested_limit and not recent_only:
         async with _training_read_session_ctx() as session:
             total_result = await session.execute(
@@ -1383,6 +1435,15 @@ async def _main() -> None:
         training_payload
     )
     training_transport_report["comparison_view"] = comparison_report
+    training_transport_report["shadow_sampling"] = {
+        "policy": "stable_raw_identity_priority_with_history_endpoints",
+        "outcome_dependent": False,
+        "candidate_limit": (
+            _REMOTE_TRAINING_MAX_SHADOW_SAMPLES
+            * _EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER
+        ),
+        "raw_identity_candidate_refill_allowed": False,
+    }
     quality_report = training_payload["quality_report"]
     training_payload["governance_report"] = artifact_bound_governance_report(
         quality_report,

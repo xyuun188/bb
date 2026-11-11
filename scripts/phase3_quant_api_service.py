@@ -966,6 +966,7 @@ def _fit_walk_forward_side(
     validation_rows: list[dict[str, Any]],
     *,
     side: str,
+    authoritative_cost_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     return_key = f"{side}_return"
     negatives = [float(row[return_key]) for row in train_rows if row[return_key] < 0]
@@ -990,12 +991,35 @@ def _fit_walk_forward_side(
         model__sample_weight=weights,
     )
     tail_model.fit(x_train, tail_labels, model__sample_weight=weights)
+    validation_start = min(
+        (_parsed_timestamp(row.get("decision_timestamp")) for row in validation_rows),
+        default=None,
+    )
+    available_cost_rows = [
+        row for row in (authoritative_cost_rows or [])
+        if validation_start is not None
+        and _parsed_timestamp(row.get("label_timestamp")) is not None
+        and _parsed_timestamp(row["label_timestamp"]) < validation_start
+    ]
+    side_cost_rows = [row for row in available_cost_rows if row["side"] == side]
+    cost_training = side_cost_rows if len(side_cost_rows) > 1 else available_cost_rows
+    cost_model = None
+    if cost_training:
+        cost_model = _make_regressor(len(cost_training))
+        cost_model.fit(
+            [row["x"] for row in cost_training],
+            [row["execution_cost"] for row in cost_training],
+            model__sample_weight=[row["sample_weight"] for row in cost_training],
+        )
+    else:
+        cost_complete_rows = []
+        x_validation = []
+    # Observed exit costs belong only in the realized label. Ranking uses a
+    # cost forecast fitted on lifecycles settled before this validation fold.
     scores = (
         np.asarray(market_model.predict(x_validation), dtype=float)
         - _predict_positive_probabilities(tail_model, x_validation) * tail_scale
-        - np.asarray(
-            [row[f"{side}_total_cost_pct"] for row in cost_complete_rows], dtype=float
-        )
+        - np.asarray(cost_model.predict(x_validation), dtype=float)
     ) if cost_complete_rows else np.asarray([], dtype=float)
     evaluated_rows = [
         {
@@ -1019,6 +1043,17 @@ def _fit_walk_forward_side(
         "training_decision_group_count": len(
             {str(row["decision_group"]) for row in train_rows}
         ),
+        "execution_cost_model": {
+            "source_authority": "okx_fills_fees_funding",
+            "training_sample_count": len(cost_training),
+            "training_label_end": max(
+                (row["label_timestamp"] for row in cost_training), default=None
+            ),
+            "validation_decision_start": (
+                validation_start.isoformat() if validation_start is not None else None
+            ),
+            "future_cost_labels_used_for_scoring": False,
+        },
     }
 
 
@@ -1026,6 +1061,7 @@ def _walk_forward_return_report(
     rows: list[dict[str, Any]],
     *,
     primary_horizon_minutes: int = PRIMARY_PREDICTION_HORIZON_MINUTES,
+    authoritative_cost_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     source_rows = list(rows)
     source_horizons = sorted(
@@ -1161,13 +1197,16 @@ def _walk_forward_return_report(
                 train_rows,
                 validation_rows,
                 side=side,
+                authoritative_cost_rows=authoritative_cost_rows,
             )
+            cost_policy = tail_policy.pop("execution_cost_model")
             oos_rows[side].extend(evaluated)
             fold_side_reports[side] = {
                 **_return_evidence(_select_top_return_rows(evaluated)),
                 "return_semantics": "shadow_net_return_after_all_cost",
                 "eligible_sample_count": len(evaluated),
                 "cost_incomplete_sample_count": len(validation_rows) - len(evaluated),
+                "execution_cost_model": cost_policy,
                 "training_tail_loss_policy": tail_policy,
             }
         folds.append(
@@ -1218,7 +1257,7 @@ def _walk_forward_return_report(
         "model_refit_per_fold": True,
         "chronological": True,
         "return_semantics": "shadow_net_return_after_all_cost",
-        "score_cost_source": "locked_decision_time_counterfactual_execution_cost",
+        "score_cost_source": "prior_settled_authoritative_lifecycle_cost_forecast",
         "independent_profitability_exam": False,
         "sides": side_reports,
         "primary_horizon_minutes": primary_horizon_minutes,
@@ -1379,7 +1418,7 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
     if (
         walk_forward.get("return_semantics") != "shadow_net_return_after_all_cost"
         or walk_forward.get("score_cost_source")
-        != "locked_decision_time_counterfactual_execution_cost"
+        != "prior_settled_authoritative_lifecycle_cost_forecast"
     ):
         blockers.append("walk_forward_fee_after_return_contract_missing")
     cost_holdout = metadata.get("execution_cost_holdout_report") or {}
@@ -6178,7 +6217,9 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
     # Walk-forward must see the complete source frame so unfitted-horizon
     # diagnostics stay visible; the report itself isolates the primary horizon
     # before any fold fitting.
-    walk_forward_report = _walk_forward_return_report(source_rows)
+    walk_forward_report = _walk_forward_return_report(
+        source_rows, authoritative_cost_rows=cost_rows
+    )
     leave_one_symbol_out_report = {
         side: (walk_forward_report.get("sides") or {}).get(side, {}).get(
             "leave_one_symbol_out",

@@ -124,7 +124,7 @@ def _test_artifact_metadata(
         "chronological_label_disjoint": True,
         "model_refit_per_fold": True,
         "return_semantics": "shadow_net_return_after_all_cost",
-        "score_cost_source": "locked_decision_time_counterfactual_execution_cost",
+        "score_cost_source": "prior_settled_authoritative_lifecycle_cost_forecast",
         "folds": [
             {
                 "decision_group_overlap_count": 0,
@@ -3728,7 +3728,12 @@ def test_local_ai_walk_forward_refits_disjoint_chronological_decision_groups(
 def test_local_ai_walk_forward_scores_and_evaluates_locked_fee_after_returns(
     tmp_path: Path,
 ) -> None:
+    from sklearn.dummy import DummyRegressor
+
     module = _local_ai_tools_training_module(tmp_path)
+    module._make_regressor = lambda _count: module.Pipeline([
+        ("model", DummyRegressor(strategy="mean")),
+    ])
     samples = _training_shadow_samples(count=20)
     for sample in samples:
         tasks = sample["profit_supervision"]["tasks"]
@@ -3742,13 +3747,36 @@ def test_local_ai_walk_forward_scores_and_evaluates_locked_fee_after_returns(
             "short_total_cost_pct": 0.4,
         }
     rows = module._market_training_rows(samples)
-    evaluated, _ = module._fit_walk_forward_side(rows[:10], rows[10:], side="long")
+    cost_rows = [{
+        "x": row["x"], "side": "long", "execution_cost": 0.4, "sample_weight": 1.0,
+        "label_timestamp": row["label_timestamp"],
+    } for row in rows[:10]]
+    evaluated, _ = module._fit_walk_forward_side(
+        rows[:10], rows[10:], side="long", authoritative_cost_rows=cost_rows
+    )
     assert all(row["gross_market_return_pct"] == pytest.approx(0.2) for row in evaluated)
     assert all(row["return_pct"] == pytest.approx(-0.2) for row in evaluated)
-    assert all(row["score"] < row["gross_market_return_pct"] for row in evaluated)
-    assert all(row["score"] < 0.0 for row in evaluated)
+    assert all(row["score"] == pytest.approx(-0.2) for row in evaluated)
+    changed = deepcopy(rows[10:])
+    for row in changed:
+        row["long_total_cost_pct"] = 40.0
+        row["long_net_return"] = row["long_return"] - 40.0
+    with_future_cost = [
+        *cost_rows,
+        {**cost_rows[0], "execution_cost": 1000.0,
+         "label_timestamp": rows[-1]["label_timestamp"]},
+    ]
+    changed_scores, policy = module._fit_walk_forward_side(
+        rows[:10], changed, side="long", authoritative_cost_rows=with_future_cost
+    )
+    assert [row["score"] for row in changed_scores] == [
+        row["score"] for row in evaluated
+    ]
+    assert all(row["return_pct"] < -39.0 for row in changed_scores)
+    assert policy["execution_cost_model"]["training_sample_count"] == len(cost_rows)
+    assert policy["execution_cost_model"]["future_cost_labels_used_for_scoring"] is False
 
-    report = module._walk_forward_return_report(rows)
+    report = module._walk_forward_return_report(rows, authoritative_cost_rows=cost_rows)
     assert report["return_semantics"] == "shadow_net_return_after_all_cost"
     assert report["independent_profitability_exam"] is False
     assert report["stable"] is False
