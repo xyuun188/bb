@@ -3454,6 +3454,67 @@ def _training_request(
     )
 
 
+def test_recent_comparison_view_never_changes_candidate_fit_or_training_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    samples = _shadow_samples_with_costs(count=20)
+    recent = _shadow_samples_with_costs(count=20)
+    for sample in recent:
+        sample["id"] += 1000
+        sample["decision_id"] += 1000
+        sample["correlation_weight"]["correlation_group"] += "-recent"
+    comparisons = []
+
+    def compare(_metadata, *, candidate_stage, candidate_bundle, holdout_rows):
+        comparisons.append(holdout_rows)
+        return {"accepted": False, "reason": "test_no_activation"}
+
+    monkeypatch.setattr(module, "_compare_candidate_to_current", compare)
+    monkeypatch.setattr(module, "persist_candidate_bundle", lambda *_args: {"version": "test"})
+    monkeypatch.setattr(module, "reject_candidate_artifact", lambda *_args: {"version": "test"})
+    monkeypatch.setattr(module, "_resolve_artifact_pointer", lambda *_args, **_kwargs: None)
+    fitted_x = []
+    original_factory = module._make_regressor
+
+    def recording_regressor(count):
+        model = original_factory(count)
+        original_fit = model.fit
+
+        def fit(x, *args, **kwargs):
+            fitted_x.extend(x)
+            return original_fit(x, *args, **kwargs)
+
+        model.fit = fit
+        return model
+
+    monkeypatch.setattr(module, "_make_regressor", recording_regressor)
+    baseline = module._train_impl_inner(_training_request(
+        module, shadow_samples=samples, persist_artifact=True, confirm_phase3_rebuild=True,
+    ))
+    baseline_fits = deepcopy(fitted_x)
+    fitted_x.clear()
+    for sample in recent:
+        sample["features"]["current_price"] = 99999.0
+        sample["profit_supervision"]["tasks"][module.MARKET_OPPORTUNITY_TASK][
+            "long_gross_market_return_pct"
+        ] = -99.0
+    changed = module._train_impl_inner(_training_request(
+        module, shadow_samples=samples, comparison_shadow_samples=recent,
+        persist_artifact=True, confirm_phase3_rebuild=True,
+    ))
+    assert baseline_fits == fitted_x
+    assert baseline["training_data_sha256"] == changed["training_data_sha256"]
+    assert baseline["shadow_sample_count"] == changed["shadow_sample_count"] == 20
+    assert baseline["comparison_fit_label_end"] == changed["comparison_fit_label_end"]
+    assert {row["id"] for row in comparisons[-1]} == {
+        sample["id"] for sample in recent
+    }
+    assert all(row["long_return"] == -99.0 for row in comparisons[-1])
+    assert all(row["id"] <= 20 for row in comparisons[0])
+
+
 @pytest.mark.parametrize("transport_version", [
     None,
     "2026-10-09.bounded-training-transport.v2",

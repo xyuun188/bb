@@ -389,6 +389,60 @@ async def test_executable_shadow_budget_excludes_unfitted_horizons_before_sampli
 
 
 @pytest.mark.asyncio
+async def test_recent_comparison_loader_bounds_raw_identities_without_quality_refill(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    start = PHASE3_CLEAN_START_UTC + timedelta(minutes=5)
+    async with get_session_ctx() as session:
+        for index in range(12):
+            session.add(ShadowBacktest(
+                decision_id=index + 1, model_name="ensemble_trader",
+                execution_mode="paper", symbol=f"S{index}/USDT", status="completed",
+                horizon_minutes=train_script.PRIMARY_PREDICTION_HORIZON_MINUTES,
+                created_at=start + timedelta(minutes=index),
+                due_at=start + timedelta(minutes=index + 240),
+                long_return_pct=0.2 if index % 2 else -0.2,
+                short_return_pct=-0.2 if index % 2 else 0.2,
+                feature_snapshot={
+                    "current_price": 100.0,
+                    "historical_market_path_only": index == 10,
+                    "training_market_fact_contract": {
+                        "version": MARKET_FACT_CONTRACT_VERSION, "status": "clean",
+                        "violation_count": 0, "native_instrument_identity_verified": True,
+                        "same_contract_price_path_verified": True,
+                        "executable_market_fact_verified": True,
+                    },
+                },
+            ))
+        await session.commit()
+    reads = []
+    original = train_script._compact_training_shadow_sample
+
+    def compact(row):
+        reads.append(row["decision_id"])
+        return original(row)
+
+    monkeypatch.setattr(train_script, "_compact_training_shadow_sample", compact)
+    try:
+        selected = await train_script._load_shadow_samples(sample_budget=4, recent_only=True)
+        assert reads == [12, 11, 10, 9]
+        assert [row["decision_id"] for row in selected] == [9, 10, 12]
+        from sqlalchemy import update
+
+        async with get_session_ctx() as session:
+            await session.execute(update(ShadowBacktest).values(
+                long_return_pct=-99.0, short_return_pct=99.0
+            ))
+            await session.commit()
+        changed = await train_script._load_shadow_samples(sample_budget=4, recent_only=True)
+        assert [row["id"] for row in changed] == [row["id"] for row in selected]
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_trade_loader_requests_compact_authoritative_view(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1148,10 +1202,13 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
 ) -> None:
     captured: dict[str, object] = {}
 
-    async def load_shadow_samples() -> list[dict[str, object]]:
+    async def load_shadow_samples(
+        *, sample_budget: int, recent_only: bool = False,
+    ) -> list[dict[str, object]]:
+        captured.setdefault("shadow_loads", []).append((sample_budget, recent_only))
         return [
             {
-                "id": 1,
+                "id": 2 if recent_only else 1,
                 "symbol": "BTC/USDT",
                 "features": {
                     "symbol": "BTC/USDT",
@@ -1253,6 +1310,16 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
         "skipped": True,
         "reason": "phase3_preflight_no_quarantine_writes",
     }
+    assert captured["shadow_loads"] == [
+        (train_script._REMOTE_TRAINING_MAX_SHADOW_SAMPLES, False),
+        (train_script._REMOTE_COMPARISON_MAX_SHADOW_SAMPLES, True),
+    ]
+    # The incomplete fixture has no immutable feature/label contract.
+    assert payload["shadow_samples"] == payload["comparison_shadow_samples"] == []
+    comparison = payload["training_transport_report"]["comparison_view"]
+    assert comparison["used_for_fitting"] is False
+    assert comparison["independent_profitability_exam"] is False
+    assert comparison["sample_count"] == 0
     assert "evaluation_policy" not in payload
     assert "model_stage" not in payload
 

@@ -83,6 +83,7 @@ _AUTH_FAILURE_STATUS_CODES = {401, 403}
 _ERROR_EXCERPT_LIMIT = 700
 _REMOTE_TRAINING_TRANSPORT_VERSION = LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
 _REMOTE_TRAINING_MAX_SHADOW_SAMPLES = 512
+_REMOTE_COMPARISON_MAX_SHADOW_SAMPLES = 512
 _EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER = 8
 _REMOTE_TRAINING_MAX_TRADE_SAMPLES = 128
 _REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES = 32
@@ -901,6 +902,7 @@ async def _load_shadow_samples(
     *,
     sample_budget: int | None = None,
     executable_only: bool = True,
+    recent_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Separate executable training from explicitly requested historical research.
 
@@ -939,9 +941,10 @@ async def _load_shadow_samples(
         )
     requested_limit = max(int(sample_budget or 0), 2) if sample_budget is not None else 0
     candidate_limit = requested_limit * (
-        _EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER if executable_only else 1
+        _EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER
+        if executable_only and not recent_only else 1
     )
-    if requested_limit:
+    if requested_limit and not recent_only:
         async with _training_read_session_ctx() as session:
             total_result = await session.execute(
                 select(func.count(ShadowBacktest.id)).where(*filters)
@@ -1009,6 +1012,34 @@ async def _load_shadow_samples(
             break
     samples.reverse()
     return _evenly_spaced_rows(samples, requested_limit) if requested_limit else samples
+
+
+async def _load_comparison_shadow_view() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Keep recent settled facts out of fitting and training quality statistics."""
+
+    samples = await _load_shadow_samples(
+        sample_budget=_REMOTE_COMPARISON_MAX_SHADOW_SAMPLES,
+        recent_only=True,
+    )
+    payload = annotate_training_payload(
+        shadow_samples=samples,
+        trade_samples=[],
+        sequence_samples=[],
+        text_sentiment_samples=[],
+    )
+    rows = [
+        _transport_sample(row, kind="shadow")
+        for row in payload["shadow_samples"]
+    ]
+    return rows, {
+        "selection_policy": "latest_bounded_primary_horizon_raw_identities",
+        "sample_count": len(rows),
+        "sample_limit": _REMOTE_COMPARISON_MAX_SHADOW_SAMPLES,
+        "used_for_fitting": False,
+        "independent_profitability_exam": False,
+        "eligibility_policy": "canonical_shadow_training_quality_and_locked_costs",
+        "temporal_policy": "server_excludes_both_artifacts_training_label_overlap",
+    }
 
 
 async def _load_trade_samples(*, compact: bool = False) -> list[dict[str, Any]]:
@@ -1333,6 +1364,7 @@ async def _main() -> None:
         if "sample_budget" in inspect.signature(shadow_loader).parameters
         else await shadow_loader()
     )
+    comparison_samples, comparison_report = await _load_comparison_shadow_view()
     trade_loader = _load_trade_samples
     trade_samples = (
         await trade_loader(compact=True)
@@ -1350,6 +1382,7 @@ async def _main() -> None:
     transport_views, training_transport_report = _build_training_transport_views(
         training_payload
     )
+    training_transport_report["comparison_view"] = comparison_report
     quality_report = training_payload["quality_report"]
     training_payload["governance_report"] = artifact_bound_governance_report(
         quality_report,
@@ -1385,6 +1418,7 @@ async def _main() -> None:
     payload = {
         "source": "local_trading_system",
         "shadow_samples": transport_views["shadow"],
+        "comparison_shadow_samples": comparison_samples,
         "trade_samples": transport_views["trade"],
         "sequence_samples": transport_views["sequence"],
         "text_sentiment_samples": transport_views["text_sentiment"],

@@ -598,6 +598,7 @@ class FeatureRequest(BaseModel):
 
 class TrainRequest(BaseModel):
     shadow_samples: list[dict[str, Any]] = []
+    comparison_shadow_samples: list[dict[str, Any]] = []
     trade_samples: list[dict[str, Any]] = []
     sequence_samples: list[dict[str, Any]] = []
     text_sentiment_samples: list[dict[str, Any]] = []
@@ -640,6 +641,7 @@ def _reduced_training_request(req: TrainRequest, fraction: float) -> TrainReques
     payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
     for key in (
         "shadow_samples",
+        "comparison_shadow_samples",
         "trade_samples",
         "sequence_samples",
         "text_sentiment_samples",
@@ -6514,7 +6516,10 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
         metadata,
         candidate_stage=activation_stage,
         candidate_bundle=bundle,
-        holdout_rows=holdout_rows,
+        holdout_rows=(
+            _market_training_rows(req.comparison_shadow_samples)
+            if req.comparison_shadow_samples else holdout_rows
+        ),
     )
     if champion_comparison.get("accepted") is not True:
         challenger = reject_candidate_artifact(champion_comparison)
