@@ -6,7 +6,12 @@ from math import isfinite
 from typing import Any
 
 from services.production_trade_gate import validate_production_trade_gate
-from services.profit_supervision import PROFIT_SUPERVISION_VERSION
+from services.profit_supervision import (
+    ORDINARY_LOSS_EVENT,
+    ORDINARY_LOSS_PREDICTION_VERSION,
+    ORDINARY_LOSS_SOURCE,
+    PROFIT_SUPERVISION_VERSION,
+)
 from services.return_objective import (
     RETURN_LABEL_NAME,
     RETURN_LABEL_VERSION,
@@ -47,6 +52,7 @@ _WRAPPER_METADATA_KEYS = (
     "primary_model",
     "challenger_model",
     "model_version",
+    "horizon_minutes",
     "route_mode",
     "live_ml_ready",
     "production_permission",
@@ -66,6 +72,7 @@ _WRAPPER_METADATA_KEYS = (
     "return_distribution_contract",
     "return_distribution_contract_version",
     "counterfactual_execution_cost_distribution",
+    "ordinary_loss_prediction",
     "actual_trade_calibration",
     "prediction_quality",
     "fallback_reason",
@@ -223,6 +230,34 @@ def signal_loss_probability(payload: dict[str, Any] | None, side: str) -> float 
     for node in _signal_governance_nodes(payload):
         predictions = safe_list(node.get("predictions"))
         primary = safe_dict(predictions[0]) if predictions else node
+        if "ordinary_loss_prediction" in node:
+            ordinary = safe_dict(node.get("ordinary_loss_prediction"))
+            distribution = signal_return_distribution(payload, side)
+            horizon = safe_float(node.get("horizon_minutes"), float("nan"))
+            distribution_horizon = safe_float(
+                distribution.get("horizon_minutes", horizon), float("nan")
+            )
+            if not distribution:
+                distribution_input = safe_dict(
+                    safe_dict(node.get("return_distribution_inputs")).get(side)
+                )
+                distribution_horizon = safe_float(
+                    distribution_input.get("horizon_minutes"), float("nan")
+                )
+            result = safe_dict(safe_dict(ordinary.get("sides")).get(side))
+            probability = safe_float(result.get("loss_probability"), float("nan"))
+            if (
+                ordinary.get("version") == ORDINARY_LOSS_PREDICTION_VERSION
+                and ordinary.get("event") == ORDINARY_LOSS_EVENT
+                and ordinary.get("source_authority") == ORDINARY_LOSS_SOURCE
+                and ordinary.get("profit_supervision_version") == PROFIT_SUPERVISION_VERSION
+                and isfinite(horizon) and horizon > 0
+                and ordinary.get("horizon_minutes") == horizon == distribution_horizon
+                and result.get("available") is True
+                and isfinite(probability) and 0.0 <= probability <= 1.0
+            ):
+                return probability
+            return None
         task = safe_dict(safe_dict(primary.get("multitask_prediction")).get(side))
         # Older tool bundles exposed a gross-tail event under ordinary-loss names.
         legacy_tail_alias = node.get("model") == "local-profit-trained-v2"

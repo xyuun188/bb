@@ -366,6 +366,9 @@ _TRAINING_PROFIT_TASK_FIELDS = {
     "execution_cost_and_slippage_distribution": (
         "eligible",
         "source_authority",
+        "horizon_minutes",
+        "long_total_cost_pct",
+        "short_total_cost_pct",
         "total_cost_pct",
         "slippage_pct",
     ),

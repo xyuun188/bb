@@ -8,10 +8,15 @@ import pytest
 
 from services import ml_signal_service as ml
 from services.entry_direction_support import assess_paper_model_trade_support
-from services.entry_signal_extraction import signal_loss_probability
+from services.entry_signal_extraction import signal_loss_probability, unwrap_tool_payload
 from services.ml_prediction_contract import risk_adjusted_expected_scores
 from services.normal_paper_trade import select_normal_paper_trade_side
-from services.profit_supervision import PROFIT_SUPERVISION_VERSION
+from services.profit_supervision import (
+    ORDINARY_LOSS_EVENT,
+    ORDINARY_LOSS_PREDICTION_VERSION,
+    ORDINARY_LOSS_SOURCE,
+    PROFIT_SUPERVISION_VERSION,
+)
 from services.return_objective import (
     combine_paper_return_distribution,
     standardized_return_distribution,
@@ -106,6 +111,75 @@ def test_ordinary_loss_probability_never_falls_back_to_tail_probability() -> Non
     assert signal_loss_probability(payload, "long") == 0.4
     payload["model"] = "local-profit-trained-v2"
     assert signal_loss_probability(payload, "long") is None
+
+
+def _ordinary_loss_contract() -> dict:
+    return {
+        "version": ORDINARY_LOSS_PREDICTION_VERSION,
+        "event": ORDINARY_LOSS_EVENT,
+        "source_authority": ORDINARY_LOSS_SOURCE,
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "horizon_minutes": 240,
+        "sides": {
+            "long": {"available": True, "loss_probability": 0.4},
+            "short": {"available": True, "loss_probability": 0.7},
+        },
+    }
+
+
+def test_fee_after_probability_survives_wrapper_and_ignores_legacy_tail_alias() -> None:
+    payload = unwrap_tool_payload({
+        "ordinary_loss_prediction": _ordinary_loss_contract(),
+        "horizon_minutes": 240,
+        "data": {
+            "model": "local-profit-trained-v2",
+            "long_loss_probability": 0.01,
+            "tail_loss_probability": 0.02,
+            "return_distribution_inputs": {
+                "long": {"horizon_minutes": 240},
+                "short": {"horizon_minutes": 240},
+            },
+        },
+    })
+    assert signal_loss_probability(payload, "long") == 0.4
+    assert signal_loss_probability(payload, "short") == 0.7
+
+
+@pytest.mark.parametrize("field,value", [
+    ("version", "legacy"),
+    ("event", "gross_market_return_below_training_lower_hinge"),
+    ("source_authority", "okx_fills_fees_funding"),
+    ("profit_supervision_version", "legacy"),
+    ("horizon_minutes", 60),
+])
+def test_fee_after_probability_rejects_wrong_event_authority_or_horizon(
+    field: str, value: object,
+) -> None:
+    contract = _ordinary_loss_contract()
+    contract[field] = value
+    payload = {
+        "horizon_minutes": 240,
+        "ordinary_loss_prediction": contract,
+        "long_loss_probability": 0.01,
+    }
+    assert signal_loss_probability(payload, "long") is None
+
+
+@pytest.mark.parametrize("probability", [None, -0.1, 1.1, float("nan")])
+def test_fee_after_probability_rejects_invalid_values(probability: object) -> None:
+    contract = _ordinary_loss_contract()
+    contract["sides"]["long"]["loss_probability"] = probability
+    assert signal_loss_probability({
+        "horizon_minutes": 240, "ordinary_loss_prediction": contract,
+    }, "long") is None
+
+
+def test_fee_after_probability_rejects_distribution_horizon_mismatch() -> None:
+    assert signal_loss_probability({
+        "horizon_minutes": 240,
+        "ordinary_loss_prediction": _ordinary_loss_contract(),
+        "return_distribution_inputs": {"long": {"horizon_minutes": 60}},
+    }, "long") is None
 
 
 @pytest.mark.parametrize("cost_mean", [-0.3, 0.1])

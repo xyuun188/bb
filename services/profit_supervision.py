@@ -26,6 +26,9 @@ from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 PROFIT_SUPERVISION_VERSION = "2026-11-11.observed-shadow-exit-cost.v6"
+ORDINARY_LOSS_PREDICTION_VERSION = "2026-11-11.fee-after-ordinary-loss.v1"
+ORDINARY_LOSS_EVENT = "net_return_after_all_cost_pct_lte_zero"
+ORDINARY_LOSS_SOURCE = "shadow_native_market_path_plus_locked_cost_evidence"
 MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
 COUNTERFACTUAL_EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
 AUTHORITATIVE_REALIZED_RETURN_TASK = "authoritative_realized_return_distribution"

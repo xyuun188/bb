@@ -115,9 +115,16 @@ RETURN_LABEL_NAME = "separated_market_cost_and_realized_return_tasks"
 RETURN_LABEL_VERSION = "2026-07-27.separated-source-supervision.v3"
 COST_MODEL_VERSION = "okx_authoritative_execution_cost_distribution_v3"
 PROFIT_SUPERVISION_VERSION = "2026-11-11.observed-shadow-exit-cost.v6"
+ORDINARY_LOSS_PREDICTION_VERSION = "2026-11-11.fee-after-ordinary-loss.v1"
+ORDINARY_LOSS_EVENT = "net_return_after_all_cost_pct_lte_zero"
+ORDINARY_LOSS_SOURCE = "shadow_native_market_path_plus_locked_cost_evidence"
 LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION = (
-    "2026-11-05.executable-cohort-training-transport.v4"
+    "2026-11-11.shadow-counterfactual-side-costs.v5"
 )
+LEGACY_INFERENCE_TRAINING_TRANSPORT_VERSIONS = {
+    "2026-11-05.executable-cohort-training-transport.v4",
+}
+MIN_ORDINARY_LOSS_HOLDOUT_SAMPLES = 30
 RETURN_DISTRIBUTION_INPUT_VERSION = "2026-07-15.model-return-distribution-input.v1"
 MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
 EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
@@ -1721,11 +1728,12 @@ def _resolve_artifact_pointer(
         raise ValueError("Local AI artifact metadata hash verification failed.")
     metadata = read_json_object(metadata_path)
     transport = metadata.get("training_transport_report")
-    if not isinstance(transport, dict) or (
-        transport.get("version") != LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
-    ):
+    if not isinstance(transport, dict) or transport.get("version") not in {
+        LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
+        *LEGACY_INFERENCE_TRAINING_TRANSPORT_VERSIONS,
+    }:
         raise IncompatibleArtifactContractError(
-            "Local AI artifact label availability belongs to an incompatible training transport."
+            "Local AI artifact label availability and training labels belong to an incompatible transport."
         )
     training_cost_policy = (
         PAPER_BOOTSTRAP_COST_POLICY
@@ -2646,6 +2654,7 @@ def _configure_bundle_for_inference(bundle: dict[str, Any]) -> None:
         "short_cost_model",
         "long_loss_model",
         "short_loss_model",
+        "ordinary_loss_models",
         "horizon_models",
         "sentiment_model",
         "text_sentiment_model",
@@ -2939,19 +2948,75 @@ def _model_artifact_status() -> dict[str, Any]:
 
 
 def predict_proba_positive(model: Pipeline, x: list[list[float]]) -> float:
+    return float(predict_proba_positive_values(model, x)[0])
+
+
+def predict_proba_positive_values(model: Pipeline, x: list[list[float]]) -> np.ndarray:
     try:
         named_steps = getattr(model, "named_steps", {})
         estimator = named_steps.get("model", model)
         if getattr(estimator, "class_weight", None) is not None:
-            return float("nan")
-        proba = model.predict_proba(x)
+            return np.full(len(x), float("nan"))
+        proba = np.asarray(model.predict_proba(x), dtype=float)
         classes = list(getattr(estimator, "classes_", []))
+        if proba.ndim != 2 or proba.shape != (len(x), len(classes)):
+            return np.full(len(x), float("nan"))
+        if classes == [0]:
+            return np.zeros(len(x), dtype=float)
         if 1 in classes:
-            value = float(proba[0][classes.index(1)])
-            return value if math.isfinite(value) and 0.0 <= value <= 1.0 else float("nan")
-        return 0.0 if classes == [0] else float("nan")
+            values = proba[:, classes.index(1)]
+            return np.where(
+                np.isfinite(values) & (values >= 0.0) & (values <= 1.0),
+                values,
+                float("nan"),
+            )
     except Exception:
-        return float("nan")
+        pass
+    return np.full(len(x), float("nan"))
+
+
+def ordinary_loss_prediction(
+    bundle: dict[str, Any], x: list[list[float]], *, horizon_minutes: int
+) -> dict[str, Any]:
+    metadata = bundle.get("metadata") or {}
+    report = metadata.get("ordinary_loss_holdout_report") or {}
+    aligned = bool(
+        report.get("version") == ORDINARY_LOSS_PREDICTION_VERSION
+        and report.get("event") == ORDINARY_LOSS_EVENT
+        and report.get("source_authority") == ORDINARY_LOSS_SOURCE
+        and report.get("profit_supervision_version") == PROFIT_SUPERVISION_VERSION
+        and report.get("horizon_minutes") == horizon_minutes
+        and report.get("chronological") is True
+        and report.get("decision_group_disjoint") is True
+    )
+    sides = {}
+    for side in ("long", "short"):
+        side_report = (report.get("sides") or {}).get(side) or {}
+        model = (bundle.get("ordinary_loss_models") or {}).get(side)
+        probability = (
+            predict_proba_positive(model, x)
+            if aligned and side_report.get("eligible") is True and model is not None
+            else float("nan")
+        )
+        available = math.isfinite(probability) and 0.0 <= probability <= 1.0
+        sides[side] = {
+            "available": available,
+            "loss_probability": probability if available else None,
+            "reason": (
+                "" if available
+                else "ordinary_loss_contract_or_horizon_mismatch"
+                if not aligned
+                else side_report.get("reason") or "ordinary_loss_model_unavailable"
+            ),
+        }
+    return {
+        "version": ORDINARY_LOSS_PREDICTION_VERSION,
+        "event": ORDINARY_LOSS_EVENT,
+        "source_authority": ORDINARY_LOSS_SOURCE,
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "horizon_minutes": horizon_minutes,
+        "sides": sides,
+    }
 
 
 def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) -> dict[str, Any]:
@@ -4423,6 +4488,7 @@ def _shadow_payload(tool: str, payload: dict[str, Any]) -> dict[str, Any]:
         "side",
         "action",
         "loss_probability",
+        "ordinary_loss_prediction",
         "tail_loss_probability",
         "long_tail_loss_probability",
         "short_tail_loss_probability",
@@ -5255,6 +5321,18 @@ def _market_training_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]
             decision_group = (
                 f"shadow_decision:{decision_identity}" if decision_identity else ""
             )
+        cost_task = tasks.get(EXECUTION_COST_TASK) or {}
+        side_costs = {
+            side: f(cost_task, f"{side}_total_cost_pct", float("nan"))
+            for side in ("long", "short")
+        }
+        complete_shadow_cost = bool(
+            cost_task.get("eligible") is True
+            and cost_task.get("source_authority")
+            == "shadow_counterfactual_live_microstructure"
+            and cost_task.get("horizon_minutes") == horizon
+            and all(math.isfinite(value) for value in side_costs.values())
+        )
         rows.append({
             "x": model_x(features, horizon_minutes=horizon),
             "id": int(sample.get("id") or 0),
@@ -5266,6 +5344,14 @@ def _market_training_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]
             "label_timestamp": _timestamp_text(sample.get("label_timestamp")),
             "long_return": long_return,
             "short_return": short_return,
+            "long_total_cost_pct": side_costs["long"] if complete_shadow_cost else None,
+            "short_total_cost_pct": side_costs["short"] if complete_shadow_cost else None,
+            "long_net_return": (
+                long_return - side_costs["long"] if complete_shadow_cost else None
+            ),
+            "short_net_return": (
+                short_return - side_costs["short"] if complete_shadow_cost else None
+            ),
             "best_side": (
                 "long"
                 if long_return > 0.0 and long_return >= short_return
@@ -5279,6 +5365,80 @@ def _market_training_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]
             "return_semantics": "gross_fixed_horizon_market_opportunity",
         })
     return rows
+
+
+def _fit_ordinary_loss_models(
+    train_rows: list[dict[str, Any]],
+    holdout_rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    # These labels require locked two-sided shadow costs. Actual single-side
+    # fills and the gross-tail classifiers cannot supply counterfactual labels.
+    training = [row for row in train_rows if row.get("long_net_return") is not None]
+    holdout = [row for row in holdout_rows if row.get("long_net_return") is not None]
+    train_groups = {row["decision_group"] for row in training}
+    holdout_groups = {row["decision_group"] for row in holdout}
+    report = {
+        "version": ORDINARY_LOSS_PREDICTION_VERSION,
+        "event": ORDINARY_LOSS_EVENT,
+        "source_authority": ORDINARY_LOSS_SOURCE,
+        "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
+        "chronological": True,
+        "decision_group_disjoint": not bool(train_groups & holdout_groups),
+        "training_sample_count": len(training),
+        "holdout_sample_count": len(holdout),
+        "training_label_end": max(
+            (row["label_timestamp"] for row in training), default=None
+        ),
+        "holdout_decision_start": min(
+            (row["decision_timestamp"] for row in holdout), default=None
+        ),
+        "weighting_policy": "natural_prior_without_class_or_loss_reweighting",
+        "sides": {},
+    }
+    models = {}
+    for side in ("long", "short"):
+        side_report = {"eligible": False, "reason": "ordinary_loss_cost_holdout_unavailable"}
+        report["sides"][side] = side_report
+        if len(training) < 2 or not holdout or train_groups & holdout_groups:
+            continue
+        labels = [int(row[f"{side}_net_return"] <= 0.0) for row in training]
+        model = _make_classifier(labels)
+        model.fit([row["x"] for row in training], labels)
+        models[side] = model
+        probabilities = predict_proba_positive_values(model, [row["x"] for row in holdout])
+        if not np.all(np.isfinite(probabilities)):
+            side_report["reason"] = "ordinary_loss_probabilities_invalid"
+            continue
+        actual = np.asarray(
+            [int(row[f"{side}_net_return"] <= 0.0) for row in holdout], dtype=float
+        )
+        prior = float(np.mean(labels))
+        brier = float(np.mean((probabilities - actual) ** 2))
+        baseline = float(np.mean((prior - actual) ** 2))
+        enough_independent_evidence = (
+            len(holdout) >= MIN_ORDINARY_LOSS_HOLDOUT_SAMPLES
+            and set(labels) == {0, 1}
+            and set(actual.tolist()) == {0.0, 1.0}
+        )
+        eligible = enough_independent_evidence and brier < baseline
+        side_report.update({
+            "eligible": eligible,
+            "reason": (
+                ""
+                if eligible
+                else "ordinary_loss_holdout_evidence_insufficient"
+                if not enough_independent_evidence
+                else "ordinary_loss_brier_not_better_than_training_prior"
+            ),
+            "minimum_holdout_sample_count": MIN_ORDINARY_LOSS_HOLDOUT_SAMPLES,
+            "holdout_class_count": len(set(actual.tolist())),
+            "training_loss_rate": prior,
+            "holdout_loss_rate": float(np.mean(actual)),
+            "brier_score": brier,
+            "training_prior_brier_score": baseline,
+        })
+    return models, report
 
 
 def _authoritative_cost_training_rows(
@@ -5660,6 +5820,9 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
     short_loss_model.fit(X, short_loss_y, model__sample_weight=sample_weights)
     del X, long_y, short_y, long_loss_y, short_loss_y, sample_weights
     _training_gc()
+    ordinary_loss_models, ordinary_loss_holdout_report = _fit_ordinary_loss_models(
+        train_rows, holdout_rows
+    )
 
     cost_side_training_counts: dict[str, int] = {}
     cost_side_fallbacks: dict[str, str | None] = {}
@@ -5862,6 +6025,8 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
                 "horizon": row.get("horizon"),
                 "long_return_pct": row.get("long_return"),
                 "short_return_pct": row.get("short_return"),
+                "long_total_cost_pct": row.get("long_total_cost_pct"),
+                "short_total_cost_pct": row.get("short_total_cost_pct"),
                 "sample_weight": row.get("sample_weight"),
                 "feature_vector": row.get("x"),
             }
@@ -6049,6 +6214,7 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
             else None
         ),
         "execution_cost_holdout_report": execution_cost_holdout_report,
+        "ordinary_loss_holdout_report": ordinary_loss_holdout_report,
         "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
         "profit_supervision_report": req.profit_supervision_report or {},
         "market_fact_contract": (req.quality_report or {}).get(
@@ -6137,6 +6303,7 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
                 else "ExtraTreesRegressor authoritative OKX long/short execution cost"
             ),
             "loss_filter": "ExtraTreesClassifier fixed-horizon market tail probability",
+            "ordinary_loss": "ExtraTreesClassifier locked-cost fee-after nonpositive return",
             "timeseries": "Per-horizon long/short ExtraTreesRegressor return distributions",
             "deep_timeseries": (
                 "Torch PatchTST/TFT-style sequence model"
@@ -6177,6 +6344,7 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
         "short_cost_model": short_cost_model,
         "long_loss_model": long_loss_model,
         "short_loss_model": short_loss_model,
+        "ordinary_loss_models": ordinary_loss_models,
         "horizon_models": horizon_models,
         "deep_sequence_model": deep_sequence_model,
         "torch_patch_model": torch_patch_model,
@@ -6756,6 +6924,9 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                 "symbol": req.symbol,
                 "best_side": best_side,
                 "horizon_minutes": horizon_minutes,
+                "ordinary_loss_prediction": ordinary_loss_prediction(
+                    bundle, x, horizon_minutes=horizon_minutes
+                ),
                 "profit_edge_pct": round(edge, 4),
                 "profit_quality_score": round(quality, 4),
                 "return_semantics": "gross_market_opportunity_before_execution",
@@ -6944,6 +7115,9 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                 )
                 predictions.append({
                     "horizon_minutes": int(horizon),
+                    "ordinary_loss_prediction": ordinary_loss_prediction(
+                        bundle, x, horizon_minutes=int(horizon)
+                    ),
                     "prediction_sample_count": min(
                         int(long_distribution["sample_count"]),
                         int(short_distribution["sample_count"]),
@@ -7065,6 +7239,7 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "side": best_side,
                     "direction": primary["direction"],
                     "horizon_minutes": primary["horizon_minutes"],
+                    "ordinary_loss_prediction": primary["ordinary_loss_prediction"],
                     "primary_prediction_horizon_minutes": (
                         PRIMARY_PREDICTION_HORIZON_MINUTES
                     ),

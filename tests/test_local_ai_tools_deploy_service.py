@@ -1923,7 +1923,10 @@ def test_local_ai_registry_replaces_incompatible_activation_permission_contract(
     assert reason == "Local AI activation belongs to an incompatible permission contract."
 
 
-@pytest.mark.parametrize("transport_version", [None, "2026-10-09.bounded-training-transport.v2"])
+@pytest.mark.parametrize("transport_version", [
+    None,
+    "2026-10-09.bounded-training-transport.v2",
+])
 def test_local_ai_registry_retires_old_label_availability_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1953,6 +1956,27 @@ def test_local_ai_registry_retires_old_label_availability_contract(
     assert comparison["accepted"] is True
     assert comparison["reason"] == "incompatible_champion_contract_replaced"
     assert module.health()["trained_models_available"] is False
+
+
+def test_local_ai_registry_keeps_previous_transport_for_inference(
+    tmp_path: Path,
+) -> None:
+    module = ModuleType("local_ai_tools_legacy_transport_inference_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    old_transport = "2026-11-05.executable-cohort-training-transport.v4"
+    _persist_test_shadow_artifact(
+        module,
+        tmp_path,
+        training_transport_report={"version": old_transport},
+    )
+
+    artifact = module._resolve_artifact_pointer(
+        module.CURRENT_POINTER_PATH,
+        role="current",
+        deserialize_bundle=False,
+    )
+    assert artifact["metadata"]["training_transport_report"]["version"] == old_transport
+    assert module.health()["trained_models_available"] is True
 
 
 def test_local_ai_tools_generated_service_reports_specialist_model_chains() -> None:
@@ -3165,6 +3189,154 @@ def _training_trade_samples(count: int = 20) -> list[dict[str, object]]:
     return samples
 
 
+def _shadow_samples_with_costs(count: int = 20) -> list[dict[str, object]]:
+    samples = _training_shadow_samples(count=count)
+    for sample in samples:
+        sample["profit_supervision"]["tasks"]["execution_cost_and_slippage_distribution"] = {
+            "eligible": True,
+            "source_authority": "shadow_counterfactual_live_microstructure",
+            "horizon_minutes": 240,
+            "long_total_cost_pct": 0.5,
+            "short_total_cost_pct": -0.2,
+        }
+    return samples
+
+
+def test_ordinary_loss_labels_use_complete_signed_costs_only(tmp_path: Path) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    samples = _shadow_samples_with_costs(count=6)
+    tasks = [
+        sample["profit_supervision"]["tasks"][module.EXECUTION_COST_TASK]
+        for sample in samples
+    ]
+    tasks[1]["eligible"] = False
+    tasks[2]["source_authority"] = "okx_fills_fees_funding"
+    tasks[3]["horizon_minutes"] = 60
+    tasks[4].pop("short_total_cost_pct")
+    tasks[5]["long_total_cost_pct"] = float("nan")
+    rows = module._market_training_rows(samples)
+    assert len(rows) == 6  # Gross opportunity training remains available.
+    assert rows[0]["long_net_return"] == pytest.approx(-0.05)
+    assert rows[0]["short_net_return"] == pytest.approx(0.05)
+    assert all(row["long_net_return"] is None for row in rows[1:])
+    assert all(row["short_net_return"] is None for row in rows[1:])
+
+
+def test_ordinary_loss_training_uses_natural_prior_and_purged_cost_holdout(
+    tmp_path: Path,
+) -> None:
+    from services.entry_signal_extraction import signal_loss_probability
+    from services.profit_supervision import (
+        ORDINARY_LOSS_EVENT,
+        ORDINARY_LOSS_PREDICTION_VERSION,
+        ORDINARY_LOSS_SOURCE,
+    )
+
+    module = _local_ai_tools_training_module(tmp_path)
+    assert module.ORDINARY_LOSS_EVENT == ORDINARY_LOSS_EVENT
+    assert module.ORDINARY_LOSS_PREDICTION_VERSION == ORDINARY_LOSS_PREDICTION_VERSION
+    assert module.ORDINARY_LOSS_SOURCE == ORDINARY_LOSS_SOURCE
+    fitted = []
+    returns_feature_index = module.FEATURE_KEYS.index("returns_1")
+
+    class RuleModel:
+        classes_ = [0, 1]
+
+        def fit(self, x, y, **kwargs):
+            fitted.append((x, y, kwargs))
+            return self
+
+        def predict_proba(self, x):
+            return [
+                [0.1, 0.9] if row[returns_feature_index] < 0 else [0.9, 0.1]
+                for row in x
+            ]
+
+    module._make_classifier = lambda _y: RuleModel()
+    samples = _shadow_samples_with_costs(count=200)
+    for index, sample in enumerate(samples):
+        profitable = index % 2 == 0
+        sample["features"]["returns_1"] = 0.02 if profitable else -0.02
+        task = sample["profit_supervision"]["tasks"][module.EXECUTION_COST_TASK]
+        task["long_total_cost_pct"] = 0.35 if profitable else 0.55
+        task["short_total_cost_pct"] = -0.25 if profitable else -0.05
+    split = module._purged_chronological_holdout(module._market_training_rows(samples))
+    models, report = module._fit_ordinary_loss_models(
+        split["train_rows"], split["holdout_rows"],
+    )
+    assert set(fitted[0][1]) == {0, 1}
+    assert set(fitted[1][1]) == {0, 1}
+    assert all(not kwargs for _x, _y, kwargs in fitted)
+    assert report["decision_group_disjoint"] is True
+    assert report["training_label_end"] < report["holdout_decision_start"]
+    assert report["sides"]["long"]["eligible"] is True
+    assert report["sides"]["long"]["brier_score"] == pytest.approx(0.01)
+    bundle = {
+        "ordinary_loss_models": models,
+        "metadata": {"ordinary_loss_holdout_report": report},
+    }
+    inference_features = [0.0] * len(module.FEATURE_KEYS)
+    inference_features[returns_feature_index] = 0.02
+    prediction = module.ordinary_loss_prediction(
+        bundle, [inference_features], horizon_minutes=240,
+    )
+    payload = {
+        "horizon_minutes": 240,
+        "ordinary_loss_prediction": prediction,
+        "return_distribution_inputs": {
+            "long": {"horizon_minutes": 240},
+            "short": {"horizon_minutes": 240},
+        },
+    }
+    assert signal_loss_probability(payload, "long") == 0.1
+    assert signal_loss_probability(payload, "short") == 0.1
+    wrong_horizon = module.ordinary_loss_prediction(bundle, [[0.0]], horizon_minutes=60)
+    assert wrong_horizon["sides"]["long"]["available"] is False
+    report["sides"]["long"]["eligible"] = False
+    blocked = module.ordinary_loss_prediction(bundle, [[0.0]], horizon_minutes=240)
+    assert blocked["sides"]["long"]["available"] is False
+
+
+def test_ordinary_loss_holdout_never_fits_future_labels(tmp_path: Path) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    split = module._purged_chronological_holdout(
+        module._market_training_rows(_shadow_samples_with_costs())
+    )
+    models, report = module._fit_ordinary_loss_models(
+        split["train_rows"], split["holdout_rows"],
+    )
+    # The dummy predicts zero loss but has neither class nor sample evidence.
+    assert models["long"] is not None
+    assert report["sides"]["long"]["eligible"] is False
+    assert report["sides"]["long"]["brier_score"] == 1.0
+    assert report["sides"]["long"]["training_prior_brier_score"] == 0.0
+    assert report["sides"]["long"]["reason"] == (
+        "ordinary_loss_holdout_evidence_insufficient"
+    )
+    assert report["sides"]["short"]["eligible"] is False
+    empty_models, empty_report = module._fit_ordinary_loss_models(
+        split["train_rows"], [],
+    )
+    assert empty_models == {}
+    assert empty_report["sides"]["long"]["eligible"] is False
+
+
+def test_ordinary_loss_training_hash_binds_costs_and_missing_labels(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    samples = _shadow_samples_with_costs()
+    original = module.train(_training_request(module, shadow_samples=samples))
+    samples[0]["profit_supervision"]["tasks"][module.EXECUTION_COST_TASK][
+        "short_total_cost_pct"
+    ] = -0.3
+    changed = module.train(_training_request(module, shadow_samples=samples))
+    assert changed["training_data_sha256"] != original["training_data_sha256"]
+    assert changed["ordinary_loss_holdout_report"]["holdout_sample_count"] > 0
+    missing = module.train(_training_request(module, shadow_samples=_training_shadow_samples()))
+    assert missing["ordinary_loss_holdout_report"]["training_sample_count"] == 0
+
+
 def _training_request(
     module: ModuleType,
     *,
@@ -3180,7 +3352,11 @@ def _training_request(
     )
 
 
-@pytest.mark.parametrize("transport_version", [None, "2026-10-09.bounded-training-transport.v2"])
+@pytest.mark.parametrize("transport_version", [
+    None,
+    "2026-10-09.bounded-training-transport.v2",
+    "2026-11-05.executable-cohort-training-transport.v4",
+])
 def test_local_ai_training_rejects_old_transport_before_fitting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -730,6 +730,21 @@ def test_remote_training_transport_bounds_sequence_sample_count() -> None:
     )
 
 
+def test_remote_training_transport_preserves_signed_two_sided_cost_labels() -> None:
+    task = {
+        "eligible": True,
+        "source_authority": "shadow_counterfactual_live_microstructure",
+        "horizon_minutes": 240,
+        "long_total_cost_pct": 0.12,
+        "short_total_cost_pct": -0.02,
+    }
+    compact = train_script._training_transport_profit_supervision({
+        "version": "test",
+        "tasks": {"execution_cost_and_slippage_distribution": task},
+    })
+    assert compact["tasks"]["execution_cost_and_slippage_distribution"] == task
+
+
 @pytest.mark.parametrize("nested", [False, True])
 def test_shadow_transport_preserves_actual_availability_and_decision_time(nested: bool) -> None:
     decision = "2026-11-05T01:00:03+00:00"
