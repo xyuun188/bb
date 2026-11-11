@@ -544,14 +544,7 @@ def _bucket_return_summary(
     top: bool,
     tail_loss_threshold_pct: float,
 ) -> dict[str, Any]:
-    if not len(scores):
-        return return_distribution_summary(
-            [],
-            tail_loss_threshold_pct=tail_loss_threshold_pct,
-        )
-    count = max(int(math.sqrt(len(scores))), 1)
-    order = np.argsort(scores)
-    idx = order[-count:] if top else order[:count]
+    idx = _bucket_indices(scores, top=top)
     return return_distribution_summary(
         pd.Series(net_returns).iloc[idx].astype(float).tolist(),
         tail_loss_threshold_pct=tail_loss_threshold_pct,
@@ -650,11 +643,9 @@ def _local_ml_training_cadence(
 
 
 def _bucket_win_rate(y_win: pd.Series, scores: np.ndarray, top: bool) -> float | None:
-    if not len(scores):
+    idx = _bucket_indices(scores, top=top)
+    if not len(idx):
         return None
-    count = max(int(math.sqrt(len(scores))), 1)
-    order = np.argsort(scores)
-    idx = order[-count:] if top else order[:count]
     return float(pd.Series(y_win).iloc[idx].mean())
 
 
@@ -5469,9 +5460,11 @@ def _flatten_quality_reasons(values: list[Any]) -> list[str]:
 
 
 def _bucket_indices(scores: np.ndarray, *, top: bool) -> np.ndarray:
+    """Use the promotion cohort for both return metrics and diagnostics."""
+
     if len(scores) == 0:
         return np.array([], dtype=int)
-    count = max(int(len(scores) * 0.20), 1)
+    count = max(int(math.sqrt(len(scores))), 1)
     order = np.argsort(scores)
     return order[-count:] if top else order[:count]
 

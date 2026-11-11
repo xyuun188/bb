@@ -1301,6 +1301,49 @@ def test_train_from_frame_reports_score_bucket_diagnostic_segments() -> None:
     assert set(diagnostics["long"]["top"]["horizon_counts"]) == {str(primary)}
 
 
+@pytest.mark.parametrize("sample_count", [1, 5, 100, 400])
+def test_holdout_diagnostics_describe_the_exact_promotion_score_buckets(
+    sample_count: int,
+) -> None:
+    scores = np.arange(sample_count, dtype=float)
+    returns = np.where(scores >= sample_count - int(np.sqrt(sample_count)), 1.0, -0.5)
+    frame = pd.DataFrame(
+        {
+            "horizon_minutes": ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES,
+            **{
+                key: value
+                for side in ("long", "short")
+                for key, value in {
+                    f"{side}_return_pct": returns,
+                    f"{side}_execution_cost_pct": np.full(sample_count, 0.1),
+                    f"{side}_win": (returns > 0.1).astype(int),
+                    f"{side}_tail_loss": (returns - 0.1 < -0.4).astype(int),
+                }.items()
+            },
+        },
+        index=np.arange(sample_count) * 3 + 7,
+    )
+    result = ml_signal_module._holdout_return_evaluation(
+        frame,
+        long_win_scores=np.full(sample_count, 0.5),
+        short_win_scores=np.full(sample_count, 0.5),
+        long_expected_scores=scores,
+        short_expected_scores=scores,
+        tail_scales={"long": 0.4, "short": 0.4},
+    )
+
+    for side in ("long", "short"):
+        for bucket in ("top", "bottom"):
+            diagnostic = result["score_bucket_diagnostics"][side][bucket]
+            evidence = result["return_buckets"][side][bucket]
+            assert diagnostic["count"] == evidence["count"]
+            assert diagnostic["avg_return_pct"] == pytest.approx(evidence["avg_return_pct"])
+            assert diagnostic["tail_loss_rate"] == pytest.approx(evidence["tail_loss_rate"])
+            assert diagnostic["win_rate"] == pytest.approx(
+                result["metrics"][f"{bucket}_{side}_win_rate"]
+            )
+
+
 def test_train_from_frame_holdout_quality_metrics_use_fee_after_returns() -> None:
     frame = _training_frame(120)
     for side in ("long", "short"):
