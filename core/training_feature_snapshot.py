@@ -1181,6 +1181,42 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
         END;
         $compact_features$;
     """
+    shadow_evidence_sql = f"""
+        CREATE OR REPLACE FUNCTION bb_project_specialist_shadow_evidence(input_value JSONB)
+        RETURNS JSONB
+        LANGUAGE plpgsql IMMUTABLE
+        AS $project_specialist_evidence$
+        DECLARE
+            result JSONB;
+        BEGIN
+            CASE jsonb_typeof(input_value)
+            WHEN 'string' THEN
+                RETURN to_jsonb(left(
+                    input_value #>> '{{}}', {TRAINING_FEATURE_MAX_STRING_CHARS}
+                ));
+            WHEN 'object' THEN
+                SELECT COALESCE(jsonb_object_agg(
+                    entry.key, bb_project_specialist_shadow_evidence(entry.value)
+                ), '{{}}'::JSONB)
+                    INTO result
+                    FROM jsonb_each(input_value) AS entry(key, value)
+                    WHERE entry.value <> 'null'::JSONB;
+                RETURN result;
+            WHEN 'array' THEN
+                SELECT COALESCE(jsonb_agg(
+                    bb_project_specialist_shadow_evidence(entry.value)
+                    ORDER BY entry.ordinality
+                ), '[]'::JSONB)
+                    INTO result
+                    FROM jsonb_array_elements(input_value) WITH ORDINALITY
+                        AS entry(value, ordinality);
+                RETURN result;
+            ELSE
+                RETURN input_value;
+            END CASE;
+        END;
+        $project_specialist_evidence$;
+    """
     shadow_sql = """
         CREATE OR REPLACE FUNCTION bb_compact_specialist_shadow(input_value JSONB)
         RETURNS JSONB
@@ -1246,6 +1282,12 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                                     prediction->'short'->'objective_expected_return_pct'
                             ))
                         ));
+                        IF compact_prediction->'long' = '{}'::JSONB THEN
+                            compact_prediction := compact_prediction - 'long';
+                        END IF;
+                        IF compact_prediction->'short' = '{}'::JSONB THEN
+                            compact_prediction := compact_prediction - 'short';
+                        END IF;
                         IF compact_prediction <> '{}'::JSONB THEN
                             predictions := predictions || jsonb_build_array(compact_prediction);
                         END IF;
@@ -1345,6 +1387,22 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                                         ))
                                 ))
                         ));
+                        IF jsonb_typeof(
+                            tool_item.value->'professional_model_shadow'
+                        ) IS DISTINCT FROM 'object' THEN
+                            tool_compact := tool_compact - 'professional_model_shadow';
+                        ELSE
+                            IF jsonb_typeof(
+                                tool_item.value->'professional_model_shadow'->'shadow_result'
+                            ) IS DISTINCT FROM 'object' THEN
+                                tool_compact := tool_compact #- ARRAY[
+                                    'professional_model_shadow', 'shadow_result'
+                                ];
+                            END IF;
+                            IF tool_compact->'professional_model_shadow' = '{}'::JSONB THEN
+                                tool_compact := tool_compact - 'professional_model_shadow';
+                            END IF;
+                        END IF;
                         IF tool_compact <> '{}'::JSONB THEN
                             tools_compact := tools_compact
                                 || jsonb_build_object(tool_item.key, tool_compact);
@@ -1357,7 +1415,7 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                     );
                 END IF;
             END IF;
-            RETURN result;
+            RETURN bb_project_specialist_shadow_evidence(result);
         END;
         $compact_specialist_shadow$;
     """
@@ -1366,6 +1424,7 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
         normalize_sql,
         market_fact_sql,
         market_fact_contract_sql,
+        shadow_evidence_sql,
         shadow_sql,
         compact_sql,
     )

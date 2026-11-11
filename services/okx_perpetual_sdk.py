@@ -836,6 +836,10 @@ class OkxPerpetualSdkExchange:
                 except asyncio.CancelledError:
                     cancelled = True
                     continue
+                except Exception:
+                    # Consume the worker's failure below, after its shield
+                    # wakes the finalizer, so cleanup cannot leak the exception.
+                    break
             try:
                 worker.result()
             except BaseException as exc:

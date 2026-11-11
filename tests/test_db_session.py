@@ -992,16 +992,17 @@ def test_postgres_training_feature_snapshot_functions_are_single_ddl_statements(
 
     statements = postgres_training_feature_snapshot_functions()
 
-    assert len(statements) == 6
+    assert len(statements) == 7
     assert [
         statement.count("CREATE OR REPLACE FUNCTION")
         for statement in statements
-    ] == [1, 1, 1, 1, 1, 1]
+    ] == [1, 1, 1, 1, 1, 1, 1]
     assert [
         "bb_training_feature_storage_bytes",
         "bb_training_feature_normalize_jsonb",
         "bb_compact_market_fact",
         "bb_compact_training_market_fact_contract",
+        "bb_project_specialist_shadow_evidence",
         "bb_compact_specialist_shadow",
         "bb_compact_training_feature_snapshot",
     ] == [

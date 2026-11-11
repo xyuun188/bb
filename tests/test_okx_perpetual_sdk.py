@@ -344,6 +344,51 @@ async def test_sdk_adapter_serializes_calls_on_same_sync_client() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_finalizer", [False, True])
+async def test_retired_sdk_worker_failure_is_consumed_before_client_cleanup(
+    cancel_finalizer: bool,
+) -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    closed: list[bool] = []
+
+    class RetiredApi:
+        def close(self) -> None:
+            closed.append(True)
+
+    api = RetiredApi()
+    call_lock = asyncio.Lock()
+    await call_lock.acquire()
+    exchange._sdk_call_locks[id(api)] = call_lock
+    release_worker = asyncio.Event()
+
+    async def fail_after_timeout() -> dict[str, Any]:
+        await release_worker.wait()
+        raise ConnectionError("network unavailable after caller timeout")
+
+    worker = asyncio.create_task(fail_after_timeout())
+    finalizer = asyncio.create_task(
+        exchange._finish_retired_sdk_call(api, call_lock, worker)
+    )
+    await asyncio.sleep(0)
+    if cancel_finalizer:
+        finalizer.cancel()
+        await asyncio.sleep(0)
+    assert call_lock.locked()
+    assert closed == []
+    release_worker.set()
+
+    if cancel_finalizer:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(finalizer, timeout=2)
+    else:
+        await asyncio.wait_for(finalizer, timeout=2)
+
+    assert closed == [True]
+    assert not call_lock.locked()
+    assert exchange._sdk_call_locks == {}
+
+
+@pytest.mark.asyncio
 async def test_native_consistency_candles_use_isolated_market_client() -> None:
     exchange = OkxPerpetualSdkExchange("paper")
     primary_api = _MarketApi()

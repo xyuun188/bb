@@ -133,6 +133,22 @@ flat and mixed contracts, explicit null/false/zero and the single-group byte
 budget; its transaction was rolled back without changing permanent functions.
 Final deployment and model acceptance must still be checked after the repair.
 
+The final storage-boundary repair also removes synthetic empty specialist
+objects from PostgreSQL projections and applies Python's recursive 512-character
+string bound. Missing results stay missing, observed `false` stays `false`, and
+an explicitly observed empty result stays empty. Temporary-function PostgreSQL
+tests cover these cases and verify that a second compaction changes nothing.
+The pre-deployment 24-row source audit found no Python/updated-SQL differences,
+but four recent stored projections still reflected the old function and three
+older rows had lost an existing cost observation. Historical repair and fresh
+post-deployment settlements must be counted separately.
+
+A runtime audit also reproduced an unhandled exception in the finalizer of a
+timed-out OKX SDK request when its detached worker later failed. The finalizer
+now consumes that failure, closes the client once and releases its lock;
+cancelling the finalizer still waits for worker completion before propagating
+cancellation. Both failure paths have regression coverage.
+
 Both v6 model branches were rebuilt on November 11. Local ML activated
 `20261111T062814771915Z-d60502ab` as a paper canary; the independent quant API
 loaded `20261111T061626933821Z-50e17452` in shadow. Live permission remained

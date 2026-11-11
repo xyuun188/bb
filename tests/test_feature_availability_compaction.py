@@ -944,6 +944,43 @@ def test_specialist_shadow_survives_compaction_without_full_payload() -> None:
     assert _compact_training_feature_snapshot(features) == compacted
 
 
+def test_sparse_specialist_shadow_preserves_only_observed_fields() -> None:
+    features = {
+        "local_ml_shadow": {
+            "available": True,
+            "raw_payload": "x" * 5000,
+            "predictions": [
+                {},
+                {"horizon_minutes": 240, "long": {}, "short": None},
+            ],
+        },
+        "local_ai_tools_shadow": {
+            "raw_payload": "x" * 5000,
+            "profit_prediction": {"available": False},
+            "time_series_prediction": {"professional_model_shadow": {}},
+            "sentiment_analysis": {
+                "professional_model_shadow": {"actual_inference": False},
+            },
+        },
+    }
+
+    compacted = compact_training_feature_snapshot(features)
+
+    assert compacted == {
+        "local_ml_shadow": {
+            "available": True,
+            "predictions": [{"horizon_minutes": 240}],
+        },
+        "local_ai_tools_shadow": {
+            "profit_prediction": {"available": False},
+            "sentiment_analysis": {
+                "professional_model_shadow": {"actual_inference": False},
+            },
+        },
+    }
+    assert compact_training_feature_snapshot(compacted) == compacted
+
+
 def test_postgres_compaction_retains_specialist_shadow_projection() -> None:
     functions = postgres_training_feature_snapshot_functions()
     shadow_sql = next(
@@ -1251,6 +1288,7 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
             "bb_compact_market_fact",
             "bb_compact_training_market_fact_contract",
             "bb_compact_training_feature_snapshot",
+            "bb_project_specialist_shadow_evidence",
             "bb_compact_specialist_shadow",
         )
         for sql in postgres_training_feature_snapshot_functions():
@@ -1345,6 +1383,48 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
         with_missing_nested_window["training_market_fact_contract"]["provenance"] = {
             "data_fingerprint": "d" * 64,
         }
+        with_sparse_specialists = {
+            "local_ml_shadow": {
+                "available": True,
+                "raw_payload": "x" * 5000,
+                "predictions": [
+                    {},
+                    {"horizon_minutes": 240, "long": {}, "short": None},
+                ],
+            },
+            "local_ai_tools_shadow": {
+                "raw_payload": "x" * 5000,
+                "profit_prediction": {"available": False},
+                "time_series_prediction": {"professional_model_shadow": {}},
+                "sentiment_analysis": {
+                    "professional_model_shadow": {"actual_inference": False},
+                },
+            },
+        }
+        with_empty_specialist_result = {
+            "local_ai_tools_shadow": {
+                "raw_payload": "x" * 5000,
+                "profit_prediction": {"professional_model_shadow": {"shadow_result": {}}},
+            },
+        }
+        with_long_specialist_strings = {
+            "local_ml_shadow": {
+                "available": True,
+                "raw_payload": "x" * 5000,
+                "model_version": "m" * 1000,
+                "predictions": [{"best_side": "s" * 1000}],
+            },
+            "local_ai_tools_shadow": {
+                "raw_payload": "x" * 5000,
+                "status": "s" * 1000,
+                "profit_prediction": {
+                    "fallback_reason": "r" * 1000,
+                    "professional_model_shadow": {
+                        "shadow_result": {"reason": "r" * 1000},
+                    },
+                },
+            },
+        }
         for features in (
             original,
             oversized,
@@ -1354,6 +1434,9 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
             with_mixed_contract,
             with_nested_rejection,
             with_missing_nested_window,
+            with_sparse_specialists,
+            with_empty_specialist_result,
+            with_long_specialist_strings,
             {"empty": {}, "array": [], "text": "x" * 513},
         ):
             encoded = json.dumps(features, ensure_ascii=False)
@@ -1525,6 +1608,14 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
                     == manually_rebuilt_fingerprint
                 )
             assert not differences, differences
+            pg_recompacted = json.loads(await connection.fetchval(
+                "SELECT pg_temp.bb_compact_training_feature_snapshot($1::JSONB)",
+                json.dumps(pg_compacted, ensure_ascii=False),
+            ))
+            assert pg_recompacted == pg_compacted, _json_differences(
+                pg_recompacted, pg_compacted
+            )
+            assert compact_training_feature_snapshot(expected_compacted) == expected_compacted
             assert await connection.fetchval(
                 "SELECT pg_temp.bb_training_feature_storage_bytes($1::JSONB)", encoded,
             ) == training_feature_storage_bytes(features)
