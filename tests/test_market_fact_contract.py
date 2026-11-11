@@ -3,13 +3,17 @@ from pathlib import Path
 
 from core.market_facts import (
     MARKET_FACT_CONTRACT_VERSION,
+    MARKET_FACT_STORAGE_COMPACTION_VERSION,
     MARKET_SOURCE_CONSISTENCY_VERSION,
     build_market_fact,
     build_market_source_consistency,
     build_shadow_market_fact_contract,
+    compact_market_fact,
     market_fact_contract_reasons,
+    normalize_okx_contract_spec,
     verify_market_fact_path,
 )
+from core.training_feature_snapshot import postgres_training_feature_snapshot_functions
 from data_feed.feature_vector import build_feature_vector
 
 
@@ -49,6 +53,52 @@ def _snapshot(price: float, timestamp: int, *, notional: float = 10_000.0) -> di
         "orderbook_bid_depth": 25_000,
         "orderbook_ask_depth": 25_000,
     }
+
+
+def test_public_asset_class_survives_normalization_and_training_projection() -> None:
+    base = normalize_okx_contract_spec(_spec())
+    spec = {**_spec(), "instCategory": "3", "category": "1", "openType": "fix_price"}
+    normalized = normalize_okx_contract_spec(spec)
+    assert normalize_okx_contract_spec(normalized) == normalized
+    assert normalized["spec_version"] == base["spec_version"]
+    fact = build_market_fact(
+        "ROBO/USDT", _snapshot(0.10834, 1_783_990_800_000), contract_spec=spec,
+    )
+    assert fact["quality"]["status"] == "clean"
+    compact = compact_market_fact(fact)
+    assert compact["native_identity"]["contract_spec"]["inst_category"] == "3"
+    assert compact_market_fact(compact) == compact
+
+
+def test_market_fact_projection_normalizes_category_aliases() -> None:
+    fact = {
+        "schema_version": "2026-07-14.okx-native-market-fact.v1",
+        "native_identity": {
+            "contract_spec": {
+                "instCategory": "1",
+                "category": "1",
+                "openType": "fix_price",
+            },
+        },
+    }
+
+    assert compact_market_fact(fact)["native_identity"]["contract_spec"] == {
+        "inst_category": "1",
+        "category": "1",
+        "open_type": "fix_price",
+    }
+
+
+def test_postgres_market_fact_projection_preserves_asset_class_fields() -> None:
+    sql = "\n".join(postgres_training_feature_snapshot_functions())
+
+    assert MARKET_FACT_STORAGE_COMPACTION_VERSION == "2026-11-12.compact-market-fact.v2"
+    assert "'inst_category', COALESCE(" in sql
+    assert "spec->'instCategory'" in sql
+    assert "'category', spec->'category'" in sql
+    assert "'open_type', COALESCE(" in sql
+    assert "spec->'openType'" in sql
+    assert MARKET_FACT_STORAGE_COMPACTION_VERSION in sql
 
 
 def test_zero_turnover_robo_fact_is_quarantined_without_fixed_price_threshold() -> None:

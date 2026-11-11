@@ -103,7 +103,7 @@ async def fetch_tickers(instType: str = "SWAP", mode: str = "paper") -> dict:
     tickers = {}
     for t in result.get("data", []):
         inst_id = str(t.get("instId") or "").strip().upper()
-        if supported_swap_inst_ids is not None and inst_id not in supported_swap_inst_ids:
+        if inst_id not in supported_swap_inst_ids:
             continue
         symbol = t.get("instId", "").replace("-", "/")
         last = safe_float(t.get("last"), 0.0)
@@ -125,18 +125,15 @@ async def _fetch_supported_swap_inst_ids(
     mode: str,
     *,
     exchange: OkxPerpetualSdkExchange | None = None,
-) -> set[str] | None:
+) -> set[str]:
     try:
         ex = exchange or _make_exchange(mode)
         data = await ex.publicGetPublicInstruments({"instType": "SWAP"})
         _ensure_okx_success(data)
     except Exception as exc:
-        logger.warning(
-            "fetch OKX instrument metadata failed; using unfiltered SDK tickers",
-            mode=mode,
-            error=safe_error_text(exc),
-        )
-        return None
+        raise ExchangeAPIError(
+            f"OKX instrument metadata unavailable: {safe_error_text(exc)}"
+        ) from exc
     return {
         str(inst.get("instId") or "").strip().upper()
         for inst in supported_usdt_swap_instruments(data.get("data", []))

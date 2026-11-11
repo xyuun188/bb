@@ -2901,6 +2901,10 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units(
                         "minSz": "1",
                         "lotSz": "1",
                         "tickSz": "0.1",
+                        "instCategory": "1",
+                        "category": "1",
+                        "openType": "fix_price",
+                        "state": "live",
                     }
                 ]
             }

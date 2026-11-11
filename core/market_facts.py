@@ -17,7 +17,7 @@ from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol, symb
 MARKET_FACT_SCHEMA_VERSION = "2026-07-14.okx-native-market-fact.v1"
 MARKET_FACT_CONTRACT_VERSION = "2026-07-14.native-market-fact.v1"
 MARKET_SOURCE_CONSISTENCY_VERSION = "2026-07-17.okx-source-consistency.v4"
-MARKET_FACT_STORAGE_COMPACTION_VERSION = "2026-10-22.compact-market-fact.v1"
+MARKET_FACT_STORAGE_COMPACTION_VERSION = "2026-11-12.compact-market-fact.v2"
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
@@ -106,7 +106,19 @@ def normalize_okx_contract_spec(spec: Mapping[str, Any] | None) -> dict[str, Any
         "state": _text(raw.get("state")).lower(),
         "source": _text(raw.get("source") or "okx_public_instruments"),
     }
-    normalized["spec_version"] = f"sha256:{_fingerprint(normalized)}"
+    for raw_key, normalized_key in (
+        ("instCategory", "inst_category"),
+        ("category", "category"),
+        ("openType", "open_type"),
+    ):
+        if raw_key in raw or normalized_key in raw:
+            normalized[normalized_key] = _text(raw.get(raw_key) or raw.get(normalized_key))
+    contract_identity = {
+        key: value
+        for key, value in normalized.items()
+        if key not in {"inst_category", "category", "open_type"}
+    }
+    normalized["spec_version"] = f"sha256:{_fingerprint(contract_identity)}"
     return normalized
 
 
@@ -415,7 +427,7 @@ def compact_market_fact(fact: Mapping[str, Any] | None) -> dict[str, Any]:
         for key in ("inst_id", "inst_type", "uly", "contract_spec_version")
         if key in identity
     }
-    compact_identity["contract_spec"] = {
+    compact_spec = {
         key: spec.get(key)
         for key in (
             "inst_id",
@@ -430,11 +442,24 @@ def compact_market_fact(fact: Mapping[str, Any] | None) -> dict[str, Any]:
             "minimum_size",
             "tick_size",
             "state",
+            "inst_category",
+            "category",
+            "open_type",
             "source",
             "spec_version",
         )
         if key in spec
     }
+    for output_key, input_keys in (
+        ("inst_category", ("inst_category", "instCategory")),
+        ("category", ("category",)),
+        ("open_type", ("open_type", "openType")),
+    ):
+        for input_key in input_keys:
+            if input_key in spec:
+                compact_spec[output_key] = spec[input_key]
+                break
+    compact_identity["contract_spec"] = compact_spec
     compact: dict[str, Any] = {
         key: source.get(key)
         for key in (

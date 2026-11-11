@@ -1848,6 +1848,24 @@ async def _repair_shadow_training_snapshot_batch(
                                     FALSE
                                 )
                             )
+                            OR (
+                                scanned.training_feature_snapshot_version
+                                    < :target_version
+                                AND COALESCE(
+                                    (scanned.feature_snapshot::JSONB)
+                                        ->'market_fact'->'native_identity'
+                                        ->'contract_spec',
+                                    '{}'::JSONB
+                                ) ?| ARRAY['inst_category', 'instCategory']
+                                AND NOT (
+                                    COALESCE(
+                                        (scanned.training_feature_snapshot)
+                                            ->'market_fact'->'native_identity'
+                                            ->'contract_spec',
+                                        '{}'::JSONB
+                                    ) ? 'inst_category'
+                                )
+                            )
                         )
                     )
                     OR (

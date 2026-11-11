@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from config.settings import settings
-from core.market_facts import MARKET_FACT_CONTRACT_VERSION
+from core.market_facts import MARKET_FACT_CONTRACT_VERSION, MARKET_FACT_SCHEMA_VERSION
 from core.training_contracts import HISTORICAL_SHADOW_SOURCE
 from db.session import close_db, get_session_ctx, init_db
 from models.learning import ShadowBacktest
@@ -62,7 +62,19 @@ def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def _use_temp_db(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    mask_crypto_universe: bool = True,
+) -> None:
+    if mask_crypto_universe:
+        def synthetic_universe() -> tuple:
+            return ()
+
+        monkeypatch.setattr(
+            train_script, "crypto_shadow_candidate_filters", synthetic_universe,
+        )
     await close_db()
     db_path = tmp_path / "local-ai-tools-shadow-training.db"
     monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path.as_posix()}")
@@ -228,6 +240,55 @@ async def test_shadow_loader_evenly_bounds_rows_at_database_query(
         "S6/USDT",
         "S9/USDT",
     ]
+
+
+@pytest.mark.asyncio
+async def test_executable_shadow_universe_keeps_losing_crypto_and_excludes_winning_stock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path, mask_crypto_universe=False)
+    created_at = PHASE3_CLEAN_START_UTC + timedelta(minutes=5)
+    async with get_session_ctx() as session:
+        session.add_all([
+            ShadowBacktest(
+                model_name="ensemble_trader", execution_mode="paper", symbol=symbol,
+                status="completed", created_at=created_at,
+                due_at=created_at + timedelta(minutes=train_script.PRIMARY_PREDICTION_HORIZON_MINUTES),
+                horizon_minutes=train_script.PRIMARY_PREDICTION_HORIZON_MINUTES,
+                long_return_pct=outcome, short_return_pct=-outcome,
+                feature_snapshot={
+                    "current_price": 100.0,
+                    "market_fact": {
+                        "schema_version": MARKET_FACT_SCHEMA_VERSION,
+                        "native_identity": {
+                            "inst_id": symbol.replace("/", "-") + "-SWAP",
+                            "inst_type": "SWAP",
+                            "uly": symbol.replace("/", "-"),
+                            "contract_spec": {
+                                "inst_category": "1" if symbol == "BTC/USDT" else "3",
+                            },
+                        },
+                    },
+                    "training_market_fact_contract": {
+                        "version": MARKET_FACT_CONTRACT_VERSION, "status": "clean",
+                        "violation_count": 0, "native_instrument_identity_verified": True,
+                        "same_contract_price_path_verified": True,
+                        "executable_market_fact_verified": True,
+                    },
+                },
+            )
+            for symbol, outcome in (("BTC/USDT", -10.0), ("SOXL/USDT", 10.0))
+        ])
+    try:
+        selected = await train_script._load_shadow_samples(sample_budget=2)
+        research = await train_script._load_shadow_samples(executable_only=False)
+        cursor_count = await train_script._completed_shadow_sample_count()
+    finally:
+        await close_db()
+    assert [row["symbol"] for row in selected] == ["BTC/USDT"]
+    assert selected[0]["long_return_pct"] == -10.0
+    assert {row["symbol"] for row in research} == {"BTC/USDT", "SOXL/USDT"}
+    assert cursor_count == 1
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from config.settings import settings
+from core.market_facts import MARKET_FACT_SCHEMA_VERSION
 from core.model_artifact_safety import dump_trusted_joblib
 from core.training_contracts import (
     SHADOW_LABEL_HORIZONS_MINUTES,
@@ -682,7 +683,19 @@ def _service_with_metadata(metadata: dict) -> MLSignalService:
     return service
 
 
-async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def _use_temp_db(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    mask_crypto_universe: bool = True,
+) -> None:
+    if mask_crypto_universe:
+        def synthetic_universe() -> tuple:
+            return ()
+
+        monkeypatch.setattr(
+            ml_training_dataset, "crypto_shadow_candidate_filters", synthetic_universe,
+        )
     await close_db()
     db_path = tmp_path / "ml-signal-training.db"
     monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path.as_posix()}")
@@ -720,6 +733,47 @@ async def test_local_ml_training_counts_only_phase3_clean_shadow_rows(
     assert {row.id for row in selected}.issubset({2, 3})
     assert {row.id for row in selected}
     assert 1 not in {row.id for row in selected}
+
+
+@pytest.mark.asyncio
+async def test_local_ml_loader_uses_frozen_asset_class_without_selecting_winners(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path, mask_crypto_universe=False)
+    monkeypatch.setattr(
+        ml_training_dataset, "shadow_is_trainable_trade_opportunity", lambda _row: True,
+    )
+    created_at = PHASE3_CLEAN_START_UTC + timedelta(minutes=5)
+
+    def row(row_id: int, symbol: str, category: str | None, outcome: float) -> ShadowBacktest:
+        sample = _db_shadow_row(
+            row_id,
+            created_at,
+            long_return_pct=outcome,
+            short_return_pct=-outcome,
+            asset_category=category,
+        )
+        sample.symbol = symbol
+        return sample
+
+    async with get_session_ctx() as session:
+        session.add_all(
+            [
+                row(101, "BTC/USDT", "1", -4.0),
+                row(102, "SOXL/USDT", "3", 4.0),
+                row(103, "OLD/USDT", None, 2.0),
+            ]
+        )
+        await session.commit()
+
+    try:
+        selected = await load_shadow_training_rows()
+        assert [sample.symbol for sample in selected] == ["BTC/USDT"]
+        assert await count_shadow_training_rows() == 1
+        assert await ml_training_dataset.count_shadow_training_decision_groups() == 1
+    finally:
+        await close_db()
 
 
 @pytest.mark.asyncio
@@ -770,6 +824,7 @@ def _db_shadow_row(
     status: str = "completed",
     long_return_pct: float | None = 0.1,
     short_return_pct: float | None = -0.1,
+    asset_category: str | None = None,
 ) -> ShadowBacktest:
     due_at = created_at + timedelta(minutes=30)
     decision_id = row_id + 10_000
@@ -790,6 +845,16 @@ def _db_shadow_row(
             best_action=best_action,
         ),
     }
+    if asset_category is not None:
+        feature_snapshot["market_fact"] = {
+            "schema_version": MARKET_FACT_SCHEMA_VERSION,
+            "native_identity": {
+                "inst_id": f"TEST{row_id}-USDT-SWAP",
+                "inst_type": "SWAP",
+                "uly": f"TEST{row_id}-USDT",
+                "contract_spec": {"inst_category": asset_category},
+            },
+        }
     seal_synthetic_feature_availability(feature_snapshot, decision_at=created_at)
     return ShadowBacktest(
         id=row_id,
@@ -3780,6 +3845,31 @@ async def test_training_budget_excludes_history_only_rows_before_sampling(
     finally:
         await close_db()
     assert {row.id for row in selected} == {80_001, 80_003}
+
+
+@pytest.mark.asyncio
+async def test_current_crypto_universe_is_applied_before_training_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    base_time = datetime(2026, 6, 28, 3, 0, tzinfo=UTC)
+    monkeypatch.setattr(ml_training_dataset, "LOCAL_ML_TRAINING_MAX_DECISION_GROUPS", 2)
+    rows = [_db_shadow_row(81_000 + i, base_time - timedelta(minutes=i)) for i in range(4)]
+    for row, symbol in zip(rows, ("SOXL/USDT", "BTC/USDT", "SOXL/USDT", "ETH/USDT"), strict=True):
+        row.symbol = symbol
+
+    def crypto_universe() -> tuple:
+        return (ShadowBacktest.symbol.in_(("BTC/USDT", "ETH/USDT")),)
+
+    monkeypatch.setattr(ml_training_dataset, "crypto_shadow_candidate_filters", crypto_universe)
+    async with get_session_ctx() as session:
+        session.add_all(rows)
+    try:
+        selected = await load_shadow_training_rows()
+    finally:
+        await close_db()
+    assert {row.id for row in selected} == {81_001, 81_003}
 
 
 @pytest.mark.asyncio

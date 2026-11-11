@@ -314,7 +314,17 @@ class OKXExecutor(AbstractExecutor):
         )
         response = await fetch_instruments({"instType": "SWAP"})
         instruments = response.get("data", []) if isinstance(response, dict) else []
-        filtered = supported_usdt_swap_instruments(instruments)
+        public_response = (
+            await self._exchange.publicGetPublicInstruments({"instType": "SWAP"})
+            if hasattr(self._exchange, "executionGetPublicInstruments")
+            else response
+        )
+        public_instruments = (
+            public_response.get("data", []) if isinstance(public_response, dict) else []
+        )
+        filtered = supported_usdt_swap_instruments(
+            instruments, public_instruments=public_instruments,
+        )
         markets = self._exchange.parse_markets(filtered)
         self._apply_okx_instrument_contract_rules(markets, filtered)
         self._exchange.set_markets(markets)

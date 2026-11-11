@@ -101,6 +101,9 @@ class _MarketAndExecutionInstrumentCcxt:
             "data": [{
                 "instType": "SWAP",
                 "instId": "PEPE-USDT-SWAP",
+                "instCategory": "1",
+                "category": "1",
+                "openType": "fix_price",
                 "ctVal": "10000000",
                 "ctMult": "1",
                 "tickSz": "0.000000001",
@@ -148,6 +151,8 @@ async def test_market_contract_specs_use_public_route_separate_from_execution_sp
     execution = await client.fetch_contract_specs(symbols=["PEPE/USDT"])
 
     assert market["PEPE-USDT-SWAP"]["tickSz"] == "0.000000001"
+    assert market["PEPE-USDT-SWAP"]["instCategory"] == "1"
+    assert market["PEPE-USDT-SWAP"]["openType"] == "fix_price"
     assert execution["PEPE-USDT-SWAP"]["tickSz"] == "0.00000001"
     assert ccxt.public_params == [
         {"instType": "SWAP", "instId": "PEPE-USDT-SWAP"}

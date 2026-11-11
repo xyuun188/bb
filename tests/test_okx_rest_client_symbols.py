@@ -1084,6 +1084,8 @@ async def test_fetch_instrument_spec_keeps_native_contract_identity(monkeypatch)
                     "uly": "ROBO-USDT",
                     "instFamily": "ROBO-USDT",
                     "instCategory": "1",
+                    "category": "1",
+                    "openType": "fix_price",
                     "ctType": "linear",
                     "ctVal": "1",
                     "ctMult": "1",
@@ -1104,6 +1106,9 @@ async def test_fetch_instrument_spec_keeps_native_contract_identity(monkeypatch)
     assert spec["instId"] == "ROBO-USDT-SWAP"
     assert spec["uly"] == "ROBO-USDT"
     assert spec["ctVal"] == "1"
+    assert spec["instCategory"] == "1"
+    assert spec["category"] == "1"
+    assert spec["openType"] == "fix_price"
     assert spec["source"] == "okx_public_instruments"
 
 
@@ -1132,6 +1137,9 @@ async def test_fetch_instrument_spec_reuses_loaded_native_market_without_remote_
                         "minSz": "1",
                         "tickSz": "0.00001",
                         "state": "live",
+                        "instCategory": "1",
+                        "category": "1",
+                        "openType": "fix_price",
                     }
                 }
             }
@@ -1147,6 +1155,9 @@ async def test_fetch_instrument_spec_reuses_loaded_native_market_without_remote_
 
     assert spec["instId"] == "ROBO-USDT-SWAP"
     assert spec["ctVal"] == "1"
+    assert spec["instCategory"] == "1"
+    assert spec["category"] == "1"
+    assert spec["openType"] == "fix_price"
     assert spec["source"] == "okx_public_instruments_cache"
 
 

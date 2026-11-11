@@ -15,7 +15,7 @@ from typing import Any
 from core.feature_availability import FROZEN_FEATURE_FIELDS, availability_fingerprint
 from core.market_facts import compact_market_fact, compact_market_fact_contract
 
-TRAINING_FEATURE_SNAPSHOT_VERSION = 8
+TRAINING_FEATURE_SNAPSHOT_VERSION = 9
 FROZEN_TRAINING_FEATURE_MAX_BYTES = 96 * 1024
 TRAINING_FEATURE_SNAPSHOT_MAX_BYTES = 128 * 1024
 TRAINING_FEATURE_OBJECT_MAX_BYTES = 16 * 1024
@@ -752,6 +752,11 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                         'inst_type', spec->'inst_type',
                         'uly', spec->'uly',
                         'contract_type', spec->'contract_type',
+                        'inst_category', COALESCE(
+                            spec->'inst_category', spec->'instCategory'
+                        ),
+                        'category', spec->'category',
+                        'open_type', COALESCE(spec->'open_type', spec->'openType'),
                         'contract_value', spec->'contract_value',
                         'contract_multiplier', spec->'contract_multiplier',
                         'contract_value_currency', spec->'contract_value_currency',
@@ -854,7 +859,7 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                     'reasons', source->'quality'->'reasons'
                 )),
                 'storage_contract', jsonb_strip_nulls(jsonb_build_object(
-                    'version', '2026-10-22.compact-market-fact.v1',
+                    'version', '2026-11-12.compact-market-fact.v2',
                     'full_fact_fingerprint', source->'fact_id',
                     'full_source_consistency_fingerprint',
                         provenance->'data_fingerprint'

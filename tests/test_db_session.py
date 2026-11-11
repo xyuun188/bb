@@ -847,6 +847,8 @@ async def test_shadow_repair_advances_bounded_window_and_checkpoint(
     assert "local_ai_tools_shadow" in predicate
     assert "local_ml_shadow" in predicate
     assert "shadow_settlement_cost_observation" in predicate
+    assert "inst_category" in predicate
+    assert "instCategory" in predicate
     assert "NOT COALESCE(" in predicate
     assert conn.parameters[-1] == {
         "repair_key": session_module._SHADOW_TRAINING_REPAIR_KEY,

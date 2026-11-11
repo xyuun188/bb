@@ -52,7 +52,7 @@ def test_okx_instrument_filter_keeps_only_crypto_usdt_swaps() -> None:
     )
     xrp = _instrument("XRP-USDT-SWAP", open_type="fix_price", inst_category="3")
     xrp["category"] = "1"
-    assert is_supported_usdt_swap_instrument(xrp) is True
+    assert is_supported_usdt_swap_instrument(xrp) is False
     stock = _instrument("PLTR-USDT-SWAP", open_type="pre_quote", inst_category="3")
     stock["category"] = "1"
     assert is_supported_usdt_swap_instrument(stock) is False
@@ -65,6 +65,33 @@ def test_okx_instrument_filter_keeps_only_crypto_usdt_swaps() -> None:
     missing_category = _instrument("MISSING-CATEGORY-USDT-SWAP")
     missing_category.pop("instCategory")
     assert is_supported_usdt_swap_instrument(missing_category) is False
+
+
+@pytest.mark.parametrize("base", ["SOXL", "SOXS", "KORU", "AAOI", "PLTR"])
+def test_fixed_price_stock_contract_is_not_crypto(base: str) -> None:
+    stock = _instrument(f"{base}-USDT-SWAP", inst_category="3")
+    stock["category"] = "1"
+    assert is_supported_usdt_swap_instrument(stock) is False
+
+
+def test_demo_classification_requires_matching_public_crypto_identity() -> None:
+    demo = [
+        _instrument("BCH-USDT-SWAP", inst_category="3", ct_val="0.01"),
+        _instrument("PLTR-USDT-SWAP", inst_category="1"),
+        _instrument("UNKNOWN-USDT-SWAP"),
+        _instrument("MISMATCH-USDT-SWAP", uly="BTC-USDT"),
+    ]
+    public = [
+        _instrument("BCH-USDT-SWAP", ct_val="1"),
+        _instrument("PLTR-USDT-SWAP", inst_category="3"),
+        _instrument("MISMATCH-USDT-SWAP"),
+    ]
+
+    supported = supported_usdt_swap_instruments(demo, public_instruments=public)
+
+    assert supported == [demo[0]]
+    assert supported[0]["ctVal"] == "0.01"
+    assert supported_usdt_swap_instruments(demo, public_instruments=[]) == []
 
 
 def test_supported_instruments_dedupe_like_okx_executor_market_keys() -> None:
@@ -130,6 +157,29 @@ async def test_okx_executor_market_loader_filters_unsupported_pre_quote_contract
 
     assert "BTC/USDT:USDT" in fake_ccxt.markets
     assert "PLTR/USDT:USDT" not in fake_ccxt.markets
+
+
+@pytest.mark.asyncio
+async def test_executor_uses_public_classification_and_demo_contract_rules() -> None:
+    class _DemoCategoryCcxt(_InstrumentFilteringCcxt):
+        async def publicGetPublicInstruments(self, _params: dict) -> dict:
+            return {"data": [
+                _instrument("BCH-USDT-SWAP", ct_val="1"),
+                _instrument("SOXL-USDT-SWAP", inst_category="3"),
+            ]}
+
+        async def executionGetPublicInstruments(self, _params: dict) -> dict:
+            bch = _instrument("BCH-USDT-SWAP", inst_category="3", ct_val="0.01")
+            bch["category"] = "1"
+            return {"data": [bch, _instrument("SOXL-USDT-SWAP")]}
+
+    exchange = _DemoCategoryCcxt()
+    executor = OKXExecutor(mode="paper")
+    executor._exchange = exchange
+    await executor._load_usdt_swap_markets()
+
+    assert set(exchange.markets) == {"BCH/USDT:USDT"}
+    assert exchange.markets["BCH/USDT:USDT"]["contractSize"] == pytest.approx(0.01)
 
 
 @pytest.mark.asyncio

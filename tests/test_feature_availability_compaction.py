@@ -700,7 +700,7 @@ def test_market_fact_with_old_storage_contract_is_recompacted() -> None:
     fact["source_consistency"].setdefault("path", {})
     fact["source_consistency"]["path"]["missing_open_times_ms"] = list(range(2_000))
     fact["storage_contract"] = {
-        "version": "2026-10-22.compact-market-fact.v1",
+        "version": "2026-11-12.compact-market-fact.v2",
         "full_fact_fingerprint": fact["fact_id"],
         "full_source_consistency_fingerprint": "old-source-consistency",
     }

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from config.settings import ENSEMBLE_TRADER_NAME, settings
+from core.market_facts import MARKET_FACT_SCHEMA_VERSION
 from core.training_contracts import SHADOW_LABEL_VERSION
 from db.session import close_db, get_session_ctx, init_db
 from models.learning import ShadowBacktest
@@ -28,6 +29,18 @@ async def _use_temp_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     db_path = tmp_path / "model-server-settings.db"
     monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path.as_posix()}")
     await init_db()
+
+
+def _classified_btc_market_fact() -> dict:
+    return {
+        "schema_version": MARKET_FACT_SCHEMA_VERSION,
+        "native_identity": {
+            "inst_id": "BTC-USDT-SWAP",
+            "inst_type": "SWAP",
+            "uly": "BTC-USDT",
+            "contract_spec": {"inst_category": "1"},
+        },
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -326,6 +339,7 @@ async def test_local_ai_tools_status_uses_client_when_dashboard_is_split(
                     long_return_pct=0.2,
                     short_return_pct=-0.1,
                     best_action="long",
+                    feature_snapshot={"market_fact": _classified_btc_market_fact()},
                 )
             )
         result = await dashboard.get_local_ai_tools_status()
@@ -423,6 +437,7 @@ async def test_ml_signal_status_uses_current_epoch_count_when_dashboard_is_split
                     long_return_pct=0.2,
                     short_return_pct=-0.1,
                     best_action="long",
+                    feature_snapshot={"market_fact": _classified_btc_market_fact()},
                 )
             )
         result = await dashboard.get_ml_signal_status()

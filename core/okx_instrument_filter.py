@@ -6,9 +6,14 @@ from collections.abc import Mapping
 from typing import Any
 
 OKX_CRYPTO_INSTRUMENT_CATEGORY = "1"
+OKX_CRYPTO_UNIVERSE_POLICY = "2026-11-12.public-crypto-identity.v1"
 
 
-def is_supported_usdt_swap_instrument(instrument: Mapping[str, Any]) -> bool:
+def is_supported_usdt_swap_instrument(
+    instrument: Mapping[str, Any],
+    *,
+    public_instrument: Mapping[str, Any] | None = None,
+) -> bool:
     """Return whether an OKX instrument belongs in the real trading universe.
 
     OKX's SWAP instrument endpoint includes stock and commodity derivatives beside
@@ -29,29 +34,30 @@ def is_supported_usdt_swap_instrument(instrument: Mapping[str, Any]) -> bool:
         and instrument.get("tickSz")
     ):
         return False
+    if public_instrument is not None:
+        return (
+            str(public_instrument.get("instId") or "") == inst_id
+            and _okx_executor_market_key(public_instrument)
+            == _okx_executor_market_key(instrument)
+            and is_supported_usdt_swap_instrument(public_instrument)
+        )
     return is_crypto_swap_instrument(instrument)
 
 
 def is_crypto_swap_instrument(instrument: Mapping[str, Any]) -> bool:
     """Return whether the OKX instrument is categorized as a crypto contract."""
 
-    inst_category = str(instrument.get("instCategory") or "").strip()
-    if inst_category == OKX_CRYPTO_INSTRUMENT_CATEGORY:
-        return True
-
-    # OKX currently labels some established crypto swaps (for example XRP and
-    # BCH) with ``instCategory=3`` in the SWAP payload. Their product category
-    # remains crypto (``category=1``) and they use fixed-price contracts.
-    # Stock and commodity swaps expose ``pre_quote`` contracts; keep those out.
-    return (
-        inst_category == "3"
-        and str(instrument.get("category") or "").strip() == "1"
-        and str(instrument.get("openType") or "").strip() == "fix_price"
-    )
+    # Demo categories can differ from public categories. Resolve that discrepancy
+    # using the matching public instrument, never category/openType heuristics.
+    return str(instrument.get("instCategory") or "").strip() == OKX_CRYPTO_INSTRUMENT_CATEGORY
 
 
 def supported_usdt_swap_instruments(
     instruments: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    *,
+    public_instruments: (
+        list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...] | None
+    ) = None,
 ) -> list[Mapping[str, Any]]:
     """Return supported instruments after applying OKX executor-style de-duplication.
 
@@ -62,11 +68,19 @@ def supported_usdt_swap_instruments(
     symbol the executor cannot look up by id.
     """
 
+    public_by_id = {
+        str(item.get("instId") or ""): item
+        for item in public_instruments or ()
+        if isinstance(item, Mapping) and is_supported_usdt_swap_instrument(item)
+    }
     selected: dict[str, Mapping[str, Any]] = {}
     for instrument in instruments:
-        if not isinstance(instrument, Mapping) or not is_supported_usdt_swap_instrument(
-            instrument
-        ):
+        if not isinstance(instrument, Mapping):
+            continue
+        reference = public_by_id.get(str(instrument.get("instId") or ""))
+        if public_instruments is not None and reference is None:
+            continue
+        if not is_supported_usdt_swap_instrument(instrument, public_instrument=reference):
             continue
         selected[_okx_executor_market_key(instrument)] = instrument
     return list(selected.values())

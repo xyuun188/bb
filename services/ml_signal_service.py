@@ -2783,6 +2783,8 @@ def train_from_frame(
         "authoritative_trade_training_probe": authoritative_trade_training_probe or {},
         "training_window_composition": _training_window_composition(train),
         "shadow_selection_policy": ml_training_dataset.SHADOW_SELECTION_POLICY_VERSION,
+        "trading_universe_policy": ml_training_dataset.OKX_CRYPTO_UNIVERSE_POLICY,
+        "universe_basis": "explicit_asset_class_in_frozen_market_fact",
         "training_task_manifest": task_manifest,
         "training_sample_sources": {
             "shadow_market_label": int(len(frame)),

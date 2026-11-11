@@ -12,6 +12,9 @@ from typing import Any
 
 from sqlalchemy import and_, func, or_, select
 
+from core.okx_instrument_filter import (
+    OKX_CRYPTO_UNIVERSE_POLICY as OKX_CRYPTO_UNIVERSE_POLICY,
+)
 from core.training_contracts import SHADOW_LABEL_HORIZONS_MINUTES, SHADOW_LABEL_VERSION
 from db.session import get_read_session_ctx
 from models.learning import ShadowBacktest
@@ -30,7 +33,21 @@ LOCAL_ML_TRAINING_MAX_DECISION_GROUPS = min(
     LOCAL_ML_TRAINING_HARD_MAX_DECISION_GROUPS,
 )
 LOCAL_ML_TRAINING_READ_PAGE_SIZE = 500
-SHADOW_SELECTION_POLICY_VERSION = "2026-11-10.task-eligible-shadow-budget.v3"
+SHADOW_SELECTION_POLICY_VERSION = "2026-11-12.crypto-task-eligible-shadow-budget.v4"
+
+
+def crypto_shadow_candidate_filters() -> tuple[Any, ...]:
+    """Require an explicit crypto asset classification in each frozen sample.
+
+    Historical rows without this field remain observation/research data. Never
+    infer a historical asset class from today's exchange response or symbol name.
+    """
+    return (
+        ShadowBacktest.training_feature_snapshot["market_fact"][
+            "native_identity"
+        ]["contract_spec"]["inst_category"].as_string()
+        == "1",
+    )
 
 
 @dataclass(frozen=True)
@@ -211,8 +228,11 @@ async def load_shadow_training_rows(
     """
 
     epoch_start = load_training_data_start()
-    base_filters = shadow_training_candidate_filters(
-        epoch_start, horizons=horizons, executable_features_only=True,
+    base_filters = (
+        *shadow_training_candidate_filters(
+            epoch_start, horizons=horizons, executable_features_only=True,
+        ),
+        *crypto_shadow_candidate_filters(),
     )
     horizon_count = (
         len(SHADOW_LABEL_HORIZONS_MINUTES)
@@ -325,7 +345,8 @@ async def count_shadow_training_rows() -> int:
     async with get_read_session_ctx() as session:
         result = await session.execute(
             select(func.count(ShadowBacktest.id)).where(
-                *shadow_training_candidate_filters(epoch_start)
+                *shadow_training_candidate_filters(epoch_start),
+                *crypto_shadow_candidate_filters(),
             )
         )
         return int(result.scalar() or 0)
@@ -344,7 +365,10 @@ async def count_shadow_training_decision_groups() -> int:
                         )
                     )
                 )
-            ).where(*shadow_training_candidate_filters(epoch_start))
+            ).where(
+                *shadow_training_candidate_filters(epoch_start),
+                *crypto_shadow_candidate_filters(),
+            )
         )
         return int(result.scalar() or 0)
 

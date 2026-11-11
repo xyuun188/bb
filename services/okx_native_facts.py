@@ -836,6 +836,9 @@ class OkxNativeFactsClient:
                 specs[inst_id] = {
                     "instId": inst_id,
                     "instType": str(row.get("instType") or "SWAP"),
+                    "instCategory": str(row.get("instCategory") or ""),
+                    "category": str(row.get("category") or ""),
+                    "openType": str(row.get("openType") or ""),
                     "ctType": str(row.get("ctType") or ""),
                     "ctVal": str(row.get("ctVal") or ""),
                     "ctMult": str(row.get("ctMult") or "1"),
@@ -889,6 +892,9 @@ class OkxNativeFactsClient:
             specs[inst_id] = {
                 "instId": inst_id,
                 "instType": str(row.get("instType") or "SWAP"),
+                "instCategory": str(row.get("instCategory") or ""),
+                "category": str(row.get("category") or ""),
+                "openType": str(row.get("openType") or ""),
                 "ctType": str(row.get("ctType") or ""),
                 "ctVal": str(row.get("ctVal") or ""),
                 "ctMult": str(row.get("ctMult") or "1"),

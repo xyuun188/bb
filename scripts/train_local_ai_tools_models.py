@@ -34,6 +34,7 @@ drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 
 from config.settings import settings  # noqa: E402
 from core.market_facts import market_fact_contract_reasons  # noqa: E402
+from core.okx_instrument_filter import OKX_CRYPTO_UNIVERSE_POLICY
 from core.safe_output import safe_error_text, safe_print, safe_response_error_text  # noqa: E402
 from core.training_feature_snapshot import compact_training_feature_snapshot  # noqa: E402
 from core.url_safety import normalize_http_base_url  # noqa: E402
@@ -57,6 +58,7 @@ from services.local_ai_training_contract import (  # noqa: E402
     LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
 )
 from services.ml_training_contract import PRIMARY_PREDICTION_HORIZON_MINUTES
+from services.ml_training_dataset import crypto_shadow_candidate_filters
 from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
     build_return_objective_report,
@@ -962,6 +964,7 @@ async def _load_shadow_samples(
     if executable_only:
         filters += (
             ShadowBacktest.horizon_minutes == PRIMARY_PREDICTION_HORIZON_MINUTES,
+            *crypto_shadow_candidate_filters(),
         )
     requested_limit = max(int(sample_budget or 0), 2) if sample_budget is not None else 0
     candidate_limit = requested_limit * (
@@ -1123,6 +1126,7 @@ async def _completed_shadow_sample_count() -> int:
                 ShadowBacktest.created_at >= epoch_start,
                 ShadowBacktest.long_return_pct.is_not(None),
                 ShadowBacktest.short_return_pct.is_not(None),
+                *crypto_shadow_candidate_filters(),
             )
         )
         return int(result.scalar() or 0)
@@ -1439,6 +1443,8 @@ async def _main() -> None:
     training_transport_report["comparison_view"] = comparison_report
     training_transport_report["shadow_sampling"] = {
         "policy": "stable_raw_identity_priority_with_history_endpoints",
+        "trading_universe_policy": OKX_CRYPTO_UNIVERSE_POLICY,
+        "universe_basis": "explicit_asset_class_in_frozen_market_fact",
         "outcome_dependent": False,
         "candidate_limit": (
             _REMOTE_TRAINING_MAX_SHADOW_SAMPLES

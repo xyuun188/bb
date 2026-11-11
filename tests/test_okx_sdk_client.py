@@ -181,10 +181,15 @@ async def test_fetch_tickers_raises_typed_redacted_exchange_error(monkeypatch) -
 
 @pytest.mark.asyncio
 async def test_fetch_swap_tickers_filters_to_supported_crypto_instruments(monkeypatch) -> None:
+    stock = {
+        **_instrument("PLTR-USDT-SWAP", "3"),
+        "category": "1",
+        "openType": "fix_price",
+    }
     public_api = _InstrumentPublicApi(
         [
             _instrument("BTC-USDT-SWAP", "1"),
-            _instrument("PLTR-USDT-SWAP", "3"),
+            stock,
         ]
     )
 
@@ -202,6 +207,23 @@ async def test_fetch_swap_tickers_filters_to_supported_crypto_instruments(monkey
     assert public_api.calls == [
         {"instType": "SWAP", "uly": "", "instId": "", "instFamily": ""}
     ]
+
+
+@pytest.mark.asyncio
+async def test_ticker_metadata_failure_cannot_bypass_universe_filter(monkeypatch) -> None:
+    class BrokenInstruments(_InstrumentPublicApi):
+        def get_instruments(self, **_kwargs):
+            raise RuntimeError("metadata unavailable")
+
+    monkeypatch.setattr(
+        okx_sdk_client,
+        "_make_exchange",
+        lambda _mode: _Exchange(
+            market_api=_TickerMarketApi(), public_api=BrokenInstruments([])
+        ),
+    )
+    with pytest.raises(ExchangeAPIError, match="instrument metadata"):
+        await okx_sdk_client.fetch_tickers()
 
 
 @pytest.mark.asyncio
