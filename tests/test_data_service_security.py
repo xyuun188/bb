@@ -2511,6 +2511,64 @@ async def test_blocking_derivatives_read_refreshes_stale_cache() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("funding_age_seconds", [None, 1, 30])
+async def test_final_derivatives_cache_age_uses_funding_receipt(
+    funding_age_seconds,
+) -> None:
+    service = _service()
+    service._derivatives_update_interval = 20.0
+    now = datetime.now(UTC)
+    reference = {
+        "price": 100.0,
+        "source_timestamp_ms": int(now.timestamp() * 1000),
+        "received_at": now.isoformat(),
+    }
+    cached = {
+        "orderbook_data_available": True,
+        "orderbook_bid_depth": 10.0,
+        "orderbook_ask_depth": 11.0,
+        "orderbook_fact": {**reference, "bid": 100.0, "ask": 100.1},
+        "reference_prices_data_available": True,
+        "mark_price_fact": dict(reference),
+        "index_price_fact": dict(reference),
+        "derivatives_required_data_available": True,
+        "funding_data_available": True,
+        "funding_rate": 0.0001,
+        "funding_interval_minutes": 480.0,
+        "next_funding_time": (now + timedelta(hours=1)).isoformat(),
+        "funding_rate_observed_at": now.isoformat(),
+    }
+    if funding_age_seconds is not None:
+        cached["funding_rate_received_at"] = (
+            now - timedelta(seconds=funding_age_seconds)
+        ).isoformat()
+    # A broad market refresh just updated the executable routes while
+    # retaining the funding receipt from an earlier final analysis.
+    service._derivatives_cache["ETH/USDT"] = {
+        "updated_at": now,
+        "data": cached,
+    }
+    calls = []
+
+    async def refresh(symbol, **kwargs):
+        calls.append((symbol, kwargs.get("require_funding")))
+        return {"funding_data_available": True, "refreshed": True}
+
+    service._refresh_derivatives_snapshot = refresh
+
+    result = await service._get_derivatives_snapshot(
+        "ETH/USDT", require_funding=True
+    )
+
+    if funding_age_seconds == 1:
+        assert calls == []
+        assert result == cached
+    else:
+        assert calls == [("ETH/USDT", True)]
+        assert result["refreshed"] is True
+
+
+@pytest.mark.asyncio
 async def test_incomplete_derivatives_cache_is_not_reused_as_fresh() -> None:
     service = _service()
     service._derivatives_update_interval = 20.0

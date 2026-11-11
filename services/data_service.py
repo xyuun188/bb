@@ -4307,6 +4307,21 @@ class DataService:
             cached_data
         )
         cached_funding_ready = self._derivatives_funding_ready(cached_data)
+        if require_funding and cached_funding_ready:
+            # Broad scans refresh executable facts and preserve funding. Their
+            # cache write must not extend the lifetime of that older receipt.
+            funding_received_at = availability_timestamp(
+                cached_data.get("funding_rate_received_at")
+            )
+            funding_age_seconds = (
+                (now - funding_received_at).total_seconds()
+                if funding_received_at is not None
+                else None
+            )
+            cached_funding_ready = bool(
+                funding_age_seconds is not None
+                and 0.0 <= funding_age_seconds < self._derivatives_update_interval
+            )
         if cached:
             updated_at = cached.get("updated_at")
             cache_age_seconds = (
