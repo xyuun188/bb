@@ -249,8 +249,10 @@ async def test_executable_shadow_loader_separates_history_without_selecting_winn
             },
             status="completed",
             created_at=created_at + timedelta(minutes=index),
-            due_at=created_at + timedelta(minutes=index + 5),
-            horizon_minutes=5,
+            due_at=created_at + timedelta(
+                minutes=index + train_script.PRIMARY_PREDICTION_HORIZON_MINUTES
+            ),
+            horizon_minutes=train_script.PRIMARY_PREDICTION_HORIZON_MINUTES,
             long_return_pct=-0.2 if index < 6 else 0.2,
             short_return_pct=0.2 if index < 6 else -0.2,
         ))
@@ -304,8 +306,10 @@ async def test_executable_shadow_loader_bounds_provenance_reads_before_filtering
                 feature_snapshot={"current_price": 100.0},
                 status="completed",
                 created_at=created_at + timedelta(minutes=index),
-                due_at=created_at + timedelta(minutes=index + 5),
-                horizon_minutes=5,
+                due_at=created_at + timedelta(
+                    minutes=index + train_script.PRIMARY_PREDICTION_HORIZON_MINUTES
+                ),
+                horizon_minutes=train_script.PRIMARY_PREDICTION_HORIZON_MINUTES,
                 long_return_pct=0.2,
                 short_return_pct=-0.2,
             )
@@ -329,6 +333,59 @@ async def test_executable_shadow_loader_bounds_provenance_reads_before_filtering
     assert len(reads) <= 8
     assert min(reads) == 1
     assert max(reads) == 40
+
+
+@pytest.mark.asyncio
+async def test_executable_shadow_budget_excludes_unfitted_horizons_before_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    created_at = PHASE3_CLEAN_START_UTC + timedelta(minutes=5)
+    primary = train_script.PRIMARY_PREDICTION_HORIZON_MINUTES
+    async with get_session_ctx() as session:
+        for index in range(12):
+            for horizon in (5, 15, 60, primary):
+                session.add(ShadowBacktest(
+                    decision_id=index + 1,
+                    model_name="ensemble_trader", execution_mode="paper", symbol="BTC/USDT",
+                    status="completed", horizon_minutes=horizon,
+                    created_at=created_at + timedelta(minutes=index),
+                    due_at=created_at + timedelta(minutes=index + horizon),
+                    long_return_pct=-0.2 if index % 2 else 0.2,
+                    short_return_pct=0.2 if index % 2 else -0.2,
+                    feature_snapshot={
+                        "current_price": 100.0,
+                        "training_market_fact_contract": {
+                            "version": MARKET_FACT_CONTRACT_VERSION, "status": "clean",
+                            "violation_count": 0, "native_instrument_identity_verified": True,
+                            "same_contract_price_path_verified": True,
+                            "executable_market_fact_verified": True,
+                        },
+                    },
+                ))
+        await session.commit()
+    try:
+        selected = await train_script._load_shadow_samples(sample_budget=8)
+        research = await train_script._load_shadow_samples(executable_only=False)
+        from sqlalchemy import delete
+
+        async with get_session_ctx() as session:
+            await session.execute(
+                delete(ShadowBacktest).where(ShadowBacktest.horizon_minutes != primary)
+            )
+            await session.commit()
+        without_other_horizons = await train_script._load_shadow_samples(sample_budget=8)
+    finally:
+        await close_db()
+    assert len(selected) == 8
+    assert {sample["horizon_minutes"] for sample in selected} == {primary}
+    assert selected[0]["decision_id"] == 1
+    assert selected[-1]["decision_id"] == 12
+    assert [sample["id"] for sample in selected] == [
+        sample["id"] for sample in without_other_horizons
+    ]
+    assert {sample["horizon_minutes"] for sample in research} == {5, 15, 60, primary}
 
 
 @pytest.mark.asyncio

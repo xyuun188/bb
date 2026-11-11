@@ -56,6 +56,7 @@ from services.local_ai_training_contract import (  # noqa: E402
     LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX,
     LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION,
 )
+from services.ml_training_contract import PRIMARY_PREDICTION_HORIZON_MINUTES
 from services.model_promotion_policy import (
     build_phase3_promotion_recommendation,
     build_return_objective_report,
@@ -903,8 +904,9 @@ async def _load_shadow_samples(
 ) -> list[dict[str, Any]]:
     """Separate executable training from explicitly requested historical research.
 
-    Bound raw identities before inspecting provenance. Historical rejection must
-    never refill a time stratum according to its realized return or label quality.
+    Scope the fitted horizon before bounding raw identities and inspecting
+    provenance. Historical rejection must never refill a time stratum according
+    to its realized return or label quality.
     """
 
     before_id: int | None = None
@@ -931,6 +933,10 @@ async def _load_shadow_samples(
         ShadowBacktest.long_return_pct.is_not(None),
         ShadowBacktest.short_return_pct.is_not(None),
     )
+    if executable_only:
+        filters += (
+            ShadowBacktest.horizon_minutes == PRIMARY_PREDICTION_HORIZON_MINUTES,
+        )
     requested_limit = max(int(sample_budget or 0), 2) if sample_budget is not None else 0
     candidate_limit = requested_limit * (
         _EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER if executable_only else 1
