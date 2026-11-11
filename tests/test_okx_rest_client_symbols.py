@@ -2041,8 +2041,97 @@ async def test_derivatives_snapshot_can_require_funding_for_final_analysis(
     assert result["derivatives_funding_data_available"] is True
     assert result["derivatives_required_data_available"] is True
     assert "funding" in result["derivatives_route_status"]["completed"]
-    assert "open_interest" not in result["derivatives_route_status"]["completed"]
+    assert result["open_interest_contracts"] == 123.0
+    assert "open_interest" not in result["derivatives_required_routes"]
+    assert result["derivatives_optional_routes_skipped"] is False
     assert funding_priorities == [True]
+
+
+@pytest.mark.asyncio
+async def test_scan_derivatives_snapshot_skips_optional_enrichment(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    optional_calls = []
+
+    async def optional_route(*_args: Any, **_kwargs: Any) -> dict:
+        optional_calls.append(True)
+        return {}
+
+    async def unavailable(*_args: Any, **_kwargs: Any) -> dict:
+        return {}
+
+    monkeypatch.setattr(client, "fetch_funding_rate", optional_route)
+    monkeypatch.setattr(client, "fetch_open_interest", optional_route)
+    monkeypatch.setattr(client, "fetch_order_book_metrics", unavailable)
+    monkeypatch.setattr(client, "fetch_reference_prices", unavailable)
+
+    result = await client.fetch_derivatives_snapshot(
+        "BTC/USDT", required_only=True
+    )
+
+    assert optional_calls == []
+    assert result["derivatives_optional_routes_skipped"] is True
+    assert result["derivatives_optional_refresh_in_background"] is False
+
+
+@pytest.mark.asyncio
+async def test_final_derivatives_analysis_keeps_open_interest_refresh_off_critical_path(
+    monkeypatch,
+) -> None:
+    client = OKXRestClient()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def funding(_symbol: str, **_kwargs: Any) -> dict:
+        return {"funding_rate": 0.0001, "funding_data_available": True}
+
+    async def open_interest(_symbol: str) -> dict:
+        calls.append(_symbol)
+        started.set()
+        await release.wait()
+        return {
+            "open_interest_contracts": 321.0,
+            "open_interest_value": 12345.0,
+            "open_interest_observed_at": 1_783_990_800_000,
+            "open_interest_received_at": "2026-10-22T12:00:04+00:00",
+        }
+
+    async def unavailable(*_args: Any, **_kwargs: Any) -> dict:
+        return {}
+
+    monkeypatch.setattr(client, "fetch_funding_rate", funding)
+    monkeypatch.setattr(client, "fetch_open_interest", open_interest)
+    monkeypatch.setattr(client, "fetch_order_book_metrics", unavailable)
+    monkeypatch.setattr(client, "fetch_reference_prices", unavailable)
+    try:
+        result = await asyncio.wait_for(
+            client.fetch_derivatives_snapshot(
+                "BTC/USDT", required_only=True, require_funding=True
+            ),
+            timeout=0.5,
+        )
+        await asyncio.wait_for(started.wait(), timeout=0.5)
+        assert not release.is_set()
+        assert result["derivatives_optional_refresh_in_background"] is True
+        assert result["derivatives_funding_data_available"] is True
+        task = client._derivatives_route_tasks[("open_interest", "BTC-USDT-SWAP")]
+        release.set()
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
+        refreshed = await client.fetch_derivatives_snapshot(
+            "BTC/USDT", required_only=True, require_funding=True
+        )
+        assert refreshed["open_interest_contracts"] == 321.0
+        assert refreshed["open_interest_value"] == 12345.0
+        assert refreshed["open_interest_observed_at"] == 1_783_990_800_000
+        assert refreshed["open_interest_received_at"] == "2026-10-22T12:00:04+00:00"
+        assert calls == ["BTC/USDT"]
+    finally:
+        release.set()
+        await asyncio.gather(
+            *client._derivatives_route_tasks.values(), return_exceptions=True
+        )
 
 
 @pytest.mark.asyncio

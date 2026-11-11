@@ -1847,7 +1847,7 @@ class OKXRestClient:
                     ),
                 )
             )
-        if not required_only:
+        if not required_only or require_funding:
             route_tasks["open_interest"] = asyncio.create_task(
                 self._cached_derivatives_route(
                     "open_interest",
@@ -1930,12 +1930,14 @@ class OKXRestClient:
             merged.get("funding_data_available") is True
         )
         merged["derivatives_optional_refresh_in_background"] = bool(
-            not required_only and any(
+            any(
                 name in ({"open_interest"} if require_funding else {"funding", "open_interest"})
                 for name in timed_out_routes
             )
         )
-        merged["derivatives_optional_routes_skipped"] = bool(required_only)
+        merged["derivatives_optional_routes_skipped"] = bool(
+            required_only and not require_funding
+        )
         merged["derivatives_snapshot_partial"] = bool(
             failed_routes
             or timed_out_routes
