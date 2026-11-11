@@ -976,6 +976,28 @@ def test_optional_diagnostics_are_dropped_when_they_exceed_snapshot_budget() -> 
     assert _compact_training_feature_snapshot(features) == compacted
 
 
+def test_shadow_exit_cost_observation_survives_optional_budget_without_entering_seal() -> None:
+    features = _full_feature_vector_sample()["features"]
+    original_seal = deepcopy(features["feature_availability_contract"])
+    observation = {
+        "version": "2026-11-11.observed-shadow-exit-cost.v2",
+        "used_as_decision_time_features": False,
+        "market_snapshot": {"bid": 101.0, "ask": 101.1, "taker_fee_rate": 0.0005},
+        "entry_price": 100.0,
+        "exit_price": 101.05,
+    }
+    features["shadow_settlement_cost_observation"] = observation
+    features.update({f"optional_diagnostic_{index:03d}": "x" * 512 for index in range(220)})
+
+    compacted = _compact_training_feature_snapshot(features)
+
+    assert compacted["shadow_settlement_cost_observation"] == observation
+    assert compacted["feature_availability_contract"] == original_seal
+    assert "optional_diagnostic_219" not in compacted
+    assert "shadow_settlement_cost_observation" not in FROZEN_FEATURE_FIELDS
+    assert _compact_training_feature_snapshot(compacted) == compacted
+
+
 def test_postgres_optional_compaction_uses_non_conflicting_loop_record() -> None:
     functions = postgres_training_feature_snapshot_functions()
     compact_sql = functions[-1]
@@ -1140,6 +1162,11 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
         with_contract["training_market_fact_contract"] = (
             _large_native_market_fact_contract()
         )
+        with_contract["shadow_settlement_cost_observation"] = {
+            "version": "2026-11-11.observed-shadow-exit-cost.v2",
+            "used_as_decision_time_features": False,
+            "market_snapshot": {"bid": 101.0, "ask": 101.1, "taker_fee_rate": 0.0005},
+        }
         with_contract.update(
             {
                 f"optional_diagnostic_{index:03d}": "x" * 512

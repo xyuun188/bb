@@ -168,7 +168,15 @@ def _prediction_cache_context(
     horizon_minutes: int,
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
     source_id = _int(observation.get("source_id"))
-    features = dict(_dict(observation.get("feature_snapshot")))
+    features = {
+        key: value for key, value in _dict(observation.get("feature_snapshot")).items()
+        if key not in {
+            "shadow_settlement_cost_observation", "training_label_contract",
+            "training_market_fact_contract", "market_fact_contract",
+            "training_leverage_counterfactuals", "local_ai_tools_shadow",
+            "local_ml_shadow",
+        }
+    }
     features.setdefault("symbol", str(observation.get("symbol") or ""))
     feature_fingerprint = hashlib.sha256(
         json.dumps(
@@ -371,6 +379,11 @@ def _replay_entry(
             "net_return_after_all_cost_pct": round(float(realized), 8),
             "gross_return_pct": observation.get(f"{side}_gross_return_pct"),
             "execution_cost_pct": round(float(execution_cost), 8),
+            "realized_execution_cost_pct": _float(
+                _dict(observation.get("side_realized_execution_cost_pct")).get(side)
+            ),
+            "label_cost_basis": observation.get("label_cost_basis"),
+            "execution_replay_complete": observation.get("execution_replay_complete") is True,
             "funding_return_pct": round(float(funding_return), 8),
             "model_expected_return_after_all_cost_pct": round(expected_after_cost, 8),
             "model_return_lcb_after_cost_pct": round(lower_after_cost, 8),

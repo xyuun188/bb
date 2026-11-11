@@ -160,6 +160,7 @@ def test_reports_keep_shadow_market_cost_and_actual_returns_separate() -> None:
     assert report["shadow_counterfactual_cost_sample_count"] == 1
     assert report["actual_execution_cost_sample_count"] == 1
     assert report["actual_realized_return_sample_count"] == 1
+    assert report["shadow_cost_basis_counts"] == {"entry_snapshot_round_trip_projection": 1}
     assert report["shadow_samples_are_actual_returns"] is False
     assert report["authoritative_realized_trade"][PROFIT_TRAINING_TARGET][
         "expected"

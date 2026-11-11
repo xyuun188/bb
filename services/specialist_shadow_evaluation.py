@@ -7,7 +7,7 @@ from math import sqrt
 from types import SimpleNamespace
 from typing import Any
 
-from services.execution_cost_model import execution_cost_estimate, funding_cost_estimate
+from services.execution_cost_model import funding_cost_estimate, shadow_execution_cost_estimate
 from services.profit_supervision import (
     PROFIT_SUPERVISION_VERSION,
     shadow_fee_after_return_labels,
@@ -144,7 +144,7 @@ def _cost_complete_shadow_return(
     gross_return_pct: float,
 ) -> tuple[float, dict[str, Any]] | None:
     features = _features(row)
-    execution_cost = execution_cost_estimate(features)
+    execution_cost = shadow_execution_cost_estimate(features, side=side)
     horizon_minutes = max(
         _safe_float(_row_get(row, "horizon_minutes"), 0.0) or 0.0,
         0.0,

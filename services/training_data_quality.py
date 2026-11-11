@@ -27,7 +27,7 @@ from services.authoritative_trade_outcome import (
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
 )
 from services.dynamic_policy_values import empirical_policy_value
-from services.execution_cost_model import execution_cost_estimate
+from services.execution_cost_model import execution_cost_estimate, shadow_execution_cost_estimate
 from services.okx_training_facts import REALIZED_NET_PNL_FORMULA
 from services.profit_supervision import (
     PROFIT_SUPERVISION_VERSION,
@@ -387,7 +387,7 @@ def _shadow_cost_completeness_reasons(features: dict[str, Any]) -> list[str]:
         )
     if funding_interval_minutes is None or funding_interval_minutes <= 0:
         reasons.append("cost_incomplete:funding_interval_missing")
-    return reasons
+    return list(dict.fromkeys(reasons))
 
 
 def _sample_feature_availability_reasons(sample: dict[str, Any]) -> list[str]:
@@ -490,6 +490,17 @@ def assess_shadow_sample(sample: dict[str, Any]) -> SampleQualityAssessment:
             0.0, [f"shadow_label_timing:{reason}" for reason in timing_reasons],
             exclude=True,
         )
+
+    if not historical_market_only and features.get("shadow_settlement_cost_observation"):
+        cost_reasons = {
+            f"cost_incomplete:{estimate.reason}"
+            for side in ("long", "short")
+            if not (estimate := shadow_execution_cost_estimate(
+                features, side=side,
+            )).production_eligible
+        }
+        if cost_reasons:
+            return _final_assessment(0.0, sorted(cost_reasons), exclude=True)
 
     availability_reasons = _sample_feature_availability_reasons(sample)
     if availability_reasons:

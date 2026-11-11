@@ -215,6 +215,31 @@ def test_replay_keeps_unprofitable_prediction_for_continuous_paper_evaluation() 
     )
 
 
+def test_exit_observations_cannot_change_prediction_or_entry_gate() -> None:
+    observations = _observations()
+    for row in observations:
+        row["feature_snapshot"]["shadow_settlement_cost_observation"] = {"future": 999}
+        row["feature_snapshot"]["training_label_contract"] = {"best_action": "short"}
+        row["side_realized_execution_cost_pct"] = {"long": 9.0}
+        row["label_cost_basis"] = "entry_and_observed_exit_microstructure"
+        row["execution_replay_complete"] = False
+
+    def predictor(features, *, horizons):
+        assert "shadow_settlement_cost_observation" not in features
+        assert "training_label_contract" not in features
+        return _predictor(features, horizons=horizons)
+
+    report = build_strategy_historical_replay(
+        blueprint=_blueprint(), observations=observations, predictor=predictor,
+    )
+    selected = [*report["development_samples"], *report["exam_samples"]]
+
+    assert len(selected) == 5
+    assert all(row["normal_entry_return_gate_passed"] is True for row in selected)
+    assert all(row["realized_execution_cost_pct"] == 9.0 for row in selected)
+    assert all(row["execution_replay_complete"] is False for row in selected)
+
+
 def test_paper_bootstrap_replay_does_not_require_existing_trade_calibration() -> None:
     blueprint = _blueprint()
     blueprint.update(

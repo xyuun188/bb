@@ -114,7 +114,7 @@ TRAINING_HORIZON_POLICY = "fit_primary_horizon_only"
 RETURN_LABEL_NAME = "separated_market_cost_and_realized_return_tasks"
 RETURN_LABEL_VERSION = "2026-07-27.separated-source-supervision.v3"
 COST_MODEL_VERSION = "okx_authoritative_execution_cost_distribution_v3"
-PROFIT_SUPERVISION_VERSION = "2026-11-10.scheduled-shadow-funding.v5"
+PROFIT_SUPERVISION_VERSION = "2026-11-11.observed-shadow-exit-cost.v6"
 LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION = (
     "2026-11-05.executable-cohort-training-transport.v4"
 )

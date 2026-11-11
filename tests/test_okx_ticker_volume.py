@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -228,7 +229,13 @@ async def test_okx_ws_connect_uses_unified_sdk_stream(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_okx_ws_subscription_batches_are_rate_limited(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("elapsed", "expected_delays"),
+    [(0.0, [0.5]), (0.125, [0.375]), (0.6, [])],
+)
+async def test_okx_ws_subscription_batches_are_rate_limited(
+    monkeypatch, elapsed: float, expected_delays: list[float]
+) -> None:
     client = OKXWebSocketClient()
     sent: list[dict[str, Any]] = []
     delays: list[float] = []
@@ -242,6 +249,12 @@ async def test_okx_ws_subscription_batches_are_rate_limited(monkeypatch) -> None
 
     client._ws = _FakeStream()
     client._running = True
+    clock = iter([100.0, 100.0 + elapsed, 100.0 + max(elapsed, 0.5)])
+    monkeypatch.setattr(
+        okx_ws_client,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(clock), time=okx_ws_client.time.time),
+    )
     monkeypatch.setattr(okx_ws_client.asyncio, "sleep", fake_sleep)
 
     channels = client._subscription_args(
@@ -251,8 +264,7 @@ async def test_okx_ws_subscription_batches_are_rate_limited(monkeypatch) -> None
 
     assert request_count == 2
     assert [len(request["args"]) for request in sent] == [100, 4]
-    assert len(delays) == 1
-    assert 0.49 <= delays[0] <= 0.51
+    assert delays == pytest.approx(expected_delays)
     assert client.get_stats()["subscription_request_count"] == 2
 
 

@@ -15,7 +15,7 @@ from typing import Any
 from core.feature_availability import FROZEN_FEATURE_FIELDS, availability_fingerprint
 from core.market_facts import compact_market_fact, compact_market_fact_contract
 
-TRAINING_FEATURE_SNAPSHOT_VERSION = 6
+TRAINING_FEATURE_SNAPSHOT_VERSION = 7
 FROZEN_TRAINING_FEATURE_MAX_BYTES = 96 * 1024
 TRAINING_FEATURE_SNAPSHOT_MAX_BYTES = 128 * 1024
 TRAINING_FEATURE_OBJECT_MAX_BYTES = 16 * 1024
@@ -49,6 +49,7 @@ TRAINING_FEATURE_RAW_TEXT_KEYS = (
 TRAINING_FEATURE_REQUIRED_CONTRACT_KEYS = (
     "training_label_contract",
     "training_market_fact_contract",
+    "shadow_settlement_cost_observation",
 )
 SPECIALIST_SHADOW_FEATURE_KEYS = (
     "local_ai_tools_shadow",
@@ -478,9 +479,9 @@ def compact_training_feature_snapshot(value: object) -> dict[str, Any]:
         if not isinstance(raw_contract, dict) or not raw_contract:
             continue
         contract = (
-            raw_contract
-            if key == "training_label_contract"
-            else _compact_training_market_fact_contract(raw_contract)
+            _compact_training_market_fact_contract(raw_contract)
+            if key == "training_market_fact_contract"
+            else raw_contract
         )
         if training_feature_storage_bytes(contract) > TRAINING_FEATURE_OBJECT_MAX_BYTES:
             return {"training_feature_compaction_error": "required_contract_budget_exceeded"}
@@ -1004,6 +1005,22 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                 END IF;
                 compact := candidate;
             END IF;
+            IF jsonb_typeof(raw->'shadow_settlement_cost_observation') = 'object'
+               AND raw->'shadow_settlement_cost_observation' <> '{{}}'::JSONB THEN
+                required_contract := raw->'shadow_settlement_cost_observation';
+                candidate := compact || jsonb_build_object(
+                    'shadow_settlement_cost_observation', required_contract
+                );
+                IF bb_training_feature_storage_bytes(required_contract)
+                    > {TRAINING_FEATURE_OBJECT_MAX_BYTES}
+                    OR bb_training_feature_storage_bytes(candidate)
+                        > {TRAINING_FEATURE_SNAPSHOT_MAX_BYTES} THEN
+                    RETURN jsonb_build_object(
+                        'training_feature_compaction_error', 'required_contract_budget_exceeded'
+                    );
+                END IF;
+                compact := candidate;
+            END IF;
             candidate := compact || bb_compact_specialist_shadow(raw);
             IF bb_training_feature_storage_bytes(candidate)
                 <= {TRAINING_FEATURE_SNAPSHOT_MAX_BYTES} THEN
@@ -1016,7 +1033,8 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                   AND NOT (entry.key = ANY(frozen_keys))
                   AND NOT (entry.key = ANY(ARRAY[
                       'training_label_contract',
-                      'training_market_fact_contract'
+                      'training_market_fact_contract',
+                      'shadow_settlement_cost_observation'
                   ]::TEXT[]))
                   AND NOT (entry.key = ANY(raw_keys))
                   AND (

@@ -16,6 +16,8 @@ from core.training_contracts import (
     SHADOW_LABEL_VERSION,
     shadow_label_contract_reasons,
 )
+from core.training_feature_snapshot import compact_training_feature_snapshot
+from services.profit_supervision import shadow_fee_after_return_labels
 from services.shadow_backtest_service import (
     SHADOW_BACKTEST_HORIZONS_MINUTES,
     SHADOW_SAMPLE_RECOVERY_MAX_BATCH,
@@ -212,6 +214,9 @@ def _service(
     async def latest(_symbol: str) -> float:
         return latest_price
 
+    async def fee_facts(_mode: str) -> dict[str, Any]:
+        return {"taker_fee_rate": 0.0005}
+
     for row in repo.due_rows:
         if getattr(row, "due_at", None) is None:
             row.due_at = datetime.fromtimestamp(_RESULT_TIMESTAMP_MS / 1000.0, tz=UTC)
@@ -253,7 +258,7 @@ def _service(
         float_parser=_float,
         session_factory=_SessionCtx,
         repository_factory=lambda _session: repo,
-        execution_cost_facts_provider=execution_cost_facts_provider,
+        execution_cost_facts_provider=execution_cost_facts_provider or fee_facts,
         latest_market_fact_provider=latest_fact,
         price_path_provider=price_path,
         horizons_minutes=(10, 30),
@@ -286,7 +291,7 @@ def test_shadow_fee_after_label_uses_funding_when_it_changes_the_best_side() -> 
             "orderbook_bid_depth": 100_000.0,
             "orderbook_ask_depth": 100_000.0,
             "taker_fee_rate": 0.0004,
-            "funding_rate": 0.002,
+            "funding_rate": 0.003,
             "funding_data_available": True,
             "funding_interval_minutes": 480.0,
         },
@@ -829,6 +834,22 @@ async def test_due_shadow_observes_current_fee_without_replacing_decision_facts(
         assert "entry_fee_rate" not in snapshot
         assert "exit_fee_rate" not in snapshot
         assert snapshot["training_label_contract"]["fee_after_complete"] is True
+        compacted = compact_training_feature_snapshot(snapshot)
+        labels = shadow_fee_after_return_labels({
+            "features": compacted,
+            "horizon_minutes": 10,
+            "long_return_pct": 1.0,
+            "short_return_pct": -1.0,
+        })
+        assert labels["long_net_return_after_all_cost_pct"] == pytest.approx(
+            snapshot["training_label_contract"]["long_net_return_after_all_cost_pct"]
+        )
+        assert labels["short_net_return_after_all_cost_pct"] == pytest.approx(
+            snapshot["training_label_contract"]["short_net_return_after_all_cost_pct"]
+        )
+        assert settlement["market_snapshot"]["bid"] == pytest.approx(100.9899)
+        assert settlement["entry_price"] == 100.0
+        assert settlement["exit_price"] == 101.0
 
 
 @pytest.mark.asyncio
@@ -952,6 +973,8 @@ async def test_shadow_backtest_service_does_not_apply_fixed_price_range_toleranc
             "high_24h": 0.5707,
             "spread_pct": 0.03,
             "round_trip_fee_pct": 0.08,
+            "entry_fee_rate": 0.0004,
+            "exit_fee_rate": 0.0004,
             "funding_rate": 0.0,
             "funding_interval_minutes": 480.0,
             "market_fact": _market_fact("PROS/USDT", 0.3902, _ENTRY_TIMESTAMP_MS),

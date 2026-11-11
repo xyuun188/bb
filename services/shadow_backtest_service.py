@@ -32,9 +32,9 @@ from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
 from services.execution_cost_model import (
     EXECUTION_COST_FACT_FIELDS,
-    execution_cost_estimate,
-    funding_cost_estimate,
+    SHADOW_SETTLEMENT_COST_VERSION,
 )
+from services.profit_supervision import shadow_cost_labels
 from services.return_objective import RETURN_OBJECTIVE_NAME, RETURN_OBJECTIVE_VERSION
 from services.shadow_training_quarantine import quarantine_completed_shadow_row
 
@@ -414,15 +414,13 @@ def shadow_fee_after_outcome(
 ) -> dict[str, Any]:
     snapshot = getattr(row, "feature_snapshot", None)
     features = snapshot if isinstance(snapshot, dict) else {}
-    execution_cost = execution_cost_estimate(features)
     horizon_minutes = max(int(getattr(row, "horizon_minutes", 0) or 0), 0)
-    funding = funding_cost_estimate(features, side="long", horizon_minutes=horizon_minutes)
-    cost_complete = bool(
-        execution_cost.production_eligible
-        and funding.production_eligible
-        and funding.signed_cashflow_pct is not None
+    costs = shadow_cost_labels({"features": features, "horizon_minutes": horizon_minutes})
+    execution_cost = costs["cost_model"]
+    cost_complete = costs["eligible"]
+    funding_return_long_pct = (
+        -costs["funding_drag_pct"] if costs["funding_drag_pct"] is not None else None
     )
-    funding_return_long_pct = funding.signed_cashflow_pct
     funding_return_short_pct = (
         -funding_return_long_pct if funding_return_long_pct is not None else None
     )
@@ -430,17 +428,13 @@ def shadow_fee_after_outcome(
     gross_short_pct = short_return * 100.0
     long_net_pct = (
         gross_long_pct
-        - execution_cost.fee_pct
-        - execution_cost.slippage_pct
-        + funding_return_long_pct
+        - costs["long_total_cost_pct"]
         if cost_complete
         else None
     )
     short_net_pct = (
         gross_short_pct
-        - execution_cost.fee_pct
-        - execution_cost.slippage_pct
-        + funding_return_short_pct
+        - costs["short_total_cost_pct"]
         if cost_complete
         else None
     )
@@ -468,21 +462,17 @@ def shadow_fee_after_outcome(
         "objective": RETURN_OBJECTIVE_NAME,
         "objective_version": RETURN_OBJECTIVE_VERSION,
         "cost_complete": cost_complete,
-        "incomplete_reasons": [
-            reason
-            for condition, reason in (
-                (execution_cost.production_eligible, execution_cost.reason),
-                (funding.production_eligible, funding.reason),
-            )
-            if not condition
-        ],
-        "cost_source": "dynamic_execution_estimate_from_shadow_snapshot",
-        "fee_return_pct": execution_cost.fee_pct,
-        "slippage_return_pct": execution_cost.slippage_pct,
+        "incomplete_reasons": costs["incomplete_reasons"],
+        "cost_source": execution_cost["policy_provenance"]["label_cost_basis"],
+        "fee_return_pct": execution_cost["fee_pct"],
+        "slippage_return_pct": execution_cost["slippage_pct"],
+        "side_execution_cost_pct": {
+            side: item["total_pct"] for side, item in costs["side_cost_models"].items()
+        },
         "funding_return_long_pct": funding_return_long_pct,
         "funding_return_short_pct": funding_return_short_pct,
-        "funding_interval_minutes": funding.funding_interval_minutes,
-        "funding_cost": funding.to_dict(),
+        "funding_interval_minutes": costs["funding_cost"]["funding_interval_minutes"],
+        "funding_cost": costs["funding_cost"],
         "long_net_return_after_all_cost_pct": long_net_pct,
         "short_net_return_after_all_cost_pct": short_net_pct,
         "leverage_counterfactuals": leverage_counterfactuals,
@@ -492,7 +482,7 @@ def shadow_fee_after_outcome(
             "creates_order": False,
             "notional_return_is_shared_before_margin_leverage": True,
         },
-        "execution_cost": execution_cost.to_dict(),
+        "execution_cost": execution_cost,
     }
 
 
@@ -1455,15 +1445,40 @@ class ShadowBacktestService:
                         compact_market_fact_contract(market_contract)
                     )
                 current_cost_facts = execution_cost_facts.get(execution_mode, {})
-                if current_cost_facts:
+                if not historical_outcome:
                     # Settlement observations must not become decision-time inputs.
+                    liquidity = result_fact.get("liquidity") or {}
+                    bid_depth = self.float_parser(liquidity.get("bid_depth_usdt"), 0.0)
+                    ask_depth = self.float_parser(liquidity.get("ask_depth_usdt"), 0.0)
                     feature_snapshot["shadow_settlement_cost_observation"] = {
                         key: current_cost_facts[key]
                         for key in EXECUTION_COST_FACT_FIELDS
                         if key in current_cost_facts
                     } | {
-                        "version": "2026-10-22.immutable-shadow-entry-cost.v1",
+                        "version": SHADOW_SETTLEMENT_COST_VERSION,
                         "used_as_decision_time_features": False,
+                        "market_fact_verified": market_contract.get("status") == "clean",
+                        "result_fact_id": result_fact.get("fact_id"),
+                        "source_timestamp_ms": result_fact.get("source_timestamp_ms"),
+                        "received_at": result_fact.get("received_at"),
+                        "scheduled_label_at": row.due_at.isoformat(),
+                        "entry_price": entry_price,
+                        "exit_price": actual_price,
+                        "market_snapshot": {
+                            **{
+                                key: current_cost_facts[key]
+                                for key in EXECUTION_COST_FACT_FIELDS
+                                if key in current_cost_facts
+                            },
+                            "bid": result_prices.get("bid"),
+                            "ask": result_prices.get("ask"),
+                            "orderbook_bid_depth": bid_depth,
+                            "orderbook_ask_depth": ask_depth,
+                            "orderbook_imbalance": (
+                                (bid_depth - ask_depth) / (bid_depth + ask_depth)
+                                if bid_depth + ask_depth > 0 else 0.0
+                            ),
+                        },
                     }
                 row.feature_snapshot = feature_snapshot
 

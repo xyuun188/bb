@@ -30,6 +30,7 @@ from services.continuous_strategy_routing import (
     ContinuousStrategyRoutingPolicy,
     ContinuousStrategyRoutingStore,
 )
+from services.execution_cost_model import execution_cost_estimate
 from services.model_strategy_blueprint import paper_strategy_replay_available
 from services.paper_strategy_champion import PaperStrategyChampionService
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
@@ -205,6 +206,9 @@ def _historical_replay_observation(
         and created_at >= epoch_start
         and not quality.exclude_from_training
     )
+    decision_cost = execution_cost_estimate(snapshot)
+    if not decision_cost.production_eligible:
+        return None, [decision_cost.reason]
     return {
         "source_id": _safe_int(getattr(row, "id", None)),
         "decision_id": _safe_int(getattr(row, "decision_id", None)) or None,
@@ -216,11 +220,10 @@ def _historical_replay_observation(
         "decision_timestamp": _timestamp_text(created_at),
         "label_timestamp": _timestamp_text(getattr(row, "due_at", None) or created_at),
         "feature_snapshot": snapshot,
-        "execution_cost_pct": round(
-            _safe_float(outcome.get("fee_return_pct"))
-            + _safe_float(outcome.get("slippage_return_pct")),
-            8,
-        ),
+        "execution_cost_pct": decision_cost.total_pct,
+        "side_realized_execution_cost_pct": outcome.get("side_execution_cost_pct"),
+        "label_cost_basis": outcome.get("cost_source"),
+        "execution_replay_complete": False,
         "long_gross_return_pct": round(long_gross, 8),
         "short_gross_return_pct": round(short_gross, 8),
         "long_net_return_after_all_cost_pct": outcome.get("long_net_return_after_all_cost_pct"),
@@ -1807,11 +1810,9 @@ class StrategyLearningService:
                             round(net_return, 8) if net_return is not None else None
                         ),
                         "gross_return_pct": round(gross_return, 8),
-                        "execution_cost_pct": round(
-                            _safe_float(outcome.get("fee_return_pct"))
-                            + _safe_float(outcome.get("slippage_return_pct")),
-                            8,
-                        ),
+                        "execution_cost_pct": _safe_dict(
+                            outcome.get("side_execution_cost_pct")
+                        ).get(side),
                         "funding_return_pct": outcome.get(f"funding_return_{side}_pct"),
                         "timestamp": _timestamp_text(getattr(row, "created_at", None)),
                         "cost_policy_provenance": _safe_dict(

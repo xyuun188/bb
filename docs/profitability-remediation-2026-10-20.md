@@ -1,7 +1,34 @@
 # Profitability Remediation And Acceptance
 
-Updated 2026-10-22. The account used for this investigation is paper trading.
+Updated 2026-11-11. The account used for this investigation is paper trading.
 No live trading is enabled, and no result below is a promise of profit.
+
+## November 11 Follow-up
+
+The latest audit still found no executed entries. The model's historical
+fee-after evidence remained below break-even; healthy services and elapsed
+overnight time did not satisfy profitability acceptance.
+
+The v6 repair addresses additional concrete cost-label defects. Settlement now
+records exit microstructure and current account fees as separate label-only
+metadata. Training, settlement and specialist evaluation share these costs,
+including exit-notional scaling and distinct direction estimates. A
+counterfactual observation cannot earn a maker discount by assuming a fill.
+Invalid observed evidence fails explicitly. Old entry-only projections remain
+identified as projections.
+
+The training snapshot previously dropped the saved settlement observation
+when optional diagnostics exhausted its byte budget. Snapshot v7 reserves the
+observation in both Python and PostgreSQL and includes it in the existing
+bounded repair. Historical prediction inputs exclude outcome metadata; the
+entry gate reads its original cost projection, while its scored result can use
+observed exit costs.
+
+These changes do not establish profitable strategy selection, passive fills,
+unfilled-order economics or complete portfolio execution. The independent
+profitability exam and a qualified strategy's paper entry-to-settlement
+acceptance are still required. The October evidence below is historical and
+must not be read as the current artifact identity or current account PnL.
 
 ## Latest Remediation: October 22
 

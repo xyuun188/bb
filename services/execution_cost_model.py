@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from math import floor, isfinite
 from typing import Any
+
+from core.training_contracts import SHADOW_LABEL_MAX_SOURCE_LAG_SECONDS
 
 EXECUTION_COST_FACT_FIELDS = (
     "taker_fee_rate",
@@ -22,6 +24,7 @@ EXECUTION_COST_FACT_FIELDS = (
     "entry_execution_style",
     "post_only_fill_probability",
 )
+SHADOW_SETTLEMENT_COST_VERSION = "2026-11-11.observed-shadow-exit-cost.v2"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -415,6 +418,134 @@ def execution_cost_estimate(feature_snapshot: dict[str, Any] | None) -> Executio
     )
 
 
+def shadow_execution_cost_estimate(
+    feature_snapshot: dict[str, Any] | None,
+    *,
+    side: str,
+) -> ExecutionCostEstimate:
+    """Price label costs with an observed exit; never use this for live inputs."""
+
+    snapshot = _safe_dict(feature_snapshot)
+    entry_snapshot = {**snapshot, "planned_order_side": side}
+    # A counterfactual book observation cannot prove a passive fill.
+    entry_snapshot.pop("entry_execution_style", None)
+    entry = execution_cost_estimate(entry_snapshot)
+    observation = _safe_dict(snapshot.get("shadow_settlement_cost_observation"))
+    basis = "entry_snapshot_round_trip_projection"
+    if not observation or observation.get("version") == "2026-10-22.immutable-shadow-entry-cost.v1":
+        return replace(entry, policy_provenance={
+            **entry.policy_provenance,
+            "label_cost_basis": basis,
+            "execution_replay_complete": False,
+        })
+
+    exit_snapshot = dict(_safe_dict(observation.get("market_snapshot")))
+    entry_price = _optional_finite_float(observation.get("entry_price"))
+    exit_price = _optional_finite_float(observation.get("exit_price"))
+    reason = ""
+    source_at = _parse_timestamp(str(observation.get("source_timestamp_ms") or ""))
+    received_at = _parse_timestamp(str(observation.get("received_at") or ""))
+    due_at = _parse_timestamp(str(observation.get("scheduled_label_at") or ""))
+    if observation.get("version") != SHADOW_SETTLEMENT_COST_VERSION:
+        reason = "shadow_exit_cost_version_unknown"
+    elif side not in {"long", "short"}:
+        reason = "shadow_cost_side_invalid"
+    elif observation.get("used_as_decision_time_features") is not False:
+        reason = "shadow_exit_observation_not_label_only"
+    elif observation.get("market_fact_verified") is not True:
+        reason = "shadow_exit_market_fact_unverified"
+    elif not observation.get("result_fact_id"):
+        reason = "shadow_exit_fact_identity_missing"
+    elif source_at is None or received_at is None or due_at is None:
+        reason = "shadow_exit_clock_missing"
+    elif not (due_at <= source_at <= received_at):
+        reason = "shadow_exit_clock_invalid"
+    elif (source_at - due_at).total_seconds() > SHADOW_LABEL_MAX_SOURCE_LAG_SECONDS:
+        reason = "shadow_exit_observation_late"
+    elif entry_price is None or entry_price <= 0 or exit_price is None or exit_price <= 0:
+        reason = "shadow_exit_reference_price_missing"
+    lineage = _safe_dict(
+        snapshot.get("training_market_fact_contract") or snapshot.get("market_fact_contract")
+    )
+    expected_result_id = lineage.get("result_fact_id") or _safe_dict(
+        lineage.get("result_fact")
+    ).get("fact_id")
+    if not reason and expected_result_id and expected_result_id != observation.get("result_fact_id"):
+        reason = "shadow_exit_fact_identity_mismatch"
+
+    # The exit closes the same base quantity, not the original quote notional.
+    exit_snapshot["planned_order_side"] = "short" if side == "long" else "long"
+    notional = _optional_finite_float(snapshot.get("planned_order_notional_usdt"))
+    if notional is not None and notional > 0:
+        entry_mid = entry.reference_price
+        exit_bid = _optional_finite_float(exit_snapshot.get("bid"))
+        exit_ask = _optional_finite_float(exit_snapshot.get("ask"))
+        exit_mid = (
+            (exit_bid + exit_ask) / 2.0
+            if exit_bid is not None and exit_ask is not None else 0.0
+        )
+        exit_snapshot["planned_order_notional_usdt"] = (
+            notional * exit_mid / entry_mid if entry_mid > 0 else notional
+        )
+    entry_impact = _orderbook_market_impact(entry_snapshot)
+    exit_impact = _orderbook_market_impact(exit_snapshot)
+    exit_estimate = execution_cost_estimate(exit_snapshot)
+    entry_rate, _ = entry_fee_rate(entry_snapshot)
+    exit_rate = _normalized_fee_rate(
+        exit_snapshot.get("exit_fee_rate", exit_snapshot.get("taker_fee_rate"))
+    )
+    sized = notional is not None and notional > 0
+    entry_ready = (
+        not execution_cost_provenance_blocker(entry_snapshot)
+        and entry.fee_pct > 0 and entry.spread_pct > 0
+        and entry_impact.get("eligible") is True
+    ) if sized else entry.production_eligible
+    exit_ready = (
+        exit_estimate.fee_pct > 0 and exit_estimate.spread_pct > 0
+        and exit_impact.get("eligible") is True
+    ) if sized else exit_estimate.production_eligible
+    if not reason and not entry_ready:
+        reason = entry.reason
+    if not reason and not exit_ready:
+        reason = f"shadow_exit:{exit_estimate.reason}"
+    if not reason and (entry_rate <= 0 or exit_rate <= 0):
+        reason = "shadow_per_leg_fee_rate_missing"
+    ratio = exit_price / entry_price if entry_price and exit_price else 1.0
+    entry_slippage = (
+        _safe_float(entry_impact.get("execution_slippage_pct"), 0.0)
+        if sized else entry.slippage_pct / 2.0
+    )
+    exit_slippage = (
+        _safe_float(exit_impact.get("execution_slippage_pct"), 0.0)
+        if sized else exit_estimate.slippage_pct / 2.0
+    )
+    fee_pct = (entry_rate + exit_rate * ratio) * 100.0
+    slippage_pct = entry_slippage + exit_slippage * ratio
+    return replace(
+        entry,
+        fee_pct=round(fee_pct, 8),
+        slippage_pct=round(slippage_pct, 8),
+        total_pct=round(fee_pct + slippage_pct, 8),
+        order_size_complete=bool(sized and entry_ready and exit_ready),
+        production_eligible=not reason,
+        reason=reason or "shadow_observed_exit_microstructure_cost_ready",
+        policy_provenance={
+            **entry.policy_provenance,
+            "label_cost_basis": "entry_and_observed_exit_microstructure",
+            "strategy_version": SHADOW_SETTLEMENT_COST_VERSION,
+            "entry_slippage_pct": entry_slippage,
+            "exit_slippage_pct": exit_slippage,
+            "exit_notional_ratio": ratio,
+            "exit_fact_id": observation.get("result_fact_id"),
+            "exit_source_timestamp_ms": observation.get("source_timestamp_ms"),
+            "maker_fill_policy": "taker_counterfactual_without_assumed_passive_fill",
+            "actual_execution": False,
+            "execution_replay_complete": False,
+            "fallback_reason": reason,
+        },
+    )
+
+
 def _orderbook_market_impact(snapshot: dict[str, Any]) -> dict[str, Any]:
     order_notional = max(_safe_float(snapshot.get("planned_order_notional_usdt"), 0.0), 0.0)
     side = str(snapshot.get("planned_order_side") or "").lower()
@@ -573,7 +704,8 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
             return default
-        return float(value)
+        number = float(value)
+        return number if isfinite(number) else default
     except (TypeError, ValueError):
         return default
 

@@ -21,11 +21,11 @@ from core.training_contracts import (
     AUTHORITATIVE_TRADE_OUTCOME_SOURCES,
     SHADOW_FEE_AFTER_LABEL_VERSION,
 )
-from services.execution_cost_model import execution_cost_estimate, funding_cost_estimate
+from services.execution_cost_model import funding_cost_estimate, shadow_execution_cost_estimate
 from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
-PROFIT_SUPERVISION_VERSION = "2026-11-10.scheduled-shadow-funding.v5"
+PROFIT_SUPERVISION_VERSION = "2026-11-11.observed-shadow-exit-cost.v6"
 MARKET_OPPORTUNITY_TASK = "market_opportunity_distribution"
 COUNTERFACTUAL_EXECUTION_COST_TASK = "execution_cost_and_slippage_distribution"
 AUTHORITATIVE_REALIZED_RETURN_TASK = "authoritative_realized_return_distribution"
@@ -126,10 +126,14 @@ def weighted_distribution(
     }
 
 
-def _shadow_cost_labels(sample: dict[str, Any]) -> dict[str, Any]:
+def shadow_cost_labels(sample: dict[str, Any]) -> dict[str, Any]:
     features = _safe_dict(sample.get("features"))
     horizon = _safe_int(sample.get("horizon_minutes") or features.get("horizon_minutes"))
-    estimate = execution_cost_estimate(features)
+    estimates = {
+        side: shadow_execution_cost_estimate(features, side=side)
+        for side in ("long", "short")
+    }
+    estimate = estimates["long"]
     funding = funding_cost_estimate(features, side="long", horizon_minutes=horizon)
     funding_drag = (
         -funding.signed_cashflow_pct
@@ -137,9 +141,9 @@ def _shadow_cost_labels(sample: dict[str, Any]) -> dict[str, Any]:
         else None
     )
     eligible = bool(
-        estimate.production_eligible and funding_drag is not None and horizon > 0
+        all(item.production_eligible for item in estimates.values())
+        and funding_drag is not None and horizon > 0
     )
-    common_cost = estimate.fee_pct + estimate.slippage_pct
     return {
         "eligible": eligible,
         "source_authority": "shadow_counterfactual_live_microstructure",
@@ -148,9 +152,14 @@ def _shadow_cost_labels(sample: dict[str, Any]) -> dict[str, Any]:
         "slippage_pct": estimate.slippage_pct if estimate.production_eligible else None,
         "funding_drag_pct": funding_drag,
         "funding_cost": funding.to_dict(),
-        "long_total_cost_pct": common_cost + funding_drag if eligible else None,
-        "short_total_cost_pct": common_cost - funding_drag if eligible else None,
+        "long_total_cost_pct": estimates["long"].total_pct + funding_drag if eligible else None,
+        "short_total_cost_pct": estimates["short"].total_pct - funding_drag if eligible else None,
         "cost_model": estimate.to_dict(),
+        "side_cost_models": {side: item.to_dict() for side, item in estimates.items()},
+        "incomplete_reasons": [
+            item.reason for item in (*estimates.values(), funding)
+            if not item.production_eligible
+        ],
         "reason": "" if eligible else "counterfactual_execution_cost_incomplete",
     }
 
@@ -160,7 +169,7 @@ def shadow_fee_after_return_labels(sample: dict[str, Any]) -> dict[str, Any]:
 
     long_gross = _safe_float(sample.get("long_return_pct"))
     short_gross = _safe_float(sample.get("short_return_pct"))
-    costs = _shadow_cost_labels(sample)
+    costs = shadow_cost_labels(sample)
     long_cost = _safe_float(costs.get("long_total_cost_pct"))
     short_cost = _safe_float(costs.get("short_total_cost_pct"))
     complete = bool(
@@ -257,7 +266,7 @@ def build_profit_supervision_contract(
             "short_gross_market_return_pct": short_return,
             "reason": "" if market_eligible else "shadow_market_opportunity_incomplete",
         }
-        cost_task = _shadow_cost_labels(sample)
+        cost_task = shadow_cost_labels(sample)
         cost_task["eligible"] = bool(quality_eligible and cost_task.get("eligible"))
         fee_after_labels = shadow_fee_after_return_labels(sample)
         fee_after_labels["complete"] = bool(
@@ -484,11 +493,19 @@ def profit_supervision_report(
             PROFIT_TRAINING_TARGET,
         )
     )
+    cost_basis_counts: Counter[str] = Counter()
+    for sample in shadow_samples:
+        supervision = _safe_dict(sample.get("profit_supervision"))
+        tasks = _safe_dict(supervision.get("tasks"))
+        cost = _safe_dict(tasks.get(COUNTERFACTUAL_EXECUTION_COST_TASK))
+        provenance = _safe_dict(_safe_dict(cost.get("cost_model")).get("policy_provenance"))
+        cost_basis_counts[_safe_text(provenance.get("label_cost_basis")) or "unspecified"] += 1
     report = {
         "version": PROFIT_SUPERVISION_VERSION,
         "task_counts": task_counts,
         "shadow_market_sample_count": shadow_market_count,
         "shadow_counterfactual_cost_sample_count": shadow_cost_count,
+        "shadow_cost_basis_counts": dict(cost_basis_counts),
         "actual_execution_cost_sample_count": actual_cost_count,
         "actual_realized_return_sample_count": actual_return_count,
         "shadow_samples_are_actual_returns": False,

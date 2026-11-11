@@ -19,8 +19,8 @@ non-settlement periods, passive entry fallback could race an unconfirmed
 cancellation, and the training dataset lookup timed out. These have separate
 fixes and must not be conflated with an unprofitable strategy.
 
-The current funding supervision policy is
-`2026-11-10.scheduled-shadow-funding.v5`; v4 artifacts are incompatible.
+The current supervision policy is
+`2026-11-11.observed-shadow-exit-cost.v6`; v5 artifacts are incompatible.
 Rebuild both model branches before interpreting their readiness. Do not force
 trades, shorten the primary horizon, mix horizons, or relax the positive-LCB,
 profit-factor, disjoint-exam, or live-readiness gates to manufacture entries.
@@ -85,10 +85,37 @@ more evidence, not proven profitable.
 The five remediation items are not all accepted: development separation and
 recipe comparison exist, but there is no qualifying replacement, completed
 fresh independent exam, complete maker-fill/exit-cost portfolio replay, or
-qualified strategy's paper entry-to-settlement acceptance. Shadow costs still
-project the round trip from entry-time market facts. The separately saved
-settlement observation is not an actual exit fill and must not be presented as
-one or leaked into decision-time features.
+qualified strategy's paper entry-to-settlement acceptance. Legacy shadow rows
+still project costs from entry-time market facts. New native settlements use
+separately recorded exit microstructure and current exit fees, scaled to exit
+notional. These are counterfactual estimates, not actual fills or complete
+portfolio replay. They cannot become decision-time features.
+
+## November 11 Exit-Cost Repair
+
+- New native settlements preserve exit bid/ask, depth, account fees, scheduled
+  time, source/receipt clocks and fact identity as label-only evidence.
+- Costs are computed separately for both sides. Sized estimates close the same
+  base quantity on the exit book; they do not require closing liquidity on the
+  earlier entry book. Counterfactual labels cannot assume a passive maker fill.
+- Missing, late, unverified or mismatched exit evidence cannot silently fall
+  back to an entry projection once the observed-exit contract is declared.
+- Training supervision, settlement labels and specialist quality evaluations
+  share the same cost implementation. Historical replay uses the entry-time
+  projection for its entry gate and observed exit costs for its outcome.
+- Training snapshot v7 makes settlement cost observations required metadata,
+  ahead of optional diagnostics, in both Python and PostgreSQL. A bounded
+  repair recovers observations dropped from older compact snapshots.
+- Prediction replay strips settlement, label and specialist outcome metadata
+  before single or batch inference.
+- The label cost basis is explicit. Passive fill probability, unfilled orders,
+  actual exits and concurrent portfolio PnL remain unaccepted; the code records
+  `execution_replay_complete=false` instead of claiming those tests passed.
+
+Before this deployment, the November 11 13:26 Beijing bounded audit still
+showed zero entries, a current paper canary and no live permission. The latest
+candidate had not replaced the champion. These are pre-deployment findings,
+not validation of v6.
 
 ## November 11 Remediation
 

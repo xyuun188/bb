@@ -1839,6 +1839,15 @@ async def _repair_shadow_training_snapshot_batch(
                                     FALSE
                                 )
                             )
+                            OR (
+                                (scanned.feature_snapshot::JSONB)
+                                    ? 'shadow_settlement_cost_observation'
+                                AND NOT COALESCE(
+                                    (scanned.training_feature_snapshot)
+                                        ? 'shadow_settlement_cost_observation',
+                                    FALSE
+                                )
+                            )
                         )
                     )
                     OR (
