@@ -201,6 +201,7 @@ def feature_availability_reasons(features: dict[str, Any], *, decision_at: Any =
                 FEATURE_STORAGE_COMPACTION_VERSION,
                 LEGACY_FEATURE_STORAGE_COMPACTION_VERSION,
                 compact_input_fingerprint,
+                legacy_market_fact_compact_input_fingerprint,
                 storage_feature_fingerprint,
             )
 
@@ -225,9 +226,18 @@ def feature_availability_reasons(features: dict[str, Any], *, decision_at: Any =
             else:
                 expected_compact_fingerprint = None
                 reasons.append("feature_storage_contract_version_unsupported")
-            if storage_contract.get("compact_input_fingerprint") != (
-                expected_compact_fingerprint
-            ):
+            legacy_fingerprint = (
+                legacy_market_fact_compact_input_fingerprint(
+                    features,
+                    contract.get("input_fingerprint"),
+                )
+                if storage_version == FEATURE_STORAGE_COMPACTION_VERSION
+                else None
+            )
+            if storage_contract.get("compact_input_fingerprint") not in {
+                expected_compact_fingerprint,
+                legacy_fingerprint,
+            }:
                 reasons.append("feature_inputs_changed_after_freeze")
             fingerprint = contract.get("input_fingerprint")
         elif storage_contract is not None:

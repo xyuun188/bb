@@ -18,10 +18,12 @@ from core.feature_availability import (
     sentiment_input_availability,
 )
 from core.market_facts import (
+    LEGACY_MARKET_FACT_STORAGE_COMPACTION_VERSION,
     MARKET_FACT_CONTRACT_VERSION,
     build_market_fact,
     compact_market_fact,
     compact_market_fact_contract,
+    compact_market_fact_legacy_v1,
     market_fact_contract_reasons,
     market_fact_reasons,
 )
@@ -857,6 +859,46 @@ def test_compacted_market_fact_input_tampering_breaks_storage_fingerprint() -> N
     assert "feature_inputs_changed_after_freeze" in feature_availability_reasons(
         compacted,
         decision_at=compacted["original_decision_timestamp"],
+    )
+
+
+def test_legacy_market_fact_compaction_preserves_frozen_fingerprint() -> None:
+    features = _full_feature_vector_sample()["features"]
+    compacted = compact_frozen_feature_payload(features)
+    legacy_market_fact = compact_market_fact_legacy_v1(features["market_fact"])
+    compacted["market_fact"] = legacy_market_fact
+
+    projection = {
+        key: compacted[key]
+        for key in FROZEN_FEATURE_FIELDS
+        if key in compacted
+    }
+    projection["market_fact"] = legacy_market_fact
+    projection["__feature_availability_input_fingerprint__"] = (
+        features["feature_availability_contract"]["input_fingerprint"]
+    )
+    compacted["feature_storage_compaction"]["compact_input_fingerprint"] = (
+        storage_feature_fingerprint(projection)
+    )
+
+    reasons = feature_availability_reasons(
+        compacted,
+        decision_at=compacted["original_decision_timestamp"],
+    )
+    assert "feature_inputs_changed_after_freeze" not in reasons
+    upgraded = compact_training_feature_snapshot(compacted)
+    assert "training_feature_compaction_error" not in upgraded
+    assert upgraded["market_fact"]["storage_contract"]["version"] != (
+        LEGACY_MARKET_FACT_STORAGE_COMPACTION_VERSION
+    )
+
+    compacted["market_fact"]["prices"]["last"] += 1
+    assert "feature_inputs_changed_after_freeze" in feature_availability_reasons(
+        compacted,
+        decision_at=compacted["original_decision_timestamp"],
+    )
+    assert legacy_market_fact["storage_contract"]["version"] == (
+        LEGACY_MARKET_FACT_STORAGE_COMPACTION_VERSION
     )
 
 

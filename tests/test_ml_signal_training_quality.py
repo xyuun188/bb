@@ -284,6 +284,50 @@ def test_primary_horizon_fit_ignores_contradicting_short_horizon_labels() -> Non
         )
 
 
+def test_train_from_empty_frame_fails_with_training_reason() -> None:
+    with pytest.raises(
+        ValueError,
+        match="training_frame_empty: no eligible primary-horizon rows",
+    ):
+        train_from_frame(pd.DataFrame(), persist_artifact=False)
+
+
+@pytest.mark.asyncio
+async def test_training_preflight_reports_empty_primary_horizon_without_fitting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def no_rows() -> list[object]:
+        return []
+
+    async def no_count() -> int:
+        return 0
+
+    async def forbidden_trade_load() -> list[dict[str, object]]:
+        raise AssertionError("trade outcomes must not be loaded when shadow rows are empty")
+
+    def forbidden_fit(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("empty data must not enter model fitting")
+
+    monkeypatch.setattr(train_ml_signal_script, "load_primary_horizon_training_rows", no_rows)
+    monkeypatch.setattr(train_ml_signal_script, "count_shadow_training_rows", no_count)
+    monkeypatch.setattr(
+        train_ml_signal_script,
+        "load_authoritative_trade_training_samples",
+        forbidden_trade_load,
+    )
+    monkeypatch.setattr(train_ml_signal_script, "train_from_frame", forbidden_fit)
+    result = await train_ml_signal_script.run_training()
+
+    assert result["metadata"]["training_blocked"] is True
+    assert result["metadata"]["training_block_reason"] == "no_eligible_primary_horizon_rows"
+    assert result["metadata"]["primary_prediction_horizon_minutes"] == (
+        ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES
+    )
+    assert result["loaded_row_count"] == 0
+    assert result["frame_sample_count"] == 0
+    assert result["metadata"]["artifact_persisted"] is False
+
+
 def test_walk_forward_scores_apply_the_same_dispersion_penalty_as_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

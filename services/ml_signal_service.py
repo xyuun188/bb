@@ -2454,6 +2454,10 @@ def train_from_frame(
     trade_samples: list[dict[str, Any]] | None = None,
     persist_artifact: bool = True,
 ) -> dict[str, Any]:
+    if frame.empty:
+        raise ValueError("training_frame_empty: no eligible primary-horizon rows")
+    if "horizon_minutes" not in frame.columns:
+        raise ValueError("training_frame_missing_horizon_minutes")
     source_training_horizons = sorted(
         {
             int(value)

@@ -49,16 +49,24 @@ except Exception as exc:
     exit_code = 2
     failure = safe_error_text(exc, limit=1000)
 metadata = captured.get("metadata") or {}
+blocked_reason = metadata.get("training_block_reason")
 report = {
-    "status": "failed" if failure else "complete" if exit_code == 0 else "skipped",
+    "status": (
+        "failed" if failure
+        else "blocked" if blocked_reason
+        else "complete" if exit_code == 0
+        else "skipped"
+    ),
     "exit_code": exit_code,
     "generated_at": datetime.now(UTC).isoformat(),
     "diagnostic_only": True,
     "artifact_persisted": False,
     "promotion_authorized": False,
     "submits_orders": False,
-    "frame_sample_count": captured.get("frame_sample_count"),
+    "reason": blocked_reason,
     "loaded_row_count": captured.get("loaded_row_count"),
+    "frame_sample_count": captured.get("frame_sample_count"),
+    "completed_shadow_sample_count": captured.get("completed_shadow_sample_count"),
     "authoritative_trade_sample_count": captured.get("authoritative_trade_sample_count"),
     "metadata": {
         key: metadata.get(key) for key in (
@@ -66,6 +74,7 @@ report = {
             "source_code_sha256", "training_window_composition",
             "decision_group_partition", "walk_forward_report", "metrics",
             "holdout_horizon_diagnostics", "counterfactual_cost_holdout",
+            "primary_prediction_horizon_minutes", "training_blocked",
         )
     },
 }

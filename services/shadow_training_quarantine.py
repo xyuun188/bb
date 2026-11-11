@@ -8,6 +8,7 @@ all consume the same clean training view.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import Counter
@@ -18,7 +19,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import load_only
 
 from core.training_contracts import SHADOW_LABEL_VERSION
-from db.session import get_session_ctx
+from db.session import get_read_session_ctx, get_session_ctx
 from models.learning import ShadowBacktest
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import SampleQualityAssessment, assess_shadow_sample
@@ -31,6 +32,9 @@ _HISTORICAL_REQUALIFICATION_REASONS = {
     "market_data_quality:native_market_fact_invalid",
     "market_data_quality:orderbook_depth_invalid",
 }
+_LEGACY_FINGERPRINT_REQUALIFICATION_REASON = (
+    "feature_availability:feature_inputs_changed_after_freeze"
+)
 _TRAINING_QUARANTINE_REASON_PATTERN = re.compile(
     r"(?:^|\n)\[training_quarantine\][ \t]*([^\r\n]+)"
 )
@@ -392,6 +396,194 @@ async def requalify_verified_historical_shadow_samples(
         "coverage_complete": coverage_complete,
         "eligible": eligible,
         "requalified": requalified,
+        "last_scanned_id": cursor_id,
+        "candidate_ids_sample": candidate_ids,
+        "skipped_reasons": dict(skipped_reasons),
+    }
+
+
+async def requalify_legacy_market_fact_fingerprint_shadow_samples(
+    *,
+    batch_size: int = 250,
+    max_batches: int = 20,
+    dry_run: bool = True,
+    only_newer_than_id: int | None = None,
+    only_up_to_id: int | None = None,
+    expected_eligible_count: int | None = None,
+    expected_eligible_ids_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Restore only rows blocked solely by the fixed legacy market-fact fingerprint."""
+
+    size = max(int(batch_size or 250), 1)
+    batches = max(int(max_batches or 20), 1)
+    now = datetime.now(UTC)
+    scanned = eligible = requalified = 0
+    cursor_id = int(only_newer_than_id) if only_newer_than_id is not None else None
+    candidate_ids: list[int] = []
+    eligible_ids: list[int] = []
+    eligible_rows: list[ShadowBacktest] = []
+    skipped_reasons: Counter[str] = Counter()
+    coverage_complete = False
+    epoch_start = load_training_data_start()
+    filters = (
+        ShadowBacktest.status == QUARANTINE_STATUS,
+        ShadowBacktest.created_at >= epoch_start,
+        ShadowBacktest.execution_mode == "paper",
+        ShadowBacktest.analysis_type == "market",
+        ShadowBacktest.label_version == SHADOW_LABEL_VERSION,
+        ShadowBacktest.long_return_pct.is_not(None),
+        ShadowBacktest.short_return_pct.is_not(None),
+        ShadowBacktest.training_feature_snapshot_version >= 1,
+        ShadowBacktest.training_feature_snapshot.is_not(None),
+        ShadowBacktest.note.like(
+            f"%{TRAINING_QUARANTINE_MARKER} "
+            f"{_LEGACY_FINGERPRINT_REQUALIFICATION_REASON}%"
+        ),
+    )
+    query_filters = list(filters)
+    if only_up_to_id is not None:
+        query_filters.append(ShadowBacktest.id <= int(only_up_to_id))
+    bounded_filters = list(query_filters)
+    if only_newer_than_id is not None:
+        bounded_filters.append(ShadowBacktest.id > int(only_newer_than_id))
+    session_context = (
+        get_session_ctx()
+        if not dry_run
+        else get_read_session_ctx(
+            statement_timeout_ms=20_000,
+            transaction_isolation="REPEATABLE READ READ ONLY",
+        )
+    )
+
+    async with session_context as session:
+        total_candidate_count = int(
+            (
+                await session.execute(
+                    select(func.count(ShadowBacktest.id)).where(*bounded_filters)
+                )
+            ).scalar_one()
+            or 0
+        )
+        for _batch_index in range(batches):
+            statement = (
+                select(ShadowBacktest)
+                .where(*query_filters)
+                .options(
+                    load_only(
+                        ShadowBacktest.id,
+                        ShadowBacktest.decision_id,
+                        ShadowBacktest.model_name,
+                        ShadowBacktest.execution_mode,
+                        ShadowBacktest.symbol,
+                        ShadowBacktest.analysis_type,
+                        ShadowBacktest.decision_action,
+                        ShadowBacktest.decision_confidence,
+                        ShadowBacktest.training_feature_snapshot,
+                        ShadowBacktest.training_feature_snapshot_version,
+                        ShadowBacktest.status,
+                        ShadowBacktest.due_at,
+                        ShadowBacktest.horizon_minutes,
+                        ShadowBacktest.label_version,
+                        ShadowBacktest.long_return_pct,
+                        ShadowBacktest.short_return_pct,
+                        ShadowBacktest.best_action,
+                        ShadowBacktest.missed_opportunity,
+                        ShadowBacktest.note,
+                        ShadowBacktest.updated_at,
+                    )
+                )
+                .order_by(ShadowBacktest.id.asc())
+            )
+            if cursor_id is not None:
+                statement = statement.where(ShadowBacktest.id > cursor_id)
+            rows = list(
+                (
+                    await session.execute(statement.limit(size))
+                ).scalars().all()
+            )
+            if not rows:
+                coverage_complete = True
+                break
+
+            for row in rows:
+                cursor_id = int(row.id)
+                scanned += 1
+                note = str(row.note or "")
+                recorded_reasons = _TRAINING_QUARANTINE_REASON_PATTERN.findall(note)
+                if (
+                    len(recorded_reasons) != 1
+                    or recorded_reasons[0].strip()
+                    != _LEGACY_FINGERPRINT_REQUALIFICATION_REASON
+                ):
+                    skipped_reasons["quarantine_reason_not_solely_legacy_fingerprint"] += 1
+                    continue
+                due_at = row.due_at
+                if isinstance(due_at, datetime) and due_at.tzinfo is None:
+                    due_at = due_at.replace(tzinfo=UTC)
+                if not isinstance(due_at, datetime) or due_at > now:
+                    skipped_reasons["label_not_mature"] += 1
+                    continue
+
+                assessment = assess_shadow_row(row)
+                if assessment.exclude_from_training:
+                    skipped_reasons.update(
+                        assessment.reasons or ("current_quality_assessment_excluded",)
+                    )
+                    continue
+
+                eligible += 1
+                eligible_ids.append(int(row.id))
+                if len(candidate_ids) < 50:
+                    candidate_ids.append(int(row.id))
+                eligible_rows.append(row)
+            if scanned >= total_candidate_count or len(rows) < size:
+                coverage_complete = True
+                break
+
+        if not dry_run:
+            if expected_eligible_count is None or expected_eligible_count < 0:
+                raise ValueError("apply requires an expected eligible-row count")
+            if not expected_eligible_ids_sha256:
+                raise ValueError("apply requires the dry-run eligible-row ID fingerprint")
+            if not coverage_complete:
+                raise ValueError("apply requires complete candidate coverage")
+            if eligible != int(expected_eligible_count):
+                raise ValueError(
+                    "eligible-row count changed since read-only requalification"
+                )
+            eligible_ids_sha256 = hashlib.sha256(
+                ",".join(str(value) for value in sorted(eligible_ids)).encode("ascii")
+            ).hexdigest()
+            if eligible_ids_sha256 != expected_eligible_ids_sha256:
+                raise ValueError(
+                    "eligible-row IDs changed since read-only requalification"
+                )
+            for row in eligible_rows:
+                row.status = "completed"
+                row.note = (
+                    f"{row.note}\n[training_requalified] "
+                    "legacy_market_fact_v1_fingerprint_verified"
+                )
+                row.updated_at = now
+                requalified += 1
+            await session.flush()
+
+    return {
+        "dry_run": dry_run,
+        "batch_size": size,
+        "max_batches": batches,
+        "only_newer_than_id": only_newer_than_id,
+        "only_up_to_id": only_up_to_id,
+        "expected_eligible_count": expected_eligible_count,
+        "training_epoch_started_at": epoch_start.isoformat(),
+        "scanned": scanned,
+        "total_candidate_count": total_candidate_count,
+        "coverage_complete": coverage_complete,
+        "eligible": eligible,
+        "requalified": requalified,
+        "eligible_ids_sha256": hashlib.sha256(
+            ",".join(str(value) for value in sorted(eligible_ids)).encode("ascii")
+        ).hexdigest(),
         "last_scanned_id": cursor_id,
         "candidate_ids_sample": candidate_ids,
         "skipped_reasons": dict(skipped_reasons),

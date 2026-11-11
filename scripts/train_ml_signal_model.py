@@ -36,6 +36,7 @@ from services.ml_signal_service import (
     shadow_training_quality_report,
     train_from_frame,
 )
+from services.ml_training_contract import PRIMARY_PREDICTION_HORIZON_MINUTES
 from services.ml_training_dataset import (
     count_shadow_training_rows,
     load_authoritative_trade_training_samples,
@@ -76,6 +77,35 @@ async def run_training(
     rows = await load_primary_horizon_training_rows()
     quality_state = shadow_training_quality_report(rows)
     frame = build_training_frame(rows)
+    if frame.empty:
+        completed_count = await count_shadow_training_rows()
+        reason = (
+            "no_eligible_primary_horizon_rows"
+            if not rows
+            else "primary_horizon_rows_rejected_during_frame_build"
+        )
+        metadata = {
+            "artifact_persisted": False,
+            "training_blocked": True,
+            "training_block_reason": reason,
+            "primary_prediction_horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
+            "loaded_row_count": len(rows),
+            "frame_sample_count": 0,
+            "training_quality_report": quality_state["quality_report"],
+        }
+        return {
+            "metadata": metadata,
+            "training_quarantine": quarantine_result,
+            "dry_run": not persist_artifact,
+            "preflight_only": not persist_artifact,
+            "persist_artifact_requested": persist_artifact,
+            "confirm_phase3_rebuild": confirm_phase3_rebuild,
+            "okx_daily_reconciliation_gate": okx_gate,
+            "frame_sample_count": 0,
+            "loaded_row_count": len(rows),
+            "completed_shadow_sample_count": completed_count,
+            "authoritative_trade_sample_count": None,
+        }
     trade_samples = await load_authoritative_trade_training_samples()
     completed_count = await count_shadow_training_rows()
     metadata = train_from_frame(
@@ -211,9 +241,12 @@ def main() -> int:
             result={
                 "trained": bool(metadata.get("artifact_persisted")),
                 "reason": (
-                    "manual_training_completed"
-                    if metadata.get("artifact_persisted")
-                    else "manual_preflight_completed"
+                    metadata.get("training_block_reason")
+                    or (
+                        "manual_training_completed"
+                        if metadata.get("artifact_persisted")
+                        else "manual_preflight_completed"
+                    )
                 ),
                 "artifact_persisted": bool(metadata.get("artifact_persisted")),
                 "completed_shadow_sample_count": result.get(

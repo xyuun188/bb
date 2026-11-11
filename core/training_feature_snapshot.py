@@ -13,7 +13,12 @@ from decimal import Decimal
 from typing import Any
 
 from core.feature_availability import FROZEN_FEATURE_FIELDS, availability_fingerprint
-from core.market_facts import compact_market_fact, compact_market_fact_contract
+from core.market_facts import (
+    LEGACY_MARKET_FACT_STORAGE_COMPACTION_VERSION,
+    compact_market_fact,
+    compact_market_fact_contract,
+    compact_market_fact_legacy_v1,
+)
 
 TRAINING_FEATURE_SNAPSHOT_VERSION = 9
 FROZEN_TRAINING_FEATURE_MAX_BYTES = 96 * 1024
@@ -244,6 +249,36 @@ def compact_input_fingerprint(features: dict[str, Any], input_fingerprint: Any) 
 
     projection = {
         key: _compact_frozen_value(key, features[key])
+        for key in FROZEN_FEATURE_FIELDS
+        if key in features
+    }
+    projection[_AVAILABILITY_FINGERPRINT_KEY] = input_fingerprint
+    return storage_feature_fingerprint(projection)
+
+
+def legacy_market_fact_compact_input_fingerprint(
+    features: dict[str, Any],
+    input_fingerprint: Any,
+) -> str | None:
+    """Verify the prior market-fact projection only for explicitly marked v1 data."""
+
+    market_fact = features.get("market_fact")
+    storage_contract = (
+        market_fact.get("storage_contract") if isinstance(market_fact, dict) else None
+    )
+    if (
+        not isinstance(storage_contract, dict)
+        or storage_contract.get("version")
+        != LEGACY_MARKET_FACT_STORAGE_COMPACTION_VERSION
+    ):
+        return None
+
+    projection = {
+        key: (
+            compact_market_fact_legacy_v1(features[key])
+            if key == "market_fact"
+            else _compact_frozen_value(key, features[key])
+        )
         for key in FROZEN_FEATURE_FIELDS
         if key in features
     }
@@ -522,12 +557,16 @@ def compact_training_feature_snapshot(value: object) -> dict[str, Any]:
                     value,
                     original_contract.get("input_fingerprint"),
                 )
-                contract_matches = True
+                legacy_fingerprint = legacy_market_fact_compact_input_fingerprint(
+                    value,
+                    original_contract.get("input_fingerprint"),
+                )
+                contract_matches = storage_contract.get(
+                    "compact_input_fingerprint"
+                ) in {current_fingerprint, legacy_fingerprint}
             else:
                 return {"training_feature_compaction_error": "frozen_input_storage_mismatch"}
-            if not contract_matches or storage_contract.get(
-                "compact_input_fingerprint"
-            ) != current_fingerprint:
+            if not contract_matches:
                 return {"training_feature_compaction_error": "frozen_input_storage_mismatch"}
         else:
             original_fingerprint = availability_fingerprint(

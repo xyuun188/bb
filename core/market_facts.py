@@ -17,6 +17,7 @@ from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol, symb
 MARKET_FACT_SCHEMA_VERSION = "2026-07-14.okx-native-market-fact.v1"
 MARKET_FACT_CONTRACT_VERSION = "2026-07-14.native-market-fact.v1"
 MARKET_SOURCE_CONSISTENCY_VERSION = "2026-07-17.okx-source-consistency.v4"
+LEGACY_MARKET_FACT_STORAGE_COMPACTION_VERSION = "2026-10-22.compact-market-fact.v1"
 MARKET_FACT_STORAGE_COMPACTION_VERSION = "2026-11-12.compact-market-fact.v2"
 
 
@@ -507,6 +508,46 @@ def compact_market_fact(fact: Mapping[str, Any] | None) -> dict[str, Any]:
         }.items()
         if value is not None
     }
+    return _strip_json_null_object_values(compact)
+
+
+def compact_market_fact_legacy_v1(fact: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Recreate the v1 storage projection only when validating old snapshots."""
+
+    source = _dict(fact)
+    compact = compact_market_fact(source)
+    if not source or source.get("schema_version") != MARKET_FACT_SCHEMA_VERSION:
+        return compact
+
+    source_identity = _dict(source.get("native_identity"))
+    source_spec = _dict(source_identity.get("contract_spec"))
+    compact_identity = _dict(compact.get("native_identity"))
+    compact_spec = _dict(compact_identity.get("contract_spec"))
+    legacy_spec_keys = (
+        "inst_id",
+        "inst_type",
+        "uly",
+        "contract_type",
+        "contract_value",
+        "contract_multiplier",
+        "contract_value_currency",
+        "settle_currency",
+        "lot_size",
+        "minimum_size",
+        "tick_size",
+        "state",
+        "source",
+        "spec_version",
+    )
+    compact_identity["contract_spec"] = {
+        key: compact_spec[key]
+        for key in legacy_spec_keys
+        if key in source_spec and key in compact_spec
+    }
+    compact["native_identity"] = compact_identity
+    storage_contract = _dict(compact.get("storage_contract"))
+    storage_contract["version"] = LEGACY_MARKET_FACT_STORAGE_COMPACTION_VERSION
+    compact["storage_contract"] = storage_contract
     return _strip_json_null_object_values(compact)
 
 

@@ -23,6 +23,7 @@ from services.historical_shadow_rebuild import build_historical_shadow_sample
 from services.shadow_training_quarantine import (
     quarantine_completed_shadow_row,
     quarantine_dirty_shadow_samples,
+    requalify_legacy_market_fact_fingerprint_shadow_samples,
     requalify_verified_historical_shadow_samples,
 )
 from services.training_data_quality import assess_shadow_sample
@@ -503,5 +504,129 @@ async def test_requalify_only_verified_historical_shadow_samples(
             dry_run=False,
         )
         assert repeat_report["eligible"] == repeat_report["requalified"] == 0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_requalify_only_currently_valid_legacy_fingerprint_samples(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    await close_db()
+    db_path = tmp_path / "legacy-fingerprint-requalify.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    await init_db()
+
+    legacy_reason = (
+        "[training_quarantine] "
+        "feature_availability:feature_inputs_changed_after_freeze"
+    )
+
+    def db_row(row_id: int, note: str, *, mutate_features: bool = False) -> ShadowBacktest:
+        sample = _row(
+            id=row_id,
+            decision_id=5000 + row_id,
+            status="quarantined",
+            note=note,
+        )
+        features = dict(sample.feature_snapshot)
+        if mutate_features:
+            features["current_price"] = float(features["current_price"]) + 1.0
+        return ShadowBacktest(
+            id=row_id,
+            decision_id=sample.decision_id,
+            model_name="ensemble_trader",
+            execution_mode="paper",
+            symbol=sample.symbol,
+            analysis_type="market",
+            decision_action=sample.decision_action,
+            decision_confidence=sample.decision_confidence,
+            entry_price=100.0,
+            feature_snapshot=features,
+            training_feature_snapshot=features,
+            training_feature_snapshot_version=9,
+            status="quarantined",
+            due_at=sample.due_at,
+            horizon_minutes=sample.horizon_minutes,
+            label_version=sample.label_version,
+            long_return_pct=sample.long_return_pct,
+            short_return_pct=sample.short_return_pct,
+            best_action=sample.best_action,
+            missed_opportunity=sample.missed_opportunity,
+            note=note,
+        )
+
+    try:
+        async with get_session_ctx() as session:
+            session.add_all(
+                [
+                    db_row(1, legacy_reason),
+                    db_row(2, legacy_reason, mutate_features=True),
+                    db_row(3, f"{legacy_reason},future_leakage"),
+                    db_row(
+                        4,
+                        "[training_quarantine] market_data_quality:orderbook_depth_invalid",
+                    ),
+                ]
+            )
+
+        dry_report = await requalify_legacy_market_fact_fingerprint_shadow_samples(
+            batch_size=2,
+            max_batches=5,
+            only_newer_than_id=0,
+            only_up_to_id=3,
+        )
+        assert dry_report["dry_run"] is True
+        assert dry_report["total_candidate_count"] == 3
+        assert dry_report["scanned"] == 3
+        assert dry_report["coverage_complete"] is True
+        assert dry_report["eligible"] == 1
+        assert dry_report["requalified"] == 0
+        assert dry_report["candidate_ids_sample"] == [1]
+        assert dry_report["skipped_reasons"].get(
+            "quarantine_reason_not_solely_legacy_fingerprint"
+        ) == 1
+
+        async with get_session_ctx() as session:
+            dry_rows = {
+                row_id: await session.get(ShadowBacktest, row_id)
+                for row_id in range(1, 5)
+            }
+        assert all(row.status == "quarantined" for row in dry_rows.values())
+
+        with pytest.raises(ValueError, match="eligible-row IDs changed"):
+            await requalify_legacy_market_fact_fingerprint_shadow_samples(
+                batch_size=2,
+                max_batches=5,
+                dry_run=False,
+                only_newer_than_id=0,
+                only_up_to_id=3,
+                expected_eligible_count=1,
+                expected_eligible_ids_sha256="0" * 64,
+            )
+        async with get_session_ctx() as session:
+            assert (await session.get(ShadowBacktest, 1)).status == "quarantined"
+
+        apply_report = await requalify_legacy_market_fact_fingerprint_shadow_samples(
+            batch_size=2,
+            max_batches=5,
+            dry_run=False,
+            only_newer_than_id=0,
+            only_up_to_id=3,
+            expected_eligible_count=dry_report["eligible"],
+            expected_eligible_ids_sha256=dry_report["eligible_ids_sha256"],
+        )
+        assert apply_report["eligible"] == apply_report["requalified"] == 1
+
+        async with get_session_ctx() as session:
+            rows = {
+                row_id: await session.get(ShadowBacktest, row_id)
+                for row_id in range(1, 5)
+            }
+        assert rows[1] is not None and rows[1].status == "completed"
+        assert "[training_quarantine] feature_availability:feature_inputs_changed_after_freeze" in rows[1].note
+        assert "[training_requalified] legacy_market_fact_v1_fingerprint_verified" in rows[1].note
+        assert all(rows[row_id].status == "quarantined" for row_id in range(2, 5))
     finally:
         await close_db()
