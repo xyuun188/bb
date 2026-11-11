@@ -4826,7 +4826,8 @@ class DataService:
                         for key in (
                             "instId", "instType", "uly", "instFamily", "ctType",
                             "ctVal", "ctMult", "ctValCcy", "settleCcy", "lotSz",
-                            "minSz", "tickSz", "state",
+                            "minSz", "tickSz", "state", "instCategory", "category",
+                            "openType",
                         )
                     } | {"source": "okx_public_instruments_cache"}
             if normalized:

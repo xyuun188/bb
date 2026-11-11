@@ -891,6 +891,46 @@ async def test_available_symbols_uses_fresh_cache_without_rest_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_available_symbols_cache_preserves_public_asset_class_metadata() -> None:
+    service = _service()
+    service._instrument_spec_cache = {}
+    instrument = {
+        "instId": "BTC-USDT-SWAP",
+        "instType": "SWAP",
+        "uly": "BTC-USDT",
+        "ctVal": "0.01",
+        "ctMult": "1",
+        "instCategory": "1",
+        "category": "1",
+        "openType": "fix_price",
+    }
+
+    class RestClient:
+        _exchange = SimpleNamespace(
+            markets={
+                "BTC/USDT:USDT": {
+                    "id": "BTC-USDT-SWAP",
+                    "symbol": "BTC/USDT:USDT",
+                    "info": instrument,
+                }
+            }
+        )
+
+        async def get_available_symbols(self) -> list[dict[str, str]]:
+            return [{"symbol": "BTC/USDT"}]
+
+    service.rest_client = RestClient()
+
+    symbols = await service._refresh_available_symbols_cache()
+
+    assert symbols == [{"symbol": "BTC/USDT"}]
+    cached_spec = service._instrument_spec_cache["BTC/USDT"]
+    assert cached_spec["instCategory"] == "1"
+    assert cached_spec["category"] == "1"
+    assert cached_spec["openType"] == "fix_price"
+
+
+@pytest.mark.asyncio
 async def test_available_symbols_returns_stale_cache_while_refreshing_background() -> None:
     service = _service()
     service._available_symbols_cache = [{"symbol": "BTC/USDT"}]
