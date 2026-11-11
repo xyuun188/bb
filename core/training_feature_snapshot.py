@@ -502,6 +502,7 @@ def compact_training_feature_snapshot(value: object) -> dict[str, Any]:
             not isinstance(key, str)
             or len(key) > 120
             or key in FROZEN_TRAINING_FEATURE_KEYS
+            or key in TRAINING_FEATURE_REQUIRED_CONTRACT_KEYS
             or key in TRAINING_FEATURE_RAW_TEXT_KEYS
         ):
             continue

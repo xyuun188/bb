@@ -998,6 +998,25 @@ def test_shadow_exit_cost_observation_survives_optional_budget_without_entering_
     assert _compact_training_feature_snapshot(compacted) == compacted
 
 
+def test_optional_metadata_cannot_overwrite_normalized_market_contract() -> None:
+    features = _full_feature_vector_sample()["features"]
+    window = {
+        "start": "2026-11-11T00:00:00+00:00",
+        "end": "2026-11-11T00:05:00+00:00",
+    }
+    features["training_market_fact_contract"] = {
+        "version": MARKET_FACT_CONTRACT_VERSION,
+        "status": "clean",
+        "observation_window": json.dumps(window),
+    }
+
+    compacted = _compact_training_feature_snapshot(features)
+
+    assert compacted["training_market_fact_contract"]["observation_window"] == window
+    assert _compact_training_feature_snapshot(compacted) == compacted
+    assert isinstance(features["training_market_fact_contract"]["observation_window"], str)
+
+
 def test_postgres_optional_compaction_uses_non_conflicting_loop_record() -> None:
     functions = postgres_training_feature_snapshot_functions()
     compact_sql = functions[-1]
@@ -1211,11 +1230,21 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
             "path_status": "clean",
             "path_fingerprint": "b" * 64,
         }
+        with_small_contract = deepcopy(original)
+        with_small_contract["training_market_fact_contract"] = {
+            "version": MARKET_FACT_CONTRACT_VERSION,
+            "status": "clean",
+            "observation_window": json.dumps({
+                "start": "2026-11-11T00:00:00+00:00",
+                "end": "2026-11-11T00:05:00+00:00",
+            }),
+        }
         for features in (
             original,
             oversized,
             with_contract,
             with_historical_contract,
+            with_small_contract,
             {"empty": {}, "array": [], "text": "x" * 513},
         ):
             encoded = json.dumps(features, ensure_ascii=False)
