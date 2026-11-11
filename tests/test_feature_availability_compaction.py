@@ -1017,6 +1017,93 @@ def test_optional_metadata_cannot_overwrite_normalized_market_contract() -> None
     assert isinstance(features["training_market_fact_contract"]["observation_window"], str)
 
 
+def test_specialist_evidence_is_preserved_one_group_at_a_time(monkeypatch) -> None:
+    features = {
+        "local_ml_shadow": {"available": True},
+        "local_ai_tools_shadow": {"available": True},
+    }
+    monkeypatch.setattr(
+        "core.training_feature_snapshot.TRAINING_FEATURE_SNAPSHOT_MAX_BYTES",
+        training_feature_storage_bytes({"local_ml_shadow": {"available": True}}),
+    )
+
+    compacted = _compact_training_feature_snapshot(features)
+
+    assert compacted == {"local_ml_shadow": {"available": True}}
+
+
+def _mixed_market_fact_contract() -> dict:
+    return {
+        "version": MARKET_FACT_CONTRACT_VERSION,
+        "status": "historical_ohlcv_only",
+        "price_path": {"status": "historical_ohlcv_only"},
+        "path_status": "clean",
+        "data_fingerprint": "d" * 64,
+        "path_fingerprint": "p" * 64,
+        "native_instrument_identity_verified": True,
+        "executable_market_fact_verified": False,
+        "source": HISTORICAL_SHADOW_SOURCE,
+        "scheduled_label_at": "2026-11-11T00:05:25+00:00",
+        "result_source_available_at": "2026-11-11T00:06:00+00:00",
+        "label_maturity_lag_seconds": 35.0,
+        "delivery_latency_observed": False,
+        "observation_window": json.dumps({"start": "entry", "end": "exit"}),
+        "entry_fact": {"fact_id": "entry-fact"},
+        "entry_inst_id": "BTC-USDT-SWAP",
+        "result_fact_id": "result-fact",
+        "violation_reason_codes": "historical_only",
+    }
+
+
+def test_mixed_market_contract_preserves_flat_provenance() -> None:
+    contract = _mixed_market_fact_contract()
+
+    compacted = _compact_training_feature_snapshot({
+        "training_market_fact_contract": contract,
+    })["training_market_fact_contract"]
+
+    for key, value in contract.items():
+        if key not in {"price_path", "entry_fact", "observation_window"}:
+            assert compacted[key] == value
+    assert compacted["entry_fact_id"] == "entry-fact"
+    assert compacted["observation_window"] == {"start": "entry", "end": "exit"}
+
+
+def test_mixed_market_contract_does_not_override_nested_rejection() -> None:
+    contract = _mixed_market_fact_contract()
+    contract["assertions"] = {"native_instrument_identity_verified": False}
+    contract["provenance"] = {
+        "data_fingerprint": None,
+        "label_maturity_lag_seconds": 0,
+        "delivery_latency_observed": None,
+        "result_source_available_at": None,
+        "observation_window": None,
+    }
+
+    compacted = _compact_training_feature_snapshot({
+        "training_market_fact_contract": contract,
+    })["training_market_fact_contract"]
+
+    assert compacted["native_instrument_identity_verified"] is False
+    assert compacted["data_fingerprint"] is None
+    assert compacted["label_maturity_lag_seconds"] == 0
+    assert compacted["delivery_latency_observed"] is None
+    assert compacted["result_source_available_at"] is None
+    assert compacted["observation_window"] is None
+    assert compacted["scheduled_label_at"] == contract["scheduled_label_at"]
+
+
+def test_mixed_market_contract_uses_flat_window_when_nested_value_is_missing() -> None:
+    contract = _mixed_market_fact_contract()
+    contract["provenance"] = {"data_fingerprint": "d" * 64}
+
+    compacted = _compact_training_feature_snapshot({
+        "training_market_fact_contract": contract,
+    })["training_market_fact_contract"]
+
+    assert compacted["observation_window"] == {"start": "entry", "end": "exit"}
+
+
 def test_postgres_optional_compaction_uses_non_conflicting_loop_record() -> None:
     functions = postgres_training_feature_snapshot_functions()
     compact_sql = functions[-1]
@@ -1145,7 +1232,9 @@ async def test_sqlite_snapshot_roundtrip_and_json_projection_remain_eligible(
     not os.environ.get("BB_TEST_POSTGRES_URL"),
     reason="BB_TEST_POSTGRES_URL must point to a dedicated PostgreSQL test database",
 )
-async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functions() -> None:
+async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import asyncpg
 
     connection = await asyncpg.connect(os.environ["BB_TEST_POSTGRES_URL"])
@@ -1162,6 +1251,7 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
             "bb_compact_market_fact",
             "bb_compact_training_market_fact_contract",
             "bb_compact_training_feature_snapshot",
+            "bb_compact_specialist_shadow",
         )
         for sql in postgres_training_feature_snapshot_functions():
             for function_name in function_names:
@@ -1239,12 +1329,31 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
                 "end": "2026-11-11T00:05:00+00:00",
             }),
         }
+        with_mixed_contract = {"training_market_fact_contract": _mixed_market_fact_contract()}
+        with_nested_rejection = deepcopy(with_mixed_contract)
+        with_nested_rejection["training_market_fact_contract"].update({
+            "assertions": {"native_instrument_identity_verified": False},
+            "provenance": {
+                "data_fingerprint": None,
+                "label_maturity_lag_seconds": 0,
+                "delivery_latency_observed": None,
+                "result_source_available_at": None,
+                "observation_window": None,
+            },
+        })
+        with_missing_nested_window = deepcopy(with_mixed_contract)
+        with_missing_nested_window["training_market_fact_contract"]["provenance"] = {
+            "data_fingerprint": "d" * 64,
+        }
         for features in (
             original,
             oversized,
             with_contract,
             with_historical_contract,
             with_small_contract,
+            with_mixed_contract,
+            with_nested_rejection,
+            with_missing_nested_window,
             {"empty": {}, "array": [], "text": "x" * 513},
         ):
             encoded = json.dumps(features, ensure_ascii=False)
@@ -1422,6 +1531,24 @@ async def test_postgres_and_python_snapshot_compaction_match_in_temporary_functi
             assert await connection.fetchval(
                 "SELECT pg_column_size($1::JSONB)", json.dumps(pg_compacted),
             ) <= TRAINING_FEATURE_SNAPSHOT_MAX_BYTES
+        partial_shadow = {
+            "local_ml_shadow": {"available": True},
+            "local_ai_tools_shadow": {"available": True},
+        }
+        monkeypatch.setattr(
+            "core.training_feature_snapshot.TRAINING_FEATURE_SNAPSHOT_MAX_BYTES",
+            training_feature_storage_bytes({"local_ml_shadow": {"available": True}}),
+        )
+        for sql in postgres_training_feature_snapshot_functions():
+            for function_name in function_names:
+                sql = sql.replace(f"{function_name}(", f"pg_temp.{function_name}(")
+            await connection.execute(sql)
+        pg_partial = json.loads(await connection.fetchval(
+            "SELECT pg_temp.bb_compact_training_feature_snapshot($1::JSONB)",
+            json.dumps(partial_shadow),
+        ))
+        assert pg_partial == _compact_training_feature_snapshot(partial_shadow)
+        assert pg_partial == {"local_ml_shadow": {"available": True}}
     finally:
         await transaction.rollback()
         await connection.close()

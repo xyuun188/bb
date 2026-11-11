@@ -103,9 +103,16 @@ portfolio replay. They cannot become decision-time features.
 - Training supervision, settlement labels and specialist quality evaluations
   share the same cost implementation. Historical replay uses the entry-time
   projection for its entry gate and observed exit costs for its outcome.
-- Training snapshot v7 makes settlement cost observations required metadata,
+- Training snapshot v8 makes settlement cost observations required metadata,
   ahead of optional diagnostics, in both Python and PostgreSQL. A bounded
   repair recovers observations dropped from older compact snapshots.
+- Required contracts cannot be overwritten by the optional-metadata pass.
+  Specialist evidence is admitted one group at a time, in the same order in
+  Python and PostgreSQL, rather than losing both groups at the byte limit.
+- Mixed nested/flat market contracts preserve label fingerprints, identity and
+  availability clocks. An explicit nested null, false or zero takes precedence
+  over a flat value. PostgreSQL also preserves the shape of flat compact
+  contracts instead of adding null fields that Python never stored.
 - Prediction replay strips settlement, label and specialist outcome metadata
   before single or batch inference.
 - The label cost basis is explicit. Passive fill probability, unfilled orders,
@@ -116,6 +123,28 @@ Before this deployment, the November 11 13:26 Beijing bounded audit still
 showed zero entries, a current paper canary and no live permission. The latest
 candidate had not replaced the champion. These are pre-deployment findings,
 not validation of v6.
+
+The deployed v6 settlement code was checked on twelve fresh samples covering
+5, 15, 60 and 240 minutes: stored labels, training recalculation and specialist
+returns agreed, exit observations survived compaction, and input seals were
+unchanged. That audit exposed the compaction discrepancies above. The full
+PostgreSQL/Python parity test passed using temporary functions, including full,
+flat and mixed contracts, explicit null/false/zero and the single-group byte
+budget; its transaction was rolled back without changing permanent functions.
+Final deployment and model acceptance must still be checked after the repair.
+
+Both v6 model branches were rebuilt on November 11. Local ML activated
+`20261111T062814771915Z-d60502ab` as a paper canary; the independent quant API
+loaded `20261111T061626933821Z-50e17452` in shadow. Live permission remained
+false. The local-ML supervision report explicitly contains 6 observed-exit
+samples and 4,927 legacy projections; rebuilding does not turn the historical
+projections into observed fills.
+
+At 14:31 Beijing, the canonical Go/No-Go audit still failed profitability:
+short-side OOS mean was `+0.244700%`, profit factor `1.775850`, and return lower
+bound `-0.043182%`; the long side remained negative. Eight fresh decisions had
+complete analysis and the new contract, but none qualified for entry. This is
+not an accepted profitable strategy or completed paper execution workflow.
 
 ## November 11 Remediation
 

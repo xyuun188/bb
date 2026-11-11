@@ -18,11 +18,24 @@ Invalid observed evidence fails explicitly. Old entry-only projections remain
 identified as projections.
 
 The training snapshot previously dropped the saved settlement observation
-when optional diagnostics exhausted its byte budget. Snapshot v7 reserves the
+when optional diagnostics exhausted its byte budget. Snapshot v8 reserves the
 observation in both Python and PostgreSQL and includes it in the existing
 bounded repair. Historical prediction inputs exclude outcome metadata; the
 entry gate reads its original cost projection, while its scored result can use
 observed exit costs.
+
+The online parity audit also found that Python's optional-metadata pass could
+overwrite a normalized market contract, while PostgreSQL dropped both specialist
+groups when only one could fit. Required metadata now remains normalized, and
+both implementations use the same per-group budget and order. Temporary
+PostgreSQL verification reproduced and cleared the real failing sample without
+changing permanent database functions or stored historical rows.
+
+Mixed nested/flat market contracts also retain their immutable label
+fingerprints and availability clocks without overriding explicit nested
+rejection values. Flat PostgreSQL projections preserve the same field presence
+as Python. The full temporary-function parity test covers these forms and
+explicit null/false/zero, and rolls its transaction back afterward.
 
 These changes do not establish profitable strategy selection, passive fills,
 unfilled-order economics or complete portfolio execution. The independent

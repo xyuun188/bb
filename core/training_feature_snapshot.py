@@ -15,7 +15,7 @@ from typing import Any
 from core.feature_availability import FROZEN_FEATURE_FIELDS, availability_fingerprint
 from core.market_facts import compact_market_fact, compact_market_fact_contract
 
-TRAINING_FEATURE_SNAPSHOT_VERSION = 7
+TRAINING_FEATURE_SNAPSHOT_VERSION = 8
 FROZEN_TRAINING_FEATURE_MAX_BYTES = 96 * 1024
 TRAINING_FEATURE_SNAPSHOT_MAX_BYTES = 128 * 1024
 TRAINING_FEATURE_OBJECT_MAX_BYTES = 16 * 1024
@@ -52,8 +52,8 @@ TRAINING_FEATURE_REQUIRED_CONTRACT_KEYS = (
     "shadow_settlement_cost_observation",
 )
 SPECIALIST_SHADOW_FEATURE_KEYS = (
-    "local_ai_tools_shadow",
     "local_ml_shadow",
+    "local_ai_tools_shadow",
 )
 SPECIALIST_SHADOW_TOOL_KEYS = (
     "profit_prediction",
@@ -123,6 +123,38 @@ _TRAINING_MARKET_FACT_CONTRACT_KEYS = (
     "path_status",
     "path_fingerprint",
 )
+_MARKET_FACT_NESTED_CONTRACT_FIELDS = {
+    "assertions": {
+        key: key for key in (
+            "native_instrument_identity_verified",
+            "same_contract_price_path_verified",
+            "executable_market_fact_verified",
+        )
+    },
+    "provenance": {
+        key: key for key in (
+            "source", "sample_count", "effective_sample_size", "generated_at",
+            "strategy_version", "fallback_reason", "data_fingerprint",
+            "scheduled_label_at", "label_maturity_lag_seconds",
+            "availability_basis", "delivery_latency_observed",
+        )
+    },
+    "entry_fact": {"entry_fact_id": "fact_id"},
+    "result_fact": {
+        "result_fact_id": "fact_id",
+        "result_source_timestamp_ms": "source_timestamp_ms",
+        "result_received_at": "received_at",
+    },
+    "entry_fact.native_identity": {
+        "entry_inst_id": "inst_id",
+        "entry_contract_spec_version": "contract_spec_version",
+    },
+    "result_fact.native_identity": {
+        "result_inst_id": "inst_id",
+        "result_contract_spec_version": "contract_spec_version",
+    },
+    "price_path": {"path_fingerprint": "path_fingerprint"},
+}
 _INVALID_SIZE = TRAINING_FEATURE_SNAPSHOT_MAX_BYTES + 1
 
 
@@ -239,9 +271,41 @@ def _compact_training_market_fact_contract(value: object) -> dict[str, Any]:
         for key in ("assertions", "entry_fact", "result_fact", "price_path", "provenance")
     ):
         compact = compact_market_fact_contract(value)
-        compact["observation_window"] = _parse_compact_observation_window(
-            compact["observation_window"]
+        # Older snapshots may combine nested facts with flat label provenance.
+        # Missing nested keys can use the flat value; explicit null/false cannot.
+        for section, fields in _MARKET_FACT_NESTED_CONTRACT_FIELDS.items():
+            nested = value
+            for part in section.split("."):
+                nested = nested.get(part)
+                if not isinstance(nested, dict):
+                    nested = {}
+                    break
+            for flat_key, nested_key in fields.items():
+                if nested_key not in nested and flat_key in value:
+                    compact[flat_key] = deepcopy(value[flat_key])
+        provenance = value.get("provenance")
+        provenance = provenance if isinstance(provenance, dict) else value
+        window = (
+            provenance["observation_window"]
+            if "observation_window" in provenance
+            else value.get("observation_window")
         )
+        compact["observation_window"] = _parse_compact_observation_window(
+            window
+        )
+        result = value.get("result_fact")
+        result = result if isinstance(result, dict) else {}
+        for source, source_key in (
+            (provenance, "result_source_available_at"),
+            (result, "source_available_at"),
+            (value, "result_source_available_at"),
+        ):
+            if source_key in source:
+                compact["result_source_available_at"] = deepcopy(source[source_key])
+                break
+        if not compact["violation_reason_codes"]:
+            compact["violation_reason_codes"] = str(value.get("violation_reason_codes") or "")
+        compact["fallback_reason"] = str(compact["fallback_reason"] or "")[:512]
         return compact
     compact: dict[str, Any] = {}
     for key in _TRAINING_MARKET_FACT_CONTRACT_KEYS:
@@ -489,7 +553,11 @@ def compact_training_feature_snapshot(value: object) -> dict[str, Any]:
         if training_feature_storage_bytes(candidate) > TRAINING_FEATURE_SNAPSHOT_MAX_BYTES:
             return {"training_feature_compaction_error": "required_contract_snapshot_budget_exceeded"}
         compact = candidate
-    for key, shadow_value in compact_specialist_shadow_features(value).items():
+    specialist_shadow = compact_specialist_shadow_features(value)
+    for key in SPECIALIST_SHADOW_FEATURE_KEYS:
+        if key not in specialist_shadow:
+            continue
+        shadow_value = specialist_shadow[key]
         candidate = {**compact, key: shadow_value}
         if training_feature_storage_bytes(candidate) <= TRAINING_FEATURE_SNAPSHOT_MAX_BYTES:
             compact = candidate
@@ -533,6 +601,8 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
         "'" + key.replace("'", "''") + "'" for key in FROZEN_FEATURE_FIELDS
     )
     raw_keys = ",".join("'" + key.replace("'", "''") + "'" for key in TRAINING_FEATURE_RAW_TEXT_KEYS)
+    specialist_keys = ",".join(f"'{key}'" for key in SPECIALIST_SHADOW_FEATURE_KEYS)
+    market_contract_keys = ",".join(f"'{key}'" for key in _TRAINING_MARKET_FACT_CONTRACT_KEYS)
     empty_json = "{}"
     storage_sql = f"""
         CREATE OR REPLACE FUNCTION bb_training_feature_storage_bytes(
@@ -819,10 +889,42 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                                THEN source->'price_path' ELSE source END;
             reason_codes TEXT;
             observation_window JSONB;
+            compact JSONB;
         BEGIN
+            IF NOT source ?| ARRAY[
+                'assertions', 'entry_fact', 'result_fact', 'price_path', 'provenance'
+            ] THEN
+                SELECT COALESCE(jsonb_object_agg(item.key, item.value), '{}'::JSONB)
+                INTO compact
+                FROM jsonb_each(source) AS item(key, value)
+                WHERE item.key = ANY(ARRAY[__MARKET_CONTRACT_KEYS__]::TEXT[]);
+                IF source ? 'observation_window' THEN
+                    observation_window := source->'observation_window';
+                    IF jsonb_typeof(observation_window) = 'string' THEN
+                        BEGIN
+                            observation_window := (source->>'observation_window')::JSONB;
+                        EXCEPTION WHEN invalid_text_representation THEN
+                            observation_window := source->'observation_window';
+                        END;
+                    END IF;
+                    compact := jsonb_set(compact, '{observation_window}', observation_window);
+                END IF;
+                IF source ? 'fallback_reason' THEN
+                    compact := jsonb_set(compact, '{fallback_reason}', to_jsonb(
+                        left(COALESCE(source->>'fallback_reason', ''), 512)
+                    ));
+                END IF;
+                IF source ? 'violation_reason_codes' THEN
+                    compact := jsonb_set(compact, '{violation_reason_codes}', to_jsonb(
+                        COALESCE(source->>'violation_reason_codes', '')
+                    ));
+                END IF;
+                RETURN compact;
+            END IF;
             IF source ? 'provenance' THEN
                 observation_window := COALESCE(
                     provenance->'observation_window',
+                    source->'observation_window',
                     'null'::JSONB
                 );
             ELSIF source ? 'observation_window' THEN
@@ -835,6 +937,13 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                 ELSE
                     observation_window := source->'observation_window';
                 END IF;
+            END IF;
+            IF jsonb_typeof(observation_window) = 'string' THEN
+                BEGIN
+                    observation_window := (observation_window #>> '{}')::JSONB;
+                EXCEPTION WHEN invalid_text_representation THEN
+                    NULL;
+                END;
             END IF;
             SELECT COALESCE(string_agg(left(item.value, 160), ';' ORDER BY item.ordinality), '')
                 INTO reason_codes
@@ -909,7 +1018,7 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
             );
         END;
         $compact_training_market_fact_contract$;
-    """
+    """.replace("__MARKET_CONTRACT_KEYS__", market_contract_keys)
 
     compact_sql = f"""
         CREATE OR REPLACE FUNCTION bb_compact_training_feature_snapshot(input_value JSONB)
@@ -1022,11 +1131,19 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                 END IF;
                 compact := candidate;
             END IF;
-            candidate := compact || bb_compact_specialist_shadow(raw);
-            IF bb_training_feature_storage_bytes(candidate)
-                <= {TRAINING_FEATURE_SNAPSHOT_MAX_BYTES} THEN
-                compact := candidate;
-            END IF;
+            FOR optional_item IN
+                SELECT entry.key, entry.value
+                FROM jsonb_each(bb_compact_specialist_shadow(raw)) AS entry(key, value)
+                ORDER BY array_position(ARRAY[{specialist_keys}]::TEXT[], entry.key)
+            LOOP
+                candidate := compact || jsonb_build_object(
+                    optional_item.key, optional_item.value
+                );
+                IF bb_training_feature_storage_bytes(candidate)
+                    <= {TRAINING_FEATURE_SNAPSHOT_MAX_BYTES} THEN
+                    compact := candidate;
+                END IF;
+            END LOOP;
             FOR optional_item IN
                 SELECT entry.key, entry.value
                 FROM jsonb_each(raw) AS entry(key, value)
