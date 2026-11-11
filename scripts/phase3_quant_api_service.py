@@ -972,7 +972,14 @@ def _fit_walk_forward_side(
     tail_boundary = empirical_lower_hinge(negatives) if negatives else 0.0
     tail_scale = abs(float(tail_boundary))
     x_train = [row["x"] for row in train_rows]
-    x_validation = [row["x"] for row in validation_rows]
+    cost_complete_rows = [
+        row for row in validation_rows
+        if all(
+            row.get(key) is not None and math.isfinite(float(row[key]))
+            for key in (f"{side}_total_cost_pct", f"{side}_net_return")
+        )
+    ]
+    x_validation = [row["x"] for row in cost_complete_rows]
     weights = [float(row["sample_weight"]) for row in train_rows]
     market_model = _make_regressor(len(train_rows))
     tail_labels = [int(row[return_key] < tail_boundary) for row in train_rows]
@@ -986,20 +993,23 @@ def _fit_walk_forward_side(
     scores = (
         np.asarray(market_model.predict(x_validation), dtype=float)
         - _predict_positive_probabilities(tail_model, x_validation) * tail_scale
-    )
+        - np.asarray(
+            [row[f"{side}_total_cost_pct"] for row in cost_complete_rows], dtype=float
+        )
+    ) if cost_complete_rows else np.asarray([], dtype=float)
     evaluated_rows = [
-            {
-                "symbol": str(row.get("symbol") or ""),
-                "market_regime": str(row.get("market_regime") or "unknown"),
-                "horizon_minutes": int(row.get("horizon") or 0),
-                "decision_group": str(row.get("decision_group") or ""),
+        {
+            "symbol": str(row.get("symbol") or ""),
+            "market_regime": str(row.get("market_regime") or "unknown"),
+            "horizon_minutes": int(row.get("horizon") or 0),
+            "decision_group": str(row.get("decision_group") or ""),
             "label_timestamp": str(row.get("label_timestamp") or ""),
-            "return_pct": float(row[return_key]),
+            "return_pct": float(row[f"{side}_net_return"]),
             "gross_market_return_pct": float(row[return_key]),
-            "return_semantics": "gross_fixed_horizon_market_opportunity",
+            "return_semantics": "shadow_net_return_after_all_cost",
             "score": float(scores[index]),
         }
-        for index, row in enumerate(validation_rows)
+        for index, row in enumerate(cost_complete_rows)
     ]
     return evaluated_rows, {
         "source": "walk_forward_training_gross_market_negative_return_lower_hinge",
@@ -1063,7 +1073,7 @@ def _walk_forward_return_report(
         }
     ordered = _chronological_rows(primary_rows)
     groups, group_bounds = _decision_group_availability(ordered)
-    version = "2026-11-08.primary-horizon-isolated-walk-forward.v3"
+    version = "2026-11-11.locked-cost-walk-forward.v4"
     if len(groups) <= 1:
         return {
             "version": version,
@@ -1155,6 +1165,9 @@ def _walk_forward_return_report(
             oos_rows[side].extend(evaluated)
             fold_side_reports[side] = {
                 **_return_evidence(_select_top_return_rows(evaluated)),
+                "return_semantics": "shadow_net_return_after_all_cost",
+                "eligible_sample_count": len(evaluated),
+                "cost_incomplete_sample_count": len(validation_rows) - len(evaluated),
                 "training_tail_loss_policy": tail_policy,
             }
         folds.append(
@@ -1178,6 +1191,11 @@ def _walk_forward_return_report(
     side_reports = {
         side: {
             **_return_evidence(_select_top_return_rows(oos_rows[side])),
+            "return_semantics": "shadow_net_return_after_all_cost",
+            "eligible_sample_count": len(oos_rows[side]),
+            "cost_incomplete_sample_count": sum(
+                fold["sides"][side]["cost_incomplete_sample_count"] for fold in folds
+            ),
             "leave_one_symbol_out": _leave_one_symbol_out_stability(oos_rows[side]),
             "market_regime_stability": _market_regime_stability(oos_rows[side]),
         }
@@ -1199,6 +1217,9 @@ def _walk_forward_return_report(
         ),
         "model_refit_per_fold": True,
         "chronological": True,
+        "return_semantics": "shadow_net_return_after_all_cost",
+        "score_cost_source": "locked_decision_time_counterfactual_execution_cost",
+        "independent_profitability_exam": False,
         "sides": side_reports,
         "primary_horizon_minutes": primary_horizon_minutes,
         "evaluation_horizon_minutes": primary_horizon_minutes,
@@ -1207,6 +1228,7 @@ def _walk_forward_return_report(
         "stable": len(folds) >= 2
         and all(
             report["promotion_math_ready"]
+            and report["cost_incomplete_sample_count"] == 0
             and report["leave_one_symbol_out"]["stable"]
             and report["market_regime_stability"]["stable"]
             and all(
@@ -1354,6 +1376,12 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
         or len(folds) < 2
     ):
         blockers.append("walk_forward_evidence_incomplete")
+    if (
+        walk_forward.get("return_semantics") != "shadow_net_return_after_all_cost"
+        or walk_forward.get("score_cost_source")
+        != "locked_decision_time_counterfactual_execution_cost"
+    ):
+        blockers.append("walk_forward_fee_after_return_contract_missing")
     cost_holdout = metadata.get("execution_cost_holdout_report") or {}
     if (
         cost_holdout.get("source_authority") != "okx_fills_fees_funding"
@@ -1366,6 +1394,21 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
     oos_report = metadata.get("oos_return_evaluation") or {}
     walk_sides = walk_forward.get("sides") or {}
     for side in ("long", "short"):
+        side_report = walk_sides.get(side) or {}
+        if (
+            side_report.get("return_semantics") != "shadow_net_return_after_all_cost"
+            or side_report.get("cost_incomplete_sample_count") != 0
+            or any(
+                ((fold.get("sides") or {}).get(side) or {}).get(
+                    "return_semantics"
+                ) != "shadow_net_return_after_all_cost"
+                or ((fold.get("sides") or {}).get(side) or {}).get(
+                    "cost_incomplete_sample_count"
+                ) != 0
+                for fold in folds
+            )
+        ):
+            blockers.append(f"{side}_walk_forward_locked_cost_evidence_incomplete")
         if (walk_sides.get(side) or {}).get("promotion_math_ready") is not True:
             blockers.append(f"{side}_walk_forward_return_evidence_not_ready")
         if (
@@ -1383,6 +1426,8 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
         if (loso_report.get(side) or {}).get("stable") is not True:
             blockers.append(f"{side}_leave_one_symbol_out_not_stable")
         evidence = oos_report.get(side) or {}
+        if evidence.get("return_semantics") != "shadow_net_return_after_all_cost":
+            blockers.append(f"{side}_oos_fee_after_return_contract_missing")
         if evidence.get("profit_factor") is None:
             blockers.append(f"{side}_oos_profit_factor_undefined")
         if evidence.get("promotion_math_ready") is not True:
@@ -2203,15 +2248,32 @@ def _paired_artifact_return_evaluation(
                     raise ValueError("paired_artifact_scores_invalid")
                 scored_rows = [
                     {
+                        "id": row.get("id"),
+                        "symbol": row.get("symbol"),
                         "decision_group": row["decision_group"],
+                        "decision_timestamp": row.get("decision_timestamp"),
                         "label_timestamp": row["label_timestamp"],
                         "return_pct": float(row[f"{side}_net_return"]),
                         "return_semantics": "shadow_net_return_after_all_cost",
                         "score": float(scores[index]),
+                        "predicted_gross_return_pct": float(market[index]),
+                        "predicted_cost_pct": float(cost[index]),
+                        "locked_cost_pct": row.get(f"{side}_total_cost_pct"),
+                        "tail_loss_probability": float(tail[index]),
                     }
                     for index, row in enumerate(rows)
                 ]
-                sides[side] = _return_evidence(_select_top_return_rows(scored_rows))
+                selected = _select_top_return_rows(scored_rows)
+                sides[side] = {
+                    **_return_evidence(selected),
+                    "selected_symbol_counts": {
+                        symbol: sum(row["symbol"] == symbol for row in selected)
+                        for symbol in sorted({str(row["symbol"] or "") for row in selected})
+                    },
+                    "worst_selected_rows": sorted(
+                        selected, key=lambda row: row["return_pct"]
+                    )[:8],
+                }
             report[role] = sides
         return {**report, "ready": True, "reason": "complete"}
     except Exception as exc:

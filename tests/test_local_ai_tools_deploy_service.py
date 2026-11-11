@@ -108,6 +108,8 @@ def _test_artifact_metadata(
         "cvar_10_pct": -0.1,
         "max_drawdown_pct": 0.1,
         "promotion_math_ready": True,
+        "return_semantics": "shadow_net_return_after_all_cost",
+        "cost_incomplete_sample_count": 0,
     }
     ready_loso = {
         "version": "2026-07-15.leave-one-symbol-out.v1",
@@ -121,6 +123,8 @@ def _test_artifact_metadata(
         "decision_group_disjoint": True,
         "chronological_label_disjoint": True,
         "model_refit_per_fold": True,
+        "return_semantics": "shadow_net_return_after_all_cost",
+        "score_cost_source": "locked_decision_time_counterfactual_execution_cost",
         "folds": [
             {
                 "decision_group_overlap_count": 0,
@@ -1958,6 +1962,12 @@ def test_local_ai_paired_comparison_uses_locked_costs_and_both_fit_boundaries(
     assert report["candidate"]["long"]["avg_return_pct"] == pytest.approx(
         sum(expected) / len(expected)
     )
+    diagnostics = report["candidate"]["long"]["worst_selected_rows"]
+    assert len(diagnostics) == 5
+    assert diagnostics[0]["return_pct"] <= diagnostics[-1]["return_pct"]
+    assert diagnostics[0]["locked_cost_pct"] == pytest.approx(0.08)
+    assert diagnostics[0]["tail_loss_probability"] == 0.0
+    assert report["candidate"]["long"]["selected_symbol_counts"] == {"BTC/USDT": 5}
     candidate["metadata"]["comparison_fit_label_end"] = rows[78]["label_timestamp"]
     unavailable = module._paired_artifact_return_evaluation(
         candidate, {"model_path": model_path}, rows[40:],
@@ -3715,6 +3725,84 @@ def test_local_ai_walk_forward_refits_disjoint_chronological_decision_groups(
     )
 
 
+def test_local_ai_walk_forward_scores_and_evaluates_locked_fee_after_returns(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    samples = _training_shadow_samples(count=20)
+    for sample in samples:
+        tasks = sample["profit_supervision"]["tasks"]
+        tasks[module.MARKET_OPPORTUNITY_TASK]["long_gross_market_return_pct"] = 0.2
+        tasks[module.MARKET_OPPORTUNITY_TASK]["short_gross_market_return_pct"] = -0.2
+        tasks[module.EXECUTION_COST_TASK] = {
+            "eligible": True,
+            "source_authority": "shadow_counterfactual_live_microstructure",
+            "horizon_minutes": sample["horizon_minutes"],
+            "long_total_cost_pct": 0.4,
+            "short_total_cost_pct": 0.4,
+        }
+    rows = module._market_training_rows(samples)
+    evaluated, _ = module._fit_walk_forward_side(rows[:10], rows[10:], side="long")
+    assert all(row["gross_market_return_pct"] == pytest.approx(0.2) for row in evaluated)
+    assert all(row["return_pct"] == pytest.approx(-0.2) for row in evaluated)
+    assert all(row["score"] < row["gross_market_return_pct"] for row in evaluated)
+    assert all(row["score"] < 0.0 for row in evaluated)
+
+    report = module._walk_forward_return_report(rows)
+    assert report["return_semantics"] == "shadow_net_return_after_all_cost"
+    assert report["independent_profitability_exam"] is False
+    assert report["stable"] is False
+    for side in ("long", "short"):
+        assert report["sides"][side]["cost_incomplete_sample_count"] == 0
+        assert report["sides"][side]["avg_return_pct"] < 0.0
+        assert report["sides"][side]["promotion_math_ready"] is False
+
+
+def test_local_ai_walk_forward_never_substitutes_gross_returns_for_missing_costs(
+    tmp_path: Path,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    rows = module._market_training_rows(_training_shadow_samples(count=20))
+    for row in rows:
+        for side in ("long", "short"):
+            row[f"{side}_total_cost_pct"] = None
+            row[f"{side}_net_return"] = None
+
+    evaluated, _ = module._fit_walk_forward_side(rows[:10], rows[10:], side="short")
+    assert evaluated == []
+    report = module._walk_forward_return_report(rows)
+    assert report["stable"] is False
+    assert report["sides"]["short"]["eligible_sample_count"] == 0
+    assert report["sides"]["short"]["cost_incomplete_sample_count"] > 0
+    assert report["sides"]["short"]["avg_return_pct"] is None
+    assert report["sides"]["short"]["promotion_math_ready"] is False
+
+
+@pytest.mark.parametrize("missing_cost", [False, True])
+def test_local_ai_promotion_requires_fee_after_walk_forward_contract(
+    tmp_path: Path,
+    missing_cost: bool,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    metadata = _test_artifact_metadata(module)
+    assert module._production_return_evidence_blockers(metadata) == []
+    if missing_cost:
+        metadata["walk_forward_report"]["folds"][0]["sides"]["short"][
+            "cost_incomplete_sample_count"
+        ] = 1
+        expected = "short_walk_forward_locked_cost_evidence_incomplete"
+    else:
+        metadata["walk_forward_report"]["return_semantics"] = (
+            "gross_fixed_horizon_market_opportunity"
+        )
+        expected = "walk_forward_fee_after_return_contract_missing"
+    metadata["evaluation_report_hashes"] = module._evaluation_report_hashes(metadata)
+    metadata["artifact_return_evidence_sha256"] = module.canonical_sha256(
+        metadata["evaluation_report_hashes"]
+    )
+    assert expected in module._production_return_evidence_blockers(metadata)
+
+
 def test_local_ai_walk_forward_scopes_each_fold_to_primary_horizon(
     tmp_path: Path,
 ) -> None:
@@ -3742,7 +3830,8 @@ def test_local_ai_walk_forward_scopes_each_fold_to_primary_horizon(
     assert report["folds"]
     for fold in report["folds"]:
         assert fold["horizon_minutes"] == primary
-        assert fold["sides"]["long"]["count"] > 0
+        assert fold["sides"]["long"]["count"] == 0
+        assert fold["sides"]["long"]["cost_incomplete_sample_count"] > 0
 
 
 def test_local_ai_walk_forward_purges_unavailable_multi_horizon_groups(
