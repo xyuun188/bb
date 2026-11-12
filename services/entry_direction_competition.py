@@ -226,6 +226,7 @@ def _attach_funding_projection(
 
 def _paper_quant_quality_permissions(
     strategy_mode: dict[str, Any] | None,
+    ml_signal_context: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     strategy = _safe_dict(strategy_mode)
     if str(strategy.get("execution_mode") or "").lower() != "paper":
@@ -234,12 +235,25 @@ def _paper_quant_quality_permissions(
     if report.get("applied") is not True:
         return {}
     rows = _safe_dict(report.get("quant_source_weights"))
-    return {
+    permissions = {
         name: _safe_dict(row)
         for name, row in rows.items()
         if name in {"local_ml", "server_profit", "timeseries", "sentiment"}
         and "paper_execution_permission" in _safe_dict(row)
     }
+    local = permissions.get("local_ml", {})
+    if "model_quality_permissions" in local:
+        version = str(_safe_dict(ml_signal_context).get("model_version") or "")
+        scoped = _safe_dict(_safe_dict(local.get("model_quality_permissions")).get(version))
+        permissions["local_ml"] = scoped or {
+            "paper_execution_permission": False,
+            "paper_execution_reason": "current_model_fee_after_evidence_missing",
+            "paper_execution_blockers": ["current_model_fee_after_evidence_missing"],
+            "paper_execution_model_version": version or None,
+            "paper_execution_evidence": {"sample_count": 0},
+            "evidence_scope": "exact_decision_time_model_version",
+        }
+    return permissions
 
 
 def _training_side_summary(
@@ -461,7 +475,9 @@ class EntryDirectionCompetitionPolicy:
                 item["observation_only"] = True
                 item["eligibility_reason"] = authorization.get("reason")
         quant_weights = _paper_quant_weights(strategy_mode)
-        quant_quality_permissions = _paper_quant_quality_permissions(strategy_mode)
+        quant_quality_permissions = _paper_quant_quality_permissions(
+            strategy_mode, ml_signal_context,
+        )
         if quant_weights:
             for side in ("long", "short"):
                 for item in evidence[side]:

@@ -2363,13 +2363,16 @@ async def test_shadow_backtest_maintenance_reuses_running_background_task() -> N
 async def test_shadow_sample_recovery_uses_bounded_small_batch() -> None:
     service = TradingService.__new__(TradingService)
     recovery_calls: list[dict[str, Any]] = []
+    order: list[str] = []
 
     class ShadowBacktestService:
         async def recover_missing_market_samples(self, **kwargs: Any) -> dict[str, int]:
+            order.append("recover")
             recovery_calls.append(kwargs)
             return {"scanned": 0, "recovered": 0, "failed": 0}
 
         async def update_due(self, limit: int = 200) -> int:
+            order.append("settle")
             return 0
 
     service.shadow_backtest_service = ShadowBacktestService()
@@ -2385,6 +2388,41 @@ async def test_shadow_sample_recovery_uses_bounded_small_batch() -> None:
         "limit": 4,
     }]
     assert service._market_shadow_sample_recovery_last_result["scan_limit"] == 4
+    assert order == ["settle", "recover"]
+
+
+@pytest.mark.asyncio
+async def test_shadow_scheduler_collects_without_waiting_for_market_round(monkeypatch) -> None:
+    service = TradingService.__new__(TradingService)
+    service._running = True
+    service._shadow_backtest_update_task = None
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    class ShadowBacktestService:
+        async def update_due(self, limit=200):
+            calls.append(limit)
+            started.set()
+            await release.wait()
+            return 1
+
+    service.shadow_backtest_service = ShadowBacktestService()
+    monkeypatch.setattr(trading_service, "SHADOW_BACKTEST_MARKET_UPDATE_INTERVAL_SECONDS", 0.001)
+    scheduler = asyncio.create_task(service._shadow_backtest_maintenance_loop())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await service._update_shadow_backtests_for_round(analysis_scope="market", results={})
+        assert calls == [trading_service.SHADOW_BACKTEST_MARKET_BACKGROUND_UPDATE_LIMIT]
+        assert service._shadow_backtest_maintenance_status()["scheduler"] == (
+            "independent_periodic_single_flight"
+        )
+    finally:
+        service._running = False
+        await asyncio.wait_for(scheduler, timeout=1)
+        release.set()
+        if service._shadow_backtest_update_task is not None:
+            await asyncio.wait_for(service._shadow_backtest_update_task, timeout=1)
 
 
 @pytest.mark.asyncio

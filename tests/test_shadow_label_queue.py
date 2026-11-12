@@ -87,6 +87,35 @@ async def test_due_label_queue_interleaves_oldest_and_fresh_evidence(limit, expe
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("limit", "expected"), [(1, [3]), (2, [3, 4]), (4, [3, 4, 1, 2])])
+async def test_expiring_native_labels_take_priority_over_historical_backlog(limit, expected):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    now = datetime.now(UTC)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(ShadowBacktest.__table__.create)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as session:
+            session.add_all([
+                ShadowBacktest(
+                    id=index, model_name="test", execution_mode="paper",
+                    symbol="BTC/USDT", status="pending",
+                    due_at=now - timedelta(seconds=age),
+                )
+                for index, age in [(1, 7200), (2, 120), (3, 40), (4, 10), (5, -60)]
+            ])
+            await session.commit()
+            repo = MemoryRepository(session)
+            assert [row.id for row in await repo.get_due_shadow_backtests(limit)] == expected
+            excluded = await repo.get_due_shadow_backtests(limit, exclude_ids=[3])
+            assert excluded[0].id == 4
+            assert 3 not in {row.id for row in excluded}
+            assert len({row.id for row in excluded}) == len(excluded) <= limit
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_shadow_label_batch_is_idempotent_for_all_horizons():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     now = datetime.now(UTC)

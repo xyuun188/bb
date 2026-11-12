@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import Float, cast, func, or_, select, update
@@ -9,6 +9,7 @@ from sqlalchemy.orm import load_only
 
 from core.symbols import normalize_trading_symbol
 from core.training_contracts import (
+    SHADOW_LABEL_MAX_SOURCE_LAG_SECONDS,
     SHADOW_LABEL_VERSION,
     is_authoritative_expert_memory_extra,
 )
@@ -384,7 +385,7 @@ class MemoryRepository(BaseRepository):
         *,
         exclude_ids: list[int] | None = None,
     ) -> list[ShadowBacktest]:
-        """Interleave old and recent labels so slow old rows cannot starve fresh work."""
+        """Capture expiring native labels before working the historical backlog."""
 
         now = datetime.now(UTC)
         budget = max(int(limit or 200), 1)
@@ -394,21 +395,36 @@ class MemoryRepository(BaseRepository):
         ]
         if exclude_ids:
             filters.append(ShadowBacktest.id.not_in(exclude_ids))
+        fresh_since = now - timedelta(seconds=SHADOW_LABEL_MAX_SOURCE_LAG_SECONDS)
+        fresh = (
+            select(ShadowBacktest.id)
+            .where(*filters, ShadowBacktest.due_at >= fresh_since)
+            .order_by(ShadowBacktest.due_at.asc(), ShadowBacktest.id.asc())
+            .limit(budget)
+            .cte("fresh_due_shadow")
+        )
+        remaining = budget - select(func.count()).select_from(fresh).scalar_subquery()
         oldest = (
             select(ShadowBacktest.id)
-            .where(*filters)
+            .where(*filters, ShadowBacktest.id.not_in(select(fresh.c.id)))
             .order_by(ShadowBacktest.due_at.asc(), ShadowBacktest.id.asc())
-            .limit((budget + 1) // 2)
+            .limit((remaining + 1) // 2)
             .cte("oldest_due_shadow")
         )
         newest = (
             select(ShadowBacktest.id)
-            .where(*filters, ShadowBacktest.id.not_in(select(oldest.c.id)))
+            .where(
+                *filters,
+                ShadowBacktest.id.not_in(select(fresh.c.id)),
+                ShadowBacktest.id.not_in(select(oldest.c.id)),
+            )
             .order_by(ShadowBacktest.due_at.desc(), ShadowBacktest.id.desc())
-            .limit(budget // 2)
+            .limit(remaining // 2)
             .cte("newest_due_shadow")
         )
-        selected = select(oldest.c.id).union_all(select(newest.c.id)).cte("due_shadow_ids")
+        selected = select(fresh.c.id).union_all(
+            select(oldest.c.id), select(newest.c.id)
+        ).cte("due_shadow_ids")
         stmt = (
             select(ShadowBacktest)
             .join(selected, ShadowBacktest.id == selected.c.id)
@@ -434,8 +450,16 @@ class MemoryRepository(BaseRepository):
             .order_by(ShadowBacktest.due_at.asc(), ShadowBacktest.id.asc())
         )
         result = await self.session.execute(stmt)
-        chronological = list(result.scalars().all())
+        chronological = []
         interleaved: list[ShadowBacktest] = []
+        for row in result.scalars().all():
+            due_at = row.due_at
+            if due_at.tzinfo is None:
+                due_at = due_at.replace(tzinfo=UTC)
+            if due_at >= fresh_since:
+                interleaved.append(row)
+            else:
+                chronological.append(row)
         left = 0
         right = len(chronological) - 1
         while left <= right:

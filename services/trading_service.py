@@ -502,7 +502,7 @@ SHADOW_BACKTEST_MARKET_RECOVERY_INTERVAL_SECONDS = 300.0
 SHADOW_BACKTEST_MARKET_RECOVERY_LOOKBACK_MINUTES = 240
 # Each recovery item opens a bounded transaction and creates four horizons.
 # A small batch keeps the 15s outer deadline available for normal settlement.
-SHADOW_BACKTEST_MARKET_UPDATE_INTERVAL_SECONDS = 30.0
+SHADOW_BACKTEST_MARKET_UPDATE_INTERVAL_SECONDS = 5.0
 SHADOW_BACKTEST_RECOVERY_TIMEOUT_SECONDS = 15.0
 SHADOW_BACKTEST_UPDATE_TIMEOUT_SECONDS = 30.0
 TRADING_STARTUP_BACKFILL_TIMEOUT_SECONDS = 20.0
@@ -2842,6 +2842,12 @@ class TradingService(ModelTrainingCoordinatorMixin):
 
     async def _run_shadow_backtest_update(self, *, limit: int) -> int:
         self._shadow_backtest_update_last_started_at = datetime.now(UTC)
+        # Native labels expire after one minute. Recovery must not consume
+        # that collection window before due samples have captured their exit.
+        completed = await asyncio.wait_for(
+            self.shadow_backtest_service.update_due(limit=limit),
+            timeout=SHADOW_BACKTEST_UPDATE_TIMEOUT_SECONDS,
+        )
         recover = getattr(self.shadow_backtest_service, "recover_missing_market_samples", None)
         now = datetime.now(UTC)
         next_allowed = getattr(self, "_market_shadow_sample_recovery_next_allowed_at", None)
@@ -2888,10 +2894,23 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 "scheduled_interval_seconds": SHADOW_BACKTEST_MARKET_RECOVERY_INTERVAL_SECONDS,
                 "scan_limit": SHADOW_BACKTEST_MARKET_RECOVERY_LIMIT,
             }
-        return await asyncio.wait_for(
-            self.shadow_backtest_service.update_due(limit=limit),
-            timeout=SHADOW_BACKTEST_UPDATE_TIMEOUT_SECONDS,
-        )
+        return completed
+
+    async def _shadow_backtest_maintenance_loop(self) -> None:
+        """Collect maturing labels even while a market analysis round is busy."""
+
+        while self._running:
+            try:
+                await self._update_shadow_backtests_for_round(
+                    analysis_scope="market", results={},
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "shadow maintenance scheduler failed", error=safe_error_text(exc),
+                )
+            await asyncio.sleep(SHADOW_BACKTEST_MARKET_UPDATE_INTERVAL_SECONDS)
 
     def _ensure_market_shadow_sample_worker(self) -> None:
         """Create the bounded writer once; never make market analysis await the DB."""
@@ -3021,6 +3040,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
         return {
             "read_only": True,
             "is_entry_gate": False,
+            "scheduler": "independent_periodic_single_flight",
+            "scheduled_interval_seconds": SHADOW_BACKTEST_MARKET_UPDATE_INTERVAL_SECONDS,
             "running": bool(task is not None and not task.done()),
             "running_seconds": running_seconds,
             "last_started_at": started_at.isoformat() if isinstance(started_at, datetime) else None,
@@ -13100,6 +13121,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self._trading_control_command_task = asyncio.create_task(
             self._trading_control_command_loop()
         )
+        self._shadow_backtest_maintenance_task = asyncio.create_task(
+            self._shadow_backtest_maintenance_loop()
+        )
         try:
             await asyncio.gather(
                 self._position_analysis_task,
@@ -13110,6 +13134,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 self._okx_position_settlement_sync_task,
                 self._okx_lifecycle_fragment_repair_task,
                 self._trading_control_command_task,
+                self._shadow_backtest_maintenance_task,
             )
         except asyncio.CancelledError:
             pass
@@ -13148,6 +13173,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             getattr(self, "_okx_position_settlement_sync_task", None),
             getattr(self, "_okx_lifecycle_fragment_repair_task", None),
             getattr(self, "_shadow_backtest_update_task", None),
+            getattr(self, "_shadow_backtest_maintenance_task", None),
             getattr(self, "_market_shadow_sample_worker_task", None),
             getattr(self, "_stale_entry_expire_task", None),
             getattr(self, "_market_indicator_prewarm_task", None),
@@ -13169,6 +13195,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self._okx_position_settlement_sync_task = None
         self._okx_lifecycle_fragment_repair_task = None
         self._shadow_backtest_update_task = None
+        self._shadow_backtest_maintenance_task = None
         self._market_shadow_sample_worker_task = None
         self._stale_entry_expire_task = None
         self._market_indicator_prewarm_task = None

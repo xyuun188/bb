@@ -164,6 +164,54 @@ def test_positive_authoritative_quant_quality_can_authorize_paper_execution() ->
     )
 
 
+def test_local_model_quality_does_not_mix_replaced_model_returns() -> None:
+    report = _build(
+        ContinuousModelWeightPolicy(),
+        specialist={"models": [
+            {
+                "tool": "local_ml", "model": version, "direction_count": 100,
+                "avg_shadow_return_after_all_cost_pct": average,
+                "shadow_return_lcb_pct": lower_bound,
+                "gross_profit_return_pct": profit, "gross_loss_return_pct": loss,
+            }
+            for version, average, lower_bound, profit, loss in [
+                ("replaced", -2.0, -3.0, 10.0, 210.0),
+                ("current", 1.0, 0.5, 110.0, 10.0),
+            ]
+        ]},
+    )
+    local = report["quant_source_weights"]["local_ml"]
+    assert local["paper_execution_permission"] is False
+    versions = local["model_quality_permissions"]
+    assert versions["replaced"]["paper_execution_permission"] is False
+    assert versions["current"]["paper_execution_permission"] is True
+    assert versions["current"]["paper_execution_evidence"]["sample_count"] == 100
+    assert versions["current"]["paper_execution_evidence"]["average_return"] == 1.0
+    assert versions["current"]["paper_execution_model_version"] == "current"
+
+
+def test_local_model_without_cost_complete_samples_cannot_borrow_other_model_profits() -> None:
+    bucket = _bucket([5.0] * 30)
+    bucket.update(trade_fact_count=30, shared_trade_fact_count=0)
+    report = _build(
+        ContinuousModelWeightPolicy(),
+        contribution={"ml_profit_model": bucket},
+        specialist={"models": [
+            {
+                "tool": "local_ml", "model": "replaced", "direction_count": 30,
+                "avg_shadow_return_after_all_cost_pct": 5.0,
+                "shadow_return_lcb_pct": 4.0,
+                "gross_profit_return_pct": 150.0, "gross_loss_return_pct": 0.0,
+            },
+            {"tool": "local_ml", "model": "current", "direction_count": 0},
+        ]},
+    )
+    versions = report["quant_source_weights"]["local_ml"]["model_quality_permissions"]
+    assert versions["replaced"]["paper_execution_permission"] is True
+    assert versions["current"]["paper_execution_permission"] is False
+    assert versions["current"]["paper_execution_evidence"]["sample_count"] == 0
+
+
 def test_legacy_aggregate_without_trade_fact_provenance_cannot_authorize_execution() -> None:
     report = _build(
         ContinuousModelWeightPolicy(),

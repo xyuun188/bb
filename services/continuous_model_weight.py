@@ -10,7 +10,7 @@ from typing import Any
 from services.model_expert_health import ModelExpertHealthService
 from services.specialist_shadow_evaluation import SpecialistShadowEvaluationService
 
-CONTINUOUS_MODEL_WEIGHT_VERSION = "2026-08-19.paper-quality-permission.v2"
+CONTINUOUS_MODEL_WEIGHT_VERSION = "2026-11-12.model-scoped-paper-quality.v3"
 EXPERT_MODEL_NAMES = (
     "trend_expert",
     "momentum_expert",
@@ -185,11 +185,16 @@ def _specialist_evidence(
     specialist_report: dict[str, Any],
     *,
     tool_name: str,
+    model_version: str | None = None,
 ) -> dict[str, Any]:
     rows = [
         _dict(row)
         for row in _list(specialist_report.get("models"))
         if str(_dict(row).get("tool") or "") == tool_name
+        and (
+            model_version is None
+            or str(_dict(row).get("model") or "") == model_version
+        )
     ]
     if not rows:
         return _return_evidence(
@@ -598,6 +603,28 @@ class ContinuousModelWeightPolicy:
                 "shadow_fee_after_return": shadow,
                 "production_permission": False,
             }
+            if source_name == "local_ml":
+                # Actual attribution buckets have no model identity. Only
+                # decision-time forecasts of this exact version can qualify it.
+                versions = sorted({
+                    str(_dict(row).get("model") or "")
+                    for row in _list(specialist.get("models"))
+                    if _dict(row).get("tool") == "local_ml"
+                    and str(_dict(row).get("model") or "")
+                })
+                quant_weights[source_name]["model_quality_permissions"] = {
+                    version: {
+                        **_paper_execution_quality_permission(
+                            actual={},
+                            shadow=_specialist_evidence(
+                                specialist, tool_name="local_ml", model_version=version,
+                            ),
+                        ),
+                        "paper_execution_model_version": version,
+                        "evidence_scope": "exact_decision_time_model_version",
+                    }
+                    for version in versions
+                }
             previous_multiplier = multiplier["previous_multiplier"]
             if previous_multiplier is None or not math.isclose(
                 float(previous_multiplier),
