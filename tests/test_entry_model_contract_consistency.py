@@ -361,13 +361,13 @@ def test_probability_replay_weights_are_independent_of_future_error_emphasis() -
 
     frame = _training_frame(40)
     frame.index = np.arange(100, 140)
-    original, _ = ml._apply_training_replay_weights(frame)
+    original, _ = ml._apply_training_replay_weights(frame, outcome_emphasis=True)
     emphasized = frame.copy()
     emphasized["long_tail_loss"] = 1
     emphasized["decision_confidence"] = 0.9
     emphasized["decision_action"] = "long"
     emphasized["best_action"] = "short"
-    changed, _ = ml._apply_training_replay_weights(emphasized)
+    changed, _ = ml._apply_training_replay_weights(emphasized, outcome_emphasis=True)
     assert changed["sample_weight"].notna().all()
     assert np.any(changed["sample_weight"] > original["sample_weight"])
     np.testing.assert_allclose(

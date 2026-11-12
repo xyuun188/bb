@@ -322,6 +322,34 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
     elif "trade_execution_contract" not in deferred_required and report_available is not False and trade_summary:
         passed.append("dynamic_return_contract_current_window_clean")
 
+    current_realized_net = _safe_float(trade_summary.get("realized_net_pnl_usdt"))
+    authoritative_settlements = bool(
+        trade_summary.get("realized_pnl_source") == "okx_position_history_realized_pnl"
+        and _safe_int(trade_summary.get("closed_position_count")) > 0
+    )
+    if (
+        "trade_execution_contract" not in deferred_required
+        and report_available is not False
+        and authoritative_settlements
+        and current_realized_net is not None
+        and current_realized_net <= 0.0
+    ):
+        blockers.append(
+            _blocker(
+                "current_authoritative_return_not_positive",
+                "Current settled trades have not earned a positive net return after costs.",
+                evidence={
+                    "source": trade_summary["realized_pnl_source"],
+                    "closed_position_count": trade_summary["closed_position_count"],
+                    "realized_net_pnl_usdt": current_realized_net,
+                    "realized_net_pnl_by_side_usdt": trade_summary.get(
+                        "realized_net_pnl_by_side_usdt"
+                    ),
+                    "scope": "current_system_execution_window_not_model_attribution",
+                },
+            )
+        )
+
     capacity = _details(by_key.get("position_capacity_release", {}))
     capacity_policy = _safe_dict(capacity.get("policy"))
     if (
@@ -480,7 +508,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
                     evidence={"source": profitability_source},
                 )
             )
-    if profit_factor is not None and profit_factor < 1.0:
+    if profit_factor is not None and profit_factor <= 1.0:
         blockers.append(
             _blocker(
                 "model_profit_factor_below_unity",
@@ -543,6 +571,8 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         },
         "policy": {
             "optimization_target": PROFIT_TRAINING_TARGET,
+            "current_authoritative_loss_blocks_go": True,
+            "positive_current_pnl_alone_grants_go": False,
             "win_rate_is_diagnostic_only": True,
             "expert_memory_strategy_learning_are_observation_only": True,
             "fixed_strategy_thresholds_forbidden": True,

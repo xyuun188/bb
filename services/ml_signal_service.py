@@ -126,7 +126,7 @@ AUTO_TRAIN_LEASE_STALE_SECONDS = 2 * 60 * 60
 MIN_ACTIVE_WALK_FORWARD_FOLDS = 2
 FEATURE_CONTRACT_VERSION = "2026-11-11.explicit-usd-open-interest.v3"
 MULTITASK_PREDICTION_CONTRACT_VERSION = "2026-11-10.signed-funding-cost.v3"
-REPLAY_WEIGHT_POLICY_VERSION = "2026-11-10.zero-preserving-replay-weights.v3"
+REPLAY_WEIGHT_POLICY_VERSION = "2026-11-12.outcome-independent-return-weights.v4"
 _TRAINING_CANDIDATE_CACHE: dict[
     int,
     tuple[dict[str, Any], dict[str, Any], str],
@@ -1081,7 +1081,7 @@ def _training_distribution_drift(
 
 
 def _apply_training_replay_weights(
-    train: pd.DataFrame, *, outcome_emphasis: bool = True,
+    train: pd.DataFrame, *, outcome_emphasis: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     weighted = train.copy()
     if weighted.empty:
@@ -1144,7 +1144,9 @@ def _apply_training_replay_weights(
         if outcome_emphasis else natural_weights
     )
     weighted["sample_weight"] = final_weights
-    # Outcome-dependent replay emphasis must not change probability priors.
+    # Return means and probabilities both require outcome-independent weights.
+    # Emphasizing past mistakes changes the conditional return being estimated.
+    # Keep the explicit emphasis option for research comparisons only.
     weighted["probability_sample_weight"] = natural_weights
     weighted["replay_recency_weight"] = recency
     weighted["replay_tail_emphasis"] = tail.astype(int)
@@ -1159,11 +1161,15 @@ def _apply_training_replay_weights(
         "outcome_emphasis": outcome_emphasis,
         "zero_weight_sample_count": int(base.eq(0.0).sum()),
         "probability_weighting": "quality_and_recency_without_outcome_emphasis",
+        "return_weighting": (
+            "research_outcome_emphasis" if outcome_emphasis
+            else "quality_and_recency_without_outcome_emphasis"
+        ),
         "recency_half_life_days": half_life_days,
         "minimum_recency_weight": minimum_recency,
-        "tail_multiplier": 1.25,
-        "hard_error_multiplier": 1.25,
-        "cost_consumed_edge_multiplier": 1.15,
+        "tail_multiplier": 1.25 if outcome_emphasis else 1.0,
+        "hard_error_multiplier": 1.25 if outcome_emphasis else 1.0,
+        "cost_consumed_edge_multiplier": 1.15 if outcome_emphasis else 1.0,
         "sample_count": int(len(weighted)),
         "raw_weight_total": round(float(base.sum()), 6),
         "final_weight_total": round(total, 6),

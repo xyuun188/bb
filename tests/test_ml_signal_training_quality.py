@@ -3445,6 +3445,8 @@ def test_train_from_frame_reports_training_window_composition() -> None:
     assert composition["best_action_counts"] == {"short": 40, "long": 20}
     assert composition["data_quality_status_counts"] == {"included": 40, "downweighted": 20}
     replay = metadata["replay_weight_manifest"]
+    assert replay["outcome_emphasis"] is False
+    assert replay["return_weighting"] == replay["probability_weighting"]
     assert replay["raw_weight_total"] == pytest.approx(20 * 0.25 + 40)
     assert composition["effective_weight_ratio"] == pytest.approx(
         replay["final_weight_total"] / 60,
@@ -3466,6 +3468,30 @@ def test_train_from_frame_reports_training_window_composition() -> None:
     assert replay_holdout["sample_count"] == metadata["test_count"]
     assert replay_holdout["decision_group_count"] == metadata["test_decision_group_count"]
     assert replay_holdout["shadow_source_id_ranges"]
+
+
+def test_return_training_weights_do_not_depend_on_previous_action_or_outcome() -> None:
+    frame = _training_frame(80)
+    baseline, _ = ml_signal_module._apply_training_replay_weights(frame)
+    changed = frame.copy()
+    changed["decision_action"] = "hold"
+    changed["best_action"] = "short"
+    changed["decision_confidence"] = 0.99
+    changed["long_tail_loss"] = 1
+    changed["short_tail_loss"] = 1
+    changed["long_return_pct"] = 0.01
+    changed["long_execution_cost_pct"] = 0.5
+
+    natural, manifest = ml_signal_module._apply_training_replay_weights(changed)
+    emphasized, research = ml_signal_module._apply_training_replay_weights(
+        changed, outcome_emphasis=True,
+    )
+
+    np.testing.assert_allclose(natural["sample_weight"], baseline["sample_weight"])
+    np.testing.assert_allclose(natural["sample_weight"], natural["probability_sample_weight"])
+    assert manifest["outcome_emphasis"] is False
+    assert research["outcome_emphasis"] is True
+    assert (emphasized["sample_weight"] > natural["sample_weight"]).all()
 
 
 def test_train_from_frame_counts_only_rows_used_for_fitting() -> None:

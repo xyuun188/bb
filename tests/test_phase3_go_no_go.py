@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+import pytest
+
 from services.phase3_go_no_go import evaluate_phase3_go_no_go_cards
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
@@ -220,6 +222,53 @@ def test_phase3_go_no_go_rejects_executed_contract_violations() -> None:
     report = evaluate_phase3_go_no_go_cards(cards)
 
     assert "dynamic_return_contract_current_violations" in report["blocker_codes"]
+
+
+@pytest.mark.parametrize("net_pnl", [-0.7046, 0.0])
+def test_shadow_profit_cannot_override_current_authoritative_losses(net_pnl: float) -> None:
+    cards = deepcopy(_cards())
+    trade = next(card for card in cards if card["key"] == "trade_execution_contract")
+    trade["details"]["current_summary"].update(
+        realized_pnl_source="okx_position_history_realized_pnl",
+        closed_position_count=12,
+        realized_net_pnl_usdt=net_pnl,
+    )
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert report["ready"] is False
+    assert "current_authoritative_return_not_positive" in report["blocker_codes"]
+
+
+def test_local_pnl_does_not_override_authoritative_profitability_audit() -> None:
+    cards = deepcopy(_cards())
+    trade = next(card for card in cards if card["key"] == "trade_execution_contract")
+    trade["details"]["current_summary"].update(
+        realized_pnl_source="local_position_realized_pnl_test_fallback",
+        closed_position_count=12,
+        realized_net_pnl_usdt=-100.0,
+    )
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert "current_authoritative_return_not_positive" not in report["blocker_codes"]
+
+
+def test_positive_current_pnl_does_not_override_model_profitability_failure() -> None:
+    cards = deepcopy(_cards())
+    trade = next(card for card in cards if card["key"] == "trade_execution_contract")
+    trade["details"]["current_summary"].update(
+        realized_pnl_source="okx_position_history_realized_pnl",
+        closed_position_count=12,
+        realized_net_pnl_usdt=1.0,
+    )
+    training = next(card for card in cards if card["key"] == "model_training")
+    training["details"]["live_ml_ready"] = False
+
+    report = evaluate_phase3_go_no_go_cards(cards)
+
+    assert report["ready"] is False
+    assert "local_ml_not_live_ready" in report["blocker_codes"]
 
 
 def test_phase3_go_no_go_keeps_unavailable_contract_audit_as_one_blocker() -> None:

@@ -21,6 +21,7 @@ import structlog
 
 from ai_brain.base_model import Action, DecisionOutput
 from config.settings import settings
+from core.entry_protection import entry_protection_prices
 from core.exceptions import (
     ExchangeAPIError,
     OrderPlacementError,
@@ -7207,43 +7208,13 @@ class OKXExecutor(AbstractExecutor):
         ticker: dict[str, Any] | None = None,
     ) -> tuple[float, float]:
         """Convert AI stop/take percentages into OKX trigger prices."""
-        refs = [self._safe_float(entry_price, 0.0)]
-        ticker = ticker if isinstance(ticker, dict) else {}
-        for key in (
-            "last",
-            "close",
-            "bid",
-            "ask",
-            "high",
-            "low",
-            "buy_price_limit",
-            "sell_price_limit",
-        ):
-            value = self._safe_float(ticker.get(key), 0.0)
-            if value > 0:
-                refs.append(value)
-        snapshot = decision.feature_snapshot if isinstance(decision.feature_snapshot, dict) else {}
-        for key in ("current_price", "close", "bid", "ask", "last", "last_price"):
-            value = self._safe_float(snapshot.get(key), 0.0)
-            if value > 0:
-                refs.append(value)
-        valid_refs = [value for value in refs if value > 0]
-        low_ref = min(valid_refs) if valid_refs else self._safe_float(entry_price, 0.0)
-        high_ref = max(valid_refs) if valid_refs else self._safe_float(entry_price, 0.0)
-        primary_ref = self._safe_float(entry_price, 0.0)
-        if primary_ref <= 0 and valid_refs:
-            primary_ref = valid_refs[0]
-        stop_pct = self._safe_float(decision.stop_loss_pct, 0.0)
-        take_pct = self._safe_float(decision.take_profit_pct, 0.0)
-        if stop_pct <= 0 or take_pct <= 0:
-            return 0.0, 0.0
-        if decision.action == Action.LONG:
-            stop_loss_px = low_ref * (1 - stop_pct)
-            take_profit_px = high_ref * (1 + take_pct)
-        else:
-            stop_loss_px = high_ref * (1 + stop_pct)
-            take_profit_px = low_ref * (1 - take_pct)
-        return stop_loss_px, take_profit_px
+        return entry_protection_prices(
+            side="long" if decision.action == Action.LONG else "short",
+            reference_price=entry_price,
+            stop_loss_fraction=decision.stop_loss_pct,
+            take_profit_fraction=decision.take_profit_pct,
+            current_quote=ticker if isinstance(ticker, dict) else None,
+        )
 
     def _format_attached_sl_tp_prices(
         self,

@@ -2647,6 +2647,32 @@ def test_okx_attached_protection_uses_market_price_precision() -> None:
     assert result["take_profit_price"] == "0.000009001"
 
 
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_okx_attached_protection_preserves_current_strategy_distances(side: str) -> None:
+    executor = _executor(_PrecisionEntryCcxt())
+    decision = _entry_decision()
+    decision.action = Action.LONG if side == "long" else Action.SHORT
+    decision.stop_loss_pct = 0.02
+    decision.take_profit_pct = 0.04
+    decision.feature_snapshot = {"current_price": 160.0, "bid": 159.0, "ask": 161.0}
+
+    stop, take = executor._attached_sl_tp_prices(
+        decision, 100.0,
+        ticker={
+            "last": 100.0, "bid": 99.9, "ask": 100.1,
+            "high": 180.0, "low": 20.0,
+            "buy_price_limit": 110.0, "sell_price_limit": 90.0,
+        },
+    )
+
+    if side == "long":
+        assert stop == pytest.approx(99.9 * 0.98)
+        assert take == pytest.approx(100.1 * 1.04)
+    else:
+        assert stop == pytest.approx(100.1 * 1.02)
+        assert take == pytest.approx(99.9 * 0.96)
+
+
 def test_okx_attached_protection_rejects_invalid_direction_after_precision() -> None:
     class RoundedToReferenceCcxt(_PrecisionEntryCcxt):
         def price_to_precision(self, _symbol: str, _price: float) -> str:
@@ -3487,8 +3513,8 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
     assert 0.0 < submitted_quantity <= 50.0 / 1.3
     request_params = exchange.create_calls[0][5]
     protection = request_params["attachAlgoOrds"][0]
-    assert float(protection["slTriggerPx"]) < 1.1
-    assert float(protection["tpTriggerPx"]) > 1.3
+    assert float(protection["slTriggerPx"]) == pytest.approx(1.199 * (1.0 - 0.013))
+    assert float(protection["tpTriggerPx"]) == pytest.approx(1.201 * (1.0 + 0.027))
     assert protection["slTriggerPxType"] == "last"
     assert protection["tpTriggerPxType"] == "last"
     refresh = result.raw_response["okx_order_rules"]["pre_submit_price_refresh"]

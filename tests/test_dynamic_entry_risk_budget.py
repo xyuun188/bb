@@ -737,6 +737,10 @@ async def test_training_budget_counts_unclassified_and_known_paper_exposure(life
     assert sizing["remaining_training_portfolio_risk_budget_usdt"] == 0.0
     assert sizing["production_eligible"] is False
     assert sizing["final_notional_usdt"] == 0.0
+    assert "normal_paper_training_portfolio_risk_budget_exhausted" in sizing["reason"]
+    assert "normal_paper_leverage_tier_incomplete" not in sizing["reason"]
+    assert "exchange_system_max_leverage_missing" not in sizing["reason"]
+    assert "target_notional_missing" not in sizing["reason"]
 
 
 @pytest.mark.asyncio
@@ -758,7 +762,7 @@ async def test_native_price_band_blocks_unaffordable_training_minimum_during_siz
     sizing = decision.raw_response["profit_risk_sizing"]
     assert sizing["production_eligible"] is False
     assert sizing["minimum_order_supported"] is False
-    assert sizing["stressed_loss_fraction"] > 0.05
+    assert sizing["stressed_loss_fraction"] > 0.03
     assert sizing["final_notional_usdt"] == 0.0
 
 
@@ -777,6 +781,47 @@ async def test_native_price_band_stress_does_not_compound_on_repeated_sizing() -
     assert sizing["production_eligible"] is True
     assert sizing["stressed_loss_fraction"] == first["stressed_loss_fraction"]
     assert decision.stop_loss_pct == pytest.approx(0.02)
+
+
+@pytest.mark.asyncio
+async def test_price_band_stress_does_not_widen_the_strategy_take_profit() -> None:
+    decision = _decision()
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    baseline_take_profit = decision.take_profit_pct
+    decision.feature_snapshot.update(buy_price_limit=110.0, sell_price_limit=90.0)
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert sizing["stressed_loss_fraction"] > baseline_take_profit
+    assert decision.take_profit_pct == baseline_take_profit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["long", "short"])
+async def test_daily_extremes_do_not_expand_entry_protection_risk(side: str) -> None:
+    decision = _decision()
+    decision.action = Action.LONG if side == "long" else Action.SHORT
+    normal = decision.raw_response["normal_paper_trade"]
+    normal["side"] = side
+    normal["contract_fingerprint"] = _fingerprint(_contract_fingerprint_payload(normal))
+    decision.feature_snapshot.update(
+        last=100.0, bid=99.9, ask=100.1, buy_price_limit=102.0, sell_price_limit=98.0,
+    )
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    baseline = deepcopy(decision.raw_response["profit_risk_sizing"])
+    assert baseline["production_eligible"] is True
+
+    decision.feature_snapshot.update(high=180.0, low=20.0)
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert sizing["stressed_loss_fraction"] == baseline["stressed_loss_fraction"]
+    assert sizing["final_notional_usdt"] == baseline["final_notional_usdt"]
 
 
 @pytest.mark.asyncio

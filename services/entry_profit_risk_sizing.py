@@ -19,6 +19,7 @@ from math import ceil, floor, isclose, isfinite, sqrt
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from core.entry_protection import entry_protection_prices
 from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol
 from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
 from services.dynamic_leverage_allocator import DynamicLeverageAllocator, DynamicLeverageInput
@@ -2055,20 +2056,13 @@ class EntryProfitRiskSizingPolicy:
         # contract. Keep the stop distance separate from price-band stress so
         # repeated sizing passes cannot compound that stress into wider stops.
         if snapshot.get("buy_price_limit") and snapshot.get("sell_price_limit"):
-            references = [
-                _safe_float(snapshot.get(key), 0.0)
-                for key in (
-                    "current_price", "close", "bid", "ask", "last", "last_price",
-                    "high", "low", "buy_price_limit", "sell_price_limit",
-                )
-            ]
-            references = [value for value in references if value > 0.0]
-            if references:
-                low_reference, high_reference = min(references), max(references)
-                native_stop = (
-                    low_reference * (1.0 - protection_stop_fraction)
-                    if side == "long"
-                    else high_reference * (1.0 + protection_stop_fraction)
+            if target_price > 0.0:
+                native_stop, _ = entry_protection_prices(
+                    side=side,
+                    reference_price=target_price,
+                    stop_loss_fraction=protection_stop_fraction,
+                    take_profit_fraction=max(declared_take_profit, 0.01),
+                    current_quote=snapshot,
                 )
                 tick = max(_safe_float(target_contract_spec.get("tickSz"), 0.0), 0.0)
                 if tick > 0.0:
@@ -2076,7 +2070,11 @@ class EntryProfitRiskSizingPolicy:
                         floor(native_stop / tick) if side == "long"
                         else ceil(native_stop / tick)
                     ) * tick
-                worst_entry = high_reference if side == "long" else low_reference
+                worst_entry = (
+                    max(target_price, _safe_float(snapshot.get("buy_price_limit")))
+                    if side == "long"
+                    else min(target_price, _safe_float(snapshot.get("sell_price_limit")))
+                )
                 stress_fraction = max(
                     stress_fraction, abs(native_stop - worst_entry) / worst_entry,
                 )
@@ -2450,10 +2448,15 @@ class EntryProfitRiskSizingPolicy:
         dynamic_take_profit = max(
             declared_take_profit,
             abs(expected_net) / 100.0,
-            stress_fraction,
+            protection_stop_fraction,
         )
         reasons: list[str] = []
         reasons.extend(contract_reasons)
+        training_capacity_exhausted = bool(
+            training_mode and remaining_portfolio_risk_budget <= 0.0
+        )
+        if training_capacity_exhausted:
+            reasons.append("normal_paper_training_portfolio_risk_budget_exhausted")
         if training_mode:
             reasons.extend(
                 f"normal_paper_training_{reason}"
@@ -2498,13 +2501,25 @@ class EntryProfitRiskSizingPolicy:
             reasons.append("normal_paper_mark_price_missing")
         if side_depth <= 0:
             reasons.append("normal_paper_orderbook_depth_missing")
-        if leverage_tier_selection.get("production_eligible") is not True:
+        zero_target_tier = (
+            leverage_tier_selection.get("reason")
+            == "target_notional_missing_for_leverage_tier"
+        )
+        if leverage_tier_selection.get("production_eligible") is not True and not (
+            training_capacity_exhausted and zero_target_tier
+        ):
             reasons.append("normal_paper_leverage_tier_incomplete")
         if (
             leverage_decision.policy_provenance.get("production_eligible") is not True
         ):
-            reasons.extend(leverage_decision.reasons)
-        if not size_aware_solution_eligible:
+            reasons.extend(
+                reason for reason in leverage_decision.reasons
+                if not (
+                    training_capacity_exhausted and zero_target_tier
+                    and reason in {"exchange_system_max_leverage_missing", "target_notional_missing"}
+                )
+            )
+        if not size_aware_solution_eligible and not training_capacity_exhausted:
             size_reason = str(
                 size_aware_solution.get("reason")
                 or "full_risk_size_profitability_not_proven"
