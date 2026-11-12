@@ -12,8 +12,15 @@ from services.dynamic_exit_policy import (
     evaluate_dynamic_exit_execution_contract,
 )
 from services.exit_execution_singleflight import EXIT_INTENT_KEY, PROFIT_LOCK_LEDGER_KEY
+from services.normal_paper_trade import (
+    build_normal_paper_trade_contract,
+    normal_paper_entry_contract_reasons,
+    reconcile_normal_paper_trade_contract,
+    select_normal_paper_trade_side,
+)
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
 from services.paper_training import PAPER_TRAINING_POSITION_LIFECYCLE_VERSION
+from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
 def _decision(raw: dict | None = None) -> DecisionOutput:
@@ -413,6 +420,140 @@ def test_loss_alone_cannot_trigger_system_reduction_before_planned_stop() -> Non
     assert "loss_reduction_evidence_insufficient" in result.reason
 
 
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("concentration", [1e-8, 0.01, 0.5, 1.0])
+def test_concentration_cannot_authorize_loss_reduction_from_its_own_pressure(
+    side: str, concentration: float,
+) -> None:
+    decision = _decision()
+    decision.action = Action.CLOSE_LONG if side == "long" else Action.CLOSE_SHORT
+    sign = -1.0 if side == "long" else 1.0
+    decision.feature_snapshot = {
+        "returns_1": sign * 0.0002,
+        "returns_5": sign * 0.0004,
+        "returns_20": sign * 0.0008,
+    }
+    position = _position(
+        side=side,
+        current_price=100.0 + sign * 0.3,
+        notional_usdt=(100.0 + sign * 0.3) * 10.0,
+        unrealized_pnl=-3.0,
+        peak_unrealized_pnl=0.0,
+        stop_loss=98.0 if side == "long" else 102.0,
+        take_profit=110.0 if side == "long" else 90.0,
+    )
+    position["current_management_contract"]["portfolio_concentration_pressure"] = concentration
+
+    first = apply_dynamic_exit(decision, [position])
+    second = apply_dynamic_exit(decision, [position])
+
+    assert first.current_management_contract_complete is True
+    assert first.stop_risk_usage < 0.5
+    assert first.continuation_deterioration < 0.25
+    if concentration >= 0.01:
+        assert first.portfolio_exposure_pressure > 0.0
+    assert first.model_exit_pressure == 0.0
+    assert first.replacement_pressure == 0.0
+    for result in (first, second):
+        assert result.hard_risk is False
+        assert result.loss_reduction_evidence_complete is False
+        assert result.eligible is False
+        assert result.close_fraction == 0.0
+        assert "loss_reduction_evidence_insufficient" in result.reason
+    assert decision.raw_response["dynamic_exit_execution_contract"]["allowed"] is False
+
+
+@pytest.mark.parametrize("authority", ["market", "model", "hard_stop"])
+def test_concentration_still_amplifies_independently_authorized_loss_exit(
+    authority: str,
+) -> None:
+    decision = _decision()
+    decision.feature_snapshot = {"returns_1": -0.001, "returns_5": -0.002}
+    if authority == "model":
+        decision.raw_response["model_exit_recommendation"] = {
+            "requested_close_fraction": 0.4, "confidence": 0.8,
+        }
+    price = {"market": 98.9, "model": 99.7, "hard_stop": 97.0}[authority]
+    position = _position(
+        current_price=price,
+        notional_usdt=price * 10,
+        unrealized_pnl=(price - 100) * 10,
+        peak_unrealized_pnl=0.0,
+    )
+    baseline = apply_dynamic_exit(decision, [position])
+    position["current_management_contract"]["portfolio_concentration_pressure"] = 0.5
+    concentrated = apply_dynamic_exit(decision, [position])
+
+    assert baseline.eligible is True
+    assert concentrated.eligible is True
+    assert concentrated.loss_reduction_evidence_complete is True
+    assert concentrated.close_fraction >= baseline.close_fraction
+    assert decision.raw_response["dynamic_exit_execution_contract"]["allowed"] is True
+    if authority == "hard_stop":
+        assert concentrated.hard_risk is True
+        assert concentrated.close_fraction == 1.0
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("historical_quality_ready", [True, False])
+def test_paper_entry_hold_profit_and_stop_contracts_remain_compatible(
+    side: str, historical_quality_ready: bool,
+) -> None:
+    permissions = paper_quality_permissions()
+    permissions["local_ml"]["paper_execution_permission"] = historical_quality_ready
+    support = {
+        "eligible": True, "selected_side": side,
+        "prediction_horizon_minutes": 240, "expected_net_return_pct": 0.4,
+        "raw_expected_return_pct": 0.5, "objective_net_return_pct": 0.1,
+        "loss_probability": 0.4, "quant_evidence_families": ["local_ml"],
+        "quant_quality_permissions": permissions, "current_edge_validated": True,
+        "strong_expert_opposition": False,
+    }
+    selection = select_normal_paper_trade_side({side: support})
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT", side=side,
+        selection_reason=selection["selection_reason"],
+        direction_support=selection["selected_support"],
+    )
+    assert selection["selected"] is True
+    assert contract["paper_training_only"] is (not historical_quality_ready)
+    assert normal_paper_entry_contract_reasons(contract) == []
+
+    lost_edge = reconcile_normal_paper_trade_contract(
+        contract, {"expected_net_return_pct": -0.1, "return_lcb_pct": -0.2},
+    )
+    assert lost_edge["authorized"] is False
+    assert normal_paper_entry_contract_reasons(lost_edge)
+
+    sign = -1.0 if side == "long" else 1.0
+    for stage, move in (("noise", 0.3), ("profit", -1.0), ("stop", 3.0)):
+        price = 100 + sign * move
+        position = _position(
+            side=side, current_price=price, notional_usdt=price * 10,
+            unrealized_pnl=-move * 10, peak_unrealized_pnl=0.0,
+            stop_loss=98.0 if side == "long" else 102.0,
+            take_profit=110.0 if side == "long" else 90.0,
+        )
+        position["current_management_contract"]["portfolio_concentration_pressure"] = 0.1
+        decision = _decision()
+        decision.action = Action.CLOSE_LONG if side == "long" else Action.CLOSE_SHORT
+        decision.feature_snapshot = {"returns_1": sign * 0.0002}
+        assessment = apply_dynamic_exit(decision, [position])
+        allowed = decision.raw_response["dynamic_exit_execution_contract"]["allowed"]
+        if stage == "noise":
+            assert assessment.eligible is False
+            assert allowed is False
+        elif stage == "profit":
+            assert assessment.lifecycle_net_pnl_usdt > 0
+            assert assessment.profit_lock_pressure > 0
+            assert allowed is True
+        else:
+            assert assessment.hard_risk is True
+            assert assessment.close_fraction == 1.0
+            assert allowed is True
+    assert normal_paper_entry_contract_reasons(contract) == []
+
+
 def test_fee_only_loss_does_not_consume_planned_stop_budget() -> None:
     position = _position(
         created_at=datetime.now(UTC) - timedelta(minutes=2),
@@ -729,7 +870,7 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     assert result.close_fraction > result.stop_risk_usage
     assert result.close_fraction < 1.0
     assert result.policy_provenance["strategy_version"] == (
-        "2026-09-22.dynamic-exit-observation-window.v19"
+        "2026-11-12.independent-loss-exit-evidence.v20"
     )
 
 

@@ -292,3 +292,39 @@ payments that credit a position (for example, negative funding paid to longs),
 and each observed negative-cost sample carries a real `funding_interval_minutes`
 and `next_funding_time`. The sign is semantically correct and is not clamped;
 the cost model remains `shadow_counterfactual_live_microstructure`.
+
+## November 12 Entry And Exit Compatibility
+
+The chronological partition repair (`808e9c61`) restored training without
+relaxing label-availability isolation. The online automatic training at 14:42
+Beijing activated paper canary `20261112T064153047017Z-f4b4e072`, using 398
+training and 397 holdout groups after purging 1,074 groups. Live permission
+remains closed. Model holdout performance is not realized trading profit.
+
+The first complete post-repair PEPE lifecycle reconciled against OKX history
+with fee-after realized PnL of `+0.065515 USDT`. This proves the entry, exit and
+settlement path works; it does not establish aggregate profitability.
+
+A subsequent exit review found a separate circular authorization defect.
+`portfolio_exposure_pressure` is concentration multiplied by pressure derived
+from the same position's loss and adverse move. Testing it for `> 0` as
+independent loss-reduction evidence bypassed the existing stop-budget and
+continuation requirements, even for an arbitrarily small concentration.
+At 15:25 Beijing, 17 of 19 executed post-training exits matched this path:
+negative current fee-after PnL, no hard stop, insufficient market loss evidence,
+no model exit request and no qualifying replacement opportunity. This is a
+bounded diagnosis of exit authorization, not a counterfactual profit estimate.
+
+The exit policy now uses concentration only to scale an independently
+authorized exit. Existing market-loss, model, replacement, stop and funding
+conditions retain their authority; no entry condition or risk budget changes.
+Policy provenance is `2026-11-12.independent-loss-exit-evidence.v20`.
+Regression coverage includes both directions, tiny and large concentration,
+repeat evaluation, market/model/hard-stop exits, and the combined paper-entry,
+temporary-loss hold, fee-after profit exit and stop lifecycle. Entry tests
+also verify that a current negative edge still rejects a new order.
+
+Remaining profitability acceptance requires complete post-fix lifecycle
+settlements and independent fee-after evidence for the actual execution
+policy. Partial reductions are not finalized lifecycles; positive holdout or
+a profitable isolated trade cannot authorize live trading.

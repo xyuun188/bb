@@ -752,8 +752,9 @@ def assess_dynamic_exit(
     independent_loss_reduction_evidence = bool(
         model_exit_pressure + 1e-9 >= MIN_AUTOMATED_EXIT_FRACTION
         or opposite > 0.0
-        or portfolio_pressure > 0.0
     )
+    # Concentration scales pressure derived from this same position's loss.
+    # It cannot independently authorize that loss as evidence for an exit.
     loss_reduction_evidence_complete = bool(
         not position_loss
         or hard_risk
@@ -903,13 +904,14 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-09-22.dynamic-exit-observation-window.v19",
+        "strategy_version": "2026-11-12.independent-loss-exit-evidence.v20",
         "fallback_reason": ",".join(reasons),
         "early_exit_observation_minutes": EARLY_EXIT_OBSERVATION_MINUTES,
         "minimum_automated_exit_fraction": MIN_AUTOMATED_EXIT_FRACTION,
         "minimum_early_model_exit_pressure": MIN_EARLY_MODEL_EXIT_PRESSURE,
         "minimum_loss_reduction_stop_usage": MIN_LOSS_REDUCTION_STOP_USAGE,
         "minimum_loss_continuation_evidence": MIN_LOSS_CONTINUATION_EVIDENCE,
+        "portfolio_concentration_authorizes_loss_exit": False,
         "standard_exit_reassessment_seconds": STANDARD_EXIT_REASSESSMENT_SECONDS,
         "minimum_target_close_fraction_step": MIN_TARGET_CLOSE_FRACTION_STEP,
         "close_fraction_basis": (
