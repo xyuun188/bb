@@ -986,6 +986,27 @@ def test_specialist_shadow_survives_compaction_without_full_payload() -> None:
     assert _compact_training_feature_snapshot(features) == compacted
 
 
+def test_settlement_contracts_do_not_evict_decision_time_model_evidence() -> None:
+    features = _specialist_shadow_payload()
+    features["close_sequence"] = [100.0] * 350
+    features["volume_sequence"] = [1000.0] * 350
+    for key in (
+        "training_label_contract", "training_market_fact_contract",
+        "shadow_settlement_cost_observation",
+    ):
+        features[key] = {"version": "test", "evidence": "x" * 2500}
+    features["training_market_fact_contract"] = {"version": "test", "source": "x" * 2500}
+    compacted = _compact_training_feature_snapshot(features)
+    assert training_feature_storage_bytes(compacted) > 128 * 1024
+    assert training_feature_storage_bytes(compacted) <= TRAINING_FEATURE_SNAPSHOT_MAX_BYTES
+    assert compacted["local_ml_shadow"]["model_version"] == "model-v2"
+    assert compacted["local_ai_tools_shadow"]["time_series_prediction"]["actual_inference"] is True
+    assert compacted["shadow_settlement_cost_observation"] == features[
+        "shadow_settlement_cost_observation"
+    ]
+    assert _compact_training_feature_snapshot(compacted) == compacted
+
+
 def test_sparse_specialist_shadow_preserves_only_observed_fields() -> None:
     features = {
         "local_ml_shadow": {

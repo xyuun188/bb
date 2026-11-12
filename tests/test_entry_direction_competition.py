@@ -3,7 +3,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from services.entry_direction_competition import EntryDirectionCompetitionPolicy
+from services.entry_direction_competition import (
+    EntryDirectionCompetitionPolicy,
+    _paper_quant_quality_permissions,
+)
 from services.entry_direction_support import assess_paper_model_trade_support
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
@@ -15,6 +18,34 @@ from services.return_objective import (
     RETURN_OBJECTIVE_VERSION,
     standardized_return_distribution,
 )
+
+
+@pytest.mark.parametrize("current_version", ["current", "unseen", ""])
+def test_quality_permission_uses_only_the_current_model_version(current_version):
+    permissions = _paper_quant_quality_permissions(
+        {
+            "execution_mode": "paper",
+            "continuous_model_weights": {
+                "applied": True,
+                "quant_source_weights": {
+                    "local_ml": {
+                        "paper_execution_permission": True,
+                        "model_quality_permissions": {
+                            "replaced": {"paper_execution_permission": True},
+                            "current": {
+                                "paper_execution_permission": False,
+                                "paper_execution_reason": "current_model_fee_after_evidence_missing",
+                                "paper_execution_model_version": "current",
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        {"model_version": current_version},
+    )
+    assert permissions["local_ml"]["paper_execution_permission"] is False
+    assert permissions["local_ml"]["paper_execution_model_version"] == (current_version or None)
 
 
 def _distribution(side: str, expected: float, *, horizon_minutes: int = 30) -> dict:

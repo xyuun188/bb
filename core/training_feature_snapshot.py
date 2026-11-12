@@ -20,9 +20,11 @@ from core.market_facts import (
     compact_market_fact_legacy_v1,
 )
 
-TRAINING_FEATURE_SNAPSHOT_VERSION = 9
+TRAINING_FEATURE_SNAPSHOT_VERSION = 10
 FROZEN_TRAINING_FEATURE_MAX_BYTES = 96 * 1024
-TRAINING_FEATURE_SNAPSHOT_MAX_BYTES = 128 * 1024
+# Reserve room beside 96 KiB sealed inputs for three 16 KiB label contracts
+# and two 16 KiB specialist projections, plus their container metadata.
+TRAINING_FEATURE_SNAPSHOT_MAX_BYTES = 192 * 1024
 TRAINING_FEATURE_OBJECT_MAX_BYTES = 16 * 1024
 TRAINING_FEATURE_MAX_STRING_CHARS = 512
 TRAINING_FEATURE_MAX_DEPTH = 16
