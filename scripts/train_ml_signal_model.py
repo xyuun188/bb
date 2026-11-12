@@ -32,6 +32,7 @@ from services.ml_signal_service import (
     LOCAL_ML_TRAINING_SCHEDULER_ID,
     MODEL_TRAINING_STATE_STORE,
     build_training_frame,
+    decision_group_partition,
     load_primary_horizon_training_rows,
     shadow_training_quality_report,
     train_from_frame,
@@ -77,12 +78,15 @@ async def run_training(
     rows = await load_primary_horizon_training_rows()
     quality_state = shadow_training_quality_report(rows)
     frame = build_training_frame(rows)
-    if frame.empty:
+    partition_report = decision_group_partition(frame).report
+    if not partition_report["ready"]:
         completed_count = await count_shadow_training_rows()
         reason = (
             "no_eligible_primary_horizon_rows"
             if not rows
             else "primary_horizon_rows_rejected_during_frame_build"
+            if frame.empty
+            else partition_report["reason"]
         )
         metadata = {
             "artifact_persisted": False,
@@ -90,7 +94,8 @@ async def run_training(
             "training_block_reason": reason,
             "primary_prediction_horizon_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
             "loaded_row_count": len(rows),
-            "frame_sample_count": 0,
+            "frame_sample_count": len(frame),
+            "decision_group_partition": partition_report,
             "training_quality_report": quality_state["quality_report"],
         }
         return {
@@ -101,7 +106,7 @@ async def run_training(
             "persist_artifact_requested": persist_artifact,
             "confirm_phase3_rebuild": confirm_phase3_rebuild,
             "okx_daily_reconciliation_gate": okx_gate,
-            "frame_sample_count": 0,
+            "frame_sample_count": len(frame),
             "loaded_row_count": len(rows),
             "completed_shadow_sample_count": completed_count,
             "authoritative_trade_sample_count": None,

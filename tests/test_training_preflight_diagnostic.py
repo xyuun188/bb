@@ -17,7 +17,12 @@ from services import strategy_replay_governance
 
 @pytest.mark.parametrize(
     ("mode", "expected_status", "expected_exit"),
-    (("complete", "complete", 0), ("skipped", "skipped", 3), ("failed", "failed", 2)),
+    (
+        ("complete", "complete", 0),
+        ("blocked", "blocked", 0),
+        ("skipped", "skipped", 3),
+        ("failed", "failed", 2),
+    ),
 )
 def test_preflight_writes_bounded_non_persisting_result(
     monkeypatch: pytest.MonkeyPatch,
@@ -40,6 +45,15 @@ def test_preflight_writes_bounded_non_persisting_result(
                 "shadow_selection_policy": "test-policy",
                 "metrics": {"net_return": -0.1},
                 "walk_forward_report": {"fold_count": 3},
+                **({
+                    "training_blocked": True,
+                    "training_block_reason": "decision_group_training_partition_immature",
+                    "decision_group_partition": {
+                        "ready": False,
+                        "train_sample_count": 0,
+                        "holdout_sample_count": 100,
+                    },
+                } if mode == "blocked" else {}),
             },
             "frame_sample_count": 100,
             "loaded_row_count": 120,
@@ -88,6 +102,11 @@ def test_preflight_writes_bounded_non_persisting_result(
         assert report["metadata"]["metrics"] == {"net_return": -0.1}
     elif mode == "failed":
         assert "terminated" in report["error"]
+    elif mode == "blocked":
+        assert report["reason"] == "decision_group_training_partition_immature"
+        assert report["frame_sample_count"] == 100
+        assert report["metadata"]["decision_group_partition"]["train_sample_count"] == 0
+        assert "error" not in report
     else:
         assert "local_ml_training_already_running" in report["result"]
 

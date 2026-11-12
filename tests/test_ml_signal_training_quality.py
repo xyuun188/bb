@@ -328,6 +328,68 @@ async def test_training_preflight_reports_empty_primary_horizon_without_fitting(
     assert result["metadata"]["artifact_persisted"] is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persist_artifact", [False, True])
+async def test_training_preflight_reports_purged_partition_without_fitting(
+    monkeypatch: pytest.MonkeyPatch,
+    persist_artifact: bool,
+) -> None:
+    frame = _training_frame(40)
+    frame["horizon_minutes"] = ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES
+    frame["label_timestamp"] = pd.date_range(
+        "2026-11-12T04:00:00Z", periods=len(frame), freq="min",
+    )
+    frame["decision_timestamp"] = frame["label_timestamp"] - pd.Timedelta(hours=4)
+    rows = [object() for _ in range(len(frame))]
+
+    async def load_rows() -> list[object]:
+        return rows
+
+    async def count_rows() -> int:
+        return 1000
+
+    async def forbidden_trade_load() -> list[dict[str, object]]:
+        raise AssertionError("immature partitions must not load unrelated trade outcomes")
+
+    def forbidden_fit(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("an empty purged training partition must not enter fitting")
+
+    monkeypatch.setattr(
+        train_ml_signal_script, "okx_training_refresh_gate", lambda: {"allowed": True},
+    )
+    monkeypatch.setattr(train_ml_signal_script, "load_primary_horizon_training_rows", load_rows)
+    monkeypatch.setattr(train_ml_signal_script, "build_training_frame", lambda _rows: frame)
+    monkeypatch.setattr(
+        train_ml_signal_script, "shadow_training_quality_report",
+        lambda _rows: {"quality_report": {}},
+    )
+    monkeypatch.setattr(train_ml_signal_script, "count_shadow_training_rows", count_rows)
+    monkeypatch.setattr(
+        train_ml_signal_script, "load_authoritative_trade_training_samples",
+        forbidden_trade_load,
+    )
+    monkeypatch.setattr(train_ml_signal_script, "train_from_frame", forbidden_fit)
+
+    result = await train_ml_signal_script.run_training(
+        skip_quarantine=True,
+        persist_artifact=persist_artifact,
+        confirm_phase3_rebuild=persist_artifact,
+    )
+
+    metadata = result["metadata"]
+    assert metadata["training_blocked"] is True
+    assert metadata["training_block_reason"] == "decision_group_training_partition_immature"
+    assert metadata["artifact_persisted"] is False
+    assert result["loaded_row_count"] == 40
+    assert result["frame_sample_count"] == 40
+    assert result["completed_shadow_sample_count"] == 1000
+    assert result["authoritative_trade_sample_count"] is None
+    partition = metadata["decision_group_partition"]
+    assert partition["train_sample_count"] == 0
+    assert partition["holdout_sample_count"] == 20
+    assert partition["purged_training_sample_count"] == 20
+
+
 def test_walk_forward_scores_apply_the_same_dispersion_penalty_as_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
