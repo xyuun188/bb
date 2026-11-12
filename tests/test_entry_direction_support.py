@@ -3,11 +3,13 @@ from __future__ import annotations
 import pytest
 
 from services.entry_direction_support import (
+    PAPER_TRAINING_ENTRY_SCOPE,
     assess_directional_entry_support,
     assess_paper_model_trade_support,
     directional_entry_support_reasons,
     summarize_paper_quantitative_evidence,
 )
+from services.normal_paper_trade import select_normal_paper_trade_side
 
 
 def _row(source: str, *, raw: float = 0.4, objective: float = 0.2) -> dict:
@@ -32,6 +34,77 @@ def _opinion(name: str, action: str, *, source_group: str) -> dict:
         "trace_only_fallback": False,
         "entry_support_eligible": True,
     }
+
+
+@pytest.mark.parametrize("qualified_source", ["local_ml", "server_profit"])
+def test_qualified_model_keeps_normal_entry_with_unqualified_observation_tools(
+    qualified_source: str,
+) -> None:
+    qualified = _row(qualified_source, raw=0.6, objective=0.4)
+    qualified["paper_return_quality_governance"] = {
+        "paper_execution_permission": True,
+        "paper_execution_evidence": {
+            "sample_count": 30, "average_return": 0.3, "return_lcb": 0.2,
+            "profit_factor": 2.0, "profit_factor_above_break_even": True,
+        },
+        "break_even_contract": {
+            "average_return_above_zero": True,
+            "return_lcb_above_zero": True,
+            "profit_factor_above_one": True,
+        },
+    }
+    observation = _row("timeseries", raw=0.5, objective=-0.8)
+    observation["paper_return_quality_governance"] = {
+        "paper_execution_permission": False,
+        "paper_execution_blockers": ["fee_after_return_quality_evidence_missing"],
+    }
+    competition = {
+        "long": {"evidence": [qualified, observation]},
+        "short": {"evidence": [
+            _row(qualified_source, raw=-0.6, objective=-0.8),
+            _row("timeseries", raw=10.0, objective=8.0),
+        ]},
+    }
+
+    support = assess_paper_model_trade_support(
+        competition, [], "long", execution_cost_pct=0.1,
+    )
+    selection = select_normal_paper_trade_side({"long": support})
+
+    assert support["quantitative_sources"] == [qualified_source]
+    assert set(support["quant_quality_permissions"]) == {qualified_source}
+    assert support["expected_net_return_pct"] == pytest.approx(0.5)
+    assert support["objective_net_return_pct"] == pytest.approx(0.3)
+    assert selection["selection_reason"] == "strategy_edge_selected"
+    assert selection["selected_support"].get("paper_training_only") is not True
+    assert competition["long"]["evidence"] == [qualified, observation]
+
+    training = summarize_paper_quantitative_evidence(
+        competition, "long", execution_cost_pct=0.1,
+        support_scope=PAPER_TRAINING_ENTRY_SCOPE,
+    )
+    assert training["positive_quant_sources"] == sorted(
+        [qualified_source, "timeseries"],
+    )
+
+
+def test_model_quality_cannot_replace_current_positive_downside_requirement() -> None:
+    row = _row("local_ml", raw=0.6, objective=-0.2)
+    row["paper_return_quality_governance"] = {"paper_execution_permission": True}
+    support = assess_paper_model_trade_support(
+        {
+            "long": {"evidence": [row]},
+            "short": {"evidence": [_row("local_ml", raw=-0.6, objective=-0.8)]},
+        },
+        [], "long", execution_cost_pct=0.1,
+    )
+
+    selection = select_normal_paper_trade_side({"long": support})
+
+    assert selection["selected"] is False
+    assert "direction_support_risk_adjusted_return_not_positive" in selection[
+        "blocking_reasons"
+    ]
 
 
 def test_governed_candidate_still_requires_positive_objective_evidence() -> None:

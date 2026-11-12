@@ -13,7 +13,7 @@ from services.normal_paper_trade import (
     normal_paper_current_return_ready,
 )
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-11-04.paper-model-direction.v16"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-11-13.qualified-paper-model-direction.v17"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 PAPER_TRAINING_ENTRY_SCOPE = "paper_training_entry"
 MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY = (
@@ -161,6 +161,20 @@ def summarize_paper_quantitative_evidence(
     evidence_rows = _dict(competition.get(side)).get("evidence")
     if not isinstance(evidence_rows, list):
         evidence_rows = []
+    if support_scope == PAPER_MODEL_TRADE_SCOPE:
+        qualified_rows = [
+            row
+            for row in evidence_rows
+            if isinstance(row, dict)
+            and row.get("decision_eligible") is True
+            and _dict(row.get("paper_return_quality_governance")).get(
+                "paper_execution_permission"
+            ) is True
+        ]
+        # Ordinary paper entries use their qualified model evidence. Mixing
+        # observation-only tools back in would downgrade them to training risk.
+        if qualified_rows:
+            evidence_rows = qualified_rows
 
     parsed_cost = _float(execution_cost_pct)
     execution_cost_complete = bool(parsed_cost is not None and parsed_cost > 0.0)
@@ -405,7 +419,10 @@ def assess_directional_entry_support(
     if paper_scope:
         opposite_rows = _dict(competition.get(opposite_side)).get("evidence")
         opposite_summaries = _quant_family_summaries(
-            opposite_rows if isinstance(opposite_rows, list) else [],
+            [
+                row for row in opposite_rows
+                if str(_dict(row).get("source") or "") in cohort_sources
+            ] if isinstance(opposite_rows, list) else [],
             float(_float(quantitative.get("execution_cost_pct")) or 0.0),
             include_direction_comparison_observations=True,
         )
