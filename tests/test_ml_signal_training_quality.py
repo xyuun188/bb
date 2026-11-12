@@ -1669,17 +1669,54 @@ def test_walk_forward_report_requires_primary_horizon_training_data() -> None:
 
 
 def test_decision_group_partition_reports_purged_immature_training_data() -> None:
-    partition = decision_group_partition(_multi_horizon_partition_frame(30))
+    partition = decision_group_partition(_multi_horizon_partition_frame(20))
 
     assert partition.report["ready"] is False
     assert partition.report["reason"] == "decision_group_training_partition_immature"
-    assert partition.report["decision_group_count"] == 30
-    assert partition.report["candidate_training_decision_group_count"] == 15
-    assert partition.report["train_decision_group_count"] == 3
-    assert partition.report["train_sample_count"] == 6
+    assert partition.report["decision_group_count"] == 20
+    assert partition.report["candidate_training_decision_group_count"] == 16
+    assert partition.report["train_decision_group_count"] == 4
+    assert partition.report["train_sample_count"] == 8
     assert partition.report["purged_training_decision_group_count"] == 12
     assert partition.report["purged_training_sample_count"] == 24
-    assert partition.report["holdout_decision_group_count"] == 15
+    assert partition.report["holdout_decision_group_count"] == 4
+
+
+def test_partition_balances_retained_groups_across_dense_four_hour_labels() -> None:
+    frame = _multi_horizon_partition_frame(
+        400, spacing_minutes=1, horizons=(240,),
+    )
+    partition = decision_group_partition(frame)
+
+    assert partition.report["ready"] is True
+    assert partition.report["train_sample_count"] == 80
+    assert partition.report["holdout_sample_count"] == 80
+    assert partition.report["purged_training_sample_count"] == 240
+    assert partition.report["training_label_end"] < partition.report["holdout_decision_start"]
+    assert set(partition.train["decision_group"]).isdisjoint(partition.holdout["decision_group"])
+    assert ml_signal_module.decision_group_partition_errors(partition.report) == []
+
+    changed = frame.sample(frac=1, random_state=42).reset_index(drop=True)
+    changed["long_return_pct"] = np.linspace(-999.0, 999.0, len(changed))
+    changed["short_return_pct"] = -changed["long_return_pct"]
+    changed["best_action"] = "short"
+    repeated = decision_group_partition(changed)
+    assert repeated.report == partition.report
+    assert repeated.train["id"].tolist() == partition.train["id"].tolist()
+    assert repeated.holdout["id"].tolist() == partition.holdout["id"].tolist()
+
+
+def test_partition_keeps_all_horizons_of_each_group_together_after_balancing() -> None:
+    partition = decision_group_partition(_multi_horizon_partition_frame(30))
+
+    assert partition.report["ready"] is True
+    assert partition.report["train_decision_group_count"] == 9
+    assert partition.report["train_sample_count"] == 18
+    assert partition.report["holdout_decision_group_count"] == 9
+    assert partition.report["holdout_sample_count"] == 18
+    assert partition.report["purged_training_sample_count"] == 24
+    assert partition.train.groupby("decision_group")["horizon_minutes"].nunique().eq(2).all()
+    assert partition.holdout.groupby("decision_group")["horizon_minutes"].nunique().eq(2).all()
 
 
 def test_decision_group_partition_rejects_single_training_decision_group() -> None:
@@ -2432,7 +2469,7 @@ async def test_ml_signal_auto_train_waits_for_mature_partition_without_artifact(
     )
     monkeypatch.setattr(
         "services.ml_signal_service.build_training_frame",
-        lambda _rows: _multi_horizon_partition_frame(30),
+        lambda _rows: _multi_horizon_partition_frame(20),
     )
     monkeypatch.setattr(
         "services.ml_training_dataset.load_authoritative_trade_training_samples",
@@ -2448,15 +2485,15 @@ async def test_ml_signal_auto_train_waits_for_mature_partition_without_artifact(
 
     assert result["trained"] is False
     assert result["reason"] == "decision_group_training_partition_immature"
-    assert result["train_decision_group_count"] == 3
-    assert result["train_sample_count"] == 6
+    assert result["train_decision_group_count"] == 4
+    assert result["train_sample_count"] == 8
     assert result["purged_training_decision_group_count"] == 12
     assert result["purged_training_sample_count"] == 24
     assert train_calls == []
     assert state["state"] == "skipped"
     assert state["retry_count"] == 0
     assert state["last_result"]["reason"] == result["reason"]
-    assert state["last_result"]["train_sample_count"] == 6
+    assert state["last_result"]["train_sample_count"] == 8
 
 
 @pytest.mark.asyncio

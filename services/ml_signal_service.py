@@ -14,7 +14,7 @@ import inspect
 import json
 import math
 import os
-from bisect import bisect_left
+from bisect import bisect_left, insort
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -2001,9 +2001,11 @@ def local_ml_artifact_compatibility_errors(
 def decision_group_partition(frame: pd.DataFrame) -> DecisionGroupPartition:
     """Build the only valid chronological train/holdout partition."""
 
+    selection_policy = "balance_retained_groups_after_result_availability_purge"
     if frame.empty:
         report = {
             "version": DECISION_GROUP_PARTITION_VERSION,
+            "selection_policy": selection_policy,
             "ready": False,
             "reason": "cost_complete_training_distribution_unavailable",
             "sample_count": 0,
@@ -2030,6 +2032,28 @@ def decision_group_partition(frame: pd.DataFrame) -> DecisionGroupPartition:
     ordered = _chronological_frame(frame).reset_index(drop=True)
     ordered_groups, group_bounds = _decision_group_availability(ordered)
     boundary = len(ordered_groups) // 2
+    available_end_times: list[pd.Timestamp] = []
+    best_boundary: tuple[int, int, int] | None = None
+    # Balance the retained groups, not the raw midpoint: a long label horizon
+    # can otherwise purge the entire training half despite a valid later split.
+    # Only group identities and timestamps select the boundary, never returns.
+    for index in range(1, len(ordered_groups)):
+        insort(available_end_times, group_bounds[ordered_groups[index - 1]]["end"])
+        train_count = bisect_left(
+            available_end_times, group_bounds[ordered_groups[index]]["decision_start"],
+        )
+        if train_count == 0:
+            continue
+        holdout_count = len(ordered_groups) - index
+        candidate = (
+            abs(train_count - holdout_count),
+            -(train_count + holdout_count),
+            index,
+        )
+        if best_boundary is None or candidate < best_boundary:
+            best_boundary = candidate
+    if best_boundary is not None:
+        boundary = best_boundary[2]
     candidate_train_groups = set(ordered_groups[:boundary])
     holdout_groups = set(ordered_groups[boundary:])
     holdout_decision_start = (
@@ -2071,6 +2095,7 @@ def decision_group_partition(frame: pd.DataFrame) -> DecisionGroupPartition:
         reason = "ready"
     report = {
         "version": DECISION_GROUP_PARTITION_VERSION,
+        "selection_policy": selection_policy,
         "ready": reason == "ready",
         "reason": reason,
         "sample_count": int(len(ordered)),

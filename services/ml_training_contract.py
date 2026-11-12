@@ -1,6 +1,6 @@
 from typing import Any
 
-DECISION_GROUP_PARTITION_VERSION = "2026-11-05.result-availability-purged-holdout.v2"
+DECISION_GROUP_PARTITION_VERSION = "2026-11-12.purge-balanced-holdout.v3"
 WALK_FORWARD_REPORT_VERSION = "2026-11-10.signed-funding-cost.v6"
 PRIMARY_PREDICTION_HORIZON_MINUTES = 240
 TRAINING_HORIZON_POLICY = "fit_primary_horizon_only"
