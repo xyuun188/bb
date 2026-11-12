@@ -27,6 +27,7 @@ from core.feature_availability import feature_availability_reasons
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
+from services.entry_direction_competition import _paper_quant_quality_permissions
 from services.entry_funnel_diagnostics import classify_entry_funnel_reason
 from services.ml_signal_service import MLSignalService, MODEL_TRAINING_STATE_STORE
 from services.shadow_training_quarantine import (
@@ -194,16 +195,21 @@ async def main():
             )
             reasons[reason or "executed"] += 1
             weights = _dict(row.get("continuous_model_weights"))
-            for source, item in _dict(weights.get("quant_source_weights")).items():
+            signal = _dict(row.get("local_ml_signal") or row.get("ml_signal"))
+            scoped_permissions = _paper_quant_quality_permissions(
+                {"execution_mode": "paper", "continuous_model_weights": weights},
+                signal,
+            )
+            for source, item in scoped_permissions.items():
                 item = _dict(item)
                 permissions.setdefault(source, {
                     key: item.get(key) for key in (
                         "paper_execution_permission", "paper_execution_reason",
                         "paper_execution_blockers", "paper_execution_evidence_source",
                         "paper_execution_evidence", "shadow_fee_after_return",
+                        "paper_execution_model_version", "evidence_scope",
                     )
                 })
-            signal = _dict(row.get("local_ml_signal") or row.get("ml_signal"))
             identities[str(signal.get("model_version") or "unavailable")] += 1
             selection = _dict(row.get("paper_trade_selection"))
             if len(examples) < 6 or (selection.get("selected") and len(examples) < 12):
