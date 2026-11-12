@@ -77,7 +77,7 @@ async def build_briefing(
 ) -> dict[str, Any]:
     # Imported lazily so the render helpers stay importable without a
     # database URL (tests, and any offline operator tooling).
-    from sqlalchemy import func, select
+    from sqlalchemy import case, func, or_, select
 
     from db.session import get_read_session_ctx
     from models.decision import AIDecision
@@ -89,8 +89,34 @@ async def build_briefing(
         "generated_at": now.isoformat(),
         "window_hours": window_hours,
     }
+    window_filters = (
+        AIDecision.is_paper.is_(True),
+        AIDecision.created_at >= since,
+        AIDecision.created_at <= now,
+    )
+    executed_condition = or_(
+        AIDecision.was_executed.is_(True), AIDecision.executed_at.is_not(None)
+    )
+    blocked_entry_condition = (
+        (AIDecision.analysis_type == "market")
+        & AIDecision.was_executed.is_not(True)
+        & AIDecision.executed_at.is_(None)
+    )
 
     async with get_read_session_ctx(statement_timeout_ms=60000) as session:
+        # Count the complete window before limiting the larger reason payloads.
+        totals = (
+            await session.execute(
+                select(
+                    AIDecision.action,
+                    func.count().label("count"),
+                    func.sum(case((executed_condition, 1), else_=0)).label("executed"),
+                    func.sum(case((blocked_entry_condition, 1), else_=0)).label("blocked"),
+                )
+                .where(*window_filters)
+                .group_by(AIDecision.action)
+            )
+        ).all()
         rows = (
             await session.execute(
                 select(
@@ -102,6 +128,7 @@ async def build_briefing(
                     AIDecision.execution_reason,
                     AIDecision.decision_learning_snapshot.label("learning"),
                 )
+                .where(*window_filters, blocked_entry_condition)
                 .order_by(AIDecision.id.desc())
                 .limit(decision_limit)
             )
@@ -110,20 +137,24 @@ async def build_briefing(
             await session.execute(
                 select(func.count(ShadowBacktest.id)).where(
                     ShadowBacktest.status == "completed",
+                    ShadowBacktest.execution_mode == "paper",
                     ShadowBacktest.created_at >= since,
+                    ShadowBacktest.created_at <= now,
                 )
             )
         ).scalar()
 
-    in_window = [row for row in rows if row.created_at and row.created_at >= since]
-    actions = Counter(str(row.action or "").lower() for row in in_window)
-    executed = sum(
-        1
-        for row in in_window
-        if row.was_executed is True or row.executed_at is not None
-    )
+    actions: Counter[str] = Counter()
+    executed = 0
+    blocked = 0
+    for row in totals:
+        action = str(row.action or "").lower()
+        actions[action] += int(row.count or 0)
+        if action in {"long", "short"}:
+            executed += int(row.executed or 0)
+        blocked += int(row.blocked or 0)
     reasons: Counter[str] = Counter()
-    for row in in_window:
+    for row in rows:
         direct = str(row.execution_reason or "").strip()
         if direct:
             reasons[direct] += 1
@@ -132,9 +163,12 @@ async def build_briefing(
 
     report["decisions"] = {
         "scanned": len(rows),
-        "in_window": len(in_window),
+        "in_window": sum(actions.values()),
         "executed": executed,
         "actions": dict(actions),
+        "reason_sample_count": len(rows),
+        "reason_total_count": blocked,
+        "reasons_sampled": len(rows) < blocked,
         "top_reasons": reasons.most_common(8),
     }
     report["shadow"] = {"completed_in_window": int(shadow_total or 0)}
@@ -160,6 +194,11 @@ def render_text(report: dict[str, Any]) -> str:
     lines.append("")
 
     lines.append("【不开仓原因】")
+    if decisions.get("reasons_sampled"):
+        lines.append(
+            f"以下统计最近 {decisions.get('reason_sample_count', 0)} 条未开仓决策"
+            f"，窗口内共 {decisions.get('reason_total_count', 0)} 条"
+        )
     reasons = decisions.get("top_reasons") or []
     if not reasons:
         lines.append("无阻塞记录")
