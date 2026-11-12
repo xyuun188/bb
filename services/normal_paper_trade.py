@@ -1057,7 +1057,11 @@ def is_normal_paper_trade_decision(decision: DecisionOutput) -> bool:
 def build_normal_paper_position_lifecycle(decision: Any) -> dict[str, Any]:
     """Snapshot the normal paper entry lineage without creating exit behavior."""
 
-    raw = _dict(getattr(decision, "raw_response", None))
+    raw = _dict(
+        getattr(decision, "raw_response", None)
+        or getattr(decision, "raw_llm_response", None)
+        or getattr(decision, "decision_learning_snapshot", None)
+    )
     contract = _dict(raw.get("normal_paper_trade"))
     if normal_paper_entry_contract_reasons(contract):
         return {}

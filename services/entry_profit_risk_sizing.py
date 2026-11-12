@@ -716,6 +716,8 @@ def _paper_training_positions(
         if (
             normal_lifecycle.get("selection_reason") == "paper_training_entry"
             or legacy_lifecycle.get("loss_tolerant_for_training") is True
+            # Missing lineage cannot create unused training risk capacity.
+            or normal_lifecycle.get("selection_reason") != "strategy_edge_selected"
         ):
             training_positions.append(item)
     return training_positions
@@ -809,7 +811,10 @@ def reconcile_profit_risk_sizing(
     facts = deepcopy(execution_facts or {})
     original_target = max(_safe_float(sizing.get("target_notional_usdt"), 0.0), 0.0)
     fill_notional_ceiling = max(
-        _safe_float(sizing.get("fill_notional_ceiling_usdt"), 0.0),
+        _safe_float(
+            sizing.get("fill_notional_ceiling_usdt") or sizing.get("final_notional_usdt"),
+            0.0,
+        ),
         0.0,
     )
     risk_budget = max(_safe_float(sizing.get("risk_budget_usdt"), 0.0), 0.0)
@@ -833,7 +838,7 @@ def reconcile_profit_risk_sizing(
         _safe_float(latest_order_rules.get("min_notional_usdt"), 0.0),
         0.0,
     )
-    if source == "okx_pre_submit_order_shape" and latest_minimum_order_notional > 0.0:
+    if source in {"okx_pre_submit_order_shape", "okx_pre_submit_protection_risk"} and latest_minimum_order_notional > 0.0:
         minimum_order_notional = latest_minimum_order_notional
     margin_basis = max(_safe_float(sizing.get("available_margin_usdt"), 0.0), 0.0)
     expected_net = max(_safe_float(sizing.get("expected_net_return_pct"), 0.0), 0.0)
@@ -949,6 +954,9 @@ def reconcile_profit_risk_sizing(
             "final_notional_usdt": round(notional, 8),
             "final_leverage": round(leverage, 8),
             "minimum_order_notional_usdt": round(minimum_order_notional, 8),
+            "minimum_order_supported": bool(
+                settled_fill or notional + 1e-8 >= minimum_order_notional
+            ),
             "facts": facts,
             "facts_fingerprint": _fingerprint(facts),
             "eligible": eligible,
@@ -965,6 +973,9 @@ def reconcile_profit_risk_sizing(
             "final_leverage": round(leverage, 8),
             "minimum_order_notional_usdt": round(minimum_order_notional, 8),
             "planned_stressed_loss_usdt": round(planned_loss, 8),
+            "minimum_order_supported": bool(
+                settled_fill or notional + 1e-8 >= minimum_order_notional
+            ),
             "stressed_loss_fraction": stress,
             "expected_profit_usdt": round(notional * expected_net / 100.0, 8),
             "execution_reconciliations": history,
@@ -2039,6 +2050,36 @@ class EntryProfitRiskSizingPolicy:
             negative_lcb_stress_fraction,
             0.01,
         )
+        protection_stop_fraction = stress_fraction
+        # Preview the executor's stop geometry before authorizing an indivisible
+        # contract. Keep the stop distance separate from price-band stress so
+        # repeated sizing passes cannot compound that stress into wider stops.
+        if snapshot.get("buy_price_limit") and snapshot.get("sell_price_limit"):
+            references = [
+                _safe_float(snapshot.get(key), 0.0)
+                for key in (
+                    "current_price", "close", "bid", "ask", "last", "last_price",
+                    "high", "low", "buy_price_limit", "sell_price_limit",
+                )
+            ]
+            references = [value for value in references if value > 0.0]
+            if references:
+                low_reference, high_reference = min(references), max(references)
+                native_stop = (
+                    low_reference * (1.0 - protection_stop_fraction)
+                    if side == "long"
+                    else high_reference * (1.0 + protection_stop_fraction)
+                )
+                tick = max(_safe_float(target_contract_spec.get("tickSz"), 0.0), 0.0)
+                if tick > 0.0:
+                    native_stop = (
+                        floor(native_stop / tick) if side == "long"
+                        else ceil(native_stop / tick)
+                    ) * tick
+                worst_entry = high_reference if side == "long" else low_reference
+                stress_fraction = max(
+                    stress_fraction, abs(native_stop - worst_entry) / worst_entry,
+                )
         risk_cap_limit = (
             NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
             if training_mode
@@ -2702,7 +2743,7 @@ class EntryProfitRiskSizingPolicy:
         decision.position_size_pct = sizing["position_size_pct"] if eligible else 0.0
         decision.suggested_leverage = sizing["final_leverage"] if eligible else 1.0
         if eligible:
-            decision.stop_loss_pct = stress_fraction
+            decision.stop_loss_pct = protection_stop_fraction
             decision.take_profit_pct = sizing["dynamic_take_profit_fraction"]
 
 

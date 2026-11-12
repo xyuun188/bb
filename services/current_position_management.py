@@ -113,6 +113,17 @@ def build_current_position_management_contract(
 
     generated_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
     previous = _safe_dict(previous_contract)
+    normal_lifecycles = [
+        item for item in (
+            _safe_dict(previous.get("normal_paper_lifecycle")),
+            _safe_dict(facts.get("normal_paper_lifecycle")),
+        ) if item
+    ]
+    normal_paper_lifecycle = dict(next(
+        (item for item in normal_lifecycles
+         if item.get("selection_reason") == "paper_training_entry"),
+        normal_lifecycles[0] if normal_lifecycles else {},
+    ))
     previous_canary_lifecycle = _safe_dict(previous.get("paper_canary_lifecycle"))
     refreshed_canary_lifecycle = _safe_dict(facts.get("paper_canary_lifecycle"))
     paper_canary_lifecycle = dict(
@@ -441,6 +452,7 @@ def build_current_position_management_contract(
         "protection_overcoverage_contracts": protection_overcoverage_contracts,
         "paper_canary_lifecycle": paper_canary_lifecycle,
         "paper_training_lifecycle": paper_training_lifecycle,
+        "normal_paper_lifecycle": normal_paper_lifecycle,
     }
     provenance = {
         "source": "okx_current_position_fills_protection_account_and_portfolio_facts",
@@ -555,6 +567,8 @@ def build_current_position_management_contract(
         contract["paper_canary_lifecycle"] = paper_canary_lifecycle
     if paper_training_lifecycle:
         contract["paper_training_lifecycle"] = paper_training_lifecycle
+    if normal_paper_lifecycle:
+        contract["normal_paper_lifecycle"] = normal_paper_lifecycle
     previous_profit_lock_ledger = previous.get(PROFIT_LOCK_LEDGER_KEY)
     if isinstance(previous_profit_lock_ledger, dict) and previous_profit_lock_ledger:
         contract[PROFIT_LOCK_LEDGER_KEY] = dict(previous_profit_lock_ledger)

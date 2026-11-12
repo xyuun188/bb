@@ -718,6 +718,68 @@ async def test_bounded_training_entry_can_use_only_its_micro_risk_budget() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle", [{}, {"selection_reason": "paper_training_entry"}])
+async def test_training_budget_counts_unclassified_and_known_paper_exposure(lifecycle) -> None:
+    decision = _quality_observation_decision(return_lcb_pct=0.3)
+    _use_bounded_training_entry(decision)
+    positions = [{
+        "symbol": "BTC/USDT", "side": "long", "contracts": 1.0,
+        "quantity": 1.0, "entry_price": 100.0, "current_price": 100.0,
+        "stop_loss": 98.0, "execution_mode": "paper",
+        "okx_inst_id": "BTC-USDT-SWAP",
+        "normal_paper_lifecycle": lifecycle,
+    }]
+    await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(
+        decision, "paper", positions,
+    )
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["current_training_portfolio_stressed_loss_usdt"] == pytest.approx(2.0)
+    assert sizing["remaining_training_portfolio_risk_budget_usdt"] == 0.0
+    assert sizing["production_eligible"] is False
+    assert sizing["final_notional_usdt"] == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["long", "short"])
+async def test_native_price_band_blocks_unaffordable_training_minimum_during_sizing(side) -> None:
+    decision = _quality_observation_decision(return_lcb_pct=0.3)
+    _use_bounded_training_entry(decision)
+    decision.action = Action.LONG if side == "long" else Action.SHORT
+    normal = decision.raw_response["normal_paper_trade"]
+    normal["side"] = side
+    normal["contract_fingerprint"] = _fingerprint(_contract_fingerprint_payload(normal))
+    decision.feature_snapshot.update(buy_price_limit=102.0, sell_price_limit=98.0)
+    decision.raw_response["exchange_risk_facts"]["contract_specs"]["BTC-USDT-SWAP"].update(
+        minSz="0.1", lotSz="0.1", tickSz="0.01",
+    )
+
+    await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is False
+    assert sizing["minimum_order_supported"] is False
+    assert sizing["stressed_loss_fraction"] > 0.05
+    assert sizing["final_notional_usdt"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_native_price_band_stress_does_not_compound_on_repeated_sizing() -> None:
+    decision = _decision()
+    decision.feature_snapshot.update(buy_price_limit=102.0, sell_price_limit=98.0)
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(decision, "paper", [])
+    first = deepcopy(decision.raw_response["profit_risk_sizing"])
+    assert first["production_eligible"] is True
+
+    await policy.apply(decision, "paper", [])
+
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is True
+    assert sizing["stressed_loss_fraction"] == first["stressed_loss_fraction"]
+    assert decision.stop_loss_pct == pytest.approx(0.02)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("key", "value"),
     [

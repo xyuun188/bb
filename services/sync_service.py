@@ -42,6 +42,7 @@ from services.exchange_position_state import (
     parse_exchange_position_snapshot,
 )
 from services.exit_execution_singleflight import preserve_exit_execution_intent
+from services.normal_paper_trade import build_normal_paper_position_lifecycle
 from services.paper_bootstrap_canary import build_paper_canary_position_lifecycle
 from services.paper_training import build_paper_training_position_lifecycle
 from services.position_open_time import (
@@ -425,6 +426,12 @@ def _merge_local_position_candidates(
             merged["paper_training_lifecycle"] = _dict_value(
                 candidate.get("paper_training_lifecycle")
             )
+        normal_lifecycle = _dict_value(candidate.get("normal_paper_lifecycle"))
+        if normal_lifecycle and (
+            not _dict_value(merged.get("normal_paper_lifecycle"))
+            or normal_lifecycle.get("selection_reason") == "paper_training_entry"
+        ):
+            merged["normal_paper_lifecycle"] = normal_lifecycle
         merged_entry_fee += max(_float_value(candidate.get("entry_fee"), 0.0), 0.0)
 
     merged["entry_fee"] = merged_entry_fee
@@ -987,6 +994,10 @@ def normalized_open_position_context(
             "entry_fee_usdt": entry_fee,
             "exit_fee_rate": exit_fee_rate,
             "current_management_contract": current_management_contract,
+            "normal_paper_lifecycle": _dict_value(
+                position_payload.get("normal_paper_lifecycle")
+                or current_management_contract.get("normal_paper_lifecycle")
+            ),
             "paper_canary_lifecycle": _dict_value(position_payload.get("paper_canary_lifecycle")),
             "paper_training_lifecycle": _dict_value(
                 position_payload.get("paper_training_lifecycle")
@@ -1143,6 +1154,10 @@ def normalized_open_position_context(
         "entry_fee_usdt": entry_fee,
         "exit_fee_rate": exit_fee_rate,
         "current_management_contract": current_management_contract,
+        "normal_paper_lifecycle": _dict_value(
+            position_payload.get("normal_paper_lifecycle")
+            or current_management_contract.get("normal_paper_lifecycle")
+        ),
         "paper_canary_lifecycle": _dict_value(position_payload.get("paper_canary_lifecycle")),
         "paper_training_lifecycle": _dict_value(position_payload.get("paper_training_lifecycle")),
         "execution_mode": position_payload.get("execution_mode"),
@@ -2518,6 +2533,7 @@ class OkxSyncService:
                     AIDecision.id,
                     AIDecision.symbol,
                     AIDecision.action,
+                    AIDecision.is_paper,
                     AIDecision.was_executed,
                     AIDecision.decision_learning_snapshot,
                 ).where(AIDecision.id.in_(decision_ids))
@@ -2527,6 +2543,7 @@ class OkxSyncService:
                     id=row.id,
                     symbol=row.symbol,
                     action=row.action,
+                    is_paper=row.is_paper,
                     was_executed=row.was_executed,
                     raw_llm_response=dict(row.decision_learning_snapshot or {}),
                 )
@@ -2688,6 +2705,26 @@ class OkxSyncService:
                 }
             )
             entry_orders = [orders_by_id.get(order_id) for order_id in entry_order_ids]
+            normal_lifecycles = [
+                build_normal_paper_position_lifecycle(decision)
+                for order in entry_orders
+                if order is not None
+                and (decision := decisions_by_id.get(int(order.decision_id or 0))) is not None
+                and decision.is_paper is True
+                and decision.was_executed is True
+                and symbol_normalizer(decision.symbol) == key[0]
+                and (
+                    "long" if str(decision.action or "").lower()
+                    in {"long", "open_long", "buy"}
+                    else "short" if str(decision.action or "").lower()
+                    in {"short", "open_short", "sell"}
+                    else ""
+                ) == key[1]
+            ]
+            normal_lifecycles = [item for item in normal_lifecycles if item]
+            normal_lifecycles.sort(
+                key=lambda item: item.get("selection_reason") != "paper_training_entry"
+            )
             original_entry_contract_gaps: list[str] = []
             entry_orders_by_decision: dict[int, list[Order]] = {}
             for order_id, order in zip(entry_order_ids, entry_orders, strict=True):
@@ -2825,6 +2862,7 @@ class OkxSyncService:
                 "account_equity_usdt": account_equity,
                 "open_position_count": len(group_rows),
                 "entry_order_ids": entry_order_ids,
+                "normal_paper_lifecycle": normal_lifecycles[0] if normal_lifecycles else {},
                 "entry_decision_ids": [
                     int(order.decision_id)
                     for order in entry_orders
@@ -4397,6 +4435,9 @@ class OkxSyncService:
                     training_lifecycle = _dict_value(
                         management_contract.get("paper_training_lifecycle")
                     )
+                    normal_lifecycle = _dict_value(
+                        management_contract.get("normal_paper_lifecycle")
+                    )
                     lineage_decision_ids = list(
                         management_contract.get("original_entry_decision_ids", [])
                     )
@@ -4409,6 +4450,30 @@ class OkxSyncService:
                         if order_id in decision_ids_by_entry_order
                     )
                     lineage_decision_ids = list(dict.fromkeys(lineage_decision_ids))
+                    for decision_id in lineage_decision_ids:
+                        decision = decisions_by_id.get(
+                            int(decision_id) if str(decision_id or "").isdigit() else -1
+                        )
+                        if (
+                            decision is None or decision.is_paper is not True
+                            or decision.was_executed is not True
+                            or normalize_symbol(decision.symbol) != normalize_symbol(p.symbol)
+                        ):
+                            continue
+                        action = str(decision.action or "").lower()
+                        decision_side = (
+                            "long" if action in {"long", "open_long", "buy"}
+                            else "short" if action in {"short", "open_short", "sell"}
+                            else ""
+                        )
+                        if decision_side != str(p.side or "").lower():
+                            continue
+                        lifecycle = build_normal_paper_position_lifecycle(decision)
+                        if lifecycle and (
+                            not normal_lifecycle
+                            or lifecycle.get("selection_reason") == "paper_training_entry"
+                        ):
+                            normal_lifecycle = lifecycle
                     if not canary_lifecycle:
                         for decision_id in lineage_decision_ids:
                             decision = decisions_by_id.get(
@@ -4448,6 +4513,7 @@ class OkxSyncService:
                             "current_management_contract": management_contract,
                             "paper_canary_lifecycle": canary_lifecycle,
                             "paper_training_lifecycle": training_lifecycle,
+                            "normal_paper_lifecycle": normal_lifecycle,
                             "execution_mode": getattr(p, "execution_mode", None),
                         }
                     )
@@ -4545,6 +4611,7 @@ class OkxSyncService:
                 ("current_management_contract", "current_management_contract"),
                 ("paper_canary_lifecycle", "paper_canary_lifecycle"),
                 ("paper_training_lifecycle", "paper_training_lifecycle"),
+                ("normal_paper_lifecycle", "normal_paper_lifecycle"),
                 ("execution_mode", "execution_mode"),
             ):
                 value = local_position.get(source_key)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -14,6 +15,15 @@ from services.current_position_management import (
     current_position_management_contract_complete,
     protection_coverage_evidence,
 )
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
+    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_VERSION,
+    _contract_fingerprint_payload,
+    _fingerprint,
+    build_normal_paper_trade_contract,
+)
 from services.sync_service import (
     OkxSyncService,
     _confirmed_local_close_fill_for_position,
@@ -21,6 +31,7 @@ from services.sync_service import (
     _okx_close_fill_order_payload,
     normalized_open_position_context,
 )
+from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
 def _float(value, default=0.0):
@@ -205,6 +216,121 @@ def test_normalized_context_preserves_paper_training_horizon_lifecycle() -> None
     )
 
     assert context["paper_training_lifecycle"] == lifecycle
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_normal_training_scope_survives_context_normalization(native: bool) -> None:
+    lifecycle = {"selection_reason": "paper_training_entry", "entry_decision_id": 786153}
+    payload = {
+        "symbol": "BTC/USDT", "side": "short", "quantity": 2.0,
+        "entry_price": 100.0, "current_price": 100.0,
+        "normal_paper_lifecycle": lifecycle, "execution_mode": "paper",
+    }
+    if native:
+        payload.update(contracts=2.0, contractSize=1.0)
+    context = normalized_open_position_context(
+        payload, symbol_normalizer=normalize_trading_symbol, float_parser=_float,
+    )
+    assert context["normal_paper_lifecycle"] == lifecycle
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision_side", ["short", "long"])
+async def test_local_context_recovers_training_scope_from_exact_entry_snapshot(
+    monkeypatch, decision_side,
+) -> None:
+    contract = {
+        "version": NORMAL_PAPER_TRADE_VERSION,
+        "symbol": "BTC/USDT",
+        "side": decision_side,
+        "selection_reason": "paper_training_entry",
+        "prediction_horizon_minutes": 30.0,
+        "expected_net_return_pct": 0.8,
+        "current_raw_expected_return_pct": 0.9,
+        "objective_net_return_pct": 0.3,
+            "authorized": True,
+            "execution_scope": "paper_only",
+            "entry_type": "normal_strategy_trade",
+            "trade_kind": "normal_strategy_trade",
+            "trade_mode": "paper",
+            "decision_authority": "ensemble",
+            "production_permission": False,
+            "current_edge_validated": True,
+            "paper_quality_observation_only": False,
+            "paper_quality_mode": "training",
+            "paper_training_only": True,
+            "strong_expert_opposition": False,
+            "uses_shared_order_pipeline": True,
+            "uses_shared_position_ledger": True,
+            "continuous_training_after_trusted_settlement": True,
+            "risk_override_permission": False,
+            "valid_for_seconds": 1800.0,
+            "single_trade_risk_fraction_cap": NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
+            "portfolio_risk_fraction_cap": NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+                "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
+                "model_leverage_role": "upper_bound_when_explicit",
+        "loss_probability": 0.25,
+        "quant_evidence_families": ["local_ml"],
+        "quant_quality_permissions": paper_quality_permissions(),
+        "paper_training_reasons": ["historical_quality_gate_is_observation_only"],
+    }
+    contract["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(contract)
+    )
+    contract["paper_quality_mode"] = "training"
+    contract["paper_quality_observation_only"] = False
+    contract["paper_training_only"] = True
+    contract["paper_training_reasons"] = ["historical_quality_gate_is_observation_only"]
+    contract["uses_shared_order_pipeline"] = True
+    contract["uses_shared_position_ledger"] = True
+    contract["continuous_training_after_trusted_settlement"] = True
+    contract["risk_override_permission"] = False
+    contract["contract_fingerprint"] = _fingerprint(
+        _contract_fingerprint_payload(contract)
+    )
+    position = SimpleNamespace(
+        id=1, model_name="ensemble_trader", symbol="BTC/USDT", side="short",
+        entry_price=100.0, current_price=100.0, quantity=1.0, leverage=2.0,
+        unrealized_pnl=0.0, stop_loss_price=104.0, take_profit_price=94.0,
+        is_open=True, created_at=datetime.now(UTC), entry_exchange_order_id="entry-1",
+        current_management_contract={}, execution_mode="paper",
+    )
+    decision = SimpleNamespace(
+        id=9, symbol="BTC/USDT", action=decision_side, is_paper=True,
+        was_executed=True, executed_at=datetime.now(UTC),
+        decision_learning_snapshot={"normal_paper_trade": contract},
+    )
+
+    class Session:
+        calls = 0
+
+        async def execute(self, _statement):
+            self.calls += 1
+            return SimpleNamespace(all=lambda: [("entry-1", 9)] if self.calls == 1 else [decision])
+
+    @asynccontextmanager
+    async def read_session():
+        yield Session()
+
+    class Repo:
+        def __init__(self, session):
+            pass
+
+        async def get_position_records(self, **kwargs):
+            return [position]
+
+    monkeypatch.setattr(sync_module, "get_read_session_ctx", read_session)
+    monkeypatch.setattr(sync_module, "TradeRepository", Repo)
+    service = OkxSyncService(
+        symbol_normalizer=normalize_trading_symbol, float_parser=_float,
+    )
+    positions = await service.get_local_open_positions_context(strict=True)
+    lifecycle = positions[0]["normal_paper_lifecycle"]
+    if decision_side == "short":
+        assert lifecycle["selection_reason"] == "paper_training_entry"
+        assert lifecycle["entry_decision_id"] == 9
+    else:
+        assert lifecycle == {}
 
 
 def _management_contract(*, contracts: float = 109.0, quantity: float = 109.0) -> dict:
@@ -475,13 +601,36 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
             id=11,
             symbol="BTC/USDT",
             action="open_long",
+            is_paper=True,
             was_executed=True,
-            decision_learning_snapshot={"profit_risk_sizing": {"risk_fraction": 0.01}},
+            decision_learning_snapshot={
+                    "profit_risk_sizing": {"risk_fraction": 0.01},
+                "normal_paper_trade": build_normal_paper_trade_contract(
+                    symbol="BTC/USDT",
+                    side="long",
+                    selection_reason="paper_training_entry",
+                    direction_support={
+                        "eligible": True,
+                        "selected_side": "long",
+                        "prediction_horizon_minutes": 30.0,
+                        "expected_net_return_pct": 0.8,
+                        "raw_expected_return_pct": 0.9,
+                        "objective_net_return_pct": 0.3,
+                        "loss_probability": 0.25,
+                        "quant_evidence_families": ["local_ml"],
+                        "quant_quality_permissions": paper_quality_permissions(),
+                        "paper_training_only": True,
+                        "paper_training_reasons": ["historical_quality_gate_is_observation_only"],
+                        "strong_expert_opposition": False,
+                    },
+                )
+            },
         ),
         SimpleNamespace(
             id=12,
             symbol="BTC/USDT",
             action="open_long",
+            is_paper=True,
             was_executed=True,
             decision_learning_snapshot={"profit_risk_sizing": {"risk_fraction": 0.01}},
         ),
@@ -559,6 +708,8 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
     assert first.entry_fee == pytest.approx(0.2)
     assert second.entry_fee == pytest.approx(0.1)
     assert contract["contracts"] == pytest.approx(3.0)
+    assert contract["normal_paper_lifecycle"]["selection_reason"] == "paper_training_entry"
+    assert contract["normal_paper_lifecycle"]["entry_decision_id"] == 11
     assert current_position_management_contract_complete(
         SimpleNamespace(
             symbol="BTC/USDT",
@@ -636,6 +787,7 @@ async def test_management_refresh_adds_only_matching_lifecycle_funding_bills(
         id=13,
         symbol="BTC/USDT",
         action="open_long",
+        is_paper=True,
         was_executed=True,
         decision_learning_snapshot={"profit_risk_sizing": {"risk_fraction": 0.01}},
     )

@@ -3511,6 +3511,32 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
 
 
 @pytest.mark.asyncio
+async def test_native_stop_risk_rejection_updates_authorization_before_minimum_rounding() -> None:
+    exchange = _MovingEntryTickerCcxt()
+    executor = _executor(exchange)
+    decision = _entry_decision()
+    decision.feature_snapshot = {"current_price": 1.0}
+    decision.raw_response["profit_risk_sizing"].update(
+        risk_budget_usdt=0.1, stressed_loss_fraction=0.01,
+        final_notional_usdt=10.0, target_notional_usdt=10.0,
+        fill_notional_ceiling_usdt=10.0,
+    )
+
+    result = await executor.place_order(decision, override_balance=100.0)
+
+    assert result.status == OrderStatus.REJECTED
+    assert exchange.create_calls == []
+    sizing = decision.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is False
+    assert sizing["minimum_order_supported"] is False
+    assert sizing["stressed_loss_fraction"] > 0.01
+    assert sizing["target_notional_usdt"] < 1.3
+    assert sizing["planned_stressed_loss_usdt"] <= 0.1 + 1e-8
+    assert result.raw_response["execution_blocker"] == "execution_protection_risk_refresh"
+    assert result.raw_response["protection_reconciliation"]["eligible"] is False
+
+
+@pytest.mark.asyncio
 async def test_okx_entry_rechecks_advisory_instrument_before_submit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

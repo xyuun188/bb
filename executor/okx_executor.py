@@ -1709,6 +1709,53 @@ class OKXExecutor(AbstractExecutor):
                         "protection_risk": protection_risk,
                     },
                 )
+                if minimum_refresh.get("eligible") and minimum_refresh.get("changed"):
+                    protection_risk = self._entry_protection_risk(
+                        decision=decision,
+                        side=side,
+                        reference_price=price,
+                        price_limit=submit_price_limit,
+                        stop_loss_price=self._safe_float(protection["stop_loss_price"]),
+                        planned_notional_usdt=self._safe_float(
+                            minimum_refresh["sizing"].get("final_notional_usdt"), 0.0,
+                        ),
+                    )
+                    position_value = protection_risk["maximum_notional_usdt"]
+                protection_reconciliation = reconcile_profit_risk_sizing(
+                    decision,
+                    final_notional_usdt=position_value,
+                    final_leverage=decision.suggested_leverage,
+                    source="okx_pre_submit_protection_risk",
+                    execution_facts={
+                        "okx_symbol": okx_symbol,
+                        "price": price,
+                        "fill_risk_price": fill_risk_price,
+                        "protection_risk": protection_risk,
+                        "okx_order_rules": {"min_notional_usdt": minimum_notional},
+                    },
+                )
+                if protection_reconciliation.get("eligible") is not True:
+                    return ExecutionResult(
+                        order_id="risk_contract_rejected",
+                        symbol=decision.symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=0.0,
+                        price=price,
+                        status=OrderStatus.REJECTED,
+                        raw_response={
+                            "error": (
+                                "当前保护止损和价格带下，最小合约不能满足已批准的风险预算；"
+                                "风险合同已更新，系统未提交订单。"
+                            ),
+                            "execution_blocker": "execution_protection_risk_refresh",
+                            "system_pre_submit_rejection": True,
+                            "okx_rejection": False,
+                            "protection_reconciliation": protection_reconciliation,
+                            "okx_symbol": okx_symbol,
+                            "okx_order_rules": okx_order_rules,
+                        },
+                    )
                 if minimum_refresh.get("eligible") is not True:
                     return ExecutionResult(
                         order_id="risk_contract_rejected",
@@ -1731,21 +1778,6 @@ class OKXExecutor(AbstractExecutor):
                             "okx_order_rules": okx_order_rules,
                         },
                     )
-                refreshed_sizing = minimum_refresh.get("sizing")
-                refreshed_notional = (
-                    self._safe_float(
-                        refreshed_sizing.get("final_notional_usdt"),
-                        0.0,
-                    )
-                    if isinstance(refreshed_sizing, dict)
-                    else 0.0
-                )
-                # The protection-derived maximum is an authoritative risk
-                # ceiling. Refreshing the exchange minimum may raise a stale
-                # undersized order, but it must never restore the old larger
-                # target and bypass the current stop/slippage stress budget.
-                if refreshed_notional > 0.0:
-                    position_value = min(position_value, refreshed_notional)
                 order_quantity, base_quantity = self._entry_order_amount(
                     ccxt,
                     market,
@@ -8150,6 +8182,7 @@ class OKXExecutor(AbstractExecutor):
             market_specs,
             fee,
             balance_snapshot,
+            price_limit,
         ) = await asyncio.gather(
             self._fetch_native_ticker(symbol),
             fetch_with_receipt(fetch_order_book, okx_symbol),
@@ -8158,6 +8191,7 @@ class OKXExecutor(AbstractExecutor):
             self._native_facts_client().fetch_market_contract_specs(symbols=[symbol]),
             self.fetch_account_fee_snapshot(),
             self.get_balance_snapshot(),
+            self._fetch_native_price_limit(symbol),
         )
         account_order_capacity = await self._fetch_account_order_capacity(
             ccxt,
@@ -8312,6 +8346,8 @@ class OKXExecutor(AbstractExecutor):
             "last_price": ticker_last or ((bid + ask) / 2.0),
             "bid": bid,
             "ask": ask,
+            "high": self._safe_float(ticker.get("high"), 0.0),
+            "low": self._safe_float(ticker.get("low"), 0.0),
             "mark_price": mark_price,
             "notional_24h_usdt": notional_24h_usdt,
             "volume_24h_contracts": volume_24h_contracts,
@@ -8382,6 +8418,9 @@ class OKXExecutor(AbstractExecutor):
         generated_at = datetime.now(UTC).isoformat()
         feature_snapshot = {
             "current_price": (bid + ask) / 2.0 if bid > 0 and ask >= bid else 0.0,
+            "last": self._safe_float(ticker.get("last"), 0.0),
+            "buy_price_limit": self._safe_float(price_limit.get("buy_price_limit"), 0.0),
+            "sell_price_limit": self._safe_float(price_limit.get("sell_price_limit"), 0.0),
             "bid": bid,
             "ask": ask,
             "mark_price": mark_price,

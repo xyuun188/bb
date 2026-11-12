@@ -194,6 +194,23 @@ def test_takeover_refresh_preserves_paper_training_lifecycle() -> None:
     assert contract["paper_training_lifecycle"] == lifecycle
 
 
+@pytest.mark.parametrize("source", ["previous", "facts"])
+def test_takeover_refresh_preserves_normal_training_risk_scope(source: str) -> None:
+    lifecycle = {
+        "kind": "normal_strategy_position",
+        "selection_reason": "paper_training_entry",
+        "entry_decision_id": 786153,
+        "production_permission": False,
+    }
+    facts = _facts(quantity=1.0)
+    previous = {}
+    (previous if source == "previous" else facts)["normal_paper_lifecycle"] = lifecycle
+
+    contract = build_current_position_management_contract(facts, previous_contract=previous)
+
+    assert contract["normal_paper_lifecycle"] == lifecycle
+
+
 def test_zero_actual_fee_is_complete_when_okx_fee_evidence_is_explicit() -> None:
     contract = build_current_position_management_contract(
         _facts(entry_fee_usdt=0.0, full_entry_fee_usdt=0.0)
