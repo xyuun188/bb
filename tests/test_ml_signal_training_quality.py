@@ -3538,6 +3538,52 @@ def test_train_from_frame_counts_only_rows_used_for_fitting() -> None:
     assert "train_count" not in metadata
     assert metadata["training_window_composition"]["sample_count"] == 40
     assert metadata["decision_group_partition"]["ready"] is True
+    assert metadata["training_distribution_profile"]["scope"] == "fitted_training_partition_only"
+    assert metadata["training_distribution_profile"]["features"]["long_return_pct"]["count"] == 40
+
+
+def test_recent_drift_detects_reversal_hidden_by_full_window() -> None:
+    frame = _training_frame(1000)
+    frame["horizon_minutes"] = 240
+    frame["label_timestamp"] = pd.date_range("2026-11-12", periods=1000, freq="5min", tz="UTC")
+    frame["returns_20"] = 0.0
+    old = ml_signal_module._training_distribution_profile(frame)
+    frame.loc[frame.index[-40:], "returns_20"] = 1.0
+
+    full = ml_signal_module._training_distribution_drift(
+        ml_signal_module._training_distribution_profile(frame), old,
+    )
+    recent = ml_signal_module._recent_training_distribution_profile(frame)
+    drift = ml_signal_module._training_distribution_drift(recent, old)
+
+    assert full["detected"] is False
+    assert recent["ready"] is True
+    assert recent["sample_count"] == 48
+    assert drift["detected"] is True
+    changed = frame.copy()
+    changed.loc[changed.index[:-48], "returns_20"] = -1000.0
+    assert ml_signal_module._recent_training_distribution_profile(changed) == recent
+
+
+def test_recent_drift_requires_mature_primary_horizon_evidence() -> None:
+    frame = _training_frame(10)
+    frame["horizon_minutes"] = 240
+    result = ml_signal_module._recent_training_distribution_profile(frame)
+    assert result["ready"] is False
+    assert result["features"] == {}
+    assert ml_signal_module._recent_training_distribution_profile(pd.DataFrame())["ready"] is False
+
+
+def test_capped_or_shrinking_training_window_counts_new_settled_groups() -> None:
+    frame = _training_frame(80)
+    checkpoint = pd.Timestamp(frame.iloc[59]["label_timestamp"]).to_pydatetime()
+    assert ml_signal_module._new_training_decision_groups(
+        frame, previous_count=80, trained_at=checkpoint,
+    ) == 20
+    frame.loc[frame.index[-10:], "decision_group"] = frame.iloc[-11]["decision_group"]
+    assert ml_signal_module._new_training_decision_groups(
+        frame, previous_count=80, trained_at=checkpoint,
+    ) == 10
 
 
 def test_quality_report_separates_missed_opportunity_downweight_from_contamination() -> None:

@@ -51,6 +51,7 @@ from services.local_ai_training_contract import (  # noqa: E402
     TRAINING_CURSOR_VERSION,
     local_ai_training_cursor,
 )
+from services.ml_training_contract import PRIMARY_PREDICTION_HORIZON_MINUTES  # noqa: E402
 from services.ml_training_dataset import (  # noqa: E402
     probe_authoritative_trade_training_cursor,
     shadow_training_candidate_filters,
@@ -82,14 +83,16 @@ async def _completed_shadow_decision_group_count() -> int:
 
 
 async def _streaming_cursor_probe() -> dict[str, Any]:
-    """Fingerprint the same bounded shadow window used by the trainer."""
+    """Read cumulative cursors and recent settled conditions independently."""
 
     shadow_count, group_count = await asyncio.gather(
         _completed_shadow_sample_count(),
         _completed_shadow_decision_group_count(),
     )
     shadow_samples, trade_probe = await asyncio.gather(
-        _load_shadow_samples(sample_budget=_REMOTE_TRAINING_MAX_SHADOW_SAMPLES),
+        _load_shadow_samples(
+            sample_budget=_REMOTE_TRAINING_MAX_SHADOW_SAMPLES, recent_only=True,
+        ),
         probe_authoritative_trade_training_cursor(),
     )
     payload = annotate_training_payload(
@@ -101,6 +104,7 @@ async def _streaming_cursor_probe() -> dict[str, Any]:
     cursor = local_ai_training_cursor(
         shadow_samples=payload["shadow_samples"],
         trade_samples=[],
+        profile_window_minutes=PRIMARY_PREDICTION_HORIZON_MINUTES,
     )
     return {
         "version": TRAINING_CURSOR_VERSION,

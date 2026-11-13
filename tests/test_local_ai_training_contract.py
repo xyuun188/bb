@@ -102,6 +102,29 @@ def test_training_cursor_counts_independent_groups_and_includes_losses() -> None
     )
 
 
+def test_recent_profile_excludes_old_labels_without_changing_cursor_counts() -> None:
+    start = datetime(2026, 11, 12, tzinfo=UTC)
+    samples = []
+    for index in range(100):
+        sample = _shadow_sample(index + 1, f"group-{index}")
+        sample["label_timestamp"] = (start + timedelta(minutes=10 * index)).isoformat()
+        sample["features"]["returns_5"] = -1.0 if index < 76 else 1.0
+        samples.append(sample)
+    cursor = local_ai_training_cursor(
+        shadow_samples=samples, trade_samples=[], profile_window_minutes=240,
+    )
+    profile = cursor["training_distribution_profile"]
+    assert cursor["completed_market_sample_count"] == 100
+    assert cursor["completed_market_decision_group_count"] == 100
+    assert profile["sample_count"] == 24
+    assert profile["features"]["returns_5"]["mean"] == 1.0
+    samples[-1]["label_timestamp"] = None
+    sparse = local_ai_training_cursor(
+        shadow_samples=samples[-4:], trade_samples=[], profile_window_minutes=240,
+    )
+    assert sparse["training_distribution_profile"]["features"] == {}
+
+
 def test_training_trigger_requires_independent_group_evidence() -> None:
     now = datetime(2026, 7, 27, 12, tzinfo=UTC)
     no_drift = {"detected": False}

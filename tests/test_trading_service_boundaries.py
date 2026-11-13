@@ -4703,6 +4703,69 @@ async def test_local_ai_tools_auto_train_cools_down_small_drift_batches(
 
 
 @pytest.mark.asyncio
+async def test_rejected_training_profile_cannot_hide_deployed_model_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._local_tools_last_completed_shadow_count = 0
+    at = (datetime.now(UTC) - timedelta(hours=7)).isoformat()
+    deployed = {"features": {"returns_5": {"mean": 0.0, "std": 0.1}}}
+    recent = {"features": {"returns_5": {"mean": 1.0, "std": 0.1}}}
+
+    class FakeTrainingState:
+        def read(self) -> dict[str, Any]:
+            return {"models": {"local_ai_profit_prediction": {
+                "sample_cursor": {"shadow": 20_016, "trade": 295, "decision_group": 20_016},
+                "last_successful_training_at": at,
+                "last_finished_at": at,
+                "last_result": {
+                    "challenger_rejected": True,
+                    "completed_shadow_sample_count": 20_016,
+                    "completed_trade_sample_count": 295,
+                    "authoritative_trade_training_probe": {"fingerprint": "same"},
+                    "training_distribution_profile": recent,
+                },
+            }}}
+
+    class FakeLocalAITools:
+        def enabled(self) -> bool:
+            return True
+
+        async def status(self) -> dict[str, Any]:
+            return {
+                "available": True,
+                "model_bundle_available": True,
+                "last_trained_completed_shadow_sample_count": 20_016,
+                "last_trained_completed_trade_sample_count": 295,
+                "last_trained_completed_training_decision_group_count": 20_016,
+                "trained_at": at,
+                "training_distribution_profile": deployed,
+            }
+
+    monkeypatch.setattr(
+        "services.okx_training_gate.okx_training_refresh_gate", lambda: {"allowed": True},
+    )
+    service.local_ai_tools = FakeLocalAITools()
+    service.model_training_state_store = FakeTrainingState()
+    service._run_local_ai_tools_training_cursor_subprocess = lambda: _async_value({
+        "reason": "cursor_probe_complete",
+        "completed_shadow_sample_count": 20_049,
+        "completed_trade_sample_count": 295,
+        "completed_training_decision_group_count": 20_049,
+        "training_distribution_profile": recent,
+    })
+    service._run_local_ai_tools_training_subprocess = lambda: _async_value({"trained": True})
+
+    result = await service._maybe_train_local_ai_tools_process(force=False)
+
+    trigger = result["training_policy"]["trigger_contract"]
+    assert result["trained"] is True
+    assert trigger["reason"] == "distribution_drift_with_new_labels"
+    assert trigger["new_mature_decision_group_count"] == 33
+    assert trigger["distribution_drift"]["maximum_shift"] == 10.0
+
+
+@pytest.mark.asyncio
 async def test_local_ai_tools_auto_train_rebuilds_when_clean_view_rebases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

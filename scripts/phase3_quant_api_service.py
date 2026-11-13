@@ -6022,6 +6022,7 @@ def _training_distribution_profile(
     )
     return {
         "version": "2026-07-27.training-distribution-profile.v1",
+        "scope": "fitted_training_partition_only",
         "features": {
             key: {
                 "count": len(rows),
@@ -6663,8 +6664,8 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
             }
         ),
         "training_distribution_profile": _training_distribution_profile(
-            rows,
-            cost_rows,
+            train_rows,
+            cost_train_rows,
         ),
         "completed_shadow_sample_count": int(req.completed_shadow_sample_count or len(rows)),
         "last_trained_completed_shadow_sample_count": int(

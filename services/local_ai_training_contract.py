@@ -5,10 +5,14 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from statistics import fmean, pstdev
 from typing import Any
 
+from services.ml_training_contract import (
+    MIN_TRAINING_DECISION_GROUP_COUNT,
+    MIN_TRAINING_SAMPLE_COUNT,
+)
 from services.profit_supervision import (
     COUNTERFACTUAL_EXECUTION_COST_TASK as EXECUTION_COST_TASK,
 )
@@ -138,12 +142,14 @@ def local_ai_training_cursor(
     *,
     shadow_samples: Sequence[Mapping[str, Any]],
     trade_samples: Sequence[Mapping[str, Any]],
+    profile_window_minutes: int | None = None,
 ) -> dict[str, Any]:
-    market_rows = [
-        identity
+    market_pairs = [
+        (sample, identity)
         for sample in shadow_samples
         if (identity := market_training_identity(sample)) is not None
     ]
+    market_rows = [row for _sample, row in market_pairs]
     cost_rows = [
         identity
         for sample in trade_samples
@@ -151,15 +157,48 @@ def local_ai_training_cursor(
     ]
     market_groups = {str(row["decision_group"]) for row in market_rows}
     cost_groups = {str(row["decision_group"]) for row in cost_rows}
+    profile_rows = market_rows
+    profile_details: dict[str, Any] = {}
+    if profile_window_minutes is not None:
+        dated_rows = []
+        for sample, row in market_pairs:
+            try:
+                label_at = datetime.fromisoformat(
+                    str(sample.get("label_timestamp") or "").replace("Z", "+00:00")
+                )
+            except ValueError:
+                continue
+            if label_at.tzinfo is not None:
+                dated_rows.append((label_at.astimezone(UTC), row))
+        latest = max((at for at, _row in dated_rows), default=None)
+        profile_rows = [
+            row for at, row in dated_rows
+            if latest is not None and at > latest - timedelta(minutes=profile_window_minutes)
+        ]
+        profile_details = {
+            "scope": "recent_matured_primary_horizon",
+            "window_minutes": profile_window_minutes,
+            "label_end": latest.isoformat() if latest else None,
+            "sample_count": len(profile_rows),
+            "decision_group_count": len({row["decision_group"] for row in profile_rows}),
+            "ready": (
+                len(profile_rows) >= MIN_TRAINING_SAMPLE_COUNT
+                and len({row["decision_group"] for row in profile_rows})
+                >= MIN_TRAINING_DECISION_GROUP_COUNT
+            ),
+        }
+        # Incomplete recent evidence must not masquerade as a regime change.
+        if not profile_details["ready"]:
+            profile_rows = []
     values: dict[str, list[float]] = defaultdict(list)
-    for row in market_rows:
+    for row in profile_rows:
         features = _mapping(row.get("features"))
         for feature in _PROFILE_FEATURES:
             if (value := _finite_float(features.get(feature))) is not None:
                 values[feature].append(value)
         values["long_return_pct"].append(float(row["long_return_pct"]))
         values["short_return_pct"].append(float(row["short_return_pct"]))
-    for row in cost_rows:
+    for row in (cost_rows if profile_window_minutes is None else []):
         values["authoritative_execution_cost_pct"].append(float(row["execution_cost_pct"]))
     profile = {
         key: {"count": len(rows), "mean": fmean(rows), "std": pstdev(rows)}
@@ -176,6 +215,7 @@ def local_ai_training_cursor(
         "training_distribution_profile": {
             "version": TRAINING_DISTRIBUTION_PROFILE_VERSION,
             "features": profile,
+            **profile_details,
         },
     }
 

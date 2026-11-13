@@ -816,7 +816,7 @@ class ModelTrainingCoordinatorMixin:
                     (status or {}).get("completed_market_decision_group_count"), 0
                 )
             previous_cursor_scope = str((status or {}).get("cursor_count_scope") or "")
-            previous_distribution_profile = (status or {}).get(
+            deployed_distribution_profile = (status or {}).get(
                 "training_distribution_profile"
             ) or {}
             training_state_cursor = 0
@@ -904,9 +904,6 @@ class ModelTrainingCoordinatorMixin:
                         previous_cursor_scope = str(
                             attempt_result.get("cursor_count_scope") or ""
                         )
-                        previous_distribution_profile = (
-                            attempt_result.get("training_distribution_profile") or {}
-                        )
                         previous_trade_probe = (
                             attempt_result.get("authoritative_trade_training_probe") or {}
                         )
@@ -969,14 +966,20 @@ class ModelTrainingCoordinatorMixin:
                     # Counts from different cursor protocols are not comparable.
                     # Establish a baseline instead of treating migration as new data.
                     previous_group_total = completed_group_total
-                    previous_distribution_profile = {}
                 elif canonical_market_cursor is not None:
                     previous_group_total = canonical_market_cursor
             distribution_drift = training_distribution_drift(
                 cursor_result.get("training_distribution_profile") or {},
-                previous_distribution_profile,
+                deployed_distribution_profile,
                 threshold=LOCAL_ML_TRAINING_PARAMS.distribution_drift_threshold,
             )
+            distribution_drift.update({
+                "reference_source": "deployed_artifact_not_rejected_training_attempt",
+                "reference_scope": deployed_distribution_profile.get(
+                    "scope", "legacy_full_training_window",
+                ),
+                "current_profile": cursor_result.get("training_distribution_profile") or {},
+            })
             trigger = decision_group_training_trigger(
                 force=False,
                 has_artifact=not learning_only,

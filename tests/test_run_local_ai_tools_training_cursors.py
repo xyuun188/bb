@@ -160,7 +160,7 @@ async def test_run_once_returns_structured_error_and_closes_database(
 
 
 @pytest.mark.asyncio
-async def test_streaming_cursor_uses_bounded_training_window(
+async def test_streaming_cursor_uses_recent_window_without_changing_cumulative_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed: dict[str, int] = {}
@@ -182,8 +182,9 @@ async def test_streaming_cursor_uses_bounded_training_window(
     async def group_count() -> int:
         return await track_read(asyncio.sleep(0, result=24_000))
 
-    async def shadow_loader(*, sample_budget: int) -> list[dict]:
+    async def shadow_loader(*, sample_budget: int, recent_only: bool) -> list[dict]:
         observed["sample_budget"] = sample_budget
+        observed["recent_only"] = recent_only
         return await track_read(asyncio.sleep(0, result=[_shadow_sample(1, "scan-1")]))
 
     async def trade_probe() -> dict:
@@ -206,6 +207,7 @@ async def test_streaming_cursor_uses_bounded_training_window(
     result = await script._streaming_cursor_probe()
 
     assert observed["sample_budget"] == script._REMOTE_TRAINING_MAX_SHADOW_SAMPLES
+    assert observed["recent_only"] is True
     assert result["completed_shadow_sample_count"] == 100_000
     assert result["completed_market_decision_group_count"] == 24_000
     assert result["cursor_count_scope"] == (

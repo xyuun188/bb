@@ -1119,6 +1119,53 @@ def _training_distribution_drift(
     }
 
 
+def _recent_training_distribution_profile(frame: pd.DataFrame) -> dict[str, Any]:
+    """Compare newly settled market conditions with the deployed fit."""
+
+    timestamps = pd.to_datetime(
+        frame.get("label_timestamp", pd.Series(index=frame.index, dtype=object)),
+        utc=True, errors="coerce",
+    )
+    latest = timestamps.max()
+    recent = frame.iloc[0:0]
+    if not pd.isna(latest):
+        recent = frame[
+            (timestamps > latest - pd.Timedelta(minutes=PRIMARY_PREDICTION_HORIZON_MINUTES))
+            & (timestamps <= latest)
+            & frame["horizon_minutes"].eq(PRIMARY_PREDICTION_HORIZON_MINUTES)
+        ]
+    group_count = int(recent["decision_group"].nunique()) if not recent.empty else 0
+    ready = (
+        len(recent) >= MIN_TRAINING_SAMPLE_COUNT
+        and group_count >= MIN_TRAINING_DECISION_GROUP_COUNT
+    )
+    return {
+        **_training_distribution_profile(recent if ready else frame.iloc[0:0]),
+        "scope": "recent_matured_primary_horizon",
+        "ready": ready,
+        "window_minutes": PRIMARY_PREDICTION_HORIZON_MINUTES,
+        "label_end": _fingerprint_value(latest) if not pd.isna(latest) else None,
+        "sample_count": int(len(recent)),
+        "decision_group_count": group_count,
+    }
+
+
+def _new_training_decision_groups(
+    frame: pd.DataFrame, *, previous_count: int, trained_at: datetime | None,
+) -> int:
+    current_count = int(frame["decision_group"].nunique()) if not frame.empty else 0
+    count_growth = max(current_count - previous_count, 0)
+    if trained_at is not None and not frame.empty:
+        # New settled labels still arrive when a bounded/filtered window's
+        # cardinality stays constant or shrinks. Count identities, not rows.
+        labels = pd.to_datetime(frame["label_timestamp"], utc=True, errors="coerce")
+        return max(
+            count_growth,
+            int(frame.loc[labels > trained_at, "decision_group"].nunique()),
+        )
+    return count_growth
+
+
 def _apply_training_replay_weights(
     train: pd.DataFrame, *, outcome_emphasis: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -2904,7 +2951,10 @@ def train_from_frame(
         "training_frame_sample_count": int(len(frame)),
         "training_frame_decision_group_count": int(frame["decision_group"].nunique()),
         "replay_weight_manifest": replay_weight_manifest,
-        "training_distribution_profile": _training_distribution_profile(frame),
+        "training_distribution_profile": {
+            **_training_distribution_profile(train),
+            "scope": "fitted_training_partition_only",
+        },
         "quality_report": frame_quality_report,
         "candidate_quality_report": training_quality_report or {},
         "artifact_quality_scope": "training_and_holdout_rows_excluding_purged_labels",
@@ -3934,15 +3984,24 @@ class MLSignalService:
                     )
                     or 0
                 )
-                new_decision_group_count = max(
-                    completed_decision_group_count - previous_group_count,
-                    0,
+                new_decision_group_count = _new_training_decision_groups(
+                    trigger_frame,
+                    previous_count=previous_group_count,
+                    trained_at=last_trained_at,
                 )
-                current_distribution_profile = _training_distribution_profile(trigger_frame)
+                current_distribution_profile = _recent_training_distribution_profile(trigger_frame)
                 distribution_drift = _training_distribution_drift(
                     current_distribution_profile,
-                    _safe_dict(cursor_metadata.get("training_distribution_profile")),
+                    _safe_dict(metadata.get("training_distribution_profile")),
                 )
+                distribution_drift.update({
+                    "current_profile": current_distribution_profile,
+                    "reference_scope": _safe_dict(
+                        metadata.get("training_distribution_profile")
+                    ).get("scope", "legacy_full_training_window"),
+                    "reference_artifact_version": self._artifact_version(metadata),
+                    "reference_source": "deployed_artifact_not_rejected_training_attempt",
+                })
                 completed_trade_count = len(trade_samples)
                 new_trade_samples = max(
                     completed_trade_count - last_completed_trade_count, 0
