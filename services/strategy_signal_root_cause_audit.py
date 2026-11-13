@@ -94,6 +94,7 @@ class StrategySignalRootCauseAuditService:
         entries = [row for row in decisions if str(row.action or "").lower() in ENTRY_ACTIONS]
         blocker_counts: Counter[str] = Counter()
         lifecycle_blocker_counts: Counter[tuple[str, str]] = Counter()
+        observation_only_counts: Counter[str] = Counter()
         pre_sizing_blocker_counts: Counter[str] = Counter()
         economic_blocker_counts: Counter[str] = Counter()
         expected_returns: list[float] = []
@@ -103,6 +104,10 @@ class StrategySignalRootCauseAuditService:
         lifecycle_ready_counts: Counter[str] = Counter()
         for row in entries:
             raw = _safe_dict(getattr(row, "raw_llm_response", None))
+            observation_only_reason = _observation_only_guard_blocker(row, raw)
+            if observation_only_reason is not None:
+                observation_only_counts[observation_only_reason] += 1
+                continue
             pre_sizing_blocker = _pre_sizing_guard_blocker(row)
             if pre_sizing_blocker is not None:
                 pre_sizing_blocker_counts[pre_sizing_blocker] += 1
@@ -155,13 +160,15 @@ class StrategySignalRootCauseAuditService:
         return {
             "status": "warning" if causes or pre_sizing_blocker_counts else "ok",
             "summary": (
-                "Production return contract gaps were found."
+                "交易执行契约存在缺陷。"
                 if causes
-                else "Entries were stopped by authoritative pre-sizing guards."
+                else "开仓在仓位计算前被权威事实校验阻断。"
                 if pre_sizing_blocker_counts
-                else "Entries with nonpositive fee-after expected returns were rejected."
+                else "扣费后预期收益不为正，已拒绝开仓。"
                 if economic_blocker_counts
-                else "审计窗口内的生产收益契约完整。"
+                else "执行契约检查通过；仅观察记录已单独统计，未进入下单。"
+                if observation_only_counts
+                else "审计窗口内的交易执行契约完整。"
             ),
             "audit_only": True,
             "read_only": True,
@@ -175,9 +182,12 @@ class StrategySignalRootCauseAuditService:
             "entry_decision_count": len(entries),
             "contract_validation_entry_count": (
                 len(entries)
+                - sum(observation_only_counts.values())
                 - sum(pre_sizing_blocker_counts.values())
                 - sum(economic_blocker_counts.values())
             ),
+            "observation_only_entry_count": sum(observation_only_counts.values()),
+            "observation_only_reason_counts": dict(observation_only_counts),
             "pre_sizing_guard_blocked_count": sum(pre_sizing_blocker_counts.values()),
             "pre_sizing_blocker_counts": dict(pre_sizing_blocker_counts),
             "economic_guard_blocked_count": sum(economic_blocker_counts.values()),
@@ -273,6 +283,31 @@ def _distribution(values: list[float]) -> dict[str, Any]:
         "max": round(ordered[-1], 8),
         "avg": round(sum(ordered) / len(ordered), 8),
     }
+
+
+def _observation_only_guard_blocker(row: Any, raw: dict[str, Any]) -> str | None:
+    """Recognize a persisted final observation veto before execution sizing."""
+
+    if getattr(row, "was_executed", None) is not False:
+        return None
+    sizing = raw.get("profit_risk_sizing")
+    if raw.get("market_analysis_only") is not True or (sizing is not None and sizing != {}):
+        return None
+    contract = _safe_dict(raw.get("market_analysis_only_contract"))
+    if (
+        contract.get("selected_for_market_analysis") is not True
+        or contract.get("entry_permission") is not False
+        or contract.get("promoted_for_execution") not in (None, False)
+        or _safe_dict(raw.get("entry_permission")).get("granted") is not False
+    ):
+        return None
+    if str(getattr(row, "execution_reason", None) or "").strip() != (
+        "该币种仅用于扩大市场观察覆盖，未通过交易候选质量层；"
+        "分析结果不能进入开仓执行链路。"
+    ):
+        return None
+    reason = contract.get("reason")
+    return reason.strip() or None if isinstance(reason, str) else None
 
 
 def _pre_sizing_guard_blocker(row: Any) -> str | None:

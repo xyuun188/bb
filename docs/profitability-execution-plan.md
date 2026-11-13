@@ -542,7 +542,41 @@ counter returned 41,591 samples in 0.0326 seconds.
 
 The complete regression suite passed 5,915 tests with one skip. After the index
 registration change, 88 focused database, maintenance and collection-status
-tests passed. The first forced integrated scan still exhausted its total budget
-and is not a clean acceptance result; a new deployed scan must verify that no
-required section was deferred and that the training counter no longer falls
-back because of timeout.
+tests passed. Two forced scans under an artificial 70% CPU quota exhausted
+their total budget and are not clean acceptance results. The final scan used
+the normal dashboard resource conditions, with Nice=10 and the unchanged
+180-second budget. Report
+`native-audit-acceptance-20261113-180232/latest.json`, generated at
+`2026-11-13T18:04:52Z`, completed all required fresh sections in 135.6231 seconds
+with no deferred or missing sections. Training counts were known, with no
+warnings: 41,723 shadow rows and 238 trade rows. Of 27 cards, 21 were OK, four
+were warnings and two were critical. Both critical cards concern failed
+profitability/promotion qualification; collection success does not pass them.
+
+The v18 entry change also produced a real bounded paper fill. AVAX/USDT short
+decision `802082` at `2026-11-13T17:46:41Z` used local model
+`20261113T155824628907Z-76761f83`. Order `18713` filled 1.8 AVAX at 8.366,
+with OKX order `4096649205102915585` confirmed at `17:47:40Z`. Its final
+fee-after objective was `+0.0219984%`; the ineligible remote family remained
+diagnostic. Production permission stayed false. Position `14461` subsequently
+had a 0.2 AVAX partial exit, represented by fragment `14462`; the initial
+settling fragment is not authoritative settled profit. The system execution
+window still had 96 settled positions and `-25.13324202 USDT`, which must not
+be attributed entirely to the current model. Profitability remains unqualified.
+
+## November 14 Observation-Only Audit Classification
+
+The final fresh scan reported two rejected entries as 24 execution-contract
+defect categories. Frozen decisions `801669` and `801683` establish the actual
+stage: both had `market_analysis_only=true`, a final observation contract with
+entry permission false, denied top-level entry permission, no sizing contract,
+and no execution. Their final reason was the shared market-observation veto;
+their candidate reason was `okx_private_entry_instrument_probe_deferred`. Both
+also failed the current return objective. These were observation records, not
+orders submitted with missing leverage, cost or account-risk contracts.
+
+Root-cause auditing now counts this narrow, fully evidenced final observation
+veto separately, preserving its candidate-reason counts. It continues complete
+execution-contract validation for executed or promoted records, conflicting
+permissions, existing sizing, missing evidence and different final reasons.
+Neither entry authorization nor profitability qualification changes.

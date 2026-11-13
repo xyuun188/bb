@@ -332,3 +332,83 @@ def test_economic_refusal_never_masks_execution_or_incomplete_evidence(field, va
     assert report["economic_guard_blocked_count"] == 0
     assert report["contract_validation_entry_count"] == 1
     assert report["contract_blocker_counts"]
+
+
+def _observation_only_rejection() -> SimpleNamespace:
+    return SimpleNamespace(
+        action="short",
+        was_executed=False,
+        execution_reason=(
+            "该币种仅用于扩大市场观察覆盖，未通过交易候选质量层；"
+            "分析结果不能进入开仓执行链路。"
+        ),
+        raw_llm_response={
+            "market_analysis_only": True,
+            "market_analysis_only_contract": {
+                "selected_for_market_analysis": True,
+                "entry_permission": False,
+                "reason": "okx_private_entry_instrument_probe_deferred",
+            },
+            "entry_permission": {"granted": False},
+            "normal_paper_trade": {"authorized": False},
+        },
+    )
+
+
+def test_observation_veto_is_counted_separately_from_execution_contract_gaps() -> None:
+    decision = _observation_only_rejection()
+    report = StrategySignalRootCauseAuditService().summarize(
+        decisions=[decision, _decision(complete=True)], shadows=[], ml_status={},
+    )
+
+    assert report["status"] == "ok"
+    assert report["entry_decision_count"] == 2
+    assert report["observation_only_entry_count"] == 1
+    assert report["observation_only_reason_counts"] == {
+        "okx_private_entry_instrument_probe_deferred": 1
+    }
+    assert report["contract_validation_entry_count"] == 1
+    assert report["entry_contract_ready_count"] == 1
+    assert report["normal_paper_entry_count"] == 0
+    assert report["contract_blocker_counts"] == {}
+    assert decision.raw_llm_response["entry_permission"]["granted"] is False
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("was_executed",), True),
+        (("was_executed",), None),
+        (("execution_reason",), "Normal paper trade contract is invalid."),
+        (("market_analysis_only",), False),
+        (("market_analysis_only_contract",), {}),
+        (("market_analysis_only_contract", "selected_for_market_analysis"), False),
+        (("market_analysis_only_contract", "entry_permission"), True),
+        (("market_analysis_only_contract", "promoted_for_execution"), True),
+        (("market_analysis_only_contract", "reason"), ""),
+        (("market_analysis_only_contract", "reason"), {}),
+        (("entry_permission",), {}),
+        (("entry_permission", "granted"), True),
+        (("profit_risk_sizing",), {"final_notional_usdt": 15.0}),
+        (("profit_risk_sizing",), False),
+        (("profit_risk_sizing",), []),
+    ],
+)
+def test_observation_veto_never_masks_executed_promoted_or_unproven_entries(path, value):
+    decision = _observation_only_rejection()
+    if path[0] in {"was_executed", "execution_reason"}:
+        setattr(decision, path[0], value)
+    elif len(path) == 1:
+        decision.raw_llm_response[path[0]] = value
+    else:
+        decision.raw_llm_response[path[0]][path[1]] = value
+
+    report = StrategySignalRootCauseAuditService().summarize(
+        decisions=[decision], shadows=[], ml_status={},
+    )
+
+    assert report["status"] == "warning"
+    assert report["observation_only_entry_count"] == 0
+    assert report["contract_validation_entry_count"] == 1
+    assert report["entry_contract_ready_count"] == 0
+    assert report["contract_blocker_counts"]
