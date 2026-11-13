@@ -671,6 +671,35 @@ def _optional_regression_value(
     return max(value, 0.0) if math.isfinite(value) else None
 
 
+def _net_return_prediction(
+    *,
+    return_contract: dict[str, Any],
+    cost_distribution: dict[str, Any],
+    index: int = 0,
+) -> dict[str, Any]:
+    """Use the same predicted costs for single and batched return scoring."""
+
+    gross_expected = _safe_float(return_contract.get("raw_expected_return_pct"), 0.0)
+    gross_q10 = _safe_float(return_contract.get("lower_quantile_return_pct"), gross_expected)
+    gross_q50 = _safe_float(return_contract.get("median_return_pct"), gross_expected)
+    gross_q90 = _safe_float(return_contract.get("upper_quantile_return_pct"), gross_expected)
+    # Total execution cost includes funding income as a negative cost.
+    cost_expected = float(cost_distribution["expected"][index])
+    cost_q10 = min(float(cost_distribution["lower_quantile"][index]), cost_expected)
+    cost_q90 = max(float(cost_distribution["upper_quantile"][index]), cost_expected)
+    quantiles = sorted((
+        gross_q10 - cost_q90, gross_q50 - cost_expected, gross_q90 - cost_q10,
+    ))
+    return {
+        "expected_net_return_pct": gross_expected - cost_expected,
+        "return_q10": quantiles[0],
+        "return_q50": quantiles[1],
+        "return_q90": quantiles[2],
+        "dispersion_pct": return_contract.get("dispersion_pct"),
+        "expected_execution_cost_pct": cost_expected,
+    }
+
+
 def _multitask_side_prediction(
     *,
     side: str,
@@ -684,34 +713,16 @@ def _multitask_side_prediction(
     expected_mfe_pct: float | None,
     expected_mae_pct: float | None,
 ) -> dict[str, Any]:
-    gross_expected = _safe_float(return_contract.get("raw_expected_return_pct"), 0.0)
-    gross_q10 = _safe_float(return_contract.get("lower_quantile_return_pct"), gross_expected)
-    gross_q50 = _safe_float(return_contract.get("median_return_pct"), gross_expected)
-    gross_q90 = _safe_float(return_contract.get("upper_quantile_return_pct"), gross_expected)
-    # Total execution cost includes funding income as a negative cost.
-    cost_expected = float(cost_distribution["expected"][0])
-    cost_q10 = min(float(cost_distribution["lower_quantile"][0]), cost_expected)
-    cost_q90 = max(float(cost_distribution["upper_quantile"][0]), cost_expected)
-    ordered_quantiles = sorted(
-        (
-            gross_q10 - cost_q90,
-            gross_q50 - cost_expected,
-            gross_q90 - cost_q10,
-        )
-    )
     return {
+        **_net_return_prediction(
+            return_contract=return_contract, cost_distribution=cost_distribution,
+        ),
         "version": MULTITASK_PREDICTION_CONTRACT_VERSION,
         "side": side,
-        "expected_net_return_pct": gross_expected - cost_expected,
-        "return_q10": ordered_quantiles[0],
-        "return_q50": ordered_quantiles[1],
-        "return_q90": ordered_quantiles[2],
-        "dispersion_pct": return_contract.get("dispersion_pct"),
         "loss_probability": 1.0 - _clamp(win_probability),
         "tail_loss_probability": (
             _clamp(tail_loss_probability) if tail_loss_probability is not None else None
         ),
-        "expected_execution_cost_pct": cost_expected,
         "expected_mfe_pct": expected_mfe_pct,
         "expected_mae_pct": expected_mae_pct,
         "prediction_horizon": int(horizon_minutes),
@@ -748,6 +759,31 @@ def _fee_after_prediction_objective(
         tail_loss_probability=tail_probability,
         tail_loss_scale_pct=tail_loss_scale_pct,
     )
+
+
+def _select_fee_after_side(
+    fee_after: dict[str, Any],
+    *,
+    net_predictions: dict[str, Any],
+    long_ready: bool,
+    short_ready: bool,
+) -> str:
+    ranks = {
+        side: _safe_float(
+            _safe_dict(fee_after.get(side)).get("objective_net_return_pct"),
+            float("nan"),
+        ) if ready else float("-inf")
+        for side, ready in (("long", long_ready), ("short", short_ready))
+    }
+    if not any(math.isfinite(value) for value in ranks.values()):
+        ranks = {
+            side: _safe_float(
+                _safe_dict(net_predictions.get(side)).get("expected_net_return_pct"),
+                float("-inf"),
+            )
+            for side in ("long", "short")
+        }
+    return "long" if ranks["long"] >= ranks["short"] else "short"
 
 
 def _actual_calibration_ready(profile: dict[str, Any]) -> bool:
@@ -4540,28 +4576,31 @@ class MLSignalService:
                 tail_loss_probability=short_tail_probability,
                 tail_loss_scale_pct=short_tail_scale,
             )
-            long_objective = _safe_float(
-                long_contract.get("objective_expected_return_pct"),
-                float("nan"),
+            long_cost_ready = _distribution_ready_at(long_cost_distribution, index)
+            short_cost_ready = _distribution_ready_at(short_cost_distribution, index)
+            fee_after_side_selection = {
+                "version": HOLDOUT_RETURN_METRIC_CONTRACT_VERSION,
+                "return_semantics": "risk_adjusted_net_after_counterfactual_execution_cost",
+            }
+            net_predictions = {}
+            for side, contract, costs, tail, scale in (
+                ("long", long_contract, long_cost_distribution, long_tail_probability, long_tail_scale),
+                ("short", short_contract, short_cost_distribution, short_tail_probability, short_tail_scale),
+            ):
+                net_prediction = _net_return_prediction(
+                    return_contract=contract, cost_distribution=costs, index=index,
+                )
+                net_predictions[side] = net_prediction
+                fee_after_side_selection[side] = _fee_after_prediction_objective(
+                    {**net_prediction, "tail_loss_probability": tail},
+                    tail_loss_scale_pct=scale,
+                )
+            best_side = _select_fee_after_side(
+                fee_after_side_selection,
+                net_predictions=net_predictions,
+                long_ready=long_contract.get("production_eligible") is True and long_cost_ready,
+                short_ready=short_contract.get("production_eligible") is True and short_cost_ready,
             )
-            short_objective = _safe_float(
-                short_contract.get("objective_expected_return_pct"),
-                float("nan"),
-            )
-            long_rank = (
-                long_objective
-                if long_contract.get("production_eligible") is True
-                else float("-inf")
-            )
-            short_rank = (
-                short_objective
-                if short_contract.get("production_eligible") is True
-                else float("-inf")
-            )
-            if not math.isfinite(long_rank) and not math.isfinite(short_rank):
-                long_rank = float(long_distribution["expected"][index])
-                short_rank = float(short_distribution["expected"][index])
-            best_side = "long" if long_rank >= short_rank else "short"
             symbol = str(features.get("symbol") or "")
             actual_calibration = {
                 side: select_trade_calibration(
@@ -4571,8 +4610,6 @@ class MLSignalService:
                 )
                 for side in ("long", "short")
             }
-            long_cost_ready = _distribution_ready_at(long_cost_distribution, index)
-            short_cost_ready = _distribution_ready_at(short_cost_distribution, index)
             results.append(
                 {
                     "available": True,
@@ -4581,6 +4618,7 @@ class MLSignalService:
                         {
                             "horizon_minutes": horizon_minutes,
                             "best_side": best_side,
+                            "fee_after_side_selection": fee_after_side_selection,
                             "actual_trade_calibration_ready": _actual_calibration_ready(
                                 _safe_dict(actual_calibration.get(best_side))
                             ),
@@ -4788,26 +4826,12 @@ class MLSignalService:
                 _safe_dict(fee_after_side_selection.get("short")).get("objective_net_return_pct"),
                 float("nan"),
             )
-            long_rank = (
-                long_objective_expected
-                if long_market_distribution_ready and long_cost_distribution_ready
-                else float("-inf")
+            best_side = _select_fee_after_side(
+                fee_after_side_selection,
+                net_predictions=multitask_prediction,
+                long_ready=long_market_distribution_ready and long_cost_distribution_ready,
+                short_ready=short_market_distribution_ready and short_cost_distribution_ready,
             )
-            short_rank = (
-                short_objective_expected
-                if short_market_distribution_ready and short_cost_distribution_ready
-                else float("-inf")
-            )
-            if not math.isfinite(long_rank) and not math.isfinite(short_rank):
-                long_rank = _safe_float(
-                    _safe_dict(multitask_prediction.get("long")).get("expected_net_return_pct"),
-                    float("-inf"),
-                )
-                short_rank = _safe_float(
-                    _safe_dict(multitask_prediction.get("short")).get("expected_net_return_pct"),
-                    float("-inf"),
-                )
-            best_side = "long" if long_rank >= short_rank else "short"
             best_win = long_win_rate if best_side == "long" else short_win_rate
             best_objective_expected = (
                 long_objective_expected if best_side == "long" else short_objective_expected

@@ -200,6 +200,20 @@ def _historical_replay_observation(
     created_at = getattr(row, "created_at", None)
     if isinstance(created_at, datetime) and created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=UTC)
+    label_contract = _safe_dict(snapshot.get("training_label_contract"))
+    label_values = _safe_dict(label_contract.get("labels")) or label_contract
+    try:
+        label_available_at = datetime.fromisoformat(
+            str(label_values.get("label_timestamp") or "").replace("Z", "+00:00"),
+        )
+        if label_available_at.tzinfo is None:
+            label_available_at = label_available_at.replace(tzinfo=UTC)
+    except ValueError:
+        return None, ["historical_replay_label_availability_invalid"]
+    if not isinstance(created_at, datetime) or label_available_at < created_at + timedelta(
+        minutes=_safe_int(getattr(row, "horizon_minutes", None)),
+    ):
+        return None, ["historical_replay_label_availability_invalid"]
     quality = assess_shadow_row(row)
     training_eligible = bool(
         isinstance(created_at, datetime)
@@ -216,9 +230,9 @@ def _historical_replay_observation(
         "market_regime": _regime_label(snapshot),
         "horizon_minutes": _safe_int(getattr(row, "horizon_minutes", None), 10),
         "created_at": _timestamp_text(created_at),
-        "completed_at": _timestamp_text(getattr(row, "updated_at", None)),
+        "completed_at": _timestamp_text(label_available_at),
         "decision_timestamp": _timestamp_text(created_at),
-        "label_timestamp": _timestamp_text(getattr(row, "due_at", None) or created_at),
+        "label_timestamp": _timestamp_text(label_available_at),
         "feature_snapshot": snapshot,
         "execution_cost_pct": decision_cost.total_pct,
         "side_realized_execution_cost_pct": outcome.get("side_execution_cost_pct"),

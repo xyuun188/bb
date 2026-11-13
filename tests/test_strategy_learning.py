@@ -55,9 +55,9 @@ def test_strategy_learning_json_payload_replaces_nested_non_finite_values() -> N
     json.dumps(payload, allow_nan=False)
 
 
-def test_historical_replay_observations_build_in_background_helper() -> None:
-    epoch_start = datetime(2026, 7, 1, tzinfo=UTC)
-    row = SimpleNamespace(
+@pytest.fixture
+def historical_replay_row() -> SimpleNamespace:
+    return SimpleNamespace(
         id=1,
         decision_id=2,
         symbol="BTC/USDT",
@@ -69,27 +69,64 @@ def test_historical_replay_observations_build_in_background_helper() -> None:
             "taker_fee_rate": 0.0005,
             "spread_pct": 0.01,
             "market_fact_quality_status": "verified",
+            "training_label_contract": {"label_timestamp": "2026-07-02T00:25:00+00:00"},
         },
         feature_snapshot={},
         horizon_minutes=10,
         long_return_pct=1.0,
         short_return_pct=-1.0,
         created_at=datetime(2026, 7, 2, tzinfo=UTC),
-        updated_at=datetime(2026, 7, 2, 0, 10, tzinfo=UTC),
+        updated_at=datetime(2026, 7, 2, 1, 0, tzinfo=UTC),
         due_at=datetime(2026, 7, 2, 0, 10, tzinfo=UTC),
         decision_action="long",
         best_action="long",
         missed_opportunity=False,
     )
 
+
+def test_historical_replay_observations_build_in_background_helper(
+    historical_replay_row: SimpleNamespace,
+) -> None:
     observations, excluded = _build_historical_replay_observations(
-        [row],
-        epoch_start=epoch_start,
+        [historical_replay_row], epoch_start=datetime(2026, 7, 1, tzinfo=UTC),
     )
 
     assert len(observations) == 1
     assert observations[0]["symbol"] == "BTC/USDT"
     assert excluded == {}
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_replay_uses_immutable_label_availability_not_due_or_update_time(
+    historical_replay_row: SimpleNamespace, nested: bool,
+) -> None:
+    contract = historical_replay_row.training_feature_snapshot["training_label_contract"]
+    if nested:
+        historical_replay_row.training_feature_snapshot["training_label_contract"] = {
+            "labels": contract,
+        }
+    observations, excluded = _build_historical_replay_observations(
+        [historical_replay_row], epoch_start=datetime(2026, 7, 1, tzinfo=UTC),
+    )
+
+    assert excluded == {}
+    assert observations[0]["label_timestamp"] == "2026-07-02T00:25:00+00:00"
+    assert observations[0]["completed_at"] == "2026-07-02T00:25:00+00:00"
+
+
+@pytest.mark.parametrize("label_timestamp", [None, "invalid", "2026-07-01T23:00:00Z"])
+def test_replay_does_not_invent_missing_or_invalid_label_availability(
+    historical_replay_row: SimpleNamespace, label_timestamp: str | None,
+) -> None:
+    historical_replay_row.training_feature_snapshot["training_label_contract"] = {
+        "label_timestamp": label_timestamp,
+    }
+    observations, excluded = _build_historical_replay_observations(
+        [historical_replay_row], epoch_start=datetime(2026, 7, 1, tzinfo=UTC),
+    )
+
+    assert observations == []
+    assert excluded == {"historical_replay_label_availability_invalid": 1}
 
 
 @pytest.mark.asyncio

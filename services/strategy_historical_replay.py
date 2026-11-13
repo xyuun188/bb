@@ -13,7 +13,7 @@ from typing import Any
 
 from services.model_strategy_blueprint import paper_strategy_replay_available
 
-STRATEGY_HISTORICAL_REPLAY_VERSION = "2026-07-21.model-selected-shadow-replay.v1"
+STRATEGY_HISTORICAL_REPLAY_VERSION = "2026-11-13.decision-time-fee-after-replay.v2"
 
 ModelPredictor = Callable[..., dict[str, Any]]
 
@@ -142,6 +142,7 @@ def _compact_cached_prediction(prediction: dict[str, Any]) -> dict[str, Any]:
             {
                 "horizon_minutes": row.get("horizon_minutes"),
                 "best_side": row.get("best_side"),
+                "fee_after_side_selection": row.get("fee_after_side_selection"),
                 "actual_trade_calibration_ready": row.get(
                     "actual_trade_calibration_ready"
                 ),
@@ -276,6 +277,7 @@ def _compact_prediction_fingerprint(
         "model_version": prediction.get("model_version"),
         "horizon_minutes": primary.get("horizon_minutes"),
         "best_side": primary.get("best_side"),
+        "fee_after_side_selection": primary.get("fee_after_side_selection"),
         "return_distribution_contract": primary.get("return_distribution_contract"),
         "counterfactual_execution_cost_distribution": primary.get(
             "counterfactual_execution_cost_distribution"
@@ -357,15 +359,17 @@ def _replay_entry(
     bootstrap_only = side not in production_eligible_sides
     if primary.get("actual_trade_calibration_ready") is not True and not bootstrap_only:
         return None, "model_replay_actual_trade_calibration_incomplete"
-    expected = _float(return_contract.get("objective_expected_return_pct"))
-    lower = _float(return_contract.get("lower_quantile_return_pct"))
+    fee_after = _dict(primary.get("fee_after_side_selection"))
+    if fee_after.get("return_semantics") != "risk_adjusted_net_after_counterfactual_execution_cost":
+        return None, "model_replay_fee_after_prediction_incomplete"
+    selected_fee_after = _dict(fee_after.get(side))
+    expected_after_cost = _float(selected_fee_after.get("objective_net_return_pct"))
+    lower_after_cost = _float(selected_fee_after.get("lower_quantile_net_return_pct"))
     execution_cost = _float(observation.get("execution_cost_pct"))
     funding_return = _float(observation.get(f"{side}_funding_return_pct"))
     realized = _float(observation.get(f"{side}_net_return_after_all_cost_pct"))
-    if None in {expected, lower, execution_cost, funding_return, realized}:
+    if None in {expected_after_cost, lower_after_cost, execution_cost, funding_return, realized}:
         return None, "model_replay_fee_after_values_incomplete"
-    expected_after_cost = float(expected) - float(execution_cost) + float(funding_return)
-    lower_after_cost = float(lower) - float(execution_cost) + float(funding_return)
     return (
         {
             "source": "trained_model_historical_shadow_replay",

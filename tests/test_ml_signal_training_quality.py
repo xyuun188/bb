@@ -4515,7 +4515,8 @@ def test_ml_signal_predict_blocks_lower_quantile_above_point_without_clamping() 
     assert prediction["prediction_quality"]["production_eligible"] is False
 
 
-def test_strategy_replay_batch_matches_single_prediction_contract() -> None:
+@pytest.mark.parametrize("costs", [(0.08, 0.09), (0.6, 0.05), (-0.3, 0.4)])
+def test_strategy_replay_batch_matches_single_prediction_contract(costs: tuple[float, float]) -> None:
     metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
     service = _service_with_metadata(metadata)
     service._bundle.update(
@@ -4526,8 +4527,12 @@ def test_strategy_replay_batch_matches_single_prediction_contract() -> None:
             "short_tail_classifier": _Classifier(0.1),
             "long_regressor": _Regressor(0.46, tree_predictions=(0.31, 0.61)),
             "short_regressor": _Regressor(0.2, tree_predictions=(0.1, 0.3)),
-            "long_cost_regressor": _Regressor(0.08, tree_predictions=(0.04, 0.12)),
-            "short_cost_regressor": _Regressor(0.09, tree_predictions=(0.05, 0.13)),
+            "long_cost_regressor": _Regressor(
+                costs[0], tree_predictions=(costs[0] - 0.04, costs[0] + 0.04),
+            ),
+            "short_cost_regressor": _Regressor(
+                costs[1], tree_predictions=(costs[1] - 0.04, costs[1] + 0.04),
+            ),
         }
     )
     features = {"symbol": "BTC/USDT", "current_price": 100.0, "atr_14": 1.0}
@@ -4547,6 +4552,10 @@ def test_strategy_replay_batch_matches_single_prediction_contract() -> None:
     assert (
         batch["predictions"][0]["actual_trade_calibration_ready"]
         == single["predictions"][0]["actual_trade_calibration_ready"]
+    )
+    assert (
+        batch["predictions"][0]["fee_after_side_selection"]
+        == single["predictions"][0]["fee_after_side_selection"]
     )
 
 

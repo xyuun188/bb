@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from services.strategy_historical_replay import build_strategy_historical_replay
 from services.strategy_learning import StrategyFeedback, StrategyLearningEngine
 
@@ -89,6 +91,7 @@ def _observations() -> list[dict]:
 def _predictor(features: dict, *, horizons: tuple[int, ...]) -> dict:
     side = str(features.get("replay_side") or "long")
     horizon = horizons[0]
+    predicted_cost = float(features.get("replay_predicted_cost", 0.1))
     return {
         "available": True,
         "model_version": "model-v2",
@@ -96,6 +99,13 @@ def _predictor(features: dict, *, horizons: tuple[int, ...]) -> dict:
             {
                 "horizon_minutes": horizon,
                 "best_side": side,
+                "fee_after_side_selection": {
+                    "return_semantics": "risk_adjusted_net_after_counterfactual_execution_cost",
+                    side: {
+                        "objective_net_return_pct": 1.2 - predicted_cost,
+                        "lower_quantile_net_return_pct": 0.8 - predicted_cost,
+                    },
+                },
                 "actual_trade_calibration_ready": True,
                 "return_distribution_contract": {
                     side: {
@@ -196,7 +206,7 @@ def test_replay_uses_model_selected_side_instead_of_scoring_both_directions() ->
 def test_replay_keeps_unprofitable_prediction_for_continuous_paper_evaluation() -> None:
     observations = _observations()
     for row in observations:
-        row["execution_cost_pct"] = 1.0
+        row["feature_snapshot"]["replay_predicted_cost"] = 1.0
 
     report = build_strategy_historical_replay(
         blueprint=_blueprint(),
@@ -238,6 +248,69 @@ def test_exit_observations_cannot_change_prediction_or_entry_gate() -> None:
     assert all(row["normal_entry_return_gate_passed"] is True for row in selected)
     assert all(row["realized_execution_cost_pct"] == 9.0 for row in selected)
     assert all(row["execution_replay_complete"] is False for row in selected)
+
+
+@pytest.mark.parametrize("funding_return", [-10.0, 10.0])
+def test_future_funding_cannot_change_prediction_or_entry_gate(funding_return: float) -> None:
+    observations = _observations()
+    baseline = build_strategy_historical_replay(
+        blueprint=_blueprint(), observations=observations, predictor=_predictor,
+    )
+    for row in observations:
+        row["long_funding_return_pct"] = funding_return
+        row["long_net_return_after_all_cost_pct"] += funding_return
+    replay = build_strategy_historical_replay(
+        blueprint=_blueprint(), observations=observations, predictor=_predictor,
+    )
+    before = [*baseline["development_samples"], *baseline["exam_samples"]]
+    after = [*replay["development_samples"], *replay["exam_samples"]]
+
+    assert len(after) == len(before) == 5
+    for original, changed in zip(before, after, strict=True):
+        for key in (
+            "side", "prediction_fingerprint", "model_expected_return_after_all_cost_pct",
+            "model_return_lcb_after_cost_pct", "normal_entry_return_gate_passed",
+        ):
+            assert changed[key] == original[key]
+        assert changed["net_return_after_all_cost_pct"] == pytest.approx(
+            original["net_return_after_all_cost_pct"] + funding_return
+        )
+
+
+def test_delayed_labels_are_purged_before_the_exam_decision() -> None:
+    observations = _observations()
+    for row in observations:
+        if row["decision_id"] == 6:
+            row["label_timestamp"] = "2026-07-20T15:00:00+00:00"
+    report = build_strategy_historical_replay(
+        blueprint=_blueprint(), observations=observations, predictor=_predictor,
+    )
+
+    assert report["status"] == "complete"
+    assert report["partition"]["purged_development_group_count"] == 1
+    assert {row["decision_id"] for row in report["development_samples"]} == {5}
+
+
+@pytest.mark.parametrize("missing_field", ["fee_after_side_selection", "objective_net_return_pct"])
+def test_replay_requires_decision_time_fee_after_prediction(missing_field: str) -> None:
+    def incomplete_predictor(features: dict, *, horizons: tuple[int, ...]) -> dict:
+        prediction = _predictor(features, horizons=horizons)
+        primary = prediction["predictions"][0]
+        if missing_field == "fee_after_side_selection":
+            primary.pop(missing_field)
+        else:
+            primary["fee_after_side_selection"][primary["best_side"]].pop(missing_field)
+        return prediction
+
+    observations = _observations()
+    for row in observations:
+        row["feature_snapshot"]["missing_prediction_field"] = missing_field
+    report = build_strategy_historical_replay(
+        blueprint=_blueprint(), observations=observations, predictor=incomplete_predictor,
+    )
+
+    assert report["selected_entry_count"] == 0
+    assert sum(report["excluded_reason_counts"].values()) == 5
 
 
 def test_paper_bootstrap_replay_does_not_require_existing_trade_calibration() -> None:

@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from services.ml_signal_service import _fee_after_prediction_objective
+from services.ml_signal_service import _fee_after_prediction_objective, _select_fee_after_side
 
 
 def test_objective_uses_explicit_model_dispersion_not_quantile_width() -> None:
@@ -59,3 +59,20 @@ def test_objective_is_nan_when_required_inputs_are_missing() -> None:
     )
 
     assert math.isnan(result["objective_net_return_pct"])
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_incomplete_objectives_preserve_the_existing_paper_direction_fallback(ready: bool) -> None:
+    incomplete = {
+        side: _fee_after_prediction_objective({}, tail_loss_scale_pct=0.0)
+        for side in ("long", "short")
+    }
+
+    assert _select_fee_after_side(
+        incomplete,
+        net_predictions={
+            "long": {"expected_net_return_pct": 0.6},
+            "short": {"expected_net_return_pct": 0.1},
+        },
+        long_ready=ready, short_ready=ready,
+    ) == "long"
