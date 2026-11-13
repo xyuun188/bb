@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import threading
+from collections import Counter
 
 import pytest
 
@@ -182,3 +186,96 @@ async def test_registry_orphan_stays_blocked_when_current_pointer_is_not_valid(t
     assert report["status"] == "retired_required"
     assert report["unresolved_artifact_count"] == 1
     assert report["retired_unreferenced_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_scan_reuses_metadata_without_reusing_previous_scan_or_skipping_hashes(
+    tmp_path, monkeypatch,
+) -> None:
+    from services import artifact_retirement_audit as audit
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    artifact = model_dir / "profit.joblib"
+    metadata_path = model_dir / "profit_metadata.json"
+    artifact.write_bytes(b"verified")
+    metadata_path.write_text(json.dumps({
+        "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
+        "training_policy": CURRENT_TRAINING_EPOCH_POLICY,
+        "model_stage": "canary",
+        "promotion_flow": "candidate_to_shadow_to_canary_to_active",
+        "artifact_persisted": True,
+        "artifact_registry_version": "v1",
+        "artifact_sha256": hashlib.sha256(b"verified").hexdigest(),
+        "quality_report": {"data_quality_version": "current", "unused": "x" * 10000},
+    }), encoding="utf-8")
+    reads = Counter()
+    original = audit._read_json
+
+    def counting_read(path):
+        reads[path] += 1
+        return original(path)
+
+    monkeypatch.setattr(audit, "_read_json", counting_read)
+    service = ArtifactRetirementAuditService(root=tmp_path)
+    first = await service.report()
+    assert first["phase3_compatible_count"] == 2
+    assert reads[metadata_path] == 1
+
+    artifact.write_bytes(b"tampered")
+    second = await service.report()
+    assert reads[metadata_path] == 2
+    assert second["status"] == "retired_required"
+    assert second["status_counts"] == {"untrusted": 1, "phase3_compatible": 1}
+    rows = {row["relative_path"]: row for row in second["artifacts"]}
+    assert "registry_artifact_hash_verification_failed" in rows["models/profit.joblib"]["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_artifact_scan_yields_to_runtime_probes(tmp_path, monkeypatch) -> None:
+    from services import artifact_retirement_audit as audit
+
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    original = audit.ArtifactRetirementAuditService._report_sync
+
+    def waiting_scan(self):
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(timeout=2)
+        return original(self)
+
+    monkeypatch.setattr(audit.ArtifactRetirementAuditService, "_report_sync", waiting_scan)
+
+    async def runtime_probe():
+        await started.wait()
+        release.set()
+        return "responsive"
+
+    report, probe = await asyncio.wait_for(asyncio.gather(
+        ArtifactRetirementAuditService(root=tmp_path).report(), runtime_probe(),
+    ), timeout=3)
+    assert report["status"] == "ready"
+    assert probe == "responsive"
+
+
+def test_audit_metadata_cache_keeps_only_classification_fields(tmp_path) -> None:
+    from services import artifact_retirement_audit as audit
+
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps({
+        "artifact_model_id": "local_ml_profit_quality",
+        "artifact_version": "20260716T051245774293Z-f783c19b",
+        "quality_report": {"data_quality_version": "current", "large": [1] * 1000},
+        "governance_report": {"training_policy": CURRENT_TRAINING_EPOCH_POLICY},
+        "unused_model_details": [1] * 1000,
+    }), encoding="utf-8")
+    reader = audit._audit_metadata_reader()
+    projected, error = reader(path)
+    assert error is None
+    assert projected == {
+        "artifact_model_id": "local_ml_profit_quality",
+        "artifact_version": "20260716T051245774293Z-f783c19b",
+        "quality_report": {"data_quality_version": "current"},
+        "governance_report": {"training_policy": CURRENT_TRAINING_EPOCH_POLICY},
+    }

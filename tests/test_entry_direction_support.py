@@ -585,6 +585,59 @@ def test_negative_non_directional_family_does_not_veto_positive_direction() -> N
     assert support["blocking_reasons"] == []
 
 
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_negative_objective_family_cannot_veto_cost_complete_training_entry(side) -> None:
+    opposite = "short" if side == "long" else "long"
+    positive = _row("local_ml", raw=1.4951299186, objective=0.4161063399)
+    negative = _row("timeseries", raw=1.112952, objective=-0.427602)
+    for row in (positive, negative):
+        row["paper_return_quality_governance"] = {
+            "paper_execution_permission": False,
+            "paper_execution_reason": "current_model_fee_after_evidence_missing",
+            "paper_execution_blockers": ["current_model_fee_after_evidence_missing"],
+        }
+    competition = {
+        side: {"evidence": [positive, negative]},
+        opposite: {"evidence": [
+            _row("local_ml", raw=-1.4951299186, objective=-3.45),
+            _row("timeseries", raw=-1.112952, objective=-3.07),
+        ]},
+    }
+
+    support = assess_paper_model_trade_support(
+        competition, [], side, execution_cost_pct=0.126794,
+    )
+    selection = select_normal_paper_trade_side({side: support})
+
+    assert support["quantitative_sources"] == ["local_ml"]
+    assert support["objective_net_return_pct"] == pytest.approx(0.2893123399)
+    assert len(support["quant_family_summaries"]) == 2
+    assert selection["selected"] is True
+    assert selection["selected_side"] == side
+    assert selection["selection_reason"] == "paper_training_entry"
+    assert selection["production_permission"] is False
+    assert competition[side]["evidence"] == [positive, negative]
+
+
+def test_two_negative_objective_families_still_cannot_authorize_entry() -> None:
+    competition = {
+        "long": {"evidence": [
+            _row("local_ml", raw=0.6, objective=-0.2),
+            _row("timeseries", raw=0.8, objective=0.05),
+        ]},
+        "short": {"evidence": [
+            _row("local_ml", raw=-0.6, objective=-0.9),
+            _row("timeseries", raw=-0.8, objective=-1.0),
+        ]},
+    }
+    support = assess_paper_model_trade_support(
+        competition, [], "long", execution_cost_pct=0.1,
+    )
+    selection = select_normal_paper_trade_side({"long": support})
+    assert selection["selected"] is False
+    assert "direction_support_risk_adjusted_return_not_positive" in selection["blocking_reasons"]
+
+
 def test_quality_observation_allows_positive_mean_with_negative_lcb() -> None:
     long_row = _row("local_ml", raw=0.45, objective=-0.20)
     long_row["paper_return_quality_governance"] = {

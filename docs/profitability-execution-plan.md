@@ -491,3 +491,41 @@ has 23 short observations, mean `+0.577111%`, PF `1.60354`, but return LCB
 with complete required market inputs, yet fail their current fee-after return
 and loss-risk conditions. Neither the positive holdout mean nor corrected audit
 availability establishes a profitable strategy or grants live permission.
+
+## November 14 Entry Veto And Fresh Audit Corrections
+
+A fresh decision timeline showed no executed market entries after the November
+13 09:00 UTC hour, before the period-contract rebuild and latest audit deployment.
+The automatic training scheduler recovered to `skipped/not_due` with no error;
+the prior interrupted state did not remain stuck. Required current market inputs
+were complete. The latest model still frequently produces nonpositive fee-after
+risk objectives; availability and missing historical permission alone do not
+explain all holds.
+
+An additional reproducible veto existed in direction-family aggregation. The
+current-direction check retained positive raw-return families even when their
+risk-adjusted fee-after objective failed the final entry gate. A negative
+objective family could therefore cancel another family's complete positive
+entry, despite being unable to authorize an entry by itself. Direction support
+v18 applies the existing positive mean/objective requirement to the participating
+entry families before combining them. All independently qualifying families
+remain in the combination; rejected families remain in the full diagnostics.
+When none qualify, the original observation summary and rejection remain.
+Historical permission, loss probability, opposing evidence, costs, horizon and
+the final order authority continue to apply.
+
+The frozen decision `801409` at `2026-11-13T13:59:58Z` reproduced the defect with
+its original costs, model outputs and expert opinions: the old combined objective
+was `-0.132542%`; the valid local-ML family alone had `+0.289312%`, expected net
+`+1.368336%` and loss probability `0.089501`. The corrected calculation authorized
+only the existing bounded paper-training contract. Three other frozen decisions
+tested alongside it remained holds. These are counterfactual contract checks,
+not submitted orders, realized returns or new profitability qualification.
+
+Profiling the fresh artifact audit found 1,051 file entries, 1,056 JSON decodes
+and 350 binary hash checks taking 63.54 seconds on the async event loop. It now
+runs filesystem and hashing work in a worker thread, shares a per-scan metadata
+reader, and caches only classification/identity fields. It still scans every
+artifact, checks every required hash and rereads all metadata on the next audit.
+Regression tests verify that tampering between scans remains blocked and that
+runtime probes can proceed while a file scan is in progress.

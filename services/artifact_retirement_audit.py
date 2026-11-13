@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -61,6 +63,43 @@ def _read_json(path: Path) -> tuple[dict[str, Any], str | None]:
     return (parsed if isinstance(parsed, dict) else {}), None
 
 
+def _audit_metadata_reader() -> Callable[[Path], tuple[dict[str, Any], str | None]]:
+    # Manifest, metadata and model entries can share one large JSON document.
+    # Keep only audit fields, and reuse them only within this fresh scan.
+    cache: dict[Path, tuple[dict[str, Any], str | None]] = {}
+
+    def read(path: Path) -> tuple[dict[str, Any], str | None]:
+        key = path.resolve(strict=False)
+        if key not in cache:
+            metadata, error = _read_json(path)
+            compact = {
+                name: metadata[name]
+                for name in (
+                    "artifact_policy_id", "policy_id", "phase", "trade_sample_cursor_policy",
+                    "training_policy", "training_mode", "model_stage", "promotion_flow",
+                    "artifact_persisted", "data_quality_version", "artifact_registry_version",
+                    "artifact_sha256", "artifact_model_id", "artifact_version", "model_id",
+                    "pointer_role", "version", "manifest_path",
+                )
+                if name in metadata
+            }
+            for name, field in (
+                ("governance_report", "training_policy"),
+                ("quality_report", "data_quality_version"),
+            ):
+                if name in metadata:
+                    compact[name] = {
+                        field: _safe_dict(metadata[name]).get(field),
+                    }
+            # Preserve the truth value of a nonempty malformed manifest.
+            if metadata and not compact:
+                compact = {"audit_metadata_unrecognized": True}
+            cache[key] = compact, error
+        return cache[key]
+
+    return read
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -87,16 +126,24 @@ def _metadata_candidates(artifact_path: Path) -> list[Path]:
     ]
 
 
-def _metadata_for_artifact(artifact_path: Path) -> tuple[Path | None, dict[str, Any], str | None]:
+def _metadata_for_artifact(
+    artifact_path: Path,
+    *,
+    read_json: Callable[[Path], tuple[dict[str, Any], str | None]] = _read_json,
+) -> tuple[Path | None, dict[str, Any], str | None]:
     for candidate in _metadata_candidates(artifact_path):
         if not candidate.exists():
             continue
-        metadata, error = _read_json(candidate)
+        metadata, error = read_json(candidate)
         return candidate, metadata, error
     return None, {}, "missing_manifest"
 
 
-def _registry_pointer_versions(root: Path) -> dict[str, set[str]]:
+def _registry_pointer_versions(
+    root: Path,
+    *,
+    read_json: Callable[[Path], tuple[dict[str, Any], str | None]] = _read_json,
+) -> dict[str, set[str]]:
     """Return only versions reachable through a structurally valid registry pointer."""
     registry_root = root / "model_artifacts"
     if not registry_root.is_dir():
@@ -107,7 +154,7 @@ def _registry_pointer_versions(root: Path) -> dict[str, set[str]]:
             continue
         for pointer_name in _REGISTRY_POINTER_NAMES:
             pointer_path = model_root / pointer_name
-            pointer, error = _read_json(pointer_path)
+            pointer, error = read_json(pointer_path)
             if error or not pointer:
                 continue
             expected_role = pointer_name.removesuffix(".json")
@@ -127,7 +174,7 @@ def _registry_pointer_versions(root: Path) -> dict[str, set[str]]:
                 manifest_path.relative_to(version_root)
             except (FileNotFoundError, OSError, ValueError):
                 continue
-            manifest, manifest_error = _read_json(manifest_path)
+            manifest, manifest_error = read_json(manifest_path)
             if (
                 manifest_error
                 or manifest.get("artifact_model_id") != model_root.name
@@ -266,15 +313,21 @@ class ArtifactRetirementAuditService:
         return sorted({path.resolve(strict=False) for path in candidates})
 
     async def report(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._report_sync)
+
+    def _report_sync(self) -> dict[str, Any]:
         started_at = datetime.now(UTC)
         root = self._root()
-        registry_references = _registry_pointer_versions(root)
+        read_json = _audit_metadata_reader()
+        registry_references = _registry_pointer_versions(root, read_json=read_json)
         artifacts: list[dict[str, Any]] = []
         status_counts: dict[str, int] = {}
 
         for path in self._candidate_paths():
             relative = _relative_path(path, root)
-            metadata_path, metadata, metadata_error = _metadata_for_artifact(path)
+            metadata_path, metadata, metadata_error = _metadata_for_artifact(
+                path, read_json=read_json,
+            )
             classification, reasons, evidence = _artifact_classification(
                 artifact_path=path,
                 relative_path=relative,

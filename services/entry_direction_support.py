@@ -11,9 +11,10 @@ from typing import Any
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY,
     normal_paper_current_return_ready,
+    normal_paper_entry_return_ready,
 )
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-11-13.qualified-paper-model-direction.v17"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-11-14.qualified-paper-model-direction.v18"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 PAPER_TRAINING_ENTRY_SCOPE = "paper_training_entry"
 MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY = (
@@ -486,6 +487,24 @@ def assess_directional_entry_support(
     # Otherwise one valid positive family is silently vetoed by an unrelated
     # negative family and the entry funnel collapses to ``no_direction``.
     effective_families = list(directional_families)
+    if paper_scope and not training_scope:
+        entry_families = [
+            item for item in effective_families
+            if normal_paper_entry_return_ready(
+                item.get("expected_net_return_pct"), item.get("objective_net_return_pct"),
+            )
+        ]
+        if entry_families:
+            # Apply the existing entry return gate before combining families.
+            # Nonpositive objectives remain visible as observations but cannot
+            # cancel an independently cost-complete positive entry family.
+            effective_families = entry_families
+            conflicting_families = [
+                item for item in conflicting_families
+                if normal_paper_entry_return_ready(
+                    item.get("expected_net_return_pct"), item.get("objective_net_return_pct"),
+                )
+            ]
     effective_expected_net_return_pct = _weighted_mean(
         effective_families,
         "expected_net_return_pct",
