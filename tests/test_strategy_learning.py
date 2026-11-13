@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import services.strategy_learning as strategy_learning_module
+from services.model_strategy_blueprint import strategy_evidence_contract
 from services.strategy_learning import (
     StrategyCandidateGenerator,
     StrategyFeedback,
@@ -282,15 +283,17 @@ async def test_replay_reads_full_holdout_and_bounded_forward_exam(monkeypatch) -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("replay_status", "current_version", "expected"),
+    ("replay_status", "current_version", "current_strategy_id", "current_policy", "expected"),
     [
-        ("complete", "v1", True),
-        ("artifact_holdout_rows_not_reconstructable", "v1", False),
-        ("complete", "v2", False),
+        ("complete", "v1", "strategy-v1", "current", True),
+        ("artifact_holdout_rows_not_reconstructable", "v1", "strategy-v1", "current", False),
+        ("complete", "v2", "strategy-v1", "current", False),
+        ("complete", "v1", "another-strategy", "current", False),
+        ("complete", "v1", "strategy-v1", "legacy", False),
     ],
 )
 async def test_background_champion_reconciles_only_complete_current_model_evidence(
-    monkeypatch, replay_status, current_version, expected
+    monkeypatch, replay_status, current_version, current_strategy_id, current_policy, expected
 ) -> None:
     reconciliations = []
 
@@ -306,12 +309,22 @@ async def test_background_champion_reconciles_only_complete_current_model_eviden
                 "historical_model_replay": {"status": replay_status},
                 "candidates": [{"id": "candidate"}],
             },
-            "model_strategy_blueprint": {"model_version": "v1"},
+            "model_strategy_blueprint": {
+                **strategy_evidence_contract(), "model_version": "v1", "strategy_id": "strategy-v1",
+            },
         }
 
     monkeypatch.setattr(
         "services.ml_signal_service.MLSignalService",
-        lambda: SimpleNamespace(strategy_blueprint=lambda: {"model_version": current_version}),
+        lambda: SimpleNamespace(strategy_blueprint=lambda: {
+            **strategy_evidence_contract(),
+            "model_version": current_version,
+            "strategy_id": current_strategy_id,
+            "prediction_score_policy_version": (
+                strategy_evidence_contract()["prediction_score_policy_version"]
+                if current_policy == "current" else current_policy
+            ),
+        }),
     )
     service = StrategyLearningService(champion_service=Champion())
     monkeypatch.setattr(service, "dashboard_payload", payload)

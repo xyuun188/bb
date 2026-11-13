@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from config.settings import settings
+from services.model_strategy_blueprint import strategy_evidence_contract
 
 REPORT_RELATIVE_PATH = "strategy_replay/latest.json"
 REPLAY_INTERVAL_SECONDS = 1800
@@ -37,6 +38,8 @@ def summarize_replay_governance(payload: dict[str, Any]) -> dict[str, Any]:
         "live_execution_permission": False,
         "submits_orders": False,
         "model_version": blueprint.get("model_version"),
+        "strategy_id": blueprint.get("strategy_id"),
+        **{key: blueprint.get(key) for key in strategy_evidence_contract()},
         "champion_reconciled": payload.get("champion_reconciled") is True,
         "governance_blocker": payload.get("governance_blocker"),
         "scheduler_mode": schedule.get("scheduler_mode"),

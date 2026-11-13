@@ -31,7 +31,11 @@ from services.continuous_strategy_routing import (
     ContinuousStrategyRoutingStore,
 )
 from services.execution_cost_model import execution_cost_estimate
-from services.model_strategy_blueprint import paper_strategy_replay_available
+from services.model_strategy_blueprint import (
+    paper_strategy_replay_available,
+    strategy_evidence_contract,
+    strategy_evidence_contract_matches,
+)
 from services.paper_strategy_champion import PaperStrategyChampionService
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.shadow_backtest_service import shadow_fee_after_outcome
@@ -738,6 +742,7 @@ class StrategyCandidateGenerator:
         evidence_source: str,
         evidence_mode: str,
         strategy_id: str | None = None,
+        evidence_contract: dict[str, Any] | None = None,
     ) -> list[StrategyProfile]:
         partitions: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
         for sample in samples:
@@ -773,6 +778,7 @@ class StrategyCandidateGenerator:
                 }
             )
             provenance = {
+                **(evidence_contract or {}),
                 "source": evidence_source,
                 "evidence_mode": evidence_mode,
                 "strategy_id": strategy_id,
@@ -967,7 +973,7 @@ class StrategyLearningEngine:
         shadow_rows: list[dict[str, Any]] = []
         include_evidence_rows = detail == "full"
         blueprint = _safe_dict(model_strategy_blueprint)
-        model_replay_required = paper_strategy_replay_available(blueprint)
+        model_replay_required = bool(blueprint)
         replay = build_strategy_historical_replay(
             blueprint=blueprint,
             observations=feedback.shadow_replay_observations,
@@ -989,6 +995,7 @@ class StrategyLearningEngine:
                     evidence_source="exact_current_model_on_immutable_shadow_snapshot",
                     evidence_mode="exact_trained_model_historical_replay",
                     strategy_id=str(blueprint.get("strategy_id") or "") or None,
+                    evidence_contract={key: replay.get(key) for key in strategy_evidence_contract()},
                 )
                 if exact_replay and replay_development
                 else []
@@ -1025,6 +1032,8 @@ class StrategyLearningEngine:
             backtest["evidence_partition"] = (
                 "strategy_development" if exact_replay else "authoritative_closed_positions"
             )
+            if exact_replay:
+                backtest.update({key: replay.get(key) for key in strategy_evidence_contract()})
             shadow = _shadow_report(shadows, include_rows=include_evidence_rows)
             shadow["cross_symbol_generalization"] = _cross_symbol_generalization(shadows)
             shadow["validation_method"] = (
@@ -1037,6 +1046,8 @@ class StrategyLearningEngine:
                 )
             )
             shadow["evidence_partition"] = "strategy_exam" if exact_replay else "closed_position_exam"
+            if exact_replay:
+                shadow.update({key: replay.get(key) for key in strategy_evidence_contract()})
             rejection_reasons = _candidate_rejections(
                 backtest,
                 shadow,
@@ -1056,6 +1067,9 @@ class StrategyLearningEngine:
                     _cross_symbol_generalization(forward_samples)
                 )
                 forward_validation["evidence_partition"] = "post_training_forward_exam"
+                forward_validation.update(
+                    {key: replay.get(key) for key in strategy_evidence_contract()}
+                )
                 forward_validation["required"] = forward_exam_required
                 if forward_exam_required:
                     forward_rejections = _candidate_rejections(
@@ -1244,7 +1258,10 @@ class StrategyLearningEngine:
             "historical_model_replay": {
                 key: _json_safe(value)
                 for key, value in replay.items()
-                if key not in {"development_samples", "exam_samples", "forward_exam_samples"}
+                if key not in {
+                    "development_samples", "exam_samples", "forward_exam_samples",
+                    "diagnostic_development_samples", "diagnostic_exam_samples",
+                }
             },
             "continuous_strategy_routing": continuous_routing,
             "scheduler_mode": scheduler_mode,
@@ -1401,8 +1418,16 @@ class StrategyLearningService:
             # An artifact may change while the isolated worker is replaying.
             from services.ml_signal_service import MLSignalService
 
-            current_version = MLSignalService().strategy_blueprint().get("model_version")
-            if current_version and current_version == blueprint.get("model_version"):
+            current_blueprint = MLSignalService().strategy_blueprint()
+            identity_keys = ("model_version", "strategy_id", *strategy_evidence_contract())
+            if (
+                strategy_evidence_contract_matches(blueprint)
+                and all(
+                    current_blueprint.get(key)
+                    and current_blueprint.get(key) == blueprint.get(key)
+                    for key in identity_keys
+                )
+            ):
                 payload["paper_strategy_champion"] = await self.champion_service.reconcile(
                     mode="paper",
                     blueprint=blueprint,
@@ -1410,7 +1435,7 @@ class StrategyLearningService:
                 )
                 payload["champion_reconciled"] = True
                 return payload
-            payload["governance_blocker"] = "model_version_changed_during_replay"
+            payload["governance_blocker"] = "model_strategy_evidence_changed_during_replay"
         else:
             payload["governance_blocker"] = replay.get("status") or "exact_replay_unavailable"
         payload["champion_reconciled"] = False

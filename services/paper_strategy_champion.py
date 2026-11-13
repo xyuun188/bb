@@ -15,6 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import get_read_session_ctx, get_session_ctx
 from models.learning import StrategyProfileSnapshot
+from services.model_strategy_blueprint import (
+    strategy_evidence_contract,
+    strategy_evidence_contract_matches,
+)
 
 PAPER_STRATEGY_CHAMPION_VERSION = "2026-07-21.paper-strategy-champion.v1"
 TRAINED_MODEL_STRATEGY_SOURCE = "trained_model_strategy_blueprint"
@@ -80,6 +84,7 @@ def build_trained_model_strategy_candidates(
         model_strategy.get("paper_execution_eligible") is not True
         or model_strategy.get("execution_scope") != "paper_only"
         or model_strategy.get("live_execution_permission") is not False
+        or not strategy_evidence_contract_matches(model_strategy)
     ):
         return []
     eligible_sides = {
@@ -99,6 +104,7 @@ def build_trained_model_strategy_candidates(
         provenance = _dict(params.get("policy_provenance"))
         backtest = _dict(candidate.get("backtest"))
         shadow_validation = _dict(candidate.get("shadow_validation"))
+        forward_validation = _dict(candidate.get("forward_validation"))
         side = str(selector.get("side") or "").lower()
         if (
             promotion.get("historical_prior_context_eligible") is not True
@@ -109,6 +115,15 @@ def build_trained_model_strategy_candidates(
             or shadow_validation.get("evidence_partition") != "strategy_exam"
             or shadow_validation.get("validation_method")
             != "exact_current_model_on_immutable_shadow_snapshot"
+            or provenance.get("strategy_id") != model_strategy.get("strategy_id")
+            or any(
+                not strategy_evidence_contract_matches(report)
+                for report in (provenance, backtest, shadow_validation)
+            )
+            or (
+                forward_validation.get("required") is True
+                and not strategy_evidence_contract_matches(forward_validation)
+            )
         ):
             continue
         metrics = _conservative_metrics(candidate)
@@ -131,6 +146,7 @@ def build_trained_model_strategy_candidates(
                 ),
                 "model_strategy_id": model_strategy.get("strategy_id"),
                 "model_version": model_strategy.get("model_version"),
+                **{key: model_strategy.get(key) for key in strategy_evidence_contract()},
                 "training_data_sha256": model_strategy.get("training_data_sha256"),
                 "selector": selector,
                 "metrics": metrics,
@@ -251,8 +267,9 @@ def compare_paper_strategy_challenger(
 def _row_payload(row: StrategyProfileSnapshot) -> dict[str, Any]:
     params = _dict(row.params)
     blueprint = _dict(params.get("blueprint"))
+    contract_current = strategy_evidence_contract_matches(blueprint)
     return {
-        "active": bool(row.is_active and not row.is_disabled),
+        "active": bool(row.is_active and not row.is_disabled and contract_current),
         "profile_id": row.profile_id,
         "profile_version": row.version,
         "status": row.status,
@@ -261,10 +278,12 @@ def _row_payload(row: StrategyProfileSnapshot) -> dict[str, Any]:
         "execution_scope": "paper_only",
         "paper_execution_permission": bool(
             _dict(row.promotion).get("paper_execution_permission") is True
+            and contract_current
         ),
         "live_execution_permission": False,
         "model_strategy_id": blueprint.get("strategy_id"),
         "model_version": blueprint.get("model_version"),
+        **{key: blueprint.get(key) for key in strategy_evidence_contract()},
         "training_data_sha256": blueprint.get("training_data_sha256"),
         "selector": _dict(params.get("selector")),
         "metrics": _dict(row.backtest_metrics).get("champion_metrics")
@@ -616,7 +635,9 @@ class PaperStrategyChampionService:
         champion_row.is_active = False
         champion_row.status = "rolled_back"
         champion_row.scheduler_reason = reason
-        if predecessor is None:
+        if predecessor is None or not strategy_evidence_contract_matches(
+            _dict(_dict(predecessor.params).get("blueprint"))
+        ):
             await session.flush()
             return {
                 **self._inactive("base_strategy_restored_after_strategy_degradation"),

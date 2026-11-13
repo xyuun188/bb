@@ -7,8 +7,24 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-11-10.compared-canary-sides.v5"
+from services.ml_prediction_contract import (
+    ENTRY_COHORT_VERSION,
+    PREDICTION_SCORE_POLICY_VERSION,
+)
+
+MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-11-13.score-bound-entry-replay.v6"
 MODEL_STRATEGY_BLUEPRINT_OWNER_SOURCE = "local_ml"
+
+
+def strategy_evidence_contract() -> dict[str, str]:
+    return {
+        "entry_cohort_version": ENTRY_COHORT_VERSION,
+        "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
+    }
+
+
+def strategy_evidence_contract_matches(value: dict[str, Any]) -> bool:
+    return all(value.get(key) == expected for key, expected in strategy_evidence_contract().items())
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -177,6 +193,7 @@ def build_model_strategy_blueprint(
     }
     identity = {
         "blueprint_version": MODEL_STRATEGY_BLUEPRINT_VERSION,
+        **strategy_evidence_contract(),
         "model_id": "local_ml_profit_quality",
         "model_version": version,
         "training_data_sha256": model.get("training_data_sha256"),
@@ -191,6 +208,7 @@ def build_model_strategy_blueprint(
         blockers.append("trained_model_not_authorized_for_paper_strategy")
     return {
         "version": MODEL_STRATEGY_BLUEPRINT_VERSION,
+        **strategy_evidence_contract(),
         "strategy_id": f"trained_model_strategy_{_canonical_id(identity)}",
         "model_id": "local_ml_profit_quality",
         "model_version": version,
@@ -410,6 +428,7 @@ def paper_strategy_replay_available(blueprint: dict[str, Any] | None) -> bool:
     evidence = _safe_dict(strategy.get("training_evidence"))
     return bool(
         strategy.get("execution_scope") == "paper_only"
+        and strategy_evidence_contract_matches(strategy)
         and strategy.get("live_execution_permission") is False
         and str(strategy.get("model_version") or "")
         and _safe_list(
@@ -500,6 +519,15 @@ def paper_strategy_authorization(
             "signal_model_version": model_version or None,
             "champion_model_version": champion_version or None,
         }
+    blueprint = _safe_dict(model_signal.get("strategy_blueprint"))
+    if (
+        not strategy_evidence_contract_matches(champion)
+        or not strategy_evidence_contract_matches(model_signal)
+        or not strategy_evidence_contract_matches(blueprint)
+        or not blueprint.get("strategy_id")
+        or champion.get("model_strategy_id") != blueprint.get("strategy_id")
+    ):
+        return {**result, "reason": "paper_strategy_evidence_contract_mismatch"}
     lifecycle = str(model_signal.get("artifact_lifecycle") or "").lower()
     if lifecycle not in {"candidate", "shadow", "canary", "active"}:
         return {**result, "reason": "paper_strategy_model_lifecycle_ineligible"}

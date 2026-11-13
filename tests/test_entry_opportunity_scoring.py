@@ -450,11 +450,19 @@ def test_advisory_ml_cannot_enter_production_return_distribution() -> None:
 
 
 def test_active_paper_strategy_uses_model_distribution_in_normal_entry_path() -> None:
+    from services.model_strategy_blueprint import strategy_evidence_contract
+
     decision = _decision()
     decision.raw_response["local_ai_tools"] = {}
     signal = decision.raw_response["ml_signal"]
     signal.update(
         {
+            **strategy_evidence_contract(),
+            "strategy_blueprint": {
+                **strategy_evidence_contract(), "strategy_id": "strategy-v1",
+                "model_version": "model-v1", "paper_execution_eligible": True,
+                "paper_execution_sides": ["long"], "eligible_sides": ["long"],
+            },
             "route_mode": "shadow_observation",
             "live_ml_ready": False,
             "artifact_lifecycle": "canary",
@@ -470,6 +478,8 @@ def test_active_paper_strategy_uses_model_distribution_in_normal_entry_path() ->
     strategy = {
         "execution_mode": "paper",
         "paper_strategy_champion": {
+            **strategy_evidence_contract(),
+            "model_strategy_id": "strategy-v1",
             "active": True,
             "execution_scope": "paper_only",
             "paper_execution_permission": True,

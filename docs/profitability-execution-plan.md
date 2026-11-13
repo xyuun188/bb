@@ -328,3 +328,36 @@ Remaining profitability acceptance requires complete post-fix lifecycle
 settlements and independent fee-after evidence for the actual execution
 policy. Partial reductions are not finalized lifecycles; positive holdout or
 a profitable isolated trade cannot authorize live trading.
+
+## November 13 Strategy Replay Identity And Entry Cohort
+
+Strategy replay previously checked only the model artifact identity. A prediction
+from an obsolete score policy could still produce a complete replay. In addition,
+observations that failed the current normal-entry return gate could enter strategy
+candidate development and validation. That made strategy evidence describe a
+different entry population from the execution policy.
+
+The blueprint, replay cache and prediction fingerprint, development and exam
+reports, persisted paper champion, and entry permission now bind both the score
+policy and entry-cohort versions. Rejected entry observations remain available
+only as diagnostics. A model blueprint with missing or invalid replay evidence
+cannot fall back to legacy selector-matched returns. Background evaluation
+rechecks the current artifact, strategy identity and evidence contract before
+activating a champion. A legacy champion cannot regain authority through rollback.
+
+The running trading service is `bb-paper-trading.service`; `bb-trader.service`
+does not exist on this deployment. An inactive result for the latter is not
+evidence that the trading loop stopped.
+
+A bounded chronological diagnostic found an actual regime reversal. Training
+contained 4,134 groups and the later test contained 397, with training labels
+available before test decisions. Fee-after short returns changed from a training
+mean of `+0.32661%` and PF `1.5705` to a test mean of `-1.20707%` and PF `0.1872`.
+Frozen-model predictions correlated `-0.31581` with realized returns; all eleven
+positive-objective selections were short and only one won. This is development
+diagnosis, not an untouched profitability exam. Neither reversing the prediction
+nor refitting the unchanged recipe establishes an executable edge.
+
+The evidence-chain fixes do not establish profitability. Independent fee-after
+validation and completed execution-policy lifecycles remain required; failed
+evidence cannot be relabeled as a reason to authorize an order.

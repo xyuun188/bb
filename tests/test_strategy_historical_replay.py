@@ -4,12 +4,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from services.model_strategy_blueprint import strategy_evidence_contract
 from services.strategy_historical_replay import build_strategy_historical_replay
 from services.strategy_learning import StrategyFeedback, StrategyLearningEngine
 
 
 def _blueprint(*, holdout_sample_count: int = 12) -> dict:
     return {
+        **strategy_evidence_contract(),
         "strategy_id": "trained-model-v2",
         "model_version": "model-v2",
         "trained_at": "2026-07-20T20:00:00+00:00",
@@ -93,6 +95,7 @@ def _predictor(features: dict, *, horizons: tuple[int, ...]) -> dict:
     horizon = horizons[0]
     predicted_cost = float(features.get("replay_predicted_cost", 0.1))
     return {
+        **strategy_evidence_contract(),
         "available": True,
         "model_version": "model-v2",
         "predictions": [
@@ -214,15 +217,77 @@ def test_replay_keeps_unprofitable_prediction_for_continuous_paper_evaluation() 
         predictor=_predictor,
     )
 
-    assert report["selected_entry_count"] == 5
+    assert report["selected_entry_count"] == 0
+    assert report["diagnostic_observation_count"] == 5
+    assert report["development_samples"] == report["exam_samples"] == []
     assert all(
         row["paper_continuous_evaluation"] is True
         and row["normal_entry_return_gate_passed"] is False
         for row in [
-            *report["development_samples"],
-            *report["exam_samples"],
+            *report["diagnostic_development_samples"],
+            *report["diagnostic_exam_samples"],
         ]
     )
+
+
+@pytest.mark.parametrize("score_policy", [None, "obsolete-score-policy"])
+@pytest.mark.parametrize("batch", [False, True])
+def test_replay_rejects_predictions_from_another_scoring_policy(score_policy, batch) -> None:
+    from services import strategy_historical_replay as replay_module
+
+    replay_module._prediction_cache.clear()
+
+    class WrongPolicyPredictor(_BatchPredictor):
+        def predict(self, features, *, horizons):
+            result = _predictor(features, horizons=horizons)
+            result["prediction_score_policy_version"] = score_policy
+            return result
+
+        def predict_strategy_replay_batch(self, feature_rows, *, horizon_minutes):
+            return [self.predict(row, horizons=(horizon_minutes,)) for row in feature_rows]
+
+    owner = WrongPolicyPredictor()
+    predictor = owner.predict if batch else lambda features, **kw: owner.predict(features, **kw)
+    report = build_strategy_historical_replay(
+        blueprint=_blueprint(), observations=_observations(), predictor=predictor,
+    )
+    assert report["status"] == "complete"
+    assert report["selected_entry_count"] == 0
+    assert report["excluded_reason_counts"]["model_replay_score_policy_mismatch"] == 5
+    assert not replay_module._prediction_cache
+
+
+@pytest.mark.parametrize("objective,lower", [(0.0, 0.0), (-0.1, -0.2), (0.5, 0.0)])
+def test_observation_returns_cannot_become_entry_profit_evidence(objective, lower) -> None:
+    def blocked_prediction(features, *, horizons):
+        result = _predictor(features, horizons=horizons)
+        result["predictions"][0]["fee_after_side_selection"]["long"].update({
+            "objective_net_return_pct": objective, "lower_quantile_net_return_pct": lower,
+        })
+        return result
+
+    observations = _observations()
+    # Different source features isolate each parameter case from the replay cache.
+    for row in observations:
+        row["feature_snapshot"]["case"] = [objective, lower]
+        row["long_net_return_after_all_cost_pct"] = 100.0
+    report = build_strategy_historical_replay(
+        blueprint=_blueprint(), observations=observations, predictor=blocked_prediction,
+    )
+    assert report["selected_entry_count"] == 0
+    assert report["diagnostic_observation_count"] == 5
+    assert report["development_samples"] == report["exam_samples"] == []
+
+
+@pytest.mark.parametrize("field", list(strategy_evidence_contract()))
+def test_legacy_blueprint_cannot_relabel_replay_evidence(field) -> None:
+    blueprint = _blueprint()
+    blueprint.pop(field)
+    report = build_strategy_historical_replay(
+        blueprint=blueprint, observations=_observations(), predictor=_predictor,
+    )
+    assert report["status"] == "trained_paper_strategy_unavailable"
+    assert report["selected_entry_count"] == 0
 
 
 def test_exit_observations_cannot_change_prediction_or_entry_gate() -> None:
@@ -520,6 +585,8 @@ def test_profitable_history_cannot_hide_a_losing_independent_forward_exam() -> N
     assert candidate["backtest"]["metrics"]["return_lcb_pct"] > 0
     assert candidate["shadow_validation"]["metrics"]["return_lcb_pct"] > 0
     assert candidate["forward_validation"]["metrics"]["sample_count"] == 2
+    for key, value in strategy_evidence_contract().items():
+        assert candidate["forward_validation"][key] == value
     assert candidate["forward_validation"]["metrics"]["return_lcb_pct"] < 0
     assert candidate["promotion"]["historical_prior_context_eligible"] is False
     assert "forward_exam_fee_after_return_lcb_not_positive" in (
@@ -571,12 +638,17 @@ def test_strategy_candidates_are_built_from_exact_replay_not_legacy_shadow_match
     )
 
 
-def test_completed_replay_without_selected_entries_creates_no_legacy_candidates() -> None:
+@pytest.mark.parametrize("blocked_by", ["side", "current_return", "legacy_policy"])
+def test_completed_replay_without_selected_entries_creates_no_legacy_candidates(blocked_by) -> None:
     observations = _observations()
     for row in observations:
-        row["feature_snapshot"]["replay_side"] = "short"
+        row["feature_snapshot"]["replay_side"] = "short" if blocked_by == "side" else "long"
+        if blocked_by == "current_return":
+            row["feature_snapshot"]["replay_predicted_cost"] = 1.0
     blueprint = _blueprint()
     blueprint["eligible_sides"] = ["long"]
+    if blocked_by == "legacy_policy":
+        blueprint.pop("prediction_score_policy_version")
     feedback = StrategyFeedback(
         mode="paper",
         window_hours=168,
@@ -615,6 +687,9 @@ def test_completed_replay_without_selected_entries_creates_no_legacy_candidates(
         model_predictor=_predictor,
     )["schedule"]
 
-    assert schedule["historical_model_replay"]["status"] == "complete"
+    assert schedule["historical_model_replay"]["status"] == (
+        "trained_paper_strategy_unavailable" if blocked_by == "legacy_policy" else "complete"
+    )
     assert schedule["candidate_count"] == 0
-    assert schedule["scheduler_mode"] == "model_replay_no_fee_after_entries"
+    if blocked_by != "legacy_policy":
+        assert schedule["scheduler_mode"] == "model_replay_no_fee_after_entries"

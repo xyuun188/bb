@@ -11,7 +11,10 @@ from math import isfinite
 from threading import Lock
 from typing import Any
 
-from services.model_strategy_blueprint import paper_strategy_replay_available
+from services.model_strategy_blueprint import (
+    paper_strategy_replay_available,
+    strategy_evidence_contract,
+)
 
 STRATEGY_HISTORICAL_REPLAY_VERSION = "2026-11-13.purged-forward-fee-after-replay.v3"
 
@@ -157,6 +160,7 @@ def _compact_cached_prediction(prediction: dict[str, Any]) -> dict[str, Any]:
     return {
         "available": prediction.get("available"),
         "model_version": prediction.get("model_version"),
+        "prediction_score_policy_version": prediction.get("prediction_score_policy_version"),
         "predictions": rows,
     }
 
@@ -192,6 +196,7 @@ def _prediction_cache_context(
         (
             _predictor_identity(predictor),
             model_version,
+            tuple(strategy_evidence_contract().items()),
             source_id,
             horizon_minutes,
             feature_fingerprint,
@@ -201,6 +206,10 @@ def _prediction_cache_context(
 
 
 def _cache_prediction(cache_key: tuple[Any, ...], prediction: dict[str, Any]) -> None:
+    if prediction.get("prediction_score_policy_version") != strategy_evidence_contract()[
+        "prediction_score_policy_version"
+    ]:
+        return
     with _prediction_cache_lock:
         _prediction_cache[cache_key] = _compact_cached_prediction(prediction)
         _prediction_cache.move_to_end(cache_key)
@@ -275,6 +284,7 @@ def _compact_prediction_fingerprint(
 ) -> str:
     payload = {
         "model_version": prediction.get("model_version"),
+        "prediction_score_policy_version": prediction.get("prediction_score_policy_version"),
         "horizon_minutes": primary.get("horizon_minutes"),
         "best_side": primary.get("best_side"),
         "fee_after_side_selection": primary.get("fee_after_side_selection"),
@@ -318,6 +328,10 @@ def _replay_entry(
         return None, "model_replay_prediction_unavailable"
     if str(prediction.get("model_version") or "") != model_version:
         return None, "model_replay_version_mismatch"
+    if prediction.get("prediction_score_policy_version") != blueprint.get(
+        "prediction_score_policy_version"
+    ):
+        return None, "model_replay_score_policy_mismatch"
     primary = next(
         (
             _dict(row)
@@ -401,6 +415,7 @@ def _replay_entry(
             "strategy_replay_partition": partition,
             "strategy_replay_version": STRATEGY_HISTORICAL_REPLAY_VERSION,
             "model_version": model_version,
+            **strategy_evidence_contract(),
             "prediction_fingerprint": _compact_prediction_fingerprint(
                 prediction,
                 primary,
@@ -607,9 +622,13 @@ def build_strategy_historical_replay(
         "version": STRATEGY_HISTORICAL_REPLAY_VERSION,
         "strategy_id": strategy.get("strategy_id"),
         "model_version": strategy.get("model_version"),
+        **{key: strategy.get(key) for key in strategy_evidence_contract()},
         "development_samples": [],
         "exam_samples": [],
         "forward_exam_samples": [],
+        "diagnostic_development_samples": [],
+        "diagnostic_exam_samples": [],
+        "diagnostic_observation_count": 0,
         "selected_entry_count": 0,
         "excluded_reason_counts": {},
         "can_authorize_live": False,
@@ -671,6 +690,10 @@ def build_strategy_historical_replay(
         "strategy_development": [],
         "strategy_exam": [],
     }
+    diagnostics: dict[str, list[dict[str, Any]]] = {
+        "strategy_development": [],
+        "strategy_exam": [],
+    }
     replayed_source_ids: set[int] = set()
     forward_source_ids = {
         _int(row.get("source_id")) for row in partitions["forward_exam"]
@@ -691,6 +714,10 @@ def build_strategy_historical_replay(
             )
             if entry is None:
                 excluded[reason] += 1
+                continue
+            if entry.get("normal_entry_return_gate_passed") is not True:
+                diagnostics[partition_name].append(entry)
+                excluded["model_replay_current_entry_return_gate_not_passed"] += 1
                 continue
             replayed[partition_name].append(entry)
     development_ids = {row["source_id"] for row in replayed["strategy_development"]}
@@ -722,6 +749,9 @@ def build_strategy_historical_replay(
         "development_samples": development,
         "exam_samples": exam,
         "forward_exam_samples": forward_exam,
+        "diagnostic_development_samples": diagnostics["strategy_development"],
+        "diagnostic_exam_samples": diagnostics["strategy_exam"],
+        "diagnostic_observation_count": sum(map(len, diagnostics.values())),
         "selected_entry_count": len(development) + len(exam),
         "development_selected_entry_count": len(development),
         "exam_selected_entry_count": len(exam),

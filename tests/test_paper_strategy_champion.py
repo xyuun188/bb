@@ -10,6 +10,8 @@ from models.learning import StrategyProfileSnapshot
 from services.model_strategy_blueprint import (
     build_model_strategy_blueprint,
     model_strategy_side_authorization,
+    paper_strategy_authorization,
+    strategy_evidence_contract,
 )
 from services.paper_strategy_champion import (
     PaperStrategyChampionService,
@@ -24,6 +26,7 @@ def _blueprint(
     comparison_reason: str = "strict_fee_after_improvement",
 ) -> dict:
     return {
+        **strategy_evidence_contract(),
         "strategy_id": f"trained_{model_version}",
         "model_version": model_version,
         "training_data_sha256": model_version * 8,
@@ -52,6 +55,7 @@ def _candidate(
     profit_factor: float = 1.5,
     drawdown: float = 0.3,
     rank: int = 1,
+    model_version: str = "v1",
 ) -> dict:
     metrics = {
         "average_net_return_pct": average,
@@ -68,16 +72,20 @@ def _candidate(
             "selector": selector or {"scope": "side", "side": "long"},
             "historical_return_distribution": metrics,
             "policy_provenance": {
+                **strategy_evidence_contract(),
+                "strategy_id": f"trained_{model_version}",
                 "evidence_mode": "exact_trained_model_historical_replay",
             },
         },
         "promotion": {"historical_prior_context_eligible": True},
         "backtest": {
+            **strategy_evidence_contract(),
             "status": "complete",
             "metrics": metrics,
             "evidence_partition": "strategy_development",
         },
         "shadow_validation": {
+            **strategy_evidence_contract(),
             "status": "complete",
             "metrics": metrics,
             "evidence_partition": "strategy_exam",
@@ -318,7 +326,7 @@ def test_challenger_requires_strict_improvement_or_strictly_better_model() -> No
     )[0]
     better_model = build_trained_model_strategy_candidates(
         _blueprint("v2"),
-        [_candidate("side_long")],
+        [_candidate("side_long", model_version="v2")],
     )[0]
 
     assert compare_paper_strategy_challenger(unchanged, champion)["accepted"] is False
@@ -340,6 +348,91 @@ def test_trained_strategy_rejects_legacy_selector_matched_shadow_evidence() -> N
         _blueprint("v1"),
         [candidate],
     ) == []
+
+
+@pytest.mark.parametrize("field", list(strategy_evidence_contract()))
+@pytest.mark.parametrize(
+    "location", ["provenance", "backtest", "shadow_validation", "forward_validation"]
+)
+@pytest.mark.parametrize("value", [None, "legacy-evidence"])
+def test_paper_candidate_cannot_borrow_another_evidence_contract(field, location, value) -> None:
+    candidate = _candidate("side_long")
+    candidate["forward_validation"] = {**strategy_evidence_contract(), "required": True}
+    assert build_trained_model_strategy_candidates(_blueprint("v1"), [candidate])
+    report = (
+        candidate["params"]["policy_provenance"]
+        if location == "provenance" else candidate[location]
+    )
+    if value is None:
+        report.pop(field)
+    else:
+        report[field] = value
+    assert build_trained_model_strategy_candidates(_blueprint("v1"), [candidate]) == []
+
+
+def test_paper_candidate_cannot_borrow_another_strategy_identity() -> None:
+    candidate = _candidate("side_long")
+    candidate["params"]["policy_provenance"]["strategy_id"] = "another-strategy"
+    assert build_trained_model_strategy_candidates(_blueprint("v1"), [candidate]) == []
+
+
+def test_blueprint_identity_changes_when_scoring_changes(monkeypatch) -> None:
+    from services import model_strategy_blueprint as module
+
+    kwargs = {
+        "metadata": {"artifact_version": "fixed-artifact", "test_count": 12},
+        "readiness": {}, "activation": {"activation_stage": "shadow"},
+    }
+    before = build_model_strategy_blueprint(**kwargs)
+    monkeypatch.setattr(module, "PREDICTION_SCORE_POLICY_VERSION", "another-score-policy")
+    after = build_model_strategy_blueprint(**kwargs)
+    assert before["model_version"] == after["model_version"]
+    assert before["strategy_id"] != after["strategy_id"]
+
+
+@pytest.mark.parametrize("location", ["champion", "signal", "blueprint"])
+@pytest.mark.parametrize("field", [*strategy_evidence_contract(), "strategy_id"])
+def test_paper_authority_rejects_same_artifact_with_stale_strategy_evidence(location, field) -> None:
+    blueprint = _blueprint("v1")
+    signal = {
+        **strategy_evidence_contract(), "model_version": "v1", "artifact_lifecycle": "canary",
+        "strategy_blueprint": blueprint,
+        "prediction_quality": {"contract_complete": True, "paper_eligible": True},
+    }
+    champion = {
+        **strategy_evidence_contract(), "active": True, "paper_execution_permission": True,
+        "live_execution_permission": False, "model_version": "v1",
+        "model_strategy_id": blueprint["strategy_id"],
+    }
+    context = {"execution_mode": "paper", "paper_strategy_champion": champion}
+    assert paper_strategy_authorization(context, signal, symbol="BTC/USDT", side="long")[
+        "eligible"
+    ] is True
+    if field == "strategy_id" and location == "signal":
+        signal["strategy_blueprint"] = {**blueprint, "strategy_id": "another-strategy"}
+    else:
+        target = {"champion": champion, "signal": signal, "blueprint": blueprint}[location]
+        target["model_strategy_id" if location == "champion" and field == "strategy_id" else field] = (
+            "legacy-evidence"
+        )
+    result = paper_strategy_authorization(context, signal, symbol="BTC/USDT", side="long")
+    assert result["eligible"] is False
+    assert result["reason"] == "paper_strategy_evidence_contract_mismatch"
+
+
+def test_persisted_champion_from_old_score_policy_loses_permission() -> None:
+    from services.paper_strategy_champion import _row_payload
+
+    blueprint = _blueprint("v1")
+    blueprint.pop("prediction_score_policy_version")
+    row = StrategyProfileSnapshot(
+        profile_id="legacy", version=1, status="champion", source="trained_model_strategy_blueprint",
+        is_active=True, is_disabled=False, params={"blueprint": blueprint},
+        promotion={"paper_execution_permission": True}, backtest_metrics={}, probe_state={},
+    )
+    payload = _row_payload(row)
+    assert payload["active"] is False
+    assert payload["paper_execution_permission"] is False
 
 
 @pytest.mark.asyncio
@@ -385,7 +478,7 @@ async def test_paper_champion_promotes_retains_and_rolls_back(tmp_path: Path) ->
         upgraded = await service.reconcile(
             mode="paper",
             blueprint=_blueprint("v2"),
-            candidates=[_candidate("side_long")],
+            candidates=[_candidate("side_long", model_version="v2")],
             session=session,
         )
     assert upgraded["active"] is True
@@ -399,6 +492,7 @@ async def test_paper_champion_promotes_retains_and_rolls_back(tmp_path: Path) ->
             candidates=[
                 _candidate(
                     "side_long",
+                    model_version="v2",
                     version=2,
                     average=0.2,
                     lcb=0.05,

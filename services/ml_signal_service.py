@@ -4713,6 +4713,7 @@ class MLSignalService:
                     "available": True,
                     "model_version": model_version,
                     "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
+                    "entry_cohort_version": ENTRY_COHORT_VERSION,
                     "predictions": [
                         {
                             "horizon_minutes": horizon_minutes,
@@ -5228,6 +5229,7 @@ class MLSignalService:
             "influence_policy": influence,
             "model_version": strategy_blueprint.get("model_version"),
             "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
+            "entry_cohort_version": ENTRY_COHORT_VERSION,
             "trained_sample_count": int(metadata.get("sample_count") or 0),
             "primary_horizon_minutes": primary.get("horizon_minutes"),
             "long_win_rate": primary.get("long_win_rate"),
