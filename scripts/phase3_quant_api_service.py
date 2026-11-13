@@ -2815,6 +2815,7 @@ def _load_bundle_unlocked() -> dict[str, Any] | None:
         activation = current.get("activation_manifest") or {}
         runtime_metadata = {
             **metadata,
+            "artifact_sha256": current["manifest"].get("artifact_sha256"),
             "artifact_lifecycle": activation.get("activation_stage") or "unregistered",
             "model_stage": activation.get("activation_stage") or "unregistered",
             "live_ml_ready": bool(
@@ -4558,6 +4559,7 @@ def _attach_timeseries_specialist_shadow(
     payload: dict[str, Any],
     *,
     features: dict[str, Any],
+    bundle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     chain = _specialist_model_chain("timeseries")
     primary_shadow = _shadow_ready_or_submit(
@@ -4621,6 +4623,7 @@ def _attach_timeseries_specialist_shadow(
         "time_series_prediction",
         payload,
         features=features,
+        bundle=bundle,
         challenger_model=str(chain.get("challenger_model") or ""),
         fallback_reason=payload.get("fallback_reason") or "",
     )
@@ -4700,6 +4703,16 @@ def _shadow_payload(tool: str, payload: dict[str, Any]) -> dict[str, Any]:
         "primary_model",
         "challenger_model",
         "model_version",
+        "artifact_version",
+        "trained_at",
+        "training_data_sha256",
+        "source_code_sha256",
+        "artifact_sha256",
+        "artifact_registry_version",
+        "artifact_model_id",
+        "artifact_lifecycle",
+        "model_stage",
+        "artifact_activation_manifest",
         "route_mode",
         "horizon_minutes",
         "objective_name",
@@ -4749,6 +4762,7 @@ def with_model_metadata(
     payload: dict[str, Any],
     *,
     features: dict[str, Any] | None = None,
+    bundle: dict[str, Any] | None = None,
     challenger_model: str | None = None,
     fallback_reason: str = "",
 ) -> dict[str, Any]:
@@ -4761,7 +4775,9 @@ def with_model_metadata(
     model_name = str(payload.get("model") or defaults.get(tool) or "local_ai_tools")
     payload.setdefault("primary_model", model_name)
     payload.setdefault("challenger_model", challenger_model)
-    payload.setdefault("model_version", f"{model_name}.v1")
+    payload.setdefault(
+        "model_version", None if payload.get("trained") is True else f"{model_name}.v1"
+    )
     payload.setdefault(
         "route_mode",
         "shadow_candidate" if bool(payload.get("trained")) else "shadow_observation",
@@ -4772,10 +4788,75 @@ def with_model_metadata(
     payload.setdefault("production_permission", False)
     payload.setdefault("live_ml_ready", False)
     payload.setdefault("paper_trading_permission", False)
+    # Inference passes its exact bundle. Wrapping an already decorated response
+    # must preserve that response's identity and permissions across model swaps.
     if payload.get("trained") is True:
-        bundle = load_bundle()
-        metadata = bundle.get("metadata") if isinstance(bundle, dict) else {}
-        metadata = metadata if isinstance(metadata, dict) else {}
+        if isinstance(bundle, dict):
+            metadata = bundle.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            artifact_version = str(metadata.get("artifact_version") or "").strip()
+            payload["model_version"] = artifact_version or None
+            for key in (
+                "artifact_version",
+                "trained_at",
+                "training_data_sha256",
+                "source_code_sha256",
+                "artifact_sha256",
+                "artifact_registry_version",
+                "artifact_model_id",
+                "artifact_lifecycle",
+                "model_stage",
+                "artifact_activation_manifest",
+            ):
+                if key in metadata:
+                    payload[key] = metadata[key]
+                else:
+                    payload.pop(key, None)
+        else:
+            artifact_version = str(payload.get("artifact_version") or "").strip()
+            payload["model_version"] = (
+                artifact_version
+                if artifact_version
+                and payload.get("model_version") == artifact_version
+                else None
+            )
+            if payload["model_version"] is None:
+                payload["production_permission"] = False
+                payload["live_ml_ready"] = False
+                payload["paper_trading_permission"] = False
+                payload["route_mode"] = "shadow_observation"
+                blockers = ["runtime_artifact_identity_missing"]
+                payload["paper_trading_blockers"] = blockers
+                distribution_inputs = payload.get("return_distribution_inputs")
+                distribution_inputs = (
+                    distribution_inputs if isinstance(distribution_inputs, dict) else {}
+                )
+                for side in ("long", "short"):
+                    distribution_input = distribution_inputs.get(side)
+                    if isinstance(distribution_input, dict):
+                        distribution_input["contract_complete"] = False
+                        distribution_input["paper_eligible"] = False
+                        distribution_input["production_eligible"] = False
+                        distribution_input["blockers"] = list(
+                            dict.fromkeys([*(distribution_input.get("blockers") or []), *blockers])
+                        )
+                        distribution_input["production_blockers"] = list(
+                            dict.fromkeys(
+                                [*(distribution_input.get("production_blockers") or []), *blockers]
+                            )
+                        )
+                quality = payload.get("prediction_quality")
+                if isinstance(quality, dict):
+                    quality["contract_complete"] = False
+                    quality["paper_eligible"] = False
+                    quality["production_eligible"] = False
+                    quality["anomalous"] = True
+                    quality["reason"] = blockers[0]
+                    quality["blockers"] = list(
+                        dict.fromkeys([*(quality.get("blockers") or []), *blockers])
+                    )
+            payload["shadow_payload"] = _shadow_payload(tool, payload)
+            return payload
         for key in (
             "objective_name",
             "objective_version",
@@ -4807,12 +4888,14 @@ def with_model_metadata(
             activation_manifest if isinstance(activation_manifest, dict) else {}
         )
         live_authorized = bool(
-            activation_stage == "active"
+            artifact_version
+            and activation_stage == "active"
             and metadata.get("live_ml_ready") is True
             and not _production_return_evidence_blockers(metadata)
         )
         paper_authorized = bool(
-            activation_stage in {"bootstrap", "canary", "active"}
+            artifact_version
+            and activation_stage in {"bootstrap", "canary", "active"}
             and activation_manifest.get("paper_execution_permission") is True
         )
         paper_bootstrap_contract = bool(
@@ -4964,8 +5047,7 @@ def with_model_metadata(
             if quality_blockers
             else "current_prediction_distribution_missing"
         )
-    if not isinstance(payload.get("shadow_payload"), dict):
-        payload["shadow_payload"] = _shadow_payload(tool, payload)
+    payload["shadow_payload"] = _shadow_payload(tool, payload)
     return payload
 
 
@@ -5206,6 +5288,7 @@ def _attach_specialist_shadow(
     *,
     kind: str,
     features: dict[str, Any],
+    bundle: dict[str, Any] | None = None,
     fallback_reason: str,
 ) -> dict[str, Any]:
     chain = _specialist_model_chain(kind)
@@ -5231,6 +5314,7 @@ def _attach_specialist_shadow(
         tool,
         payload,
         features=features,
+        bundle=bundle,
         challenger_model=str(chain.get("challenger_model") or ""),
         fallback_reason=fallback_reason,
     )
@@ -5242,6 +5326,7 @@ def _attach_baseline_only_shadow(
     *,
     kind: str,
     features: dict[str, Any],
+    bundle: dict[str, Any] | None = None,
     fallback_reason: str,
 ) -> dict[str, Any]:
     chain = _specialist_model_chain(kind)
@@ -5266,6 +5351,7 @@ def _attach_baseline_only_shadow(
         tool,
         payload,
         features=features,
+        bundle=bundle,
         challenger_model=str(chain.get("challenger_model") or ""),
         fallback_reason=fallback_reason,
     )
@@ -7236,7 +7322,7 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
                     "cost separately; only OKX lifecycles calibrate realized return "
                     "and slippage."
                 ),
-            }, kind="profit", features=features, fallback_reason="profit_specialist_pending_phase3_clean_rebuild")
+            }, kind="profit", features=features, bundle=bundle, fallback_reason="profit_specialist_pending_phase3_clean_rebuild")
         except Exception as exc:
             fallback_error = safe_error(exc)
     else:
@@ -7269,7 +7355,7 @@ def profit_predict(req: FeatureRequest) -> dict[str, Any]:
         },
         "fallback_error": fallback_error,
         "note": "A persisted governed artifact is required before return inference.",
-    }, kind="profit", features=features, fallback_reason=fallback_reason)
+    }, kind="profit", features=features, bundle=bundle, fallback_reason=fallback_reason)
 
 
 @app.post("/timeseries/predict")
@@ -7531,8 +7617,12 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                         "blockers": contract_blockers,
                         "production_blockers": production_blockers,
                     },
-                }, features=features)
-                return _attach_timeseries_specialist_shadow(payload, features=features)
+                }, features=features, bundle=bundle)
+                return _attach_timeseries_specialist_shadow(
+                    payload,
+                    features=features,
+                    bundle=bundle,
+                )
         except Exception as exc:
             fallback_reason = f"timeseries_prediction_failed:{type(exc).__name__}"
 
@@ -7566,7 +7656,7 @@ def timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
             "blockers": [fallback_reason],
             "production_blockers": [fallback_reason],
         },
-    }, features=features, fallback_reason=fallback_reason)
+    }, features=features, bundle=bundle, fallback_reason=fallback_reason)
 
 
 @app.post("/timeseries/deep/predict")
@@ -7662,7 +7752,7 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "reason": prediction_blockers[0],
                     "blockers": prediction_blockers,
                 },
-            }, features=features)
+            }, features=features, bundle=bundle)
         long_model = sequence_model.get("long_model")
         short_model = sequence_model.get("short_model")
         if long_model and short_model and not sequence_reason:
@@ -7733,7 +7823,7 @@ def deep_timeseries_predict(req: FeatureRequest) -> dict[str, Any]:
                     "reason": prediction_blockers[0],
                     "blockers": prediction_blockers,
                 },
-            }, features=features)
+            }, features=features, bundle=bundle)
     except Exception:
         pass
     base = timeseries_predict(req)
@@ -7825,7 +7915,7 @@ def sentiment_analyze(req: FeatureRequest) -> dict[str, Any]:
         "risk_level": risk,
         "mentions": int(mentions),
         "articles": int(articles),
-    }, features=features, fallback_reason="" if trained_expected is not None else "trained_sentiment_model_unavailable")
+    }, features=features, bundle=bundle, fallback_reason="" if trained_expected is not None else "trained_sentiment_model_unavailable")
 
 
 @app.post("/sentiment/deep/analyze")
@@ -7900,7 +7990,7 @@ def exit_advise(req: FeatureRequest) -> dict[str, Any]:
             "action": "hold",
             "no_matching_position": True,
             "reason": "本轮没有传入与该币种匹配的当前持仓，平仓建议模型不参与。",
-        }, features=features, fallback_reason="no_matching_open_position")
+        }, features=features, bundle=bundle, fallback_reason="no_matching_open_position")
     observations = []
     for pos in positions:
         side = str(pos.get("side") or "").lower()
@@ -7925,7 +8015,7 @@ def exit_advise(req: FeatureRequest) -> dict[str, Any]:
         "reason": "本地退出画像只提供观察事实；生产平仓由动态退出契约独占。",
         "observations": observations,
         "production_permission": False,
-    }, features=features, fallback_reason="dynamic_exit_policy_owns_production_exit")
+    }, features=features, bundle=bundle, fallback_reason="dynamic_exit_policy_owns_production_exit")
 
 
 @app.get("/v1/models")

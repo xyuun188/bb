@@ -813,6 +813,8 @@ def test_local_ai_tools_generated_service_adds_phase3_model_metadata() -> None:
     assert '"primary_model"' in SERVICE_CODE
     assert '"challenger_model"' in SERVICE_CODE
     assert '"model_version"' in SERVICE_CODE
+    assert '"runtime_artifact_identity_missing"' in SERVICE_CODE
+    assert 'payload["model_version"] = artifact_version or None' in SERVICE_CODE
     assert '"route_mode"' in SERVICE_CODE
     assert '"feature_coverage"' in SERVICE_CODE
     assert '"shadow_payload"' in SERVICE_CODE
@@ -844,6 +846,132 @@ def test_local_ai_tools_generated_service_metadata_helpers_are_callable() -> Non
     assert health["port"] == 8101
     assert "live_mutation" not in health
     assert health["trained_models_available"] is False
+
+
+@pytest.mark.parametrize("artifact_version", ["artifact-a", "artifact-b"])
+def test_trained_model_metadata_uses_exact_loaded_artifact_identity(
+    monkeypatch, artifact_version
+) -> None:
+    module = ModuleType("local_ai_tools_api_exact_artifact_identity_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    bundle = {
+        "metadata": {
+            "artifact_version": artifact_version,
+            "trained_at": "2026-11-13T06:04:13.519305Z",
+            "training_data_sha256": "a" * 64,
+            "source_code_sha256": "b" * 64,
+            "artifact_sha256": "c" * 64,
+            "artifact_registry_version": "local-ai-artifact-registry.v1",
+            "artifact_model_id": "local_ai_tools_quant_bundle",
+            "artifact_lifecycle": "canary",
+            "model_stage": "canary",
+        }
+    }
+    monkeypatch.setattr(
+        module,
+        "load_bundle",
+        lambda: (_ for _ in ()).throw(AssertionError("must reuse the inference bundle")),
+    )
+
+    payload = module.with_model_metadata(
+        "profit_prediction",
+        {
+            "available": True,
+            "trained": True,
+            "model": "local-profit-trained-v2",
+            "return_semantics": "gross_market_opportunity_before_execution",
+            "return_distribution_input_version": module.RETURN_DISTRIBUTION_INPUT_VERSION,
+            "return_distribution_inputs": {
+                "long": {"contract_complete": False, "blockers": ["test"]},
+                "short": {"contract_complete": False, "blockers": ["test"]},
+            },
+            "prediction_quality": {
+                "contract_complete": False,
+                "paper_eligible": False,
+                "production_eligible": False,
+                "anomalous": True,
+                "blockers": ["test"],
+            },
+        },
+        bundle=bundle,
+    )
+
+    assert payload["model_version"] == bundle["metadata"]["artifact_version"]
+    assert payload["artifact_version"] == bundle["metadata"]["artifact_version"]
+    assert payload["trained_at"] == bundle["metadata"]["trained_at"]
+    assert payload["training_data_sha256"] == "a" * 64
+    assert payload["shadow_payload"]["model_version"] == bundle["metadata"]["artifact_version"]
+
+    wrapped = module._attach_baseline_only_shadow(
+        "profit_prediction", payload, kind="profit", features={}, fallback_reason="test"
+    )
+    assert wrapped["model_version"] == artifact_version
+    assert wrapped["training_data_sha256"] == "a" * 64
+    assert wrapped["shadow_payload"]["artifact_version"] == artifact_version
+
+
+def test_deep_sentiment_metadata_does_not_reload_inference_bundle(monkeypatch) -> None:
+    module = ModuleType("local_ai_tools_api_deep_sentiment_identity_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    bundle = {
+        "metadata": {"artifact_version": "sentiment-inference-v1"},
+        "sentiment_model": {
+            "long_model": SimpleNamespace(predict=lambda _x: [0.6]),
+            "short_model": SimpleNamespace(predict=lambda _x: [-0.6]),
+        },
+    }
+    loads = []
+
+    def load_once():
+        loads.append(True)
+        assert len(loads) == 1, "wrapping must not load a different model"
+        return bundle
+
+    monkeypatch.setattr(module, "load_bundle", load_once)
+    monkeypatch.setattr(module, "_shadow_ready_or_submit", lambda *_args: {})
+    payload = module.deep_sentiment_analyze(SimpleNamespace(features={}, symbol="BTC/USDT"))
+
+    assert len(loads) == 1
+    assert payload["trained"] is True
+    assert payload["model_version"] == "sentiment-inference-v1"
+    assert payload["shadow_payload"]["artifact_version"] == "sentiment-inference-v1"
+
+
+def test_trained_metadata_without_exact_artifact_identity_fails_closed() -> None:
+    module = ModuleType("local_ai_tools_api_missing_identity_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    payload = module.with_model_metadata(
+        "profit_prediction",
+        {
+            "available": True,
+            "trained": True,
+            "model": "local-profit-trained-v2",
+            "model_version": "local-profit-trained-v2.v1",
+            "return_semantics": "gross_market_opportunity_before_execution",
+            "return_distribution_inputs": {
+                side: {"contract_complete": True, "paper_eligible": True, "blockers": []}
+                for side in ("long", "short")
+            },
+            "prediction_quality": {
+                "contract_complete": True,
+                "paper_eligible": True,
+                "production_eligible": False,
+                "anomalous": False,
+                "blockers": [],
+            },
+            "paper_trading_permission": True,
+        },
+    )
+
+    assert payload["model_version"] is None
+    assert payload["paper_trading_permission"] is False
+    assert payload["production_permission"] is False
+    assert payload["prediction_quality"]["anomalous"] is True
+    assert payload["prediction_quality"]["reason"] == "runtime_artifact_identity_missing"
+    assert all(
+        item["paper_eligible"] is False and item["contract_complete"] is False
+        for item in payload["return_distribution_inputs"].values()
+    )
 
 
 @pytest.mark.asyncio
@@ -1078,6 +1206,7 @@ def test_shadow_model_metadata_blocks_runtime_trading_eligibility(monkeypatch) -
         "load_bundle",
         lambda: {
             "metadata": {
+                "artifact_version": "shadow-test-v1",
                 "objective_name": module.RETURN_OBJECTIVE_NAME,
                 "objective_version": module.RETURN_OBJECTIVE_VERSION,
                 "label_name": module.RETURN_LABEL_NAME,
@@ -1093,6 +1222,7 @@ def test_shadow_model_metadata_blocks_runtime_trading_eligibility(monkeypatch) -
         },
     )
 
+    bundle = module.load_bundle()
     payload = module.with_model_metadata(
         "profit_prediction",
         {
@@ -1110,6 +1240,7 @@ def test_shadow_model_metadata_blocks_runtime_trading_eligibility(monkeypatch) -
                 "reason": "current_tree_prediction_distribution_ready",
             },
         },
+        bundle=bundle,
     )
 
     assert payload["artifact_persisted"] is True
@@ -1264,6 +1395,7 @@ def test_model_metadata_is_idempotent_for_paper_permission(
         "load_bundle",
         lambda: {
             "metadata": {
+                "artifact_version": "timeseries-test-v1",
                 "objective_name": module.RETURN_OBJECTIVE_NAME,
                 "objective_version": module.RETURN_OBJECTIVE_VERSION,
                 "label_name": module.RETURN_LABEL_NAME,
@@ -1313,7 +1445,9 @@ def test_model_metadata_is_idempotent_for_paper_permission(
         },
     }
 
-    first = module.with_model_metadata("time_series_prediction", initial)
+    first = module.with_model_metadata(
+        "time_series_prediction", initial, bundle=module.load_bundle()
+    )
     second = module.with_model_metadata("time_series_prediction", first)
     paper_authorized = expected_paper_permission
 
@@ -1350,6 +1484,9 @@ def test_deploy_smoke_verifies_timeseries_permission_contract() -> None:
     assert "timeseries.get('prediction_quality', {}).get('production_eligible')" in command
     assert "timeseries.get('production_permission') is live" in command
     assert "'timeseries_contract':" in command
+    assert "profit.get('model_version') == health.get('artifact_version')" in command
+    assert "timeseries.get('model_version') == health.get('artifact_version')" in command
+    assert "sentiment.get('model_version') == health.get('artifact_version')" in command
 
 
 def test_local_ai_tools_status_endpoints_do_not_load_joblib_bundle(tmp_path: Path) -> None:
