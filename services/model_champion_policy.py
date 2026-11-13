@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.ml_training_contract import MIN_TRAINING_SAMPLE_COUNT
 
 MODEL_CHAMPION_POLICY_VERSION = "2026-11-13.positive-entry-portfolio-champion.v5"
@@ -56,8 +56,10 @@ def _comparison_entry_evidence(
 ) -> dict[str, Any]:
     report = _dict(evaluation.get(f"{role}_entry_evaluation"))
     side_reports = _dict(report.get("sides"))
-    if report.get("version") != ENTRY_COHORT_VERSION or any(
-        not isinstance(side_reports.get(side), dict) for side in sides
+    if (
+        report.get("version") != ENTRY_COHORT_VERSION
+        or report.get("prediction_score_policy_version") != PREDICTION_SCORE_POLICY_VERSION
+        or any(not isinstance(side_reports.get(side), dict) for side in sides)
     ):
         return {}
     # Use the chronological pooled outcomes, including a legitimately empty side.

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
     NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
@@ -81,7 +81,10 @@ def _model_profitability_evidence(
             local_ml.get("sides")
             or local_ml.get("side_metrics")
         )
-        current_entry_cohort = local_ml.get("entry_cohort_version") == ENTRY_COHORT_VERSION
+        current_entry_cohort = (
+            local_ml.get("entry_cohort_version") == ENTRY_COHORT_VERSION
+            and local_ml.get("prediction_score_policy_version") == PREDICTION_SCORE_POLICY_VERSION
+        )
         portfolio = _safe_dict(local_ml.get("portfolio")) if current_entry_cohort else {}
         if _safe_int(portfolio.get("count")) <= 0:
             portfolio = {}
@@ -108,6 +111,7 @@ def _model_profitability_evidence(
                 "lifecycle": local_ml.get("lifecycle"),
                 "sides": side_evidence,
                 "evidence_scope": local_ml.get("evidence_scope"),
+                "prediction_score_policy_version": local_ml.get("prediction_score_policy_version"),
                 "count": _safe_int(portfolio.get("count")),
                 "profit_factor": _safe_float(portfolio.get("profit_factor")),
                 "return_lcb_pct": _safe_float(portfolio.get("return_lcb_pct")),

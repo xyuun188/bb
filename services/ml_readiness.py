@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.ml_training_contract import (
     PRIMARY_PREDICTION_HORIZON_MINUTES,
     WALK_FORWARD_REPORT_VERSION,
@@ -442,6 +442,7 @@ def _side_artifact_evidence_blockers(
     ]
     if not folds or any(
         report.get("version") != ENTRY_COHORT_VERSION
+        or report.get("prediction_score_policy_version") != PREDICTION_SCORE_POLICY_VERSION
         or _safe_dict(_safe_dict(report.get("sides")).get(side)).get(
             "promotion_math_ready"
         ) is not True

@@ -906,6 +906,7 @@ def _select_top_return_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 ENTRY_COHORT_VERSION = "2026-11-13.positive-objective-entry-cohort.v1"
+PREDICTION_SCORE_POLICY_VERSION = "2026-11-13.leaf-total-risk-objective.v1"
 
 
 def positive_objective_entry_rows(
@@ -942,6 +943,7 @@ def _entry_return_evaluation(
     selected = positive_objective_entry_rows(scored_rows)
     return {
         "version": ENTRY_COHORT_VERSION,
+        "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
         "selection_policy": "larger_positive_fee_after_objective_else_hold",
         "execution_replay_complete": False,
         "scope": "necessary_model_signal_gate_without_fill_exit_or_capacity_simulation",
@@ -1501,6 +1503,7 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
         ]
         if not folds or any(
             report.get("version") != ENTRY_COHORT_VERSION
+            or report.get("prediction_score_policy_version") != PREDICTION_SCORE_POLICY_VERSION
             or ((report.get("sides") or {}).get(side) or {}).get(
                 "promotion_math_ready"
             ) is not True
@@ -2276,7 +2279,11 @@ def _entry_comparison_metrics(evidence: dict[str, Any]) -> dict[str, float | Non
 
 def _comparison_entry_evidence(evaluation: dict[str, Any], role: str) -> dict[str, Any]:
     report = evaluation.get(f"{role}_entry_evaluation") or {}
-    if not isinstance(report, dict) or report.get("version") != ENTRY_COHORT_VERSION:
+    if (
+        not isinstance(report, dict)
+        or report.get("version") != ENTRY_COHORT_VERSION
+        or report.get("prediction_score_policy_version") != PREDICTION_SCORE_POLICY_VERSION
+    ):
         return {}
     sides = report.get("sides")
     portfolio = report.get("portfolio")

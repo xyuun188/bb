@@ -1,6 +1,6 @@
 import pytest
 
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.model_champion_policy import (
     PAIRED_COMPARISON_VERSION,
 )
@@ -21,7 +21,11 @@ def _entry_policy_fixture(sides: dict) -> dict:
     portfolio["profit_factor_status"] = (
         "no_loss_denominator" if portfolio["gross_loss_pct"] == 0 else "defined"
     )
-    return {"version": ENTRY_COHORT_VERSION, "sides": sides, "portfolio": portfolio}
+    return {
+        "version": ENTRY_COHORT_VERSION,
+        "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
+        "sides": sides, "portfolio": portfolio,
+    }
 
 
 def _paired_evaluation(candidate: dict, champion: dict) -> dict:
@@ -505,6 +509,7 @@ def test_comparison_uses_pooled_entry_outcomes_with_empty_direction(empty: bool)
         ])
         evaluation[f"{role}_entry_evaluation"] = {
             "version": ENTRY_COHORT_VERSION,
+            "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
             "sides": {"long": _return_evidence([]), "short": portfolio},
             "portfolio": portfolio,
         }
@@ -528,3 +533,18 @@ def test_ranking_evidence_cannot_replace_entry_portfolio(version) -> None:
         comparison_evaluation=evaluation,
     )
     assert report["accepted"] is False
+
+
+@pytest.mark.parametrize("role", ["candidate", "champion"])
+@pytest.mark.parametrize("policy", [None, "legacy-tree-mean-only"])
+def test_comparison_rejects_outcomes_from_another_scoring_policy(role, policy) -> None:
+    candidate, champion = _metadata(avg=0.4), _metadata()
+    evaluation = _paired_evaluation(candidate, champion)
+    evaluation[f"{role}_entry_evaluation"]["prediction_score_policy_version"] = policy
+    report = _compare_candidate_to_champion(
+        candidate, champion, candidate_stage="shadow", champion_stage="shadow",
+        comparison_evaluation=evaluation,
+    )
+    assert report["accepted"] is False
+    assert f"{role}_metrics" in report
+    assert report[f"{role}_metrics"]["profit_factor"] is None

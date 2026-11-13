@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.trade_execution_contract import summarize_trade_execution_contract
 from web_dashboard.api import system_audit
 
@@ -43,6 +43,7 @@ def test_local_ml_profit_quality_details_exposes_side_specific_evidence() -> Non
             "paper_model_eligible": False,
             "entry_return_evaluation": {
                 "version": ENTRY_COHORT_VERSION,
+                "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
                 "sides": {
                     "long": {"count": 4, "profit_factor": 0.2939, "return_lcb_pct": -2.0421},
                     "short": {"count": 4, "profit_factor": 0.6222, "return_lcb_pct": -3.9919},
@@ -78,6 +79,7 @@ def test_local_ml_profit_quality_details_exposes_side_specific_evidence() -> Non
     assert details["side_profit_factors"] == {"long": 0.2939, "short": 0.6222}
     assert details["side_return_lcb_pct"] == {"long": -2.0421, "short": -3.9919}
     assert details["profit_factor"] == 0.45805
+    assert details["prediction_score_policy_version"] == PREDICTION_SCORE_POLICY_VERSION
     assert details["portfolio"]["count"] == 8
     assert details["evaluated_horizon_minutes"] == 240
     assert details["blocking_reasons"] == ["long_top_profit_factor_not_above_one"]

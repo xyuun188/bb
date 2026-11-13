@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from core.model_topology import TARGET_SINGLE_MODEL_ID
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.model_training_registry import build_model_training_registry
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
@@ -18,12 +18,14 @@ def _by_id(payload: dict) -> dict[str, dict]:
 
 
 @pytest.mark.parametrize("version", [None, "old-rankings", ENTRY_COHORT_VERSION])
-def test_local_ml_registry_displays_entry_cohort_without_ranking_fallback(version) -> None:
+@pytest.mark.parametrize("policy", [None, "legacy-tree-mean-only", PREDICTION_SCORE_POLICY_VERSION])
+def test_local_ml_registry_displays_entry_cohort_without_ranking_fallback(version, policy) -> None:
     status = {
         "available": True,
         "readiness": {"metrics": {"top_long_profit_factor": 99.0}},
         "entry_return_evaluation": {
             "version": version,
+            "prediction_score_policy_version": policy,
             "sides": {
                 "long": {"count": 0, "profit_factor": 99.0},
                 "short": {"count": 4, "profit_factor": 0.4, "avg_return_pct": -0.1},
@@ -32,7 +34,9 @@ def test_local_ml_registry_displays_entry_cohort_without_ranking_fallback(versio
         },
     }
     row = _by_id(build_model_training_registry(local_ml_status=status))["local_ml_profit_quality"]
-    assert row["profit_factor"] == (0.4 if version == ENTRY_COHORT_VERSION else None)
+    matches = version == ENTRY_COHORT_VERSION and policy == PREDICTION_SCORE_POLICY_VERSION
+    assert row["profit_factor"] == (0.4 if matches else None)
+    assert row["prediction_score_policy_version"] == (policy if matches else None)
     assert row["side_metrics"]["long"]["profit_factor"] is None
     assert row["ranking_diagnostics"]["top_long_profit_factor"] == 99.0
 

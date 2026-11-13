@@ -16,7 +16,7 @@ import pytest
 from scripts import deploy_local_ai_tools_service as deploy
 from scripts.deploy_local_ai_tools_service import SERVICE_CODE
 from services.local_ai_training_contract import LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,7 +34,11 @@ def _entry_policy_fixture(sides: dict) -> dict:
     portfolio["profit_factor_status"] = (
         "no_loss_denominator" if portfolio["gross_loss_pct"] == 0 else "defined"
     )
-    return {"version": ENTRY_COHORT_VERSION, "sides": sides, "portfolio": portfolio}
+    return {
+        "version": ENTRY_COHORT_VERSION,
+        "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
+        "sides": sides, "portfolio": portfolio,
+    }
 
 
 def test_shadow_results_retrieve_delayed_exact_request_and_preserve_kind_capacity(monkeypatch):
@@ -138,6 +142,7 @@ def _test_artifact_metadata(
     def entry_evidence() -> dict:
         return {
             "version": module.ENTRY_COHORT_VERSION,
+            "prediction_score_policy_version": module.PREDICTION_SCORE_POLICY_VERSION,
             "sides": {side: dict(ready_evidence) for side in ("long", "short")},
         }
 
@@ -2236,6 +2241,7 @@ def test_local_ai_entry_cohort_matches_platform_and_excludes_profitable_nonentri
     assert report["sides"]["long"]["promotion_math_ready"] is False
     assert report["sides"]["short"]["count"] == 0
     assert report["execution_replay_complete"] is False
+    assert report["prediction_score_policy_version"] == PREDICTION_SCORE_POLICY_VERSION
 
 
 @pytest.mark.parametrize("scope", ["missing", "walk_forward", "fold"])
@@ -2256,6 +2262,31 @@ def test_local_ai_good_rankings_cannot_promote_unproven_entry_cohort(scope: str)
     assert "short_positive_entry_return_evidence_not_ready" in (
         module._production_return_evidence_blockers(metadata)
     )
+
+
+@pytest.mark.parametrize("scope", ["walk_forward", "fold"])
+@pytest.mark.parametrize("policy", [None, "legacy-tree-mean-only"])
+def test_local_ai_readiness_rejects_other_scoring_policy(scope, policy) -> None:
+    module = ModuleType("local_ai_score_policy_readiness_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    metadata = _test_artifact_metadata(module)
+    walk = metadata["walk_forward_report"]
+    report = (walk if scope == "walk_forward" else walk["folds"][0])[
+        "entry_return_evaluation"
+    ]
+    report["prediction_score_policy_version"] = policy
+    blockers = module._production_return_evidence_blockers(metadata)
+    for side in ("long", "short"):
+        assert f"{side}_positive_entry_return_evidence_not_ready" in blockers
+
+
+@pytest.mark.parametrize("policy", [None, "legacy-tree-mean-only"])
+def test_local_ai_comparison_rejects_other_scoring_policy(policy) -> None:
+    module = ModuleType("local_ai_score_policy_comparison_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    report = _entry_policy_fixture({side: {"count": 4} for side in ("long", "short")})
+    report["prediction_score_policy_version"] = policy
+    assert module._comparison_entry_evidence({"candidate_entry_evaluation": report}, "candidate") == {}
 
 
 def test_local_ai_registry_replaces_only_incompatible_champion_contract(
@@ -4628,6 +4659,7 @@ def test_local_ai_comparison_allows_empty_direction_but_not_empty_portfolio(monk
         ])
         evaluation[f"{role}_entry_evaluation"] = {
             "version": ENTRY_COHORT_VERSION,
+            "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
             "sides": {"long": module._return_evidence([]), "short": portfolio},
             "portfolio": portfolio,
         }
@@ -4661,6 +4693,7 @@ def test_entry_comparison_pools_chronological_outcomes_without_averaging_sides()
     entry = _entry_return_evaluation(rows)
     server_entry = module._entry_return_evaluation(rows)
     assert server_entry["version"] == entry["version"]
+    assert server_entry["prediction_score_policy_version"] == entry["prediction_score_policy_version"]
     assert server_entry["selection_policy"] == entry["selection_policy"]
     for side in ("long", "short"):
         assert module._entry_comparison_metrics(server_entry["sides"][side]) == _entry_metrics(entry["sides"][side])

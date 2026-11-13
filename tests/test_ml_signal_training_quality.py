@@ -616,6 +616,7 @@ def _with_return_objective(metadata: dict) -> dict:
     def entry_evidence() -> dict:
         return {
             "version": ml_signal_module.ENTRY_COHORT_VERSION,
+            "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
             "sides": {side: dict(ready_return_evidence) for side in ("long", "short")},
         }
 
@@ -3660,6 +3661,24 @@ def test_good_rankings_cannot_promote_missing_or_losing_positive_entry_cohort(sc
         item["code"] for item in readiness["side_blocking_reasons"]["long"]
     }
     assert readiness["live_ml_ready"] is (scope != "missing")
+
+
+@pytest.mark.parametrize("scope", ["holdout", "walk_forward", "fold"])
+@pytest.mark.parametrize("policy", [None, "legacy-tree-mean-only"])
+def test_readiness_rejects_other_scoring_policies_despite_good_returns(scope, policy) -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    report = {
+        "holdout": metadata["entry_return_evaluation"],
+        "walk_forward": metadata["walk_forward_report"]["entry_return_evaluation"],
+        "fold": metadata["walk_forward_report"]["folds"][0]["entry_return_evaluation"],
+    }[scope]
+    report["prediction_score_policy_version"] = policy
+    readiness = build_ml_readiness_report(metadata, {"enabled": True})
+    assert readiness["live_ml_ready"] is False
+    for side in ("long", "short"):
+        assert f"{side}_positive_entry_return_evidence_not_ready" in {
+            item["code"] for item in readiness["side_blocking_reasons"][side]
+        }
 
 
 def test_ml_readiness_blocks_artifact_without_native_market_fact_contract() -> None:

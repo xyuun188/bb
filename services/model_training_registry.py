@@ -10,7 +10,7 @@ from collections import Counter
 from typing import Any
 
 from core.model_topology import TARGET_SINGLE_MODEL_ID, TARGET_SINGLE_MODEL_PROFILE
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 MODEL_TRAINING_REGISTRY_VERSION = "2026-07-12.v2"
@@ -158,7 +158,10 @@ def _finquant_specialization_verified(
 def local_ml_entry_profitability(status: dict[str, Any]) -> dict[str, Any]:
     """Expose the frozen holdout's selected outcomes without falling back to ranks."""
     report = _safe_dict(status.get("entry_return_evaluation"))
-    if report.get("version") != ENTRY_COHORT_VERSION:
+    if (
+        report.get("version") != ENTRY_COHORT_VERSION
+        or report.get("prediction_score_policy_version") != PREDICTION_SCORE_POLICY_VERSION
+    ):
         report = {}
 
     def metrics(row: dict[str, Any]) -> dict[str, Any]:
@@ -175,6 +178,7 @@ def local_ml_entry_profitability(status: dict[str, Any]) -> dict[str, Any]:
     sides = _safe_dict(report.get("sides"))
     return {
         "entry_cohort_version": report.get("version"),
+        "prediction_score_policy_version": report.get("prediction_score_policy_version"),
         "evidence_scope": "holdout_positive_objective_entry_cohort",
         "portfolio": metrics(_safe_dict(report.get("portfolio"))),
         "side_metrics": {
@@ -238,6 +242,7 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
         "profit_factor": portfolio["profit_factor"],
         "max_drawdown": portfolio["max_drawdown_pct"],
         "entry_cohort_version": profitability["entry_cohort_version"],
+        "prediction_score_policy_version": profitability["prediction_score_policy_version"],
         "evidence_scope": profitability["evidence_scope"],
         "portfolio": portfolio,
         "ranking_diagnostics": metrics,

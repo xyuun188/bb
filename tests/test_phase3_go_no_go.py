@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import pytest
 
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.phase3_go_no_go import evaluate_phase3_go_no_go_cards
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
@@ -362,6 +362,7 @@ def _local_ml_evidence(*, long_pf: float, short_pf: float) -> dict:
         "walk_forward_stable": False,
         "fallback_used": True,
         "entry_cohort_version": ENTRY_COHORT_VERSION,
+        "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
         "evidence_scope": "holdout_positive_objective_entry_cohort",
         "portfolio": {
             "count": 8, "profit_factor": min(long_pf, short_pf),
@@ -409,6 +410,24 @@ def test_phase3_go_no_go_uses_current_local_ml_evidence_over_legacy_bundle() -> 
     )
     assert blocker["evidence"]["source"] == "local_ml_profit_quality"
     assert report["summary"]["model_profitability_sides"]["short"]["profit_factor"] == 0.6222
+
+
+@pytest.mark.parametrize("policy", [None, "legacy-tree-mean-only"])
+def test_phase3_go_no_go_rejects_profitable_metrics_from_other_scoring_policy(policy) -> None:
+    from services.phase3_go_no_go import _model_profitability_evidence
+
+    local_ml = _local_ml_evidence(long_pf=2.0, short_pf=2.0)
+    local_ml["prediction_score_policy_version"] = policy
+    local_ml["portfolio"].update({"return_lcb_pct": 0.2, "mean_return_pct": 0.4})
+    evidence, source = _model_profitability_evidence({
+        "local_ml_profit_quality": local_ml,
+        "local_ai_tools": {"profit_factor": 99.0, "return_lcb_pct": 10.0},
+    })
+    assert source == "local_ml_profit_quality"
+    assert evidence["count"] == 0
+    assert evidence["profit_factor"] is None
+    assert evidence["mean_return_pct"] is None
+    assert evidence["return_lcb_pct"] is None
 
 
 def test_phase3_go_no_go_local_ml_live_flag_overrides_legacy_promotion() -> None:

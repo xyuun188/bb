@@ -4211,6 +4211,7 @@ def _local_ml_profit_quality_details(
         "profit_factor": portfolio["profit_factor"],
         "return_lcb_pct": portfolio["return_lcb_pct"],
         "entry_cohort_version": profitability["entry_cohort_version"],
+        "prediction_score_policy_version": profitability["prediction_score_policy_version"],
         "evidence_scope": profitability["evidence_scope"],
         "portfolio": portfolio,
         "ranking_diagnostics": metrics,
