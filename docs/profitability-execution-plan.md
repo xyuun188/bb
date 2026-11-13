@@ -427,3 +427,67 @@ classifiers, risk rules and capacity limits remained in force. The symmetric
 candidate selected four longs and one short, but only two capacity observations
 and a negative return LCB remained. This demonstrates that removing directional
 bias alone does not establish a profitable executable strategy. It is not enabled.
+
+## November 14 Rebuild And Acceptance Follow-Through
+
+The period-contract rebuild completed on both deployed training paths. Local ML
+artifact `20261113T155824628907Z-76761f83` entered paper canary with no live
+permission. Remote quant artifact `20261113T155529804163Z-e39f9e55` is available
+in shadow. Both report the explicit indicator-period feature contract. The two
+automatic training timers were restored after the controlled rebuilds.
+
+The remote status endpoint previously preferred the challenger pointer over the
+current artifact regardless of training time. After a contract migration this
+could report no latest training even while the verified current model was new.
+It now chooses the newest verified current, candidate or challenger by parsed
+training time. Invalid pointers remain invalid, and reporting does not change
+model activation or execution permissions.
+
+The runtime text audit also failed on large strategy snapshots. Twenty recent
+strategy events contained about 64 million JSON characters; a single 200-row
+projection could exceed the shared database statement timeout. The audit now
+reads at most five payload rows per query, releases the read transaction before
+inspection, scans off the async event loop, and merges only bounded counts and
+examples. ASCII-only leaves bypass the non-ASCII mojibake detector. It still
+inspects all selected records and fields; it never rewrites historical text.
+An isolated twenty-row scan passed, but a fresh integrated run reproduced the
+shared 12-second statement timeout. Five-row batches alone then hit the section
+deadline during JSON decoding and traversal. The final implementation reads JSON
+as serialized text and applies a conservative marker prefilter in the worker
+thread. Any possible marker, including an escaped Unicode marker, still causes
+full decoding and per-leaf inspection. Clean serialized documents need no object
+graph. Regression checks cover every detector marker, Unicode escape casing,
+false positives in keys, and equality with the original per-leaf report. The
+scan coverage and all database and section timeouts remain unchanged.
+
+The same integrated acceptance exposed full-payload reads in the independent
+high-risk and shadow missed-opportunity audits. High-risk review now fixes its
+original scalar window before projecting only entry review keys. Missed-opportunity
+review retains its original windows and only fetches feature payloads for completed
+misses and original decision contracts for executed entries, five rows at a time.
+SQLite integration regressions verify review violations, unchanged fee-after
+observations, excluded old rows and the narrow payload queries.
+
+Final integrated report `final-acceptance-v4-20261114/latest.json`, generated at
+`2026-11-13T16:43:54Z`, completed in 94.77 seconds within the 180-second total
+budget. All three corrected audit cards passed, with no deferred audit sections.
+Text inspection covered 711 records with zero suspected defects; high-risk review
+and missed-opportunity review completed in 0.36 and 0.69 seconds respectively.
+The full suite passed 5,907 tests with one skip before the final two audit
+projections; all final edits passed 395 focused regressions, Ruff and compilation.
+
+The exact rebuilt local model replay completed at `2026-11-13T16:13:23Z`.
+It retained 17 qualifying entry observations, all in the strategy exam and none
+in strategy development. Another 1,553 observations failed the current entry
+return gate, and 91 were outside governed sides. Replay is complete, but there
+are zero validated strategy candidates. This is a failed profitability
+qualification, not an unfinished replay or a reason to force an entry.
+
+Profitability acceptance still fails. The final report records 99 settled
+positions with net PnL `-17.79576402 USDT` in the current system execution window,
+not solely the rebuilt model's trades. The current-model holdout entry cohort
+has 23 short observations, mean `+0.577111%`, PF `1.60354`, but return LCB
+`-0.400948%` and no long observations. Recent decisions use the rebuilt artifact
+with complete required market inputs, yet fail their current fee-after return
+and loss-risk conditions. Neither the positive holdout mean nor corrected audit
+availability establishes a profitable strategy or grants live permission.

@@ -25,22 +25,36 @@ class HighRiskReviewAuditService:
         session_factory = self._session_context_factory or get_read_session_ctx
         async with session_factory() as session:
             result = await session.execute(
-                # The audit only needs the review payload and a few identity
-                # fields.  Selecting the full decision row pulls large feature
-                # snapshots into memory and can make the read-only audit time
-                # out under normal production volume.
                 select(
                     AIDecision.id,
                     AIDecision.symbol,
                     AIDecision.action,
                     AIDecision.was_executed,
-                    AIDecision.raw_llm_response,
                 )
                 .where(AIDecision.created_at >= since)
                 .order_by(AIDecision.created_at.desc())
                 .limit(capped_limit)
             )
-        return summarize_high_risk_review(list(result.mappings().all()), hours=capped_hours)
+            decisions = [dict(row) for row in result.mappings().all()]
+        entries = {row["id"]: row for row in decisions if _is_entry(row)}
+        entry_ids = list(entries)
+        # Review payloads live inside large transcripts. Fetch only the review
+        # key, only for entry rows, after the scalar window is fixed.
+        for offset in range(0, len(entry_ids), 20):
+            async with session_factory() as session:
+                result = await session.execute(
+                    select(
+                        AIDecision.id,
+                        AIDecision.raw_llm_response["high_risk_review"].label(
+                            "high_risk_review"
+                        ),
+                    ).where(AIDecision.id.in_(entry_ids[offset : offset + 20]))
+                )
+                for row in result.mappings().all():
+                    entries[row["id"]]["raw_llm_response"] = {
+                        "high_risk_review": row["high_risk_review"],
+                    }
+        return summarize_high_risk_review(decisions, hours=capped_hours)
 
 
 def summarize_high_risk_review(decisions: list[Any], *, hours: int = 72) -> dict[str, Any]:

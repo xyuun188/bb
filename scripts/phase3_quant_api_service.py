@@ -3269,8 +3269,16 @@ def _model_artifact_status() -> dict[str, Any]:
 
     candidate_info = candidate_summary(candidate)
     challenger_info = candidate_summary(challenger)
-    latest_training = (
-        challenger_info if challenger_info.get("available") else candidate_info
+    current_info = candidate_summary(current)
+    latest_training = max(
+        (
+            item
+            for item in (challenger_info, candidate_info, current_info)
+            if item.get("available")
+        ),
+        key=lambda item: _parsed_timestamp(item.get("trained_at"))
+        or datetime.min.replace(tzinfo=timezone.utc),
+        default=candidate_info,
     )
     return {
         "available": model_bundle_available,

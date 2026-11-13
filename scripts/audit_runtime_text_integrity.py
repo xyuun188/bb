@@ -7,12 +7,13 @@ import asyncio
 import json
 import sys
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import JSON, Text, cast, select
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -26,7 +27,11 @@ from models.learning import (  # noqa: E402
     StrategyLearningEvent,
     TradeReflection,
 )
-from services.text_integrity import looks_like_mojibake, repair_mojibake  # noqa: E402
+from services.text_integrity import (  # noqa: E402
+    looks_like_mojibake,
+    repair_mojibake,
+    serialized_json_may_contain_mojibake,
+)
 
 TEXT_AUDIT_FIELDS: dict[str, tuple[str, ...]] = {
     "ai_decisions": (
@@ -56,6 +61,14 @@ MODEL_BY_TABLE = {
     "trade_reflections": TradeReflection,
     "shadow_backtests": ShadowBacktest,
 }
+# A few strategy rows already contain tens of MiB of nested JSON; keep each
+# projection below the shared statement budget even during concurrent audits.
+TEXT_PROJECTION_BATCH_SIZE = 5
+
+
+@dataclass(frozen=True)
+class _SerializedJSON:
+    text: str
 
 
 def _recent_record_ids_statement(model: Any, *, since: datetime, limit: int) -> Any:
@@ -74,7 +87,11 @@ def _runtime_text_projection_statement(
     record_ids: list[int],
 ) -> Any:
     selected_columns = [model.id, model.created_at, model.updated_at]
-    selected_columns.extend(getattr(model, field) for field in TEXT_AUDIT_FIELDS.get(table, ()))
+    for field in TEXT_AUDIT_FIELDS.get(table, ()):
+        column = getattr(model, field)
+        selected_columns.append(
+            cast(column, Text).label(field) if isinstance(column.type, JSON) else column
+        )
     return select(*selected_columns).where(model.id.in_(record_ids))
 
 
@@ -142,8 +159,12 @@ def build_runtime_text_integrity_report(
         record_id = getattr(row, "id", None)
         for field in TEXT_AUDIT_FIELDS.get(table, ()):  # unknown tables are counted only.
             value = getattr(row, field, None)
+            if isinstance(value, _SerializedJSON):
+                if not serialized_json_may_contain_mojibake(value.text):
+                    continue
+                value = json.loads(value.text)
             for field_path, text in _iter_text_leaves(value, field):
-                if not looks_like_mojibake(text):
+                if text.isascii() or not looks_like_mojibake(text):
                     continue
                 record_suspected = True
                 suspected_fields += 1
@@ -196,9 +217,14 @@ async def collect_runtime_text_integrity_report(
     example_limit: int = 12,
 ) -> dict[str, Any]:
     since = datetime.now(UTC) - timedelta(hours=max(1, int(hours or 24)))
-    collected: list[tuple[str, Any]] = []
-    async with get_read_session_ctx() as session:
-        for table, model in MODEL_BY_TABLE.items():
+    example_limit = max(1, int(example_limit))
+    report = build_runtime_text_integrity_report([], example_limit=example_limit)
+    for table, model in MODEL_BY_TABLE.items():
+        json_fields = [
+            field for field in TEXT_AUDIT_FIELDS.get(table, ())
+            if isinstance(getattr(model, field).type, JSON)
+        ]
+        async with get_read_session_ctx() as session:
             id_result = await session.execute(
                 _recent_record_ids_statement(
                     model,
@@ -207,25 +233,46 @@ async def collect_runtime_text_integrity_report(
                 )
             )
             record_ids = [int(value) for value in id_result.scalars().all()]
-            if not record_ids:
-                continue
-            result = await session.execute(
-                _runtime_text_projection_statement(
-                    table,
-                    model,
-                    record_ids=record_ids,
+        for offset in range(0, len(record_ids), TEXT_PROJECTION_BATCH_SIZE):
+            batch_ids = record_ids[offset : offset + TEXT_PROJECTION_BATCH_SIZE]
+            async with get_read_session_ctx() as session:
+                result = await session.execute(
+                    _runtime_text_projection_statement(
+                        table,
+                        model,
+                        record_ids=batch_ids,
+                    )
                 )
-            )
-            rows_by_id = {
-                int(row["id"]): SimpleNamespace(**dict(row))
-                for row in result.mappings().all()
-            }
-            collected.extend(
+                rows_by_id = {}
+                for row in result.mappings().all():
+                    values = dict(row)
+                    for field in json_fields:
+                        if isinstance(values.get(field), str):
+                            values[field] = _SerializedJSON(values[field])
+                    rows_by_id[int(row["id"])] = SimpleNamespace(**values)
+            batch = [
                 (table, rows_by_id[record_id])
-                for record_id in record_ids
+                for record_id in batch_ids
                 if record_id in rows_by_id
+            ]
+            # Large JSON snapshots must leave the read transaction before scanning.
+            partial = await asyncio.to_thread(
+                build_runtime_text_integrity_report, batch, example_limit=example_limit,
             )
-    return build_runtime_text_integrity_report(collected, example_limit=example_limit)
+            del result, rows_by_id, batch
+            for key in ("scanned_records", "suspected_records", "suspected_fields", "repairable_count"):
+                report[key] += partial[key]
+            for table_name, stats in partial["by_table"].items():
+                totals = report["by_table"].setdefault(table_name, _empty_table_stats())
+                for key in (
+                    "scanned_records", "suspected_records", "suspected_fields", "repairable_fields",
+                ):
+                    totals[key] += stats[key]
+                totals["status"] = "warning" if totals["suspected_records"] else "ok"
+            remaining = max(example_limit - len(report["examples"]), 0)
+            report["examples"].extend(partial["examples"][:remaining])
+    report["status"] = "warning" if report["suspected_records"] else "ok"
+    return report
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

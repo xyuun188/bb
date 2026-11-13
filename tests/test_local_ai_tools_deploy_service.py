@@ -1210,6 +1210,77 @@ def test_generated_service_status_exposes_latest_candidate_quality(
     ]
 
 
+@pytest.mark.parametrize(
+    ("trained_at_by_role", "invalid_roles", "expected_role"),
+    [
+        ({"current": "2026-11-13T15:55:29Z"}, {"challenger"}, "current"),
+        (
+            {
+                "current": "2026-11-13T15:55:29Z",
+                "challenger": "2026-11-12T15:55:29Z",
+            },
+            set(),
+            "current",
+        ),
+        (
+            {
+                "current": "2026-11-11T15:55:29Z",
+                "candidate": "2026-11-13T15:55:29Z",
+                "challenger": "2026-11-12T15:55:29Z",
+            },
+            set(),
+            "candidate",
+        ),
+        (
+            {
+                "current": "2026-11-13T16:00:00+00:00",
+                "candidate": "2026-11-14T00:01:00+08:00",
+                "challenger": "not-a-timestamp",
+            },
+            set(),
+            "candidate",
+        ),
+    ],
+)
+def test_generated_service_latest_training_follows_verified_training_time(
+    monkeypatch: pytest.MonkeyPatch,
+    trained_at_by_role: dict[str, str],
+    invalid_roles: set[str],
+    expected_role: str,
+) -> None:
+    module = ModuleType("local_ai_tools_api_latest_training_time_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+
+    def resolve(_path: Path, *, role: str) -> dict[str, Any] | None:
+        if role in invalid_roles:
+            raise ValueError("artifact feature contract requires retraining")
+        if role not in trained_at_by_role:
+            return None
+        return {
+            "version": f"{role}-version",
+            "metadata": {
+                "trained_at": trained_at_by_role[role],
+                "quality_report": {"data_quality_version": f"{role}-quality"},
+            },
+            "activation_manifest": {"activation_stage": "shadow"},
+            "model_path": Path(f"{role}.joblib"),
+            "metadata_path": Path(f"{role}.json"),
+        }
+
+    monkeypatch.setattr(module, "_resolve_artifact_pointer_for_status", resolve)
+    monkeypatch.setattr(module, "_file_stat", lambda _path: {"exists": True})
+
+    status = module._model_artifact_status()
+
+    assert status["latest_training_artifact_version"] == f"{expected_role}-version"
+    assert status["latest_training_at"] == trained_at_by_role[expected_role]
+    assert status["latest_training_data_quality_version"] == f"{expected_role}-quality"
+    assert status["artifact_version"] == "current-version"
+    assert status["artifact_lifecycle"] == "shadow"
+    assert status["paper_trading_permission"] is False
+    assert status["live_ml_ready"] is False
+
+
 def test_health_metadata_exposes_separated_supervision_contract(monkeypatch) -> None:
     module = ModuleType("local_ai_tools_health_supervision_contract_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)

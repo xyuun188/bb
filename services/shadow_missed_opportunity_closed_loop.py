@@ -31,15 +31,49 @@ class ShadowMissedOpportunityClosedLoopService:
         since = datetime.now(UTC) - timedelta(hours=capped_hours)
         session_factory = self._session_context_factory or get_read_session_ctx
         async with session_factory() as session:
-            shadows = list(
-                (await session.execute(select(ShadowBacktest).order_by(ShadowBacktest.id.desc()).limit(capped_limit))).scalars().all()
+            result = await session.execute(
+                select(
+                    ShadowBacktest.id, ShadowBacktest.created_at, ShadowBacktest.symbol,
+                    ShadowBacktest.status, ShadowBacktest.missed_opportunity,
+                    ShadowBacktest.best_action, ShadowBacktest.horizon_minutes,
+                    ShadowBacktest.long_return_pct, ShadowBacktest.short_return_pct,
+                ).order_by(ShadowBacktest.id.desc()).limit(capped_limit)
             )
-            decisions = list(
-                (await session.execute(select(AIDecision).order_by(AIDecision.id.desc()).limit(capped_limit))).scalars().all()
+            shadows = [dict(row) for row in result.mappings().all()]
+            result = await session.execute(
+                select(
+                    AIDecision.id, AIDecision.created_at,
+                    AIDecision.action, AIDecision.was_executed,
+                ).order_by(AIDecision.id.desc()).limit(capped_limit)
             )
+            decisions = [dict(row) for row in result.mappings().all()]
+        shadows = [row for row in shadows if _row_in_window(row, since)]
+        decisions = [row for row in decisions if _row_in_window(row, since)]
+        # Keep the same bounded windows, but only load JSON used by the report.
+        # Pending shadows and unexecuted decisions need no large payload at all.
+        payload_specs = (
+            (ShadowBacktest, "feature_snapshot", {
+                row["id"]: row for row in shadows
+                if row["status"] == "completed" and row["missed_opportunity"]
+            }),
+            (AIDecision, "raw_llm_response", {
+                row["id"]: row for row in decisions
+                if row["action"].lower() in {"long", "short"} and row["was_executed"]
+            }),
+        )
+        for model, field, rows_by_id in payload_specs:
+            record_ids = list(rows_by_id)
+            for offset in range(0, len(record_ids), 5):
+                async with session_factory() as session:
+                    result = await session.execute(
+                        select(model.id, getattr(model, field)).where(
+                            model.id.in_(record_ids[offset : offset + 5])
+                        )
+                    )
+                    for row in result.mappings().all():
+                        rows_by_id[row["id"]][field] = row[field]
         report = summarize_shadow_missed_opportunities(
-            [row for row in shadows if _row_in_window(row, since)],
-            decisions=[row for row in decisions if _row_in_window(row, since)],
+            shadows, decisions=decisions,
         )
         report["window_hours"] = capped_hours
         report["query_policy"] = {"online_safe": True, "ordered_by_primary_key": True, "row_limit": capped_limit}

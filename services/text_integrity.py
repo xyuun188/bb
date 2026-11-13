@@ -7,6 +7,7 @@ safe deterministic repair, and return a structured result that callers can audit
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -50,6 +51,12 @@ _COMMON_MOJIBAKE_MARKERS = (
 )
 
 _MIN_MARKER_HITS = 2
+_MARKER_STARTS = sorted({marker[0] for marker in _COMMON_MOJIBAKE_MARKERS})
+_SERIALIZED_MARKER_START = re.compile(
+    "[" + "".join(re.escape(char) for char in _MARKER_STARTS) + "]|"
+    + r"\\u(?:" + "|".join(f"{ord(char):04x}" for char in _MARKER_STARTS) + ")",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -83,6 +90,17 @@ def looks_like_mojibake(text: str | None) -> bool:
         return False
     value = str(text)
     return _looks_like_utf8_decoded_as_cjk_legacy(value)
+
+
+def serialized_json_may_contain_mojibake(text: str) -> bool:
+    """Cheap, conservative prefilter; positives still need per-leaf inspection.
+
+    Every detector marker starts with one of these characters, including JSON's
+    escaped Unicode spelling. Matching keys or escaped literal backslashes can
+    over-select a document, but cannot hide a suspicious string value.
+    """
+
+    return _SERIALIZED_MARKER_START.search(text) is not None
 
 
 def _deterministic_redecode(text: str) -> str | None:
