@@ -5,10 +5,11 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION
 from services.ml_training_contract import MIN_TRAINING_SAMPLE_COUNT
 
-MODEL_CHAMPION_POLICY_VERSION = "2026-11-13.pooled-profit-factor-champion.v4"
-PAIRED_COMPARISON_VERSION = "2026-11-11.common-unfitted-holdout.v1"
+MODEL_CHAMPION_POLICY_VERSION = "2026-11-13.positive-entry-portfolio-champion.v5"
+PAIRED_COMPARISON_VERSION = "2026-11-13.positive-entry-common-holdout.v2"
 
 _STAGE_RANK = {
     "shadow": 0,
@@ -33,53 +34,34 @@ def _float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _side_metrics(metadata: dict[str, Any], side: str) -> dict[str, float | None]:
-    evidence = _dict(_dict(metadata.get("oos_return_evaluation")).get(side))
-    return {
+def _entry_metrics(evidence: dict[str, Any]) -> dict[str, float | None]:
+    metrics = {
         "avg_return_pct": _float(evidence.get("avg_return_pct")),
         "return_lcb_pct": _float(evidence.get("return_lcb_pct")),
-        "profit_factor": _float(evidence.get("profit_factor")),
+        "profit_factor": None,
         "cvar_10_pct": _float(evidence.get("cvar_10_pct")),
         "max_drawdown_pct": _float(evidence.get("max_drawdown_pct")),
     }
+    if (_float(evidence.get("count")) or 0) <= 0:
+        return dict.fromkeys(metrics)
+    gain = _float(evidence.get("gross_profit_pct"))
+    loss = _float(evidence.get("gross_loss_pct"))
+    if gain is not None and gain >= 0 and loss is not None and loss > 1e-12:
+        metrics["profit_factor"] = gain / loss
+    return metrics
 
 
-def _average(values: list[float | None]) -> float | None:
-    finite = [value for value in values if value is not None]
-    return sum(finite) / len(finite) if finite else None
-
-
-def _aggregate(
-    metadata: dict[str, Any], sides: tuple[str, ...]
-) -> dict[str, float | None]:
-    metrics = [_side_metrics(metadata, side) for side in sides]
-    aggregate = {
-        key: (
-            _average([side[key] for side in metrics])
-            if all(side[key] is not None for side in metrics)
-            else None
-        )
-        for key in (
-            "avg_return_pct",
-            "return_lcb_pct",
-            "cvar_10_pct",
-            "max_drawdown_pct",
-        )
-    }
-    evidence = _dict(metadata.get("oos_return_evaluation"))
-    totals = [_dict(evidence.get(side)) for side in sides]
-    gains = [_float(row.get("gross_profit_pct")) for row in totals]
-    losses = [_float(row.get("gross_loss_pct")) for row in totals]
-    complete = all(
-        (_float(row.get("count")) or 0) > 0 for row in totals
-    ) and all(value is not None and value >= 0 for value in [*gains, *losses])
-    gross_loss = sum(value for value in losses if value is not None)
-    # Preserve the undefined zero-loss ratio; never invent an infinite sentinel.
-    aggregate["profit_factor"] = (
-        sum(value for value in gains if value is not None) / gross_loss
-        if complete and gross_loss > 1e-12 else None
-    )
-    return aggregate
+def _comparison_entry_evidence(
+    evaluation: dict[str, Any], role: str, sides: tuple[str, ...]
+) -> dict[str, Any]:
+    report = _dict(evaluation.get(f"{role}_entry_evaluation"))
+    side_reports = _dict(report.get("sides"))
+    if report.get("version") != ENTRY_COHORT_VERSION or any(
+        not isinstance(side_reports.get(side), dict) for side in sides
+    ):
+        return {}
+    # Use the chronological pooled outcomes, including a legitimately empty side.
+    return _dict(report.get("portfolio")) if len(sides) == 2 else side_reports[sides[0]]
 
 
 def _training_data_version(metadata: dict[str, Any] | None) -> str:
@@ -236,12 +218,12 @@ def compare_candidate_to_champion(
         report["comparison_evaluation"] = evaluation
         return report
     report["comparison_evaluation"] = evaluation
-    candidate_aggregate = _aggregate(
-        {"oos_return_evaluation": evaluation.get("candidate")}, comparison_sides
-    )
-    champion_aggregate = _aggregate(
-        {"oos_return_evaluation": evaluation.get("champion")}, comparison_sides
-    )
+    entry_evidence = {
+        role: _comparison_entry_evidence(evaluation, role, comparison_sides)
+        for role in ("candidate", "champion")
+    }
+    candidate_aggregate = _entry_metrics(entry_evidence["candidate"])
+    champion_aggregate = _entry_metrics(entry_evidence["champion"])
     report["candidate_metrics"] = candidate_aggregate
     report["champion_metrics"] = champion_aggregate
     report["metric_deltas"] = {
@@ -267,9 +249,9 @@ def compare_candidate_to_champion(
             for role, metrics in (("candidate", candidate_aggregate), ("champion", champion_aggregate)):
                 if metrics["profit_factor"] is not None:
                     continue
-                no_losses = all(
-                    _dict(_dict(evaluation.get(role)).get(side)).get("profit_factor_status")
-                    == "no_loss_denominator" for side in comparison_sides
+                no_losses = (
+                    entry_evidence[role].get("profit_factor_status") == "no_loss_denominator"
+                    and (_float(entry_evidence[role].get("count")) or 0) > 0
                 )
                 report["blocking_reasons"].append(
                     f"{role}_profit_factor_no_loss_denominator" if no_losses

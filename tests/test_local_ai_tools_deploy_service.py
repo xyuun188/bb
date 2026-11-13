@@ -16,9 +16,25 @@ import pytest
 from scripts import deploy_local_ai_tools_service as deploy
 from scripts.deploy_local_ai_tools_service import SERVICE_CODE
 from services.local_ai_training_contract import LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _entry_policy_fixture(sides: dict) -> dict:
+    """Synthetic scalar comparison inputs; real outcome pooling is tested separately."""
+    rows = [sides.get(side, {}) for side in ("long", "short")]
+    portfolio = {
+        key: sum(row[key] for row in rows) / 2 if all(key in row for row in rows) else None
+        for key in ("avg_return_pct", "return_lcb_pct", "cvar_10_pct", "max_drawdown_pct")
+    }
+    for key in ("count", "gross_profit_pct", "gross_loss_pct"):
+        portfolio[key] = sum(row[key] for row in rows) if all(key in row for row in rows) else None
+    portfolio["profit_factor_status"] = (
+        "no_loss_denominator" if portfolio["gross_loss_pct"] == 0 else "defined"
+    )
+    return {"version": ENTRY_COHORT_VERSION, "sides": sides, "portfolio": portfolio}
 
 
 def test_shadow_results_retrieve_delayed_exact_request_and_preserve_kind_capacity(monkeypatch):
@@ -119,6 +135,12 @@ def _test_artifact_metadata(
         "rows": [],
         "stable": True,
     }
+    def entry_evidence() -> dict:
+        return {
+            "version": module.ENTRY_COHORT_VERSION,
+            "sides": {side: dict(ready_evidence) for side in ("long", "short")},
+        }
+
     walk_forward_report = {
         "version": "2026-07-15.expanding-decision-group-walk-forward.v1",
         "status": "complete",
@@ -127,13 +149,16 @@ def _test_artifact_metadata(
         "model_refit_per_fold": True,
         "return_semantics": "shadow_net_return_after_all_cost",
         "score_cost_source": "prior_settled_authoritative_lifecycle_cost_forecast",
+        "entry_return_evaluation": entry_evidence(),
         "folds": [
             {
                 "decision_group_overlap_count": 0,
+                "entry_return_evaluation": entry_evidence(),
                 "sides": {side: dict(ready_evidence) for side in ("long", "short")},
             },
             {
                 "decision_group_overlap_count": 0,
+                "entry_return_evaluation": entry_evidence(),
                 "sides": {side: dict(ready_evidence) for side in ("long", "short")},
             },
         ],
@@ -1949,6 +1974,8 @@ def test_local_ai_registry_rejects_regressive_active_challenger(
             "ready": True,
             "candidate": challenger_metadata["oos_return_evaluation"],
             "champion": champion["metadata"]["oos_return_evaluation"],
+            "candidate_entry_evaluation": _entry_policy_fixture(challenger_metadata["oos_return_evaluation"]),
+            "champion_entry_evaluation": _entry_policy_fixture(champion["metadata"]["oos_return_evaluation"]),
         },
     )
 
@@ -2018,6 +2045,8 @@ def test_local_ai_registry_accepts_strictly_improved_active_challenger(
             "ready": True,
             "candidate": challenger_metadata["oos_return_evaluation"],
             "champion": champion["metadata"]["oos_return_evaluation"],
+            "candidate_entry_evaluation": _entry_policy_fixture(challenger_metadata["oos_return_evaluation"]),
+            "champion_entry_evaluation": _entry_policy_fixture(champion["metadata"]["oos_return_evaluation"]),
         },
     )
 
@@ -2106,19 +2135,18 @@ def test_local_ai_paired_comparison_uses_locked_costs_and_both_fit_boundaries(
     assert report["sample_count"] == 29
     assert report["evaluation_decision_start"] > report["training_label_end"]
     assert report["independent_profitability_exam"] is False
-    assert report["candidate"]["long"]["avg_return_pct"] > report["champion"]["long"][
-        "avg_return_pct"
-    ]
-    expected = sorted(row["long_net_return"] for row in rows[51:])[-5:]
+    assert report["champion"]["long"]["count"] == 0
+    assert report["candidate"]["short"]["count"] == 0
+    expected = [row["long_net_return"] for row in rows[51:] if row["x"][0] > 0]
     assert report["candidate"]["long"]["avg_return_pct"] == pytest.approx(
         sum(expected) / len(expected)
     )
     diagnostics = report["candidate"]["long"]["worst_selected_rows"]
-    assert len(diagnostics) == 5
+    assert len(diagnostics) == 8
     assert diagnostics[0]["return_pct"] <= diagnostics[-1]["return_pct"]
     assert diagnostics[0]["locked_cost_pct"] == pytest.approx(0.08)
     assert diagnostics[0]["tail_loss_probability"] == 0.0
-    assert report["candidate"]["long"]["selected_symbol_counts"] == {"BTC/USDT": 5}
+    assert report["candidate"]["long"]["selected_symbol_counts"] == {"BTC/USDT": len(expected)}
     candidate["metadata"]["comparison_fit_label_end"] = rows[78]["label_timestamp"]
     unavailable = module._paired_artifact_return_evaluation(
         candidate, {"model_path": model_path}, rows[40:],
@@ -2179,11 +2207,55 @@ def test_local_ai_leaf_risk_matches_platform_and_runtime_comparison(
     } for index in range(20)]
     report = module._paired_artifact_return_evaluation(bundle, {"model_path": path}, rows)
     assert report["ready"] is True
-    selected = report["candidate"]["short"]["worst_selected_rows"]
+    assert report["candidate"]["short"]["count"] == 0
+    assert report["candidate"]["long"]["count"] == 0
+    selected = report["candidate_ranking_diagnostics"]["short"]["worst_selected_rows"]
     assert selected
     assert all(row["score"] == pytest.approx(-2.1) for row in selected)
     assert all(row["uncertainty_penalty_pct"] == pytest.approx(3.0) for row in selected)
     assert np.isfinite([row["score"] for row in selected]).all()
+
+
+def test_local_ai_entry_cohort_matches_platform_and_excludes_profitable_nonentries() -> None:
+    from services.ml_prediction_contract import positive_objective_entry_rows
+
+    module = ModuleType("local_ai_entry_cohort_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    rows = {
+        side: [
+            {"decision_group": str(index), "score": -1.0 if index else 1.0,
+             "return_pct": 2.0 if index else -3.0}
+            for index in range(100)
+        ]
+        for side in ("long", "short")
+    }
+    assert module.positive_objective_entry_rows(rows) == positive_objective_entry_rows(rows)
+    report = module._entry_return_evaluation(rows)
+    assert report["sides"]["long"]["count"] == 1
+    assert report["sides"]["long"]["avg_return_pct"] == -3.0
+    assert report["sides"]["long"]["promotion_math_ready"] is False
+    assert report["sides"]["short"]["count"] == 0
+    assert report["execution_replay_complete"] is False
+
+
+@pytest.mark.parametrize("scope", ["missing", "walk_forward", "fold"])
+def test_local_ai_good_rankings_cannot_promote_unproven_entry_cohort(scope: str) -> None:
+    module = ModuleType("local_ai_entry_readiness_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    metadata = _test_artifact_metadata(module)
+    walk = metadata["walk_forward_report"]
+    if scope == "missing":
+        walk.pop("entry_return_evaluation")
+    else:
+        report = (walk if scope == "walk_forward" else walk["folds"][0])[
+            "entry_return_evaluation"
+        ]
+        report["sides"]["short"].update({
+            "avg_return_pct": -0.1, "profit_factor": 0.5, "promotion_math_ready": False,
+        })
+    assert "short_positive_entry_return_evidence_not_ready" in (
+        module._production_return_evidence_blockers(metadata)
+    )
 
 
 def test_local_ai_registry_replaces_only_incompatible_champion_contract(
@@ -4486,7 +4558,7 @@ def test_local_ai_comparison_pools_profit_factor_and_retains_tail_guard(
 
     candidate = {"long": evidence([-2.0, 1.0]), "short": evidence([0.3, 6.7])}
     champion = {"long": evidence([-1.0, 0.5]), "short": evidence([1.0, 2.0])}
-    assert module._local_oos_aggregate({"oos_return_evaluation": candidate})[
+    assert module._entry_comparison_metrics(_entry_policy_fixture(candidate)["portfolio"])[
         "profit_factor"
     ] == pytest.approx(4.0)
     if missing_totals:
@@ -4496,6 +4568,8 @@ def test_local_ai_comparison_pools_profit_factor_and_retains_tail_guard(
     }, None))
     monkeypatch.setattr(module, "_paired_artifact_return_evaluation", lambda *_args: {
         "ready": True, "candidate": candidate, "champion": champion,
+        "candidate_entry_evaluation": _entry_policy_fixture(candidate),
+        "champion_entry_evaluation": _entry_policy_fixture(champion),
     })
     report = module._compare_candidate_to_current(
         {}, candidate_stage="shadow", candidate_bundle={}, holdout_rows=[]
@@ -4516,7 +4590,7 @@ def test_local_ai_profit_factor_uses_pooled_amounts(short_returns, expected) -> 
         side: module._return_evidence([{"return_pct": value} for value in values])
         for side, values in (("long", [-2.0, 1.0]), ("short", short_returns))
     }
-    assert module._local_oos_aggregate({"oos_return_evaluation": sides})[
+    assert module._entry_comparison_metrics(_entry_policy_fixture(sides)["portfolio"])[
         "profit_factor"
     ] == pytest.approx(expected)
 
@@ -4530,6 +4604,8 @@ def test_local_ai_loss_free_comparison_stays_blocked_with_explicit_reason(monkey
     }, None))
     monkeypatch.setattr(module, "_paired_artifact_return_evaluation", lambda *_args: {
         "ready": True, "candidate": sides, "champion": sides,
+        "candidate_entry_evaluation": _entry_policy_fixture(sides),
+        "champion_entry_evaluation": _entry_policy_fixture(sides),
     })
     report = module._compare_candidate_to_current(
         {}, candidate_stage="shadow", candidate_bundle={}, holdout_rows=[]
@@ -4538,6 +4614,65 @@ def test_local_ai_loss_free_comparison_stays_blocked_with_explicit_reason(monkey
     assert report["blocking_reasons"] == [
         "candidate_profit_factor_no_loss_denominator", "champion_profit_factor_no_loss_denominator",
     ]
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_local_ai_comparison_allows_empty_direction_but_not_empty_portfolio(monkeypatch, empty) -> None:
+    module = ModuleType("local_ai_tools_single_direction_comparison_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    evaluation = {"ready": True}
+    for role, returns in (("candidate", [-0.2, 1.0, 0.5]), ("champion", [-0.3, 0.6, 0.4])):
+        portfolio = module._return_evidence([
+            {"return_pct": value, "label_timestamp": str(index)}
+            for index, value in enumerate([] if empty else returns)
+        ])
+        evaluation[f"{role}_entry_evaluation"] = {
+            "version": ENTRY_COHORT_VERSION,
+            "sides": {"long": module._return_evidence([]), "short": portfolio},
+            "portfolio": portfolio,
+        }
+    monkeypatch.setattr(module, "_replaceable_current_artifact", lambda: ({
+        "version": "champion", "activation_manifest": {"activation_stage": "shadow"},
+    }, None))
+    monkeypatch.setattr(module, "_paired_artifact_return_evaluation", lambda *_args: evaluation)
+    report = module._compare_candidate_to_current(
+        {}, candidate_stage="shadow", candidate_bundle={}, holdout_rows=[]
+    )
+    assert report["accepted"] is (not empty)
+    if not empty:
+        assert report["candidate_metrics"]["profit_factor"] == pytest.approx(7.5)
+
+
+def test_entry_comparison_pools_chronological_outcomes_without_averaging_sides() -> None:
+    from services.ml_signal_service import _entry_return_evaluation
+    from services.model_champion_policy import _comparison_entry_evidence, _entry_metrics
+
+    module = ModuleType("local_ai_tools_pooled_entry_outcomes_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    rows = {side: [] for side in ("long", "short")}
+    for index, value in enumerate([-2.0, 1.0, 3.0, 4.0, 5.0]):
+        for side in rows:
+            selected = side == ("long" if index < 2 else "short")
+            rows[side].append({
+                "decision_group": str(index), "label_timestamp": str(index),
+                "score": 1.0 if selected else -1.0,
+                "return_pct": value if selected else -10.0,
+            })
+    entry = _entry_return_evaluation(rows)
+    server_entry = module._entry_return_evaluation(rows)
+    assert server_entry["version"] == entry["version"]
+    assert server_entry["selection_policy"] == entry["selection_policy"]
+    for side in ("long", "short"):
+        assert module._entry_comparison_metrics(server_entry["sides"][side]) == _entry_metrics(entry["sides"][side])
+    evaluation = {"candidate_entry_evaluation": entry}
+    platform_metrics = _entry_metrics(_comparison_entry_evidence(evaluation, "candidate", ("long", "short")))
+    server_metrics = module._entry_comparison_metrics(module._comparison_entry_evidence(
+        {"candidate_entry_evaluation": server_entry}, "candidate"
+    ))
+    assert platform_metrics == server_metrics
+    assert platform_metrics["avg_return_pct"] == pytest.approx(2.2)
+    assert platform_metrics["profit_factor"] == pytest.approx(6.5)
+    assert platform_metrics["max_drawdown_pct"] == pytest.approx(2.0)
 
 
 def test_local_ai_leave_one_symbol_out_blocks_single_symbol_profit_support() -> None:

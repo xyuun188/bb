@@ -612,6 +612,13 @@ def _with_return_objective(metadata: dict) -> dict:
         "max_drawdown_pct": 0.05,
         "promotion_math_ready": True,
     }
+    def entry_evidence() -> dict:
+        return {
+            "version": ml_signal_module.ENTRY_COHORT_VERSION,
+            "sides": {side: dict(ready_return_evidence) for side in ("long", "short")},
+        }
+
+    metadata.setdefault("entry_return_evaluation", entry_evidence())
     metadata.setdefault(
         "walk_forward_report",
         {
@@ -709,6 +716,9 @@ def _with_return_objective(metadata: dict) -> dict:
     walk_forward.setdefault("fitted_horizons", [primary_horizon])
     walk_forward.setdefault("training_horizon_policy", ml_signal_module.TRAINING_HORIZON_POLICY)
     walk_forward.setdefault("mixed_horizon_fit_allowed", False)
+    walk_forward.setdefault("entry_return_evaluation", entry_evidence())
+    for fold in walk_forward.get("folds", []):
+        fold.setdefault("entry_return_evaluation", entry_evidence())
     return metadata
 
 
@@ -1481,6 +1491,7 @@ def test_holdout_diagnostics_describe_the_exact_promotion_score_buckets(
     frame = pd.DataFrame(
         {
             "horizon_minutes": ml_signal_module.PRIMARY_PREDICTION_HORIZON_MINUTES,
+            "decision_group": [f"decision-{index}" for index in range(sample_count)],
             **{
                 key: value
                 for side in ("long", "short")
@@ -1543,6 +1554,27 @@ def test_train_from_frame_holdout_quality_metrics_use_fee_after_returns() -> Non
             diagnostic = metadata["score_bucket_diagnostics"][side][bucket]
             assert diagnostic["avg_return_pct"] == pytest.approx(-0.10)
             assert diagnostic["return_basis"] == HOLDOUT_REALIZED_RETURN_BASIS
+
+
+def test_entry_evaluation_cannot_replace_losing_signals_with_profitable_rankings() -> None:
+    rows = {
+        side: [
+            {"decision_group": str(index), "score": -1.0 if index else 1.0,
+             "return_pct": 2.0 if index else -3.0}
+            for index in range(100)
+        ]
+        for side in ("long", "short")
+    }
+    rank = ml_signal_module._return_evidence(
+        ml_signal_module._select_top_return_rows(rows["long"])
+    )
+    report = ml_signal_module._entry_return_evaluation(rows)
+    assert rank["avg_return_pct"] > 0
+    assert report["sides"]["long"]["count"] == 1
+    assert report["sides"]["long"]["avg_return_pct"] == -3.0
+    assert report["sides"]["long"]["promotion_math_ready"] is False
+    assert report["sides"]["short"]["count"] == 0
+    assert report["execution_replay_complete"] is False
 
 
 def test_ml_readiness_rejects_unversioned_holdout_return_metrics() -> None:
@@ -1871,14 +1903,15 @@ def test_paired_comparison_scores_both_frozen_models_after_both_fit_cutoffs(
     assert report["chronological_label_disjoint"] is True
     assert report["evaluation_decision_start"] > report["training_label_end"]
     assert report["independent_profitability_exam"] is False
-    assert report["candidate"]["long"]["avg_return_pct"] > report["champion"]["long"][
-        "avg_return_pct"
-    ]
-    assert report["candidate"]["short"]["avg_return_pct"] > report["champion"]["short"][
-        "avg_return_pct"
-    ]
-    expected = (frame.iloc[-5:]["long_return_pct"] - 0.08).mean()
+    assert report["candidate"]["long"]["count"] == 29
+    assert report["champion"]["long"]["count"] == 0
+    assert report["candidate"]["short"]["count"] == 0
+    assert report["champion"]["short"]["count"] == 29
+    expected = (frame.iloc[51:]["long_return_pct"] - 0.08).mean()
     assert report["candidate"]["long"]["avg_return_pct"] == pytest.approx(expected)
+    assert report["candidate_ranking_diagnostics"]["long"]["avg_return_pct"] == pytest.approx(
+        (frame.iloc[-5:]["long_return_pct"] - 0.08).mean()
+    )
     repeated = ml_signal_module._paired_artifact_return_evaluation(
         frame.iloc[::-1], candidate, champion,
     )
@@ -3604,6 +3637,28 @@ def test_ml_readiness_allows_low_win_rate_high_fee_after_return() -> None:
     assert readiness["state"] == "ready"
     assert readiness["live_ml_ready"] is True
     assert readiness["blocking_reasons"] == []
+
+
+@pytest.mark.parametrize("scope", ["missing", "holdout", "walk_forward", "fold"])
+def test_good_rankings_cannot_promote_missing_or_losing_positive_entry_cohort(scope: str) -> None:
+    metadata = _ml_training_metadata(artifact_persisted=True, ready=True)
+    if scope == "missing":
+        metadata.pop("entry_return_evaluation")
+    else:
+        report = {
+            "holdout": metadata["entry_return_evaluation"],
+            "walk_forward": metadata["walk_forward_report"]["entry_return_evaluation"],
+            "fold": metadata["walk_forward_report"]["folds"][0]["entry_return_evaluation"],
+        }[scope]
+        report["sides"]["long"].update({
+            "avg_return_pct": -0.1, "profit_factor": 0.5, "promotion_math_ready": False,
+        })
+    readiness = build_ml_readiness_report(metadata, {"enabled": True})
+    assert "long" not in readiness["live_enabled_sides"]
+    assert "long_positive_entry_return_evidence_not_ready" in {
+        item["code"] for item in readiness["side_blocking_reasons"]["long"]
+    }
+    assert readiness["live_ml_ready"] is (scope != "missing")
 
 
 def test_ml_readiness_blocks_artifact_without_native_market_fact_contract() -> None:

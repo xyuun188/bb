@@ -1,11 +1,27 @@
 import pytest
 
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION
 from services.model_champion_policy import (
     PAIRED_COMPARISON_VERSION,
 )
 from services.model_champion_policy import (
     compare_candidate_to_champion as _compare_candidate_to_champion,
 )
+
+
+def _entry_policy_fixture(sides: dict) -> dict:
+    """Synthetic scalar policy inputs, not an outcome replay or profitability proof."""
+    rows = [sides.get(side, {}) for side in ("long", "short")]
+    portfolio = {
+        key: sum(row[key] for row in rows) / 2 if all(key in row for row in rows) else None
+        for key in ("avg_return_pct", "return_lcb_pct", "cvar_10_pct", "max_drawdown_pct")
+    }
+    for key in ("count", "gross_profit_pct", "gross_loss_pct"):
+        portfolio[key] = sum(row[key] for row in rows) if all(key in row for row in rows) else None
+    portfolio["profit_factor_status"] = (
+        "no_loss_denominator" if portfolio["gross_loss_pct"] == 0 else "defined"
+    )
+    return {"version": ENTRY_COHORT_VERSION, "sides": sides, "portfolio": portfolio}
 
 
 def _paired_evaluation(candidate: dict, champion: dict) -> dict:
@@ -19,6 +35,8 @@ def _paired_evaluation(candidate: dict, champion: dict) -> dict:
         "champion_training_data_sha256": champion["training_data_sha256"],
         "candidate": candidate["oos_return_evaluation"],
         "champion": champion["oos_return_evaluation"],
+        "candidate_entry_evaluation": _entry_policy_fixture(candidate["oos_return_evaluation"]),
+        "champion_entry_evaluation": _entry_policy_fixture(champion["oos_return_evaluation"]),
     }
 
 
@@ -472,3 +490,41 @@ def test_invalid_paired_evidence_preserves_champion(key: str, value: object) -> 
     )
     assert report["accepted"] is False
     assert report["reason"] == "paired_comparison_unavailable"
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_comparison_uses_pooled_entry_outcomes_with_empty_direction(empty: bool) -> None:
+    from services.ml_signal_service import _return_evidence
+
+    candidate, champion = _metadata(), _metadata()
+    evaluation = _paired_evaluation(candidate, champion)
+    for role, returns in (("candidate", [-0.2, 1.0, 0.5]), ("champion", [-0.3, 0.6, 0.4])):
+        portfolio = _return_evidence([
+            {"return_pct": value, "label_timestamp": str(index)}
+            for index, value in enumerate([] if empty else returns)
+        ])
+        evaluation[f"{role}_entry_evaluation"] = {
+            "version": ENTRY_COHORT_VERSION,
+            "sides": {"long": _return_evidence([]), "short": portfolio},
+            "portfolio": portfolio,
+        }
+    report = _compare_candidate_to_champion(
+        candidate, champion, candidate_stage="shadow", champion_stage="shadow",
+        comparison_evaluation=evaluation,
+    )
+    assert report["accepted"] is (not empty)
+    if not empty:
+        assert report["candidate_metrics"]["avg_return_pct"] == pytest.approx(1.3 / 3)
+        assert report["candidate_metrics"]["profit_factor"] == pytest.approx(7.5)
+
+
+@pytest.mark.parametrize("version", [None, "old-ranking-report"])
+def test_ranking_evidence_cannot_replace_entry_portfolio(version) -> None:
+    candidate, champion = _metadata(avg=0.4), _metadata()
+    evaluation = _paired_evaluation(candidate, champion)
+    evaluation["candidate_entry_evaluation"]["version"] = version
+    report = _compare_candidate_to_champion(
+        candidate, champion, candidate_stage="shadow", champion_stage="shadow",
+        comparison_evaluation=evaluation,
+    )
+    assert report["accepted"] is False

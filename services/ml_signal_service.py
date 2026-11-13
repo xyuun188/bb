@@ -41,6 +41,8 @@ from services.artifact_retirement_audit import (
 )
 from services.dynamic_policy_values import empirical_policy_value
 from services.ml_prediction_contract import (
+    ENTRY_COHORT_VERSION,
+    positive_objective_entry_rows,
     profit_quality_score,
     regression_prediction_distribution,
     risk_adjusted_expected_scores,
@@ -1462,6 +1464,20 @@ def _select_top_return_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda row: float(row["score"]))[-count:]
 
 
+def _entry_return_evaluation(
+    scored_rows: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    selected = positive_objective_entry_rows(scored_rows)
+    return {
+        "version": ENTRY_COHORT_VERSION,
+        "selection_policy": "larger_positive_fee_after_objective_else_hold",
+        "execution_replay_complete": False,
+        "scope": "necessary_model_signal_gate_without_fill_exit_or_capacity_simulation",
+        "sides": {side: _return_evidence(rows) for side, rows in selected.items()},
+        "portfolio": _return_evidence([row for rows in selected.values() for row in rows]),
+    }
+
+
 def _max_drawdown(returns: list[float]) -> float | None:
     if not returns:
         return None
@@ -1786,6 +1802,7 @@ def _walk_forward_return_report(
         train = ordered[ordered["decision_group"].astype(str).isin(training_set)].copy()
         validation = ordered[ordered["decision_group"].astype(str).isin(validation_set)].copy()
         fold_side_reports: dict[str, Any] = {}
+        fold_scored_rows: dict[str, list[dict[str, Any]]] = {}
         for side in ("long", "short"):
             scores, fold_tail_policy = _walk_forward_side_scores(
                 train,
@@ -1798,6 +1815,7 @@ def _walk_forward_return_report(
                 side=side,
             )
             scored_rows = _all_scored_return_rows(validation, scores, side=side)
+            fold_scored_rows[side] = scored_rows
             oos_rows[side].extend(scored_rows)
             fold_side_reports[side] = {
                 **_return_evidence(selected_rows),
@@ -1823,6 +1841,7 @@ def _walk_forward_return_report(
                 ),
                 "decision_group_overlap_count": 0,
                 "sides": fold_side_reports,
+                "entry_return_evaluation": _entry_return_evaluation(fold_scored_rows),
                 "horizon_minutes": primary_horizon_minutes,
             }
         )
@@ -1851,6 +1870,7 @@ def _walk_forward_return_report(
         "model_refit_per_fold": True,
         "chronological": True,
         "sides": side_reports,
+        "entry_return_evaluation": _entry_return_evaluation(oos_rows),
         "primary_horizon_minutes": primary_horizon_minutes,
         "evaluation_horizon_minutes": primary_horizon_minutes,
         "primary_horizon_available": True,
@@ -1979,7 +1999,7 @@ def _paired_artifact_return_evaluation(
                 expected_type=dict,
             )
             _configure_single_row_inference(bundle)
-            sides = {}
+            scored_rows = {}
             for side in ("long", "short"):
                 scores = risk_adjusted_expected_scores(
                     regression_prediction_distribution(bundle[f"{side}_regressor"], x),
@@ -1991,10 +2011,14 @@ def _paired_artifact_return_evaluation(
                 )
                 if len(scores) != len(test) or not np.isfinite(scores).all():
                     raise ValueError("paired_artifact_scores_invalid")
-                sides[side] = _return_evidence(
-                    _top_scored_return_rows(test, scores, side=side)
-                )
-            report[role] = sides
+                scored_rows[side] = _all_scored_return_rows(test, scores, side=side)
+            entry = _entry_return_evaluation(scored_rows)
+            report[role] = entry["sides"]
+            report[f"{role}_entry_evaluation"] = entry
+            report[f"{role}_ranking_diagnostics"] = {
+                side: _return_evidence(_select_top_return_rows(rows))
+                for side, rows in scored_rows.items()
+            }
         return {**report, "ready": True, "reason": "complete"}
     except Exception as exc:
         logger.warning("paired_artifact_evaluation_failed", error=safe_error_text(exc))
@@ -2508,6 +2532,12 @@ def _holdout_return_evaluation(
         ),
         "metrics": metrics,
         "return_buckets": return_buckets,
+        "entry_return_evaluation": _entry_return_evaluation({
+            side: _all_scored_return_rows(test, scores, side=side)
+            for side, scores in (
+                ("long", long_expected_scores), ("short", short_expected_scores)
+            )
+        }),
         "score_bucket_diagnostics": _score_bucket_diagnostics(
             test,
             long_expected_scores=long_expected_scores,
@@ -2984,6 +3014,7 @@ def train_from_frame(
             "short_lower_quantile_pct": float(short_cost_distribution["lower_quantile"].mean()),
         },
         "metrics": metrics,
+        "entry_return_evaluation": primary_holdout_evaluation["entry_return_evaluation"],
         "holdout_horizon_diagnostics": holdout_horizon_evaluations,
         "unfitted_horizon_holdout_diagnostics": {
             str(horizon): {

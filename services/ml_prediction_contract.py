@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -16,6 +17,36 @@ from services.return_objective import (
     risk_adjusted_expected_return,
     standardized_return_distribution,
 )
+
+ENTRY_COHORT_VERSION = "2026-11-13.positive-objective-entry-cohort.v1"
+
+
+def positive_objective_entry_rows(
+    scored_rows: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Select one positive objective per decision; ranking alone cannot enter."""
+
+    indexed: dict[str, dict[str, dict[str, Any]]] = {}
+    for side in ("long", "short"):
+        indexed[side] = {}
+        for row in scored_rows.get(side, []):
+            group = str(row.get("decision_group") or "")
+            if not group or group in indexed[side]:
+                raise ValueError("entry_cohort_requires_unique_decision_groups")
+            indexed[side][group] = row
+    selected: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
+    for group in indexed["long"]:
+        if group not in indexed["short"]:
+            continue
+        long_row, short_row = (indexed[side][group] for side in ("long", "short"))
+        long_score, short_score = float(long_row["score"]), float(short_row["score"])
+        if not all(math.isfinite(value) for value in (long_score, short_score)):
+            continue
+        if max(long_score, short_score) <= 0.0:
+            continue
+        side = "long" if long_score >= short_score else "short"
+        selected[side].append(indexed[side][group])
+    return selected
 
 
 def regression_prediction_distribution(

@@ -57,3 +57,25 @@ def test_leaf_risk_is_conditional_and_batch_matches_single_predictions() -> None
     for index in range(len(probes)):
         single = ml_prediction_contract.regression_prediction_distribution(model, probes.iloc[[index]])
         assert single["std"][0] == pytest.approx(batch["std"][index])
+
+
+def test_entry_cohort_uses_positive_winning_direction_and_preserves_hold() -> None:
+    scores = {
+        "long": [-0.1, 0.0, 0.4, 0.5, 0.2, float("nan"), 1.0],
+        "short": [-0.2, 0.0, 0.3, 0.7, 0.2, 0.4],
+    }
+    rows = {
+        side: [{"decision_group": str(index), "score": value}
+               for index, value in enumerate(values)]
+        for side, values in scores.items()
+    }
+    selected = ml_prediction_contract.positive_objective_entry_rows(rows)
+    assert [row["decision_group"] for row in selected["long"]] == ["2", "4"]
+    assert [row["decision_group"] for row in selected["short"]] == ["3"]
+
+
+@pytest.mark.parametrize("group", ["", "duplicate"])
+def test_entry_cohort_rejects_missing_or_duplicate_decision_identity(group: str) -> None:
+    rows = {"long": [{"decision_group": group, "score": 1.0}] * 2, "short": []}
+    with pytest.raises(ValueError, match="unique_decision_groups"):
+        ml_prediction_contract.positive_objective_entry_rows(rows)

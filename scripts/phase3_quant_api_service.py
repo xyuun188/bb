@@ -905,6 +905,51 @@ def _select_top_return_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda row: float(row["score"]))[-selected_count:]
 
 
+ENTRY_COHORT_VERSION = "2026-11-13.positive-objective-entry-cohort.v1"
+
+
+def positive_objective_entry_rows(
+    scored_rows: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Select one positive objective per decision; ranking alone cannot enter."""
+
+    indexed: dict[str, dict[str, dict[str, Any]]] = {}
+    for side in ("long", "short"):
+        indexed[side] = {}
+        for row in scored_rows.get(side, []):
+            group = str(row.get("decision_group") or "")
+            if not group or group in indexed[side]:
+                raise ValueError("entry_cohort_requires_unique_decision_groups")
+            indexed[side][group] = row
+    selected: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
+    for group in indexed["long"]:
+        if group not in indexed["short"]:
+            continue
+        long_row, short_row = (indexed[side][group] for side in ("long", "short"))
+        long_score, short_score = float(long_row["score"]), float(short_row["score"])
+        if not all(math.isfinite(value) for value in (long_score, short_score)):
+            continue
+        if max(long_score, short_score) <= 0.0:
+            continue
+        side = "long" if long_score >= short_score else "short"
+        selected[side].append(indexed[side][group])
+    return selected
+
+
+def _entry_return_evaluation(
+    scored_rows: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    selected = positive_objective_entry_rows(scored_rows)
+    return {
+        "version": ENTRY_COHORT_VERSION,
+        "selection_policy": "larger_positive_fee_after_objective_else_hold",
+        "execution_replay_complete": False,
+        "scope": "necessary_model_signal_gate_without_fill_exit_or_capacity_simulation",
+        "sides": {side: _return_evidence(rows) for side, rows in selected.items()},
+        "portfolio": _return_evidence([row for rows in selected.values() for row in rows]),
+    }
+
+
 def _market_regime_stability(rows: list[dict[str, Any]]) -> dict[str, Any]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -1204,6 +1249,7 @@ def _walk_forward_return_report(
             row for row in ordered if str(row["decision_group"]) in validation_set
         ]
         fold_side_reports: dict[str, Any] = {}
+        fold_scored_rows: dict[str, list[dict[str, Any]]] = {}
         for side in ("long", "short"):
             evaluated, tail_policy = _fit_walk_forward_side(
                 train_rows,
@@ -1212,6 +1258,7 @@ def _walk_forward_return_report(
                 authoritative_cost_rows=authoritative_cost_rows,
             )
             cost_policy = tail_policy.pop("execution_cost_model")
+            fold_scored_rows[side] = evaluated
             oos_rows[side].extend(evaluated)
             fold_side_reports[side] = {
                 **_return_evidence(_select_top_return_rows(evaluated)),
@@ -1236,6 +1283,7 @@ def _walk_forward_return_report(
                 ),
                 "decision_group_overlap_count": 0,
                 "sides": fold_side_reports,
+                "entry_return_evaluation": _entry_return_evaluation(fold_scored_rows),
                 "horizon_minutes": primary_horizon_minutes,
             }
         )
@@ -1272,6 +1320,7 @@ def _walk_forward_return_report(
         "score_cost_source": "prior_settled_authoritative_lifecycle_cost_forecast",
         "independent_profitability_exam": False,
         "sides": side_reports,
+        "entry_return_evaluation": _entry_return_evaluation(oos_rows),
         "primary_horizon_minutes": primary_horizon_minutes,
         "evaluation_horizon_minutes": primary_horizon_minutes,
         "primary_horizon_available": True,
@@ -1446,6 +1495,18 @@ def _production_return_evidence_blockers(metadata: dict[str, Any]) -> list[str]:
     walk_sides = walk_forward.get("sides") or {}
     for side in ("long", "short"):
         side_report = walk_sides.get(side) or {}
+        entry_reports = [
+            walk_forward.get("entry_return_evaluation") or {},
+            *[fold.get("entry_return_evaluation") or {} for fold in folds],
+        ]
+        if not folds or any(
+            report.get("version") != ENTRY_COHORT_VERSION
+            or ((report.get("sides") or {}).get(side) or {}).get(
+                "promotion_math_ready"
+            ) is not True
+            for report in entry_reports
+        ):
+            blockers.append(f"{side}_positive_entry_return_evidence_not_ready")
         if (
             side_report.get("return_semantics") != "shadow_net_return_after_all_cost"
             or side_report.get("cost_incomplete_sample_count") != 0
@@ -2188,49 +2249,42 @@ def _local_artifact_stage_rank(stage: str) -> int:
     )
 
 
-def _local_oos_aggregate(metadata: dict[str, Any]) -> dict[str, float | None]:
-    values: dict[str, list[float]] = {
-        "avg_return_pct": [],
-        "return_lcb_pct": [],
-        "cvar_10_pct": [],
-        "max_drawdown_pct": [],
-    }
-    evidence = metadata.get("oos_return_evaluation") or {}
-    profit_totals: list[tuple[float, float]] = []
-    for side in ("long", "short"):
-        row = evidence.get(side) if isinstance(evidence, dict) else None
-        if not isinstance(row, dict):
-            continue
+def _entry_comparison_metrics(evidence: dict[str, Any]) -> dict[str, float | None]:
+    metrics = {}
+    for key in ("avg_return_pct", "return_lcb_pct", "cvar_10_pct", "max_drawdown_pct"):
         try:
-            count = float(row.get("count"))
-            gain = float(row.get("gross_profit_pct"))
-            loss = float(row.get("gross_loss_pct"))
+            value = float(evidence.get(key))
         except (TypeError, ValueError):
-            pass
-        else:
-            if math.isfinite(count) and count > 0 and all(
-                math.isfinite(value) and value >= 0 for value in (gain, loss)
-            ):
-                profit_totals.append((gain, loss))
-        for key in values:
-            try:
-                value = float(row.get(key))
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(value):
-                values[key].append(value)
-    aggregate = {
-        key: sum(items) / len(items) if len(items) == 2 else None
-        for key, items in values.items()
-    }
-    # Ratios cannot be averaged, and a loss-free side still contributes gains.
-    gross_loss = sum(loss for _, loss in profit_totals)
-    aggregate["profit_factor"] = (
-        sum(gain for gain, _ in profit_totals) / gross_loss
-        if len(profit_totals) == 2 and gross_loss > np.finfo(float).eps
-        else None
-    )
-    return aggregate
+            value = float("nan")
+        metrics[key] = value if math.isfinite(value) else None
+    metrics["profit_factor"] = None
+    try:
+        count = float(evidence.get("count"))
+    except (TypeError, ValueError):
+        count = 0.0
+    if not math.isfinite(count) or count <= 0:
+        return dict.fromkeys(metrics)
+    try:
+        gain = float(evidence.get("gross_profit_pct"))
+        loss = float(evidence.get("gross_loss_pct"))
+    except (TypeError, ValueError):
+        return metrics
+    if math.isfinite(gain) and gain >= 0 and math.isfinite(loss) and loss > 1e-12:
+        metrics["profit_factor"] = gain / loss
+    return metrics
+
+
+def _comparison_entry_evidence(evaluation: dict[str, Any], role: str) -> dict[str, Any]:
+    report = evaluation.get(f"{role}_entry_evaluation") or {}
+    if not isinstance(report, dict) or report.get("version") != ENTRY_COHORT_VERSION:
+        return {}
+    sides = report.get("sides")
+    portfolio = report.get("portfolio")
+    if not isinstance(sides, dict) or any(
+        not isinstance(sides.get(side), dict) for side in ("long", "short")
+    ):
+        return {}
+    return portfolio if isinstance(portfolio, dict) else {}
 
 
 def _paired_artifact_return_evaluation(
@@ -2239,7 +2293,7 @@ def _paired_artifact_return_evaluation(
     holdout_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
     report = {
-        "version": "2026-11-13.predictive-variance-common-holdout.v2",
+        "version": "2026-11-13.positive-entry-common-holdout.v3",
         "ready": False,
         "independent_profitability_exam": False,
         "return_semantics": "shadow_net_return_after_all_cost",
@@ -2296,7 +2350,7 @@ def _paired_artifact_return_evaluation(
         })
         x = [row["x"] for row in rows]
         for role, bundle in bundles.items():
-            sides = {}
+            scored_by_side = {}
             for side in ("long", "short"):
                 moments = _regression_prediction_moments(bundle[f"{side}_return_model"], x)
                 market = moments["expected"]
@@ -2340,7 +2394,10 @@ def _paired_artifact_return_evaluation(
                     }
                     for index, row in enumerate(rows)
                 ]
-                selected = _select_top_return_rows(scored_rows)
+                scored_by_side[side] = scored_rows
+            selected_by_side = positive_objective_entry_rows(scored_by_side)
+            sides = {}
+            for side, selected in selected_by_side.items():
                 sides[side] = {
                     **_return_evidence(selected),
                     "selected_symbol_counts": {
@@ -2352,6 +2409,16 @@ def _paired_artifact_return_evaluation(
                     )[:8],
                 }
             report[role] = sides
+            report[f"{role}_entry_evaluation"] = _entry_return_evaluation(scored_by_side)
+            report[f"{role}_ranking_diagnostics"] = {
+                side: {
+                    **_return_evidence(_select_top_return_rows(rows)),
+                    "worst_selected_rows": sorted(
+                        _select_top_return_rows(rows), key=lambda row: row["return_pct"]
+                    )[:8],
+                }
+                for side, rows in scored_by_side.items()
+            }
         return {**report, "ready": True, "reason": "complete"}
     except Exception as exc:
         return {
@@ -2384,7 +2451,7 @@ def _compare_candidate_to_current(
     holdout_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
-        "policy": "local_ai_tools_paired_fee_after_champion_v3_pooled_profit_factor",
+        "policy": "local_ai_tools_positive_entry_portfolio_champion_v4",
         "candidate_stage": candidate_stage,
         "accepted": False,
         "blocking_reasons": [],
@@ -2458,16 +2525,21 @@ def _compare_candidate_to_current(
             "blocking_reasons": ["common_unfitted_holdout_unavailable"],
             "champion_version": current.get("version"),
         }
-    candidate = _local_oos_aggregate({"oos_return_evaluation": evaluation.get("candidate")})
-    champion = _local_oos_aggregate({"oos_return_evaluation": evaluation.get("champion")})
+    entry_evidence = {
+        role: _comparison_entry_evidence(evaluation, role)
+        for role in ("candidate", "champion")
+    }
+    candidate = _entry_comparison_metrics(entry_evidence["candidate"])
+    champion = _entry_comparison_metrics(entry_evidence["champion"])
     report["candidate_metrics"] = candidate
     report["champion_metrics"] = champion
     if any(candidate.get(key) is None or champion.get(key) is None for key in candidate):
         missing_reasons = []
         for role, metrics in (("candidate", candidate), ("champion", champion)):
-            no_loss_denominator = metrics["profit_factor"] is None and all(
-                (evaluation.get(role, {}).get(side) or {}).get("profit_factor_status")
-                == "no_loss_denominator" for side in ("long", "short")
+            no_loss_denominator = (
+                metrics["profit_factor"] is None
+                and entry_evidence[role].get("profit_factor_status") == "no_loss_denominator"
+                and bool(entry_evidence[role].get("count"))
             )
             if no_loss_denominator:
                 missing_reasons.append(f"{role}_profit_factor_no_loss_denominator")
@@ -6524,6 +6596,8 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
             _walk_forward_return_report,
             _fit_walk_forward_side,
             _regression_prediction_moments,
+            positive_objective_entry_rows,
+            _entry_return_evaluation,
             _return_evidence,
             _leave_one_symbol_out_stability,
             _authoritative_trade_return_evidence,
