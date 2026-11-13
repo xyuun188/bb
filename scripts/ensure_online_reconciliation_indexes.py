@@ -24,6 +24,8 @@ load_runtime_env_files(project_root=ROOT)
 drop_privileges_to_runtime_user_if_needed(project_root=ROOT)
 
 from db.session import (  # noqa: E402
+    SHADOW_CRYPTO_TRAINING_INDEX_DDL,
+    SHADOW_CRYPTO_TRAINING_INDEX_NAME,
     SHADOW_EXECUTABLE_TRAINING_INDEX_DDL,
     SHADOW_EXECUTABLE_TRAINING_INDEX_NAME,
     close_db,
@@ -61,6 +63,12 @@ TRAINING_INDEX_DDLS = (
     (
         SHADOW_EXECUTABLE_TRAINING_INDEX_NAME,
         SHADOW_EXECUTABLE_TRAINING_INDEX_DDL.replace(
+            "CREATE INDEX ", "CREATE INDEX CONCURRENTLY ", 1
+        ),
+    ),
+    (
+        SHADOW_CRYPTO_TRAINING_INDEX_NAME,
+        SHADOW_CRYPTO_TRAINING_INDEX_DDL.replace(
             "CREATE INDEX ", "CREATE INDEX CONCURRENTLY ", 1
         ),
     ),

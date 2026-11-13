@@ -583,6 +583,7 @@ async def test_postgres_trade_fact_indexes_skip_existing_indexes(
             "idx_ai_decisions_market_learning_recent",
             "idx_shadow_backtests_training_completed",
             session_module.SHADOW_EXECUTABLE_TRAINING_INDEX_NAME,
+            session_module.SHADOW_CRYPTO_TRAINING_INDEX_NAME,
         }
     )
 
@@ -605,6 +606,7 @@ async def test_postgres_trade_fact_indexes_create_pending_entry_index(
     await session_module._ensure_trade_fact_indexes(fake_conn)
 
     assert session_module.SHADOW_EXECUTABLE_TRAINING_INDEX_DDL in fake_conn.statements
+    assert session_module.SHADOW_CRYPTO_TRAINING_INDEX_DDL in fake_conn.statements
     assert any(
         "CREATE INDEX IF NOT EXISTS idx_ai_decisions_pending_entry_recent" in statement
         for statement in fake_conn.statements

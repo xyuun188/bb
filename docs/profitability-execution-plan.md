@@ -529,3 +529,20 @@ reader, and caches only classification/identity fields. It still scans every
 artifact, checks every required hash and rereads all metadata on the next audit.
 Regression tests verify that tampering between scans remains blocked and that
 runtime probes can proceed while a file scan is in progress.
+
+The follow-up fresh scan exposed a separate training-count timeout. PostgreSQL
+was scanning completed shadow rows and decoding their feature JSON to find the
+native crypto category. A partial index now covers the existing completed,
+two-return, crypto-only predicate and includes the decision ID. The online
+maintenance command creates it concurrently and retains invalid-build recovery;
+startup schema setup also registers it for new databases. No sample eligibility,
+training epoch or return gate changed. The online index was verified ready and
+valid; EXPLAIN used it and completed in 60.452 ms, and the unchanged training
+counter returned 41,591 samples in 0.0326 seconds.
+
+The complete regression suite passed 5,915 tests with one skip. After the index
+registration change, 88 focused database, maintenance and collection-status
+tests passed. The first forced integrated scan still exhausted its total budget
+and is not a clean acceptance result; a new deployed scan must verify that no
+required section was deferred and that the training counter no longer falls
+back because of timeout.

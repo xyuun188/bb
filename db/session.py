@@ -51,6 +51,15 @@ SHADOW_EXECUTABLE_TRAINING_INDEX_DDL = (
     "AND ((training_feature_snapshot->>'historical_market_path_only')::boolean IS NULL "
     "OR (training_feature_snapshot->>'historical_market_path_only')::boolean IS FALSE)"
 )
+SHADOW_CRYPTO_TRAINING_INDEX_NAME = "idx_shadow_backtests_crypto_training"
+SHADOW_CRYPTO_TRAINING_INDEX_DDL = (
+    f"CREATE INDEX IF NOT EXISTS {SHADOW_CRYPTO_TRAINING_INDEX_NAME} "
+    "ON shadow_backtests (created_at DESC, id DESC) INCLUDE (decision_id) "
+    "WHERE status = 'completed' "
+    "AND long_return_pct IS NOT NULL AND short_return_pct IS NOT NULL "
+    "AND training_feature_snapshot->'market_fact'->'native_identity'"
+    "->'contract_spec'->>'inst_category' = '1'"
+)
 
 
 def _session_gate_capacity() -> int:
@@ -791,6 +800,8 @@ async def _ensure_trade_fact_indexes(conn: Any) -> None:
                 await conn.execute(text(ddl))
         if SHADOW_EXECUTABLE_TRAINING_INDEX_NAME not in index_names:
             await conn.execute(text(SHADOW_EXECUTABLE_TRAINING_INDEX_DDL))
+        if SHADOW_CRYPTO_TRAINING_INDEX_NAME not in index_names:
+            await conn.execute(text(SHADOW_CRYPTO_TRAINING_INDEX_DDL))
         return
     for _name, ddl in index_ddls:
         # SQLite remains a local/test backend and may intentionally contain
