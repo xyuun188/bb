@@ -11,7 +11,7 @@ from services.continuous_model_weight import (
     ContinuousModelWeightPolicy,
     market_regime_name,
 )
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 
 
 def _bucket(pnls: list[float]) -> dict:
@@ -176,6 +176,7 @@ def test_local_model_quality_does_not_mix_replaced_model_returns() -> None:
                 "gross_profit_return_pct": profit, "gross_loss_return_pct": loss,
                 "entry_return_evaluation": {
                     "version": ENTRY_COHORT_VERSION,
+                    "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
                     "direction_count": 100,
                     "avg_shadow_return_after_all_cost_pct": average,
                     "shadow_return_lcb_pct": lower_bound,
@@ -212,6 +213,7 @@ def test_local_model_without_cost_complete_samples_cannot_borrow_other_model_pro
                 "gross_profit_return_pct": 150.0, "gross_loss_return_pct": 0.0,
                 "entry_return_evaluation": {
                     "version": ENTRY_COHORT_VERSION, "direction_count": 30,
+                    "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
                     "avg_shadow_return_after_all_cost_pct": 5.0,
                     "shadow_return_lcb_pct": 4.0,
                     "gross_profit_return_pct": 150.0, "gross_loss_return_pct": 0.0,
@@ -239,6 +241,7 @@ def test_local_model_permission_uses_positive_entry_cohort_instead_of_all_predic
             "gross_loss_return_pct": 100 if entry_profitable else 1,
             "entry_return_evaluation": {
                 "version": ENTRY_COHORT_VERSION, "direction_count": 20,
+                "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
                 "avg_shadow_return_after_all_cost_pct": entry_sign,
                 "shadow_return_lcb_pct": entry_sign - 0.1,
                 "gross_profit_return_pct": 100 if entry_profitable else 1,
@@ -266,6 +269,25 @@ def test_local_model_permission_cannot_fall_back_to_legacy_profitable_diagnostic
     }
     if version is not None:
         row["entry_return_evaluation"] = {**row, "version": version}
+    report = _build(ContinuousModelWeightPolicy(), specialist={"models": [row]})
+    permission = report["quant_source_weights"]["local_ml"]["model_quality_permissions"]["current"]
+    assert permission["paper_execution_permission"] is False
+    assert permission["paper_execution_evidence"]["sample_count"] == 0
+
+
+@pytest.mark.parametrize("score_policy", [None, "tree-mean-only-legacy"])
+def test_local_model_permission_cannot_reuse_same_artifact_results_from_another_scoring_policy(score_policy):
+    row = {
+        "tool": "local_ml", "model": "current",
+        "entry_return_evaluation": {
+            "version": ENTRY_COHORT_VERSION,
+            "prediction_score_policy_version": score_policy,
+            "direction_count": 100,
+            "avg_shadow_return_after_all_cost_pct": 1.0,
+            "shadow_return_lcb_pct": 0.5,
+            "gross_profit_return_pct": 110.0, "gross_loss_return_pct": 10.0,
+        },
+    }
     report = _build(ContinuousModelWeightPolicy(), specialist={"models": [row]})
     permission = report["quant_source_weights"]["local_ml"]["model_quality_permissions"]["current"]
     assert permission["paper_execution_permission"] is False

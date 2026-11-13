@@ -395,6 +395,7 @@ def compact_specialist_shadow_features(features: dict[str, Any]) -> dict[str, An
             "readiness_state",
             "route_mode",
             "model_version",
+            "prediction_score_policy_version",
             "primary_horizon_minutes",
         ):
             if local_ml.get(key) is not None:
@@ -1291,6 +1292,7 @@ def postgres_training_feature_snapshot_functions() -> tuple[str, ...]:
                     'readiness_state', ml->'readiness_state',
                     'route_mode', ml->'route_mode',
                     'model_version', ml->'model_version',
+                    'prediction_score_policy_version', ml->'prediction_score_policy_version',
                     'primary_horizon_minutes', ml->'primary_horizon_minutes'
                 ));
                 IF jsonb_typeof(ml->'predictions') = 'array' THEN

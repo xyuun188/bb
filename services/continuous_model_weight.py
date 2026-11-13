@@ -7,11 +7,11 @@ import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.model_expert_health import ModelExpertHealthService
 from services.specialist_shadow_evaluation import SpecialistShadowEvaluationService
 
-CONTINUOUS_MODEL_WEIGHT_VERSION = "2026-11-13.positive-entry-model-paper-quality.v4"
+CONTINUOUS_MODEL_WEIGHT_VERSION = "2026-11-13.scoring-policy-entry-paper-quality.v5"
 EXPERT_MODEL_NAMES = (
     "trend_expert",
     "momentum_expert",
@@ -204,6 +204,7 @@ def _specialist_evidence(
             for row in rows
             if (entry := _dict(row.get("entry_return_evaluation"))).get("version")
             == ENTRY_COHORT_VERSION
+            and entry.get("prediction_score_policy_version") == PREDICTION_SCORE_POLICY_VERSION
         ]
     if not rows:
         return _return_evidence(
@@ -633,6 +634,7 @@ class ContinuousModelWeightPolicy:
                         "paper_execution_model_version": version,
                         "evidence_scope": "exact_decision_time_model_version",
                         "entry_cohort_version": ENTRY_COHORT_VERSION,
+                        "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
                     }
                     for version in versions
                 }

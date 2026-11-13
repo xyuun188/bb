@@ -14,7 +14,7 @@ from scripts import run_specialist_shadow_evaluation as runner
 from services import specialist_shadow_evaluation as specialist_evaluation
 from services.continuous_model_weight import ContinuousModelWeightPolicy
 from services.entry_direction_competition import _paper_quant_quality_permissions
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.specialist_shadow_evaluation import (
     SpecialistShadowEvaluationAccumulator,
@@ -311,6 +311,7 @@ def test_local_ml_shadow_settles_its_own_decision_time_prediction() -> None:
         "available": True,
         "actual_inference": True,
         "model_version": "local-ml-v7",
+        "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
         "primary_horizon_minutes": 10,
         "status": "learning_only",
         "readiness_state": "learning_only",
@@ -350,6 +351,7 @@ def test_local_ml_shadow_does_not_settle_other_model_shadow_sides() -> None:
         "available": True,
         "actual_inference": True,
         "model_version": "local-ml-v7",
+        "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
         "primary_horizon_minutes": 10,
         "predictions": [
             {
@@ -380,6 +382,7 @@ def _local_ml_row(*, index=1, realized=0.42, version="local-ml-v7"):
         "available": True,
         "actual_inference": True,
         "model_version": version,
+        "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
         "primary_horizon_minutes": 10,
         "predictions": [{
             "horizon_minutes": 10,
@@ -424,6 +427,7 @@ def test_local_ml_positive_entry_keeps_losses_and_separates_model_versions():
     "missing_other_side", "expected_only", "gross_only", "nan", "infinity",
     "wrong_best_side", "zero", "unavailable", "no_inference", "no_primary", "other_primary",
     "incomplete_cost",
+    "legacy_score_policy", "missing_score_policy",
 ])
 def test_local_ml_entry_cohort_requires_complete_frozen_primary_prediction(invalid):
     row = _local_ml_row()
@@ -448,6 +452,10 @@ def test_local_ml_entry_cohort_requires_complete_frozen_primary_prediction(inval
         shadow.pop("primary_horizon_minutes")
     elif invalid == "other_primary":
         shadow["primary_horizon_minutes"] = 240
+    elif invalid == "legacy_score_policy":
+        shadow["prediction_score_policy_version"] = "tree-mean-only-legacy"
+    elif invalid == "missing_score_policy":
+        shadow.pop("prediction_score_policy_version")
     else:
         row.feature_snapshot["funding_data_available"] = False
 
@@ -471,6 +479,22 @@ def test_local_ml_positive_entry_selects_short_and_uses_long_on_ties():
     assert [event["predicted_side"] for event in entry["shadow_events"]] == ["short", "long"]
     assert entry["gross_loss_return_pct"] > 0
     assert entry["gross_profit_return_pct"] > 0
+
+
+@pytest.mark.parametrize("legacy_return", [-100.0, 100.0])
+def test_local_ml_same_artifact_cannot_mix_results_from_different_scoring_policies(legacy_return):
+    current = _local_ml_row(realized=-0.5)
+    legacy = _local_ml_row(index=2, realized=legacy_return)
+    legacy.feature_snapshot["local_ml_shadow"].pop("prediction_score_policy_version")
+
+    report = summarize_specialist_shadow_evaluation([current, legacy])
+    local = next(row for row in report["models"] if row["tool"] == "local_ml")
+    entry = local["entry_return_evaluation"]
+    assert local["direction_count"] == 2
+    assert entry["direction_count"] == 1
+    assert entry["prediction_score_policy_version"] == PREDICTION_SCORE_POLICY_VERSION
+    assert entry["avg_shadow_return_after_all_cost_pct"] < -0.5
+    assert entry["gross_profit_return_pct"] == 0.0
 
 
 def test_local_ml_other_horizon_cannot_duplicate_primary_entry_evidence():

@@ -8,7 +8,7 @@ from services.entry_direction_competition import (
     _paper_quant_quality_permissions,
 )
 from services.entry_direction_support import assess_paper_model_trade_support
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
     COST_MODEL_VERSION,
@@ -50,7 +50,8 @@ def test_quality_permission_uses_only_the_current_model_version(current_version)
 
 
 @pytest.mark.parametrize("cohort_version", [None, "legacy-cohort", ENTRY_COHORT_VERSION])
-def test_quality_permission_rejects_cached_model_permission_from_old_sample_cohort(cohort_version):
+@pytest.mark.parametrize("score_policy", [None, "legacy-score-policy", PREDICTION_SCORE_POLICY_VERSION])
+def test_quality_permission_rejects_cached_model_permission_from_old_sample_cohort(cohort_version, score_policy):
     permissions = _paper_quant_quality_permissions(
         {
             "execution_mode": "paper",
@@ -62,13 +63,16 @@ def test_quality_permission_rejects_cached_model_permission_from_old_sample_coho
                         "paper_execution_permission": True,
                         "paper_execution_model_version": "current",
                         "entry_cohort_version": cohort_version,
+                        "prediction_score_policy_version": score_policy,
                     }},
                 }},
             },
         },
         {"model_version": "current"},
     )
-    assert permissions["local_ml"]["paper_execution_permission"] is (cohort_version == ENTRY_COHORT_VERSION)
+    assert permissions["local_ml"]["paper_execution_permission"] is (
+        cohort_version == ENTRY_COHORT_VERSION and score_policy == PREDICTION_SCORE_POLICY_VERSION
+    )
 
 
 def _distribution(side: str, expected: float, *, horizon_minutes: int = 30) -> dict:

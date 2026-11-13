@@ -19,6 +19,7 @@ from services.return_objective import (
 )
 
 ENTRY_COHORT_VERSION = "2026-11-13.positive-objective-entry-cohort.v1"
+PREDICTION_SCORE_POLICY_VERSION = "2026-11-13.leaf-total-risk-objective.v1"
 
 
 def positive_objective_entry_rows(

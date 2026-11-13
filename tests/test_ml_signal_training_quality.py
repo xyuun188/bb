@@ -30,6 +30,7 @@ from services.artifact_retirement_audit import (
     PHASE3_ARTIFACT_POLICY_ID,
     PHASE3_REQUIRED_PROMOTION_FLOW,
 )
+from services.ml_prediction_contract import PREDICTION_SCORE_POLICY_VERSION
 from services.ml_readiness import build_ml_readiness_report
 from services.ml_signal_service import (
     FEATURE_CONTRACT_VERSION,
@@ -4513,6 +4514,7 @@ def test_ml_signal_predict_emits_complete_paper_multitask_contract() -> None:
     assert prediction["paper_ml_ready"] is True
     assert prediction["production_permission"] is False
     assert prediction["prediction_quality"]["contract_complete"] is True
+    assert prediction["prediction_score_policy_version"] == PREDICTION_SCORE_POLICY_VERSION
     assert prediction["prediction_quality"]["paper_eligible"] is True
     assert prediction["prediction_quality"]["production_eligible"] is False
     assert prediction["prediction_quality"]["anomalous"] is False
@@ -4599,6 +4601,7 @@ def test_strategy_replay_batch_matches_single_prediction_contract(costs: tuple[f
     )[0]
 
     assert batch["model_version"] == single["model_version"]
+    assert batch["prediction_score_policy_version"] == single["prediction_score_policy_version"]
     assert batch["predictions"][0]["best_side"] == single["predictions"][0]["best_side"]
     assert (
         batch["predictions"][0]["return_distribution_contract"]

@@ -42,6 +42,7 @@ from services.artifact_retirement_audit import (
 from services.dynamic_policy_values import empirical_policy_value
 from services.ml_prediction_contract import (
     ENTRY_COHORT_VERSION,
+    PREDICTION_SCORE_POLICY_VERSION,
     positive_objective_entry_rows,
     profit_quality_score,
     regression_prediction_distribution,
@@ -1470,6 +1471,7 @@ def _entry_return_evaluation(
     selected = positive_objective_entry_rows(scored_rows)
     return {
         "version": ENTRY_COHORT_VERSION,
+        "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
         "selection_policy": "larger_positive_fee_after_objective_else_hold",
         "execution_replay_complete": False,
         "scope": "necessary_model_signal_gate_without_fill_exit_or_capacity_simulation",
@@ -4651,6 +4653,7 @@ class MLSignalService:
                 {
                     "available": True,
                     "model_version": model_version,
+                    "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
                     "predictions": [
                         {
                             "horizon_minutes": horizon_minutes,
@@ -5165,6 +5168,7 @@ class MLSignalService:
             "advisory_enabled": advisory_enabled,
             "influence_policy": influence,
             "model_version": strategy_blueprint.get("model_version"),
+            "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
             "trained_sample_count": int(metadata.get("sample_count") or 0),
             "primary_horizon_minutes": primary.get("horizon_minutes"),
             "long_win_rate": primary.get("long_win_rate"),

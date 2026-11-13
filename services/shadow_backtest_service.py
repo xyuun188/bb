@@ -615,6 +615,9 @@ def compact_local_ml_shadow(ml_signal_context: dict[str, Any] | None) -> dict[st
         "readiness_state": str(signal.get("readiness_state") or "")[:80],
         "route_mode": str(signal.get("route_mode") or "")[:60],
         "model_version": str(signal.get("model_version") or "")[:160],
+        "prediction_score_policy_version": str(
+            signal.get("prediction_score_policy_version") or ""
+        )[:160],
         "primary_horizon_minutes": _safe_shadow_number(
             signal.get("primary_horizon_minutes")
         ),

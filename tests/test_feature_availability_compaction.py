@@ -954,6 +954,7 @@ def _specialist_shadow_payload() -> dict[str, object]:
             "available": True,
             "actual_inference": True,
             "model_version": "model-v2",
+            "prediction_score_policy_version": "score-policy-v2",
             "primary_horizon_minutes": 240,
             "predictions": [
                 {
@@ -981,6 +982,7 @@ def test_specialist_shadow_survives_compaction_without_full_payload() -> None:
     assert result["expected_return_pct"] == 1.25
     assert "debug_payload" not in tools["time_series_prediction"]
     ml = compacted["local_ml_shadow"]
+    assert ml["prediction_score_policy_version"] == "score-policy-v2"
     assert ml["predictions"][0]["long"]["objective_net_return_pct"] == 1.1
     assert "debug_payload" not in ml["predictions"][0]
     assert _compact_training_feature_snapshot(features) == compacted
@@ -1053,6 +1055,7 @@ def test_postgres_compaction_retains_specialist_shadow_projection() -> None:
 
     assert "local_ai_tools_shadow" in shadow_sql
     assert "local_ml_shadow" in shadow_sql
+    assert "'prediction_score_policy_version', ml->'prediction_score_policy_version'" in shadow_sql
     assert "'professional_model_shadow'" in shadow_sql
     assert "bb_compact_specialist_shadow(raw)" in compact_sql
 

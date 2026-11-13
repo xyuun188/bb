@@ -17,6 +17,7 @@ from core.training_contracts import (
     shadow_label_contract_reasons,
 )
 from core.training_feature_snapshot import compact_training_feature_snapshot
+from services.ml_prediction_contract import PREDICTION_SCORE_POLICY_VERSION
 from services.profit_supervision import shadow_fee_after_return_labels
 from services.shadow_backtest_service import (
     SHADOW_BACKTEST_HORIZONS_MINUTES,
@@ -40,6 +41,7 @@ def test_local_ml_shadow_uses_the_canonical_fee_after_field() -> None:
         {
             "available": True,
             "model_version": "local-ml-v7",
+            "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
             "primary_horizon_minutes": 10,
             "predictions": [
                 {
@@ -59,6 +61,9 @@ def test_local_ml_shadow_uses_the_canonical_fee_after_field() -> None:
     short = shadow["predictions"][0]["short"]
     assert short["objective_net_return_pct"] == pytest.approx(0.31)
     assert short["expected_net_return_pct"] == pytest.approx(0.42)
+    assert shadow["prediction_score_policy_version"] == PREDICTION_SCORE_POLICY_VERSION
+    compact = compact_training_feature_snapshot({"local_ml_shadow": shadow})
+    assert compact["local_ml_shadow"]["prediction_score_policy_version"] == PREDICTION_SCORE_POLICY_VERSION
 
 
 def test_compact_specialist_results_preserve_request_and_completion_provenance():

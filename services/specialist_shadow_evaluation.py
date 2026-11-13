@@ -8,7 +8,11 @@ from types import SimpleNamespace
 from typing import Any
 
 from services.execution_cost_model import funding_cost_estimate, shadow_execution_cost_estimate
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION, positive_objective_entry_rows
+from services.ml_prediction_contract import (
+    ENTRY_COHORT_VERSION,
+    PREDICTION_SCORE_POLICY_VERSION,
+    positive_objective_entry_rows,
+)
 from services.profit_supervision import (
     PROFIT_SUPERVISION_VERSION,
     shadow_fee_after_return_labels,
@@ -142,6 +146,8 @@ def _local_ml_positive_entry(row: Any, shadow: dict[str, Any]) -> bool:
     """Use frozen primary-horizon objectives, never realized returns, to select entries."""
 
     if shadow.get("actual_inference") is not True or shadow.get("available") is not True:
+        return False
+    if shadow.get("prediction_score_policy_version") != PREDICTION_SCORE_POLICY_VERSION:
         return False
     primary = _safe_float(shadow.get("primary_horizon_minutes"), None)
     if (
@@ -1368,6 +1374,7 @@ def summarize_specialist_shadow_evaluation(
             entry_metric = metric.get("entry_metric") or _empty_metric("local_ml", metric["model"])
             model_row["entry_return_evaluation"] = {
                 "version": ENTRY_COHORT_VERSION,
+                "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
                 "scope": "decision_time_primary_positive_objective_after_cost",
                 **_finalize_metric(entry_metric),
             }

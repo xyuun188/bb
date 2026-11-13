@@ -15,7 +15,7 @@ from services.entry_signal_extraction import (
     signal_return_distribution_eligibility,
 )
 from services.execution_cost_model import funding_cost_estimate
-from services.ml_prediction_contract import ENTRY_COHORT_VERSION
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.model_strategy_blueprint import model_strategy_side_authorization
 from services.paper_prediction_horizon import select_paper_horizon_cohort
 
@@ -246,7 +246,10 @@ def _paper_quant_quality_permissions(
     if "model_quality_permissions" in local:
         version = str(_safe_dict(ml_signal_context).get("model_version") or "")
         scoped = _safe_dict(_safe_dict(local.get("model_quality_permissions")).get(version))
-        if scoped.get("entry_cohort_version") != ENTRY_COHORT_VERSION:
+        if (
+            scoped.get("entry_cohort_version") != ENTRY_COHORT_VERSION
+            or scoped.get("prediction_score_policy_version") != PREDICTION_SCORE_POLICY_VERSION
+        ):
             scoped = {}
         permissions["local_ml"] = scoped or {
             "paper_execution_permission": False,
@@ -256,6 +259,7 @@ def _paper_quant_quality_permissions(
             "paper_execution_evidence": {"sample_count": 0},
             "evidence_scope": "exact_decision_time_model_version",
             "entry_cohort_version": ENTRY_COHORT_VERSION,
+            "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
         }
     return permissions
 
