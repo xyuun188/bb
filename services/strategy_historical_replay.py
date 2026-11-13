@@ -13,7 +13,7 @@ from typing import Any
 
 from services.model_strategy_blueprint import paper_strategy_replay_available
 
-STRATEGY_HISTORICAL_REPLAY_VERSION = "2026-11-13.decision-time-fee-after-replay.v2"
+STRATEGY_HISTORICAL_REPLAY_VERSION = "2026-11-13.purged-forward-fee-after-replay.v3"
 
 ModelPredictor = Callable[..., dict[str, Any]]
 
@@ -517,6 +517,16 @@ def _partition_observations(
         for group in raw_development_groups
         if historical_bounds[group]["label_end"] < exam_decision_start
     ]
+    purged_development_count = len(raw_development_groups) - len(development_groups)
+    partition_policy = "artifact_holdout_suffix_then_purged_chronological_strategy_split"
+    if not development_groups and explicit_holdout_ids:
+        # Dense multi-hour labels cannot be split in the middle without
+        # overlap. Keep the immutable holdout for development and examine
+        # only later decisions, after every development label is available.
+        development_groups = holdout_groups
+        exam_groups = []
+        purged_development_count = 0
+        partition_policy = "artifact_holdout_development_then_purged_forward_exam"
     development = [
         row
         for group in development_groups
@@ -531,14 +541,32 @@ def _partition_observations(
         for group in holdout_groups
         for row in historical_bounds[group]["rows"]
     }
+    development_label_end = max(
+        (historical_bounds[group]["label_end"] for group in development_groups),
+        default=trained_at,
+    )
+    forward_cutoff = max(trained_at, development_label_end)
+    forward_groups = [
+        group for group in _ordered_groups(post_bounds)
+        if group not in holdout_groups
+        and post_bounds[group]["decision_start"] > forward_cutoff
+    ]
     post_training_additions = [
-        row for row in post_training if _int(row.get("source_id")) not in holdout_row_ids
+        row for group in forward_groups for row in post_bounds[group]["rows"]
+        if _int(row.get("source_id")) not in holdout_row_ids
     ]
     exam = [*historical_exam, *post_training_additions]
     development_ids = {_int(row.get("source_id")) for row in development}
     exam_ids = {_int(row.get("source_id")) for row in exam}
     overlap = development_ids & exam_ids
-    status = "complete" if development and exam and not overlap else "partition_incomplete"
+    exam_decision_starts = [
+        historical_bounds[group]["decision_start"] for group in exam_groups
+    ] + [post_bounds[group]["decision_start"] for group in forward_groups]
+    chronological_disjoint = bool(
+        development and exam and not overlap and exam_decision_starts
+        and development_label_end < min(exam_decision_starts)
+    )
+    status = "complete" if chronological_disjoint else "partition_incomplete"
     return {
         "status": status,
         "development": development,
@@ -555,13 +583,13 @@ def _partition_observations(
             "strategy_exam_historical_group_count": len(exam_groups),
             "strategy_exam_post_training_group_count": len(post_bounds),
             "strategy_exam_post_training_added_count": len(post_training_additions),
-            "purged_development_group_count": len(raw_development_groups)
-            - len(development_groups),
+            "purged_development_group_count": purged_development_count,
+            "purged_forward_exam_group_count": sum(
+                group not in holdout_groups for group in post_bounds
+            ) - len(forward_groups),
             "development_exam_overlap_count": len(overlap),
-            "chronological_partition_disjoint": not overlap,
-            "partition_policy": (
-                "artifact_holdout_suffix_then_purged_chronological_strategy_split"
-            ),
+            "chronological_partition_disjoint": chronological_disjoint,
+            "partition_policy": partition_policy,
         },
     }
 

@@ -291,6 +291,80 @@ def test_delayed_labels_are_purged_before_the_exam_decision() -> None:
     assert {row["decision_id"] for row in report["development_samples"]} == {5}
 
 
+@pytest.mark.parametrize("forward_available", [False, True])
+def test_dense_holdout_uses_only_independent_forward_decisions_for_exam(
+    forward_available: bool,
+) -> None:
+    blueprint = _blueprint()
+    blueprint["trained_at"] = "2026-07-20T05:00:00+00:00"
+    blueprint["exit_policy"]["historical_replay_horizon_minutes"] = 240
+    blueprint["training_evidence"]["strategy_replay_holdout"] = {
+        "shadow_source_id_ranges": [[1, 12]],
+    }
+    base = datetime(2026, 7, 20, tzinfo=UTC)
+    observations = [
+        _observation(
+            source_id, decision_id=source_id,
+            created_at=base + timedelta(minutes=source_id), horizon=240,
+        )
+        for source_id in range(1, 13)
+    ]
+    if forward_available:
+        observations.append(_observation(
+            13, decision_id=13, created_at=base + timedelta(hours=6), horizon=240,
+        ))
+
+    report = build_strategy_historical_replay(
+        blueprint=blueprint, observations=observations, predictor=_predictor,
+    )
+
+    if not forward_available:
+        assert report["status"] == "partition_incomplete"
+        assert report["selected_entry_count"] == 0
+        return
+    assert report["status"] == "complete"
+    assert report["partition"]["partition_policy"] == (
+        "artifact_holdout_development_then_purged_forward_exam"
+    )
+    assert report["partition"]["strategy_exam_historical_group_count"] == 0
+    assert report["partition"]["chronological_partition_disjoint"] is True
+    assert {row["source_id"] for row in report["development_samples"]} == set(range(1, 13))
+    assert {row["source_id"] for row in report["exam_samples"]} == {13}
+    assert report["forward_exam_samples"] == report["exam_samples"]
+
+
+def test_dense_holdout_forward_exam_waits_for_all_development_labels() -> None:
+    blueprint = _blueprint()
+    blueprint["trained_at"] = "2026-07-20T05:00:00+00:00"
+    blueprint["exit_policy"]["historical_replay_horizon_minutes"] = 240
+    blueprint["training_evidence"]["strategy_replay_holdout"] = {
+        "shadow_source_id_ranges": [[1, 12]],
+    }
+    base = datetime(2026, 7, 20, tzinfo=UTC)
+    observations = [
+        _observation(
+            source_id, decision_id=source_id,
+            created_at=base + timedelta(minutes=source_id), horizon=240,
+        )
+        for source_id in range(1, 13)
+    ]
+    observations[-1]["label_timestamp"] = "2026-07-20T06:30:00+00:00"
+    observations.extend(
+        _observation(
+            source_id, decision_id=source_id,
+            created_at=base + timedelta(hours=hour), horizon=240,
+        )
+        for source_id, hour in ((13, 6), (14, 7))
+    )
+    report = build_strategy_historical_replay(
+        blueprint=blueprint, observations=observations, predictor=_predictor,
+    )
+
+    assert report["status"] == "complete"
+    assert {row["source_id"] for row in report["exam_samples"]} == {14}
+    assert report["partition"]["purged_forward_exam_group_count"] == 1
+
+
 @pytest.mark.parametrize("missing_field", ["fee_after_side_selection", "objective_net_return_pct"])
 def test_replay_requires_decision_time_fee_after_prediction(missing_field: str) -> None:
     def incomplete_predictor(features: dict, *, horizons: tuple[int, ...]) -> dict:
