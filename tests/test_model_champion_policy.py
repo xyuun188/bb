@@ -41,9 +41,12 @@ def _metadata(
     training_data_version: str = "2026-09-15.authoritative-trade-integrity.v6",
 ) -> dict:
     side = {
+        "count": 4,
         "avg_return_pct": avg,
         "return_lcb_pct": lcb,
         "profit_factor": profit_factor,
+        "gross_profit_pct": profit_factor,
+        "gross_loss_pct": 1.0,
         "cvar_10_pct": cvar,
         "max_drawdown_pct": drawdown,
         "promotion_math_ready": True,
@@ -410,6 +413,30 @@ def test_different_historical_reports_cannot_replace_common_evaluation() -> None
     )
     assert report["accepted"] is False
     assert "common_unfitted_holdout_unavailable" in report["blocking_reasons"]
+
+
+@pytest.mark.parametrize("loss", [0.0, 2.0])
+def test_comparison_pools_profits_including_loss_free_direction(loss: float) -> None:
+    from services.ml_signal_service import _return_evidence
+
+    candidate, champion = _metadata(), _metadata()
+    candidate["oos_return_evaluation"] = {
+        side: _return_evidence([
+            {"return_pct": value, "label_timestamp": str(index)}
+            for index, value in enumerate(values)
+        ])
+        for side, values in (("long", [-loss, 1.0]), ("short", [0.3, 6.7]))
+    }
+    report = compare_candidate_to_champion(
+        candidate, champion, candidate_stage="shadow", champion_stage="shadow"
+    )
+    if loss:
+        assert report["candidate_metrics"]["profit_factor"] == pytest.approx(4.0)
+        assert "candidate_cvar_materially_worsened" in report["blocking_reasons"]
+    else:
+        assert report["candidate_metrics"]["profit_factor"] is None
+        assert "candidate_profit_factor_no_loss_denominator" in report["blocking_reasons"]
+    assert report["accepted"] is False
 
 
 def test_paired_results_override_stale_historical_metrics() -> None:

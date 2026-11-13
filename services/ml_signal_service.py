@@ -1503,6 +1503,12 @@ def _return_evidence(
     max_drawdown = _max_drawdown(returns)
     return {
         **summary,
+        "gross_profit_pct": sum(value for value in returns if math.isfinite(value) and value > 0),
+        "gross_loss_pct": -sum(value for value in returns if math.isfinite(value) and value < 0),
+        "profit_factor_status": (
+            "defined" if profit_factor_value is not None else
+            "no_loss_denominator" if summary.get("count") else "no_observations"
+        ),
         "tail_loss_policy": tail_policy.to_dict(),
         "tail_loss_scale_pct": abs(tail_boundary),
         "max_drawdown_pct": max_drawdown,

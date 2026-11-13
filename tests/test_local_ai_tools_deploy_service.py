@@ -105,6 +105,8 @@ def _test_artifact_metadata(
         "median_return_pct": 0.3,
         "return_lcb_pct": 0.1,
         "profit_factor": 2.0,
+        "gross_profit_pct": 2.0,
+        "gross_loss_pct": 1.0,
         "cvar_10_pct": -0.1,
         "max_drawdown_pct": 0.1,
         "promotion_math_ready": True,
@@ -1926,6 +1928,7 @@ def test_local_ai_registry_rejects_regressive_active_challenger(
                 "avg_return_pct": 0.2,
                 "return_lcb_pct": 0.05,
                 "profit_factor": 1.5,
+                "gross_profit_pct": 1.5,
                 "cvar_10_pct": -0.2,
                 "max_drawdown_pct": 0.2,
             }
@@ -1994,6 +1997,7 @@ def test_local_ai_registry_accepts_strictly_improved_active_challenger(
                 "avg_return_pct": 0.6,
                 "return_lcb_pct": 0.2,
                 "profit_factor": 2.5,
+                "gross_profit_pct": 2.5,
                 "cvar_10_pct": -0.05,
                 "max_drawdown_pct": 0.05,
             }
@@ -4378,7 +4382,79 @@ def test_local_ai_profit_factor_is_undefined_without_loss_denominator() -> None:
 
     assert module._profit_factor([0.2, 0.4, 0.1]) is None
     assert evidence["profit_factor"] is None
+    assert evidence["gross_profit_pct"] == pytest.approx(0.7)
+    assert evidence["gross_loss_pct"] == 0.0
+    assert evidence["profit_factor_status"] == "no_loss_denominator"
     assert evidence["promotion_math_ready"] is False
+
+
+@pytest.mark.parametrize("missing_totals", [False, True])
+def test_local_ai_comparison_pools_profit_factor_and_retains_tail_guard(
+    monkeypatch, missing_totals
+) -> None:
+    module = ModuleType("local_ai_tools_pooled_profit_factor_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+
+    def evidence(values):
+        return module._return_evidence([
+            {"return_pct": value, "label_timestamp": str(index)}
+            for index, value in enumerate(values)
+        ])
+
+    candidate = {"long": evidence([-2.0, 1.0]), "short": evidence([0.3, 6.7])}
+    champion = {"long": evidence([-1.0, 0.5]), "short": evidence([1.0, 2.0])}
+    assert module._local_oos_aggregate({"oos_return_evaluation": candidate})[
+        "profit_factor"
+    ] == pytest.approx(4.0)
+    if missing_totals:
+        candidate["short"].pop("gross_loss_pct")
+    monkeypatch.setattr(module, "_replaceable_current_artifact", lambda: ({
+        "version": "champion", "activation_manifest": {"activation_stage": "shadow"},
+    }, None))
+    monkeypatch.setattr(module, "_paired_artifact_return_evaluation", lambda *_args: {
+        "ready": True, "candidate": candidate, "champion": champion,
+    })
+    report = module._compare_candidate_to_current(
+        {}, candidate_stage="shadow", candidate_bundle={}, holdout_rows=[]
+    )
+    assert report["accepted"] is False
+    assert ("champion_comparison_metric_missing" if missing_totals else
+            "candidate_cvar_materially_worsened") in report["blocking_reasons"]
+    if not missing_totals:
+        assert report["candidate_metrics"]["profit_factor"] == pytest.approx(4.0)
+        assert report["champion_metrics"]["profit_factor"] == pytest.approx(3.5)
+
+
+@pytest.mark.parametrize("short_returns,expected", [([7.0, -1.0], 8.0 / 3.0), ([3.0, 4.0], 4.0)])
+def test_local_ai_profit_factor_uses_pooled_amounts(short_returns, expected) -> None:
+    module = ModuleType("local_ai_tools_profit_factor_amounts_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    sides = {
+        side: module._return_evidence([{"return_pct": value} for value in values])
+        for side, values in (("long", [-2.0, 1.0]), ("short", short_returns))
+    }
+    assert module._local_oos_aggregate({"oos_return_evaluation": sides})[
+        "profit_factor"
+    ] == pytest.approx(expected)
+
+
+def test_local_ai_loss_free_comparison_stays_blocked_with_explicit_reason(monkeypatch) -> None:
+    module = ModuleType("local_ai_tools_loss_free_comparison_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    sides = {side: module._return_evidence([{"return_pct": 1.0}]) for side in ("long", "short")}
+    monkeypatch.setattr(module, "_replaceable_current_artifact", lambda: ({
+        "version": "champion", "activation_manifest": {"activation_stage": "shadow"},
+    }, None))
+    monkeypatch.setattr(module, "_paired_artifact_return_evaluation", lambda *_args: {
+        "ready": True, "candidate": sides, "champion": sides,
+    })
+    report = module._compare_candidate_to_current(
+        {}, candidate_stage="shadow", candidate_bundle={}, holdout_rows=[]
+    )
+    assert report["accepted"] is False
+    assert report["blocking_reasons"] == [
+        "candidate_profit_factor_no_loss_denominator", "champion_profit_factor_no_loss_denominator",
+    ]
 
 
 def test_local_ai_leave_one_symbol_out_blocks_single_symbol_profit_support() -> None:

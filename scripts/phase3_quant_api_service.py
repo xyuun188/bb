@@ -837,6 +837,9 @@ def _return_evidence(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "median_return_pct": None,
             "return_lcb_pct": None,
             "profit_factor": None,
+            "gross_profit_pct": 0.0,
+            "gross_loss_pct": 0.0,
+            "profit_factor_status": "no_observations",
             "cvar_10_pct": None,
             "max_drawdown_pct": None,
             "tail_loss_rate": None,
@@ -867,6 +870,11 @@ def _return_evidence(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "median_return_pct": float(np.median(values)),
         "return_lcb_pct": return_lcb,
         "profit_factor": profit_factor_value,
+        "gross_profit_pct": float(values[values > 0].sum()),
+        "gross_loss_pct": abs(float(values[values < 0].sum())),
+        "profit_factor_status": (
+            "defined" if profit_factor_value is not None else "no_loss_denominator"
+        ),
         "cvar_10_pct": cvar_value,
         "max_drawdown_pct": max_drawdown,
         "tail_loss_rate": (
@@ -2180,15 +2188,26 @@ def _local_oos_aggregate(metadata: dict[str, Any]) -> dict[str, float | None]:
     values: dict[str, list[float]] = {
         "avg_return_pct": [],
         "return_lcb_pct": [],
-        "profit_factor": [],
         "cvar_10_pct": [],
         "max_drawdown_pct": [],
     }
     evidence = metadata.get("oos_return_evaluation") or {}
+    profit_totals: list[tuple[float, float]] = []
     for side in ("long", "short"):
         row = evidence.get(side) if isinstance(evidence, dict) else None
         if not isinstance(row, dict):
             continue
+        try:
+            count = float(row.get("count"))
+            gain = float(row.get("gross_profit_pct"))
+            loss = float(row.get("gross_loss_pct"))
+        except (TypeError, ValueError):
+            pass
+        else:
+            if math.isfinite(count) and count > 0 and all(
+                math.isfinite(value) and value >= 0 for value in (gain, loss)
+            ):
+                profit_totals.append((gain, loss))
         for key in values:
             try:
                 value = float(row.get(key))
@@ -2196,10 +2215,18 @@ def _local_oos_aggregate(metadata: dict[str, Any]) -> dict[str, float | None]:
                 continue
             if math.isfinite(value):
                 values[key].append(value)
-    return {
+    aggregate = {
         key: sum(items) / len(items) if len(items) == 2 else None
         for key, items in values.items()
     }
+    # Ratios cannot be averaged, and a loss-free side still contributes gains.
+    gross_loss = sum(loss for _, loss in profit_totals)
+    aggregate["profit_factor"] = (
+        sum(gain for gain, _ in profit_totals) / gross_loss
+        if len(profit_totals) == 2 and gross_loss > np.finfo(float).eps
+        else None
+    )
+    return aggregate
 
 
 def _paired_artifact_return_evaluation(
@@ -2350,7 +2377,7 @@ def _compare_candidate_to_current(
     holdout_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
-        "policy": "local_ai_tools_paired_fee_after_champion_v2",
+        "policy": "local_ai_tools_paired_fee_after_champion_v3_pooled_profit_factor",
         "candidate_stage": candidate_stage,
         "accepted": False,
         "blocking_reasons": [],
@@ -2429,10 +2456,23 @@ def _compare_candidate_to_current(
     report["candidate_metrics"] = candidate
     report["champion_metrics"] = champion
     if any(candidate.get(key) is None or champion.get(key) is None for key in candidate):
+        missing_reasons = []
+        for role, metrics in (("candidate", candidate), ("champion", champion)):
+            no_loss_denominator = metrics["profit_factor"] is None and all(
+                (evaluation.get(role, {}).get(side) or {}).get("profit_factor_status")
+                == "no_loss_denominator" for side in ("long", "short")
+            )
+            if no_loss_denominator:
+                missing_reasons.append(f"{role}_profit_factor_no_loss_denominator")
+            if any(
+                value is None and (key != "profit_factor" or not no_loss_denominator)
+                for key, value in metrics.items()
+            ):
+                missing_reasons.append("champion_comparison_metric_missing")
         return {
             **report,
             "reason": "champion_retained",
-            "blocking_reasons": ["champion_comparison_metric_missing"],
+            "blocking_reasons": list(dict.fromkeys(missing_reasons)),
             "champion_version": current.get("version"),
         }
     blockers: list[str] = []

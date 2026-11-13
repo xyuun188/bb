@@ -7,7 +7,7 @@ from typing import Any
 
 from services.ml_training_contract import MIN_TRAINING_SAMPLE_COUNT
 
-MODEL_CHAMPION_POLICY_VERSION = "2026-11-11.paired-artifact-champion.v3"
+MODEL_CHAMPION_POLICY_VERSION = "2026-11-13.pooled-profit-factor-champion.v4"
 PAIRED_COMPARISON_VERSION = "2026-11-11.common-unfitted-holdout.v1"
 
 _STAGE_RANK = {
@@ -53,7 +53,7 @@ def _aggregate(
     metadata: dict[str, Any], sides: tuple[str, ...]
 ) -> dict[str, float | None]:
     metrics = [_side_metrics(metadata, side) for side in sides]
-    return {
+    aggregate = {
         key: (
             _average([side[key] for side in metrics])
             if all(side[key] is not None for side in metrics)
@@ -62,11 +62,24 @@ def _aggregate(
         for key in (
             "avg_return_pct",
             "return_lcb_pct",
-            "profit_factor",
             "cvar_10_pct",
             "max_drawdown_pct",
         )
     }
+    evidence = _dict(metadata.get("oos_return_evaluation"))
+    totals = [_dict(evidence.get(side)) for side in sides]
+    gains = [_float(row.get("gross_profit_pct")) for row in totals]
+    losses = [_float(row.get("gross_loss_pct")) for row in totals]
+    complete = all(
+        (_float(row.get("count")) or 0) > 0 for row in totals
+    ) and all(value is not None and value >= 0 for value in [*gains, *losses])
+    gross_loss = sum(value for value in losses if value is not None)
+    # Preserve the undefined zero-loss ratio; never invent an infinite sentinel.
+    aggregate["profit_factor"] = (
+        sum(value for value in gains if value is not None) / gross_loss
+        if complete and gross_loss > 1e-12 else None
+    )
+    return aggregate
 
 
 def _training_data_version(metadata: dict[str, Any] | None) -> str:
@@ -248,7 +261,20 @@ def compare_candidate_to_champion(
     if missing:
         report["blocking_reasons"] = [
             f"champion_comparison_metric_missing:{key}" for key in missing
+            if key != "profit_factor"
         ]
+        if "profit_factor" in missing:
+            for role, metrics in (("candidate", candidate_aggregate), ("champion", champion_aggregate)):
+                if metrics["profit_factor"] is not None:
+                    continue
+                no_losses = all(
+                    _dict(_dict(evaluation.get(role)).get(side)).get("profit_factor_status")
+                    == "no_loss_denominator" for side in comparison_sides
+                )
+                report["blocking_reasons"].append(
+                    f"{role}_profit_factor_no_loss_denominator" if no_losses
+                    else "champion_comparison_metric_missing:profit_factor"
+                )
         return report
 
     assert all(value is not None for value in candidate_aggregate.values())
