@@ -2065,6 +2065,72 @@ def test_open_interest_feature_requires_explicit_usd_unit(unit, expected) -> Non
     assert row["log_open_interest_value"] == pytest.approx(expected)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "short_returns_timeframe",
+        "technical_indicator_timeframe",
+        "volume_ratio_timeframe",
+        "entry_activity_volume_timeframe",
+    ],
+)
+def test_ml_features_distinguish_indicator_observation_periods(source: str) -> None:
+    snapshot = {"current_price": 100.0, "returns_20": 0.01, "volume_ratio": 1.2}
+    one_minute = ml_signal_module._feature_row_from_snapshot({**snapshot, source: "1m"})
+    five_minutes = ml_signal_module._feature_row_from_snapshot({**snapshot, source: "5m"})
+    key = f"{source}_minutes"
+    assert one_minute[key] == 1.0
+    assert five_minutes[key] == 5.0
+    assert one_minute != five_minutes
+    assert one_minute["returns_20"] == five_minutes["returns_20"] == 0.01
+    assert list(one_minute) == FEATURE_KEYS
+
+
+@pytest.mark.parametrize(
+    "timeframe,expected",
+    [("1h", 60.0), ("4H", 240.0), ("1D", 1440.0), ("", 0.0),
+     (None, 0.0), ("garbage", 0.0), ("1M", 0.0), ("0m", 0.0)],
+)
+def test_ml_timeframe_encoding_keeps_unknown_sources_explicit(timeframe, expected) -> None:
+    row = ml_signal_module._feature_row_from_snapshot({"short_returns_timeframe": timeframe})
+    assert row["short_returns_timeframe_minutes"] == expected
+
+
+def test_live_and_training_feature_encoders_keep_the_same_timeframe_context() -> None:
+    from data_feed.feature_vector import build_feature_vector
+
+    indicators = {
+        "returns_20": 0.01, "short_returns_timeframe": "1m",
+        "technical_indicator_timeframe": "1h", "volume_ratio_timeframe": "5m",
+        "entry_activity_volume_timeframe": "1m",
+    }
+    features = build_feature_vector("BTC/USDT", indicators=indicators)
+    live = ml_signal_module._feature_row_from_feature_vector(features, horizon_minutes=240)
+    frozen = ml_signal_module._feature_row_from_snapshot(
+        features.to_dict(), horizon_minutes=240,
+    )
+    assert live == frozen
+    assert live["short_returns_timeframe_minutes"] == 1.0
+    assert live["technical_indicator_timeframe_minutes"] == 60.0
+    assert live["volume_ratio_timeframe_minutes"] == 5.0
+    assert live["entry_activity_volume_timeframe_minutes"] == 1.0
+
+
+def test_training_frame_preserves_each_frozen_observation_period() -> None:
+    snapshot = {
+        "technical_indicator_timeframe": "1h", "short_returns_timeframe": "5m",
+        "volume_ratio_timeframe": "1h", "entry_activity_volume_timeframe": "1m",
+    }
+    row = _shadow_row(1, feature_snapshot=snapshot)
+    frame = build_training_frame([row])
+    assert len(frame) == 1
+    for source, minutes in zip(
+        ml_signal_module.INDICATOR_TIMEFRAME_KEYS, (60, 5, 60, 1), strict=True,
+    ):
+        assert frame.iloc[0][f"{source}_minutes"] == minutes
+        assert row.feature_snapshot[source] == snapshot[source]
+
+
 def test_bundle_feature_columns_must_exactly_match_runtime_contract(tmp_path: Path) -> None:
     metadata = _with_return_objective({"artifact_version": "wrong-feature-columns"})
     service = _service_with_registered_bundle(

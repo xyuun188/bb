@@ -95,7 +95,12 @@ _REMOTE_TRAINING_MAX_SEQUENCE_LENGTH = 128
 _REMOTE_TRAINING_MAX_TEXT_SAMPLES = 128
 _SEQUENCE_ROWS_PER_SERIES_LIMIT = _REMOTE_TRAINING_MAX_SEQUENCE_LENGTH
 _LOCAL_ML_TRAINING_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
+_LOCAL_AI_TOOLS_TEXT_FEATURE_KEYS = {
+    "symbol", "open_interest_value_unit", "technical_indicator_timeframe",
+    "short_returns_timeframe", "volume_ratio_timeframe", "entry_activity_volume_timeframe",
+}
 _LOCAL_AI_TOOLS_FEATURE_KEYS = {
+    *_LOCAL_AI_TOOLS_TEXT_FEATURE_KEYS,
     "change_24h_pct",
     "spread_pct",
     "rsi_14",
@@ -124,7 +129,6 @@ _LOCAL_AI_TOOLS_FEATURE_KEYS = {
     "round_trip_fee_pct",
     "volume_24h",
     "open_interest_value",
-    "open_interest_value_unit",
     "orderbook_imbalance",
     "orderbook_bid_depth",
     "orderbook_ask_depth",
@@ -134,7 +138,6 @@ _LOCAL_AI_TOOLS_FEATURE_KEYS = {
     "news_article_count",
     "decision_confidence",
     "horizon_minutes",
-    "symbol",
 }
 _LOCAL_AI_TOOLS_SEQUENCE_KEYS = {
     "close_sequence",
@@ -303,7 +306,7 @@ def _compact_local_ai_tools_features(features: dict[str, Any]) -> dict[str, Any]
     for key in _LOCAL_AI_TOOLS_FEATURE_KEYS:
         if key not in features:
             continue
-        if key in {"symbol", "open_interest_value_unit"}:
+        if key in _LOCAL_AI_TOOLS_TEXT_FEATURE_KEYS:
             symbol = str(features.get(key) or "").strip()
             if symbol:
                 compact[key] = symbol[:40]
@@ -404,7 +407,7 @@ def _training_transport_features(features: Any) -> dict[str, Any]:
         if key not in features:
             continue
         value = features.get(key)
-        if key in {"symbol", "open_interest_value_unit"}:
+        if key in _LOCAL_AI_TOOLS_TEXT_FEATURE_KEYS:
             text = str(value or "").strip()
             if text:
                 compact[key] = text[:40]

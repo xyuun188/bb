@@ -127,7 +127,7 @@ LOCAL_ML_TRAINING_SCHEDULER_ID = "local_ml_auto_train"
 AUTO_TRAIN_RETRY_INTERVAL_SECONDS = 5 * 60
 AUTO_TRAIN_LEASE_STALE_SECONDS = 2 * 60 * 60
 MIN_ACTIVE_WALK_FORWARD_FOLDS = 2
-FEATURE_CONTRACT_VERSION = "2026-11-11.explicit-usd-open-interest.v3"
+FEATURE_CONTRACT_VERSION = "2026-11-13.explicit-indicator-timeframes.v4"
 MULTITASK_PREDICTION_CONTRACT_VERSION = "2026-11-10.signed-funding-cost.v3"
 REPLAY_WEIGHT_POLICY_VERSION = "2026-11-12.outcome-independent-return-weights.v4"
 _TRAINING_CANDIDATE_CACHE: dict[
@@ -162,6 +162,13 @@ _LOCAL_ML_PARAMS = DEFAULT_TRADING_PARAMS.local_ml_training
 AUTO_TRAIN_CHECK_INTERVAL_SECONDS = _LOCAL_ML_PARAMS.auto_train_check_interval_seconds
 FULL_TRAINING_PROBE_INTERVAL_SECONDS = 6 * 60 * 60
 LOCAL_ML_RESOURCE_RECOVERY_FRACTIONS = (0.75, 0.50, 0.35)
+
+INDICATOR_TIMEFRAME_KEYS = (
+    "technical_indicator_timeframe",
+    "short_returns_timeframe",
+    "volume_ratio_timeframe",
+    "entry_activity_volume_timeframe",
+)
 
 FEATURE_KEYS = [
     "abnormal_wick_count_72h",
@@ -209,6 +216,7 @@ FEATURE_KEYS = [
     "direct_news_item_count",
     "market_news_item_count",
     "sequence_length",
+    *(f"{key}_minutes" for key in INDICATOR_TIMEFRAME_KEYS),
     "horizon_minutes",
     "regime_trending",
     "regime_volatile",
@@ -241,6 +249,18 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return result
     except (TypeError, ValueError):
         return default
+
+
+def _indicator_timeframe_minutes(value: Any) -> float:
+    """Encode observed candle periods; zero means unknown, never a fallback."""
+
+    text = str(value or "").strip().replace("H", "h").replace("D", "d").replace("W", "w")
+    periods = {
+        "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+        "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720,
+        "1d": 1440, "1w": 10080,
+    }
+    return float(periods.get(text, 0))
 
 
 def _market_regime_label(features: dict[str, Any]) -> str:
@@ -409,6 +429,11 @@ def _feature_row_from_snapshot(
         "news_shock_present": 1.0 if direct_news_count > 0.0 else 0.0,
         "major_asset": 1.0 if base_asset in {"BTC", "ETH", "SOL", "BNB"} else 0.0,
     }
+    # Identical returns over 20 minutes and 100 minutes are different inputs.
+    values.update({
+        f"{key}_minutes": _indicator_timeframe_minutes(snapshot.get(key))
+        for key in INDICATOR_TIMEFRAME_KEYS
+    })
     return {key: float(values.get(key, 0.0)) for key in FEATURE_KEYS}
 
 

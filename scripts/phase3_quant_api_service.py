@@ -93,6 +93,12 @@ LOCAL_REVIEW_DISABLED_DETAIL = (
     "Configure HIGH_RISK_REVIEW_* in the trading app to an online reviewer."
 )
 
+# This standalone service cannot import the platform feature encoder. Keep the
+# observed period keys and encoding aligned with services/ml_signal_service.py.
+INDICATOR_TIMEFRAME_KEYS = (
+    "technical_indicator_timeframe", "short_returns_timeframe",
+    "volume_ratio_timeframe", "entry_activity_volume_timeframe",
+)
 FEATURE_KEYS = [
     "change_24h_pct", "spread_pct", "rsi_14", "rsi_7", "macd", "macd_signal",
     "macd_diff", "stoch_k", "adx_14", "bb_width", "bb_pct", "atr_pct",
@@ -100,9 +106,10 @@ FEATURE_KEYS = [
     "price_vs_sma20", "price_vs_sma50", "funding_rate", "log_volume_24h",
     "log_open_interest_value", "orderbook_imbalance", "orderbook_depth_ratio",
     "news_sentiment_avg", "social_sentiment_avg", "social_mention_count",
-    "news_article_count", "horizon_minutes",
+    "news_article_count", *(f"{key}_minutes" for key in INDICATOR_TIMEFRAME_KEYS),
+    "horizon_minutes",
 ]
-FEATURE_PROBABILITY_CONTRACT_VERSION = "2026-11-11.explicit-usd-open-interest.v3"
+FEATURE_PROBABILITY_CONTRACT_VERSION = "2026-11-13.explicit-indicator-timeframes.v4"
 SENTIMENT_KEYS = ["news_sentiment_avg", "social_sentiment_avg", "social_mention_count", "news_article_count"]
 PROFIT_TRAINING_TARGET = "net_return_after_all_cost_pct"
 RETURN_OBJECTIVE_NAME = "maximize_expected_realized_net_return_after_cost"
@@ -1601,6 +1608,16 @@ def _paper_bootstrap_contract_blockers(metadata: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(blockers))
 
 
+def _indicator_timeframe_minutes(value: Any) -> float:
+    text = str(value or "").strip().replace("H", "h").replace("D", "d").replace("W", "w")
+    periods = {
+        "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+        "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720,
+        "1d": 1440, "1w": 10080,
+    }
+    return float(periods.get(text, 0))
+
+
 def feature_row(features: dict[str, Any], *, horizon_minutes: int | None = None) -> dict[str, float]:
     price = f(features, "current_price", f(features, "close", 0.0))
     atr = f(features, "atr_14")
@@ -1644,6 +1661,10 @@ def feature_row(features: dict[str, Any], *, horizon_minutes: int | None = None)
         "news_article_count": f(features, "news_article_count"),
         "horizon_minutes": float(horizon_minutes if horizon_minutes is not None else f(features, "horizon_minutes", 10.0)),
     }
+    values.update({
+        f"{key}_minutes": _indicator_timeframe_minutes(features.get(key))
+        for key in INDICATOR_TIMEFRAME_KEYS
+    })
     return {key: float(values.get(key, 0.0)) for key in FEATURE_KEYS}
 
 

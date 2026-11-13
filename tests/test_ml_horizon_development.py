@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from services import ml_development_snapshot as snapshots
 from services import ml_horizon_development as research
 from services.ml_development_snapshot import (
     load_development_snapshot,
@@ -113,9 +114,28 @@ def test_snapshot_preserves_canonical_symbols_and_uses_them_for_parallel_capacit
     assert development["symbol"].tolist() == [
         "BTC/USDT", "ETH/USDT", "BTC/USDT", "ETH/USDT"
     ]
-    assert snapshot["version"] == "2026-11-06.symbol-bound-frozen-development.v2"
+    assert snapshot["version"] == "2026-11-13.timeframe-bound-frozen-development.v3"
     views = research._views(development, np.array(["long", "short", "long", "short"]))
     assert views["nonoverlapping"]["selected_count"] == 4
+
+
+def test_snapshot_binds_indicator_periods_and_rejects_legacy_feature_schema():
+    frame = _frame()
+    frame["short_returns_timeframe_minutes"] = 1.0
+    _, one_minute = _snapshot(frame)
+    frame["short_returns_timeframe_minutes"] = 5.0
+    _, five_minutes = _snapshot(frame)
+    assert one_minute["development_input_sha256"] != five_minutes["development_input_sha256"]
+    legacy = copy.deepcopy(one_minute)
+    legacy["version"] = "2026-11-06.symbol-bound-frozen-development.v2"
+    for row in legacy["records"]:
+        for key in tuple(row):
+            if key.endswith("_timeframe_minutes"):
+                del row[key]
+    payload = {key: value for key, value in legacy.items() if key != "snapshot_sha256"}
+    legacy["snapshot_sha256"] = snapshots._digest(payload)
+    with pytest.raises(ValueError, match="integrity failure"):
+        snapshot_frame(legacy, cutoff=CUTOFF)
 
 
 def test_missing_symbol_forces_conservative_global_nonoverlap_fallback():

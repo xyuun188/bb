@@ -53,6 +53,16 @@ def test_open_interest_unit_survives_training_compaction_and_transport() -> None
     assert train_script._training_transport_features(compact) == features
 
 
+def test_indicator_periods_survive_training_compaction_and_transport() -> None:
+    features = {
+        "technical_indicator_timeframe": "1h", "short_returns_timeframe": "5m",
+        "volume_ratio_timeframe": "1h", "entry_activity_volume_timeframe": "1m",
+    }
+    compact = train_script._compact_local_ai_tools_features(features)
+    assert compact == features
+    assert train_script._training_transport_features(compact) == features
+
+
 @pytest.fixture(autouse=True)
 def _current_training_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(

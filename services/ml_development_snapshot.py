@@ -18,10 +18,10 @@ from services.ml_development_baselines import _development_input_sha256
 from services.ml_signal_service import FEATURE_KEYS, _decision_group_availability
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 
-SNAPSHOT_VERSION = "2026-11-06.symbol-bound-frozen-development.v2"
-REPLAY_SNAPSHOT_VERSION = "2026-11-10.replay-metadata-frozen-development.v3"
+SNAPSHOT_VERSION = "2026-11-13.timeframe-bound-frozen-development.v3"
+REPLAY_SNAPSHOT_VERSION = "2026-11-13.timeframe-replay-frozen-development.v4"
 REPLAY_METADATA_COLUMNS = ("decision_action", "decision_confidence", "best_action", "market_regime")
-SNAPSHOT_FILENAME = "frozen_development_v2.json"
+SNAPSHOT_FILENAME = "frozen_development_v3.json"
 SNAPSHOT_COLUMNS = list(dict.fromkeys([
     "id", "decision_group", "symbol", "decision_timestamp", "label_timestamp",
     "horizon_minutes", *FEATURE_KEYS,

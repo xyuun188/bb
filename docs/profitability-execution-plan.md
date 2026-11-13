@@ -380,3 +380,50 @@ Reconciliation also retires a persisted champion from an obsolete score or entry
 contract before considering current validated candidates. This prevents stale
 metrics or a rollback from deferring an otherwise eligible current candidate to
 the next evaluator cycle; it grants no permission when current validation fails.
+
+## November 13 Indicator Period Identity
+
+A frozen 4,988-group development window contains 3,056 short-return snapshots
+from one-minute candles and 1,932 from five-minute candles. Both used the same
+`returns_1`, `returns_5`, `returns_20`, and volatility columns, while the model
+discarded their observed candle period. A 20-minute return and a 100-minute
+return could therefore produce identical model inputs. The trend, volume and
+entry-activity periods were also omitted.
+
+The feature encoder now preserves all four observed periods as explicit minute
+features in training, single-row inference and batch replay. Missing or unknown
+periods remain zero (unknown); they are never guessed from current settings or
+the prediction horizon. The feature contract and immutable development snapshot
+schemas change together, so old artifacts and frozen frames cannot silently use
+the new input schema. Existing sealed market snapshots are not rewritten.
+
+The regression first reproduced the collision, then verified distinct inputs,
+known and unknown intervals, frozen training rows and live encoder parity. This
+fix addresses an input ambiguity, not proven profitability. On the same purged
+development folds, adding period context alone still selected 11 shorts with
+negative fee-after mean; it is not a profitable challenger.
+
+A separate preregistered four-arm diagnostic compared the unchanged recipe,
+price-unit normalization, ATR-normalized targets, and both changes. The combined
+arm improved aggregate fee-after opportunity mean to `+0.12011%` (PF `1.16771`),
+but its return LCB was `-0.03188%`. Under the existing three-position capacity
+limit it produced 12 observations with mean `+1.00614%`, PF `3.11860`, and LCB
+`-0.12786%`; the first chronological fold still lost money. All four arms failed
+qualification. These are inspected development counterfactuals, not executed
+PnL or an untouched exam. Neither normalization change is enabled in production,
+and no failed result authorizes a trade or an increase in exposure.
+
+The same missing period identity also affected the standalone model server.
+Its training projection discarded the four period strings before transport,
+and its separate feature encoder omitted them. Both are repaired together with
+the local ML encoder. An end-to-end regression verifies that compaction,
+transport, standalone training and live inputs preserve the same period values;
+legacy remote probability artifacts require rebuilding under the new contract.
+
+A second registered diagnostic tested direction-reflected fitting to remove a
+historical short intercept. Reflected rows had half weight and were used only
+for fitting; all validation outcomes were original observations. Costs, tail
+classifiers, risk rules and capacity limits remained in force. The symmetric
+candidate selected four longs and one short, but only two capacity observations
+and a negative return LCB remained. This demonstrates that removing directional
+bias alone does not establish a profitable executable strategy. It is not enabled.

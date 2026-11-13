@@ -376,6 +376,29 @@ def test_quant_open_interest_feature_requires_explicit_usd_unit(unit, expected) 
     assert module.feature_row(snapshot)["log_open_interest_value"] == pytest.approx(expected)
 
 
+@pytest.mark.parametrize("period", ["1m", "5m", "1h", "4H", "1D", "", None, "1M", "bad"])
+def test_quant_and_local_ml_preserve_the_same_observed_indicator_periods(period) -> None:
+    from scripts.train_local_ai_tools_models import (
+        _compact_local_ai_tools_features,
+        _training_transport_features,
+    )
+    from services import ml_signal_service as ml
+
+    module = ModuleType("local_ai_tools_indicator_periods_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    snapshot = {key: period for key in ml.INDICATOR_TIMEFRAME_KEYS}
+    training = _training_transport_features(_compact_local_ai_tools_features(snapshot))
+    remote = module.feature_row(training)
+    live = module.feature_row(snapshot)
+    local = ml._feature_row_from_snapshot(snapshot)
+    assert remote == live
+    for key in ml.INDICATOR_TIMEFRAME_KEYS:
+        assert remote[f"{key}_minutes"] == local[f"{key}_minutes"]
+    assert module.model_x({"short_returns_timeframe": "1m"}) != module.model_x(
+        {"short_returns_timeframe": "5m"}
+    )
+
+
 def test_quant_rejects_artifacts_from_the_old_probability_contract(tmp_path: Path) -> None:
     module = ModuleType("local_ai_tools_old_probability_contract_test")
     exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
