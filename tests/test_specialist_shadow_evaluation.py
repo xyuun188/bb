@@ -12,6 +12,9 @@ from db.session import close_db, get_engine, get_session_ctx, init_db
 from models.learning import ShadowBacktest
 from scripts import run_specialist_shadow_evaluation as runner
 from services import specialist_shadow_evaluation as specialist_evaluation
+from services.continuous_model_weight import ContinuousModelWeightPolicy
+from services.entry_direction_competition import _paper_quant_quality_permissions
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.specialist_shadow_evaluation import (
     SpecialistShadowEvaluationAccumulator,
@@ -334,6 +337,10 @@ def test_local_ml_shadow_settles_its_own_decision_time_prediction() -> None:
     assert local["actual_inference_count"] == 1
     assert local["avg_shadow_return_after_all_cost_pct"] > 0.0
     assert local["promotion_ready"] is False
+    entry = local["entry_return_evaluation"]
+    assert entry["version"] == ENTRY_COHORT_VERSION
+    assert entry["direction_count"] == 1
+    assert entry["avg_shadow_return_after_all_cost_pct"] == local["avg_shadow_return_after_all_cost_pct"]
 
 
 def test_local_ml_shadow_does_not_settle_other_model_shadow_sides() -> None:
@@ -365,6 +372,143 @@ def test_local_ml_shadow_does_not_settle_other_model_shadow_sides() -> None:
     assert local["avg_shadow_return_after_all_cost_pct"] != timeseries[
         "avg_shadow_return_after_all_cost_pct"
     ]
+
+
+def _local_ml_row(*, index=1, realized=0.42, version="local-ml-v7"):
+    row = _row(index=index, realized=realized)
+    row.feature_snapshot["local_ml_shadow"] = {
+        "available": True,
+        "actual_inference": True,
+        "model_version": version,
+        "primary_horizon_minutes": 10,
+        "predictions": [{
+            "horizon_minutes": 10,
+            "best_side": "long",
+            "long": {"objective_net_return_pct": 0.25},
+            "short": {"objective_net_return_pct": -0.20},
+        }],
+    }
+    return row
+
+
+@pytest.mark.parametrize("realized", [-0.5, 0.5])
+def test_local_ml_entry_cohort_excludes_hold_predictions_regardless_of_outcome(realized):
+    row = _local_ml_row(realized=realized)
+    prediction = row.feature_snapshot["local_ml_shadow"]["predictions"][0]
+    prediction["long"]["objective_net_return_pct"] = -0.1
+    prediction["short"]["objective_net_return_pct"] = -0.2
+
+    local = next(item for item in summarize_specialist_shadow_evaluation([row])["models"]
+                 if item["tool"] == "local_ml")
+
+    assert local["direction_count"] == 1
+    assert local["entry_return_evaluation"]["direction_count"] == 0
+    assert local["entry_return_evaluation"]["shadow_return_lcb_pct"] is None
+
+
+def test_local_ml_positive_entry_keeps_losses_and_separates_model_versions():
+    loss = _local_ml_row(realized=-0.5)
+    win = _local_ml_row(index=2, realized=0.5, version="other-version")
+    report = summarize_specialist_shadow_evaluation([loss, win])
+    models = {item["model"]: item for item in report["models"] if item["tool"] == "local_ml"}
+
+    entry = models["local-ml-v7"]["entry_return_evaluation"]
+    assert entry["direction_count"] == 1
+    assert entry["gross_loss_return_pct"] > 0.5
+    assert entry["gross_profit_return_pct"] == 0.0
+    assert entry["shadow_return_lcb_pct"] < 0.0
+    assert models["other-version"]["entry_return_evaluation"]["shadow_return_lcb_pct"] > 0.0
+
+
+@pytest.mark.parametrize("invalid", [
+    "missing_other_side", "expected_only", "gross_only", "nan", "infinity",
+    "wrong_best_side", "zero", "unavailable", "no_inference", "no_primary", "other_primary",
+    "incomplete_cost",
+])
+def test_local_ml_entry_cohort_requires_complete_frozen_primary_prediction(invalid):
+    row = _local_ml_row()
+    shadow = row.feature_snapshot["local_ml_shadow"]
+    prediction = shadow["predictions"][0]
+    if invalid == "missing_other_side":
+        prediction.pop("short")
+    elif invalid in {"expected_only", "gross_only"}:
+        key = "expected_net_return_pct" if invalid == "expected_only" else "objective_expected_return_pct"
+        prediction["long"] = {key: 10.0}
+    elif invalid in {"nan", "infinity"}:
+        prediction["long"]["objective_net_return_pct"] = float("nan" if invalid == "nan" else "inf")
+    elif invalid == "wrong_best_side":
+        prediction["best_side"] = "short"
+    elif invalid == "zero":
+        prediction["long"]["objective_net_return_pct"] = 0.0
+    elif invalid == "unavailable":
+        shadow["available"] = False
+    elif invalid == "no_inference":
+        shadow["actual_inference"] = False
+    elif invalid == "no_primary":
+        shadow.pop("primary_horizon_minutes")
+    elif invalid == "other_primary":
+        shadow["primary_horizon_minutes"] = 240
+    else:
+        row.feature_snapshot["funding_data_available"] = False
+
+    report = summarize_specialist_shadow_evaluation([row])
+    local = next(item for item in report["models"] if item["tool"] == "local_ml")
+    assert local["entry_return_evaluation"]["direction_count"] == 0
+
+
+def test_local_ml_positive_entry_selects_short_and_uses_long_on_ties():
+    short_row = _local_ml_row()
+    prediction = short_row.feature_snapshot["local_ml_shadow"]["predictions"][0]
+    prediction["short"]["objective_net_return_pct"] = 0.5
+    prediction["best_side"] = "short"
+    tie_row = _local_ml_row(index=2)
+    tie_row.feature_snapshot["local_ml_shadow"]["predictions"][0]["short"]["objective_net_return_pct"] = 0.25
+
+    report = summarize_specialist_shadow_evaluation([short_row, tie_row])
+    local = next(item for item in report["models"] if item["tool"] == "local_ml")
+    entry = local["entry_return_evaluation"]
+    assert entry["direction_count"] == 2
+    assert [event["predicted_side"] for event in entry["shadow_events"]] == ["short", "long"]
+    assert entry["gross_loss_return_pct"] > 0
+    assert entry["gross_profit_return_pct"] > 0
+
+
+def test_local_ml_other_horizon_cannot_duplicate_primary_entry_evidence():
+    primary = _local_ml_row()
+    other = _local_ml_row(index=2)
+    other.horizon_minutes = 30
+    other.feature_snapshot["local_ml_shadow"]["predictions"].append({
+        "horizon_minutes": 30,
+        "best_side": "long",
+        "long": {"objective_net_return_pct": 0.5},
+        "short": {"objective_net_return_pct": 0.25},
+    })
+    report = summarize_specialist_shadow_evaluation([primary, other])
+    local = next(item for item in report["models"] if item["tool"] == "local_ml")
+    assert local["direction_count"] == 2
+    assert local["entry_return_evaluation"]["direction_count"] == 1
+
+
+@pytest.mark.parametrize("profitable", [False, True])
+def test_frozen_local_ml_entry_outcomes_reach_only_the_matching_model_permission(profitable):
+    sign = 1 if profitable else -1
+    rows = [_local_ml_row(realized=sign * 0.5)]
+    for index in range(2, 12):
+        hold = _local_ml_row(index=index, realized=-sign * 5.0)
+        hold.feature_snapshot["local_ml_shadow"]["predictions"][0]["long"]["objective_net_return_pct"] = -0.1
+        rows.append(hold)
+    specialist = summarize_specialist_shadow_evaluation(rows)
+    weights = ContinuousModelWeightPolicy().build(
+        execution_mode="paper", market_regime={}, health_report={},
+        specialist_report=specialist, contribution_performance={},
+    )
+    strategy = {"execution_mode": "paper", "continuous_model_weights": weights}
+    permission = _paper_quant_quality_permissions(strategy, {"model_version": "local-ml-v7"})["local_ml"]
+    assert permission["paper_execution_permission"] is profitable
+    assert permission["paper_execution_evidence"]["sample_count"] == 1
+    assert _paper_quant_quality_permissions(strategy, {"model_version": "other-version"})["local_ml"][
+        "paper_execution_permission"
+    ] is False
 
 
 def test_specialist_shadow_evaluation_reports_timesfm_challenger_metrics() -> None:

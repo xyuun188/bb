@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from services.execution_cost_model import funding_cost_estimate, shadow_execution_cost_estimate
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION, positive_objective_entry_rows
 from services.profit_supervision import (
     PROFIT_SUPERVISION_VERSION,
     shadow_fee_after_return_labels,
@@ -135,6 +136,33 @@ def _local_ml_shadow_candidate(
             or "local_ml_prediction_unavailable"
         ),
     }
+
+
+def _local_ml_positive_entry(row: Any, shadow: dict[str, Any]) -> bool:
+    """Use frozen primary-horizon objectives, never realized returns, to select entries."""
+
+    if shadow.get("actual_inference") is not True or shadow.get("available") is not True:
+        return False
+    primary = _safe_float(shadow.get("primary_horizon_minutes"), None)
+    if (
+        primary is None
+        or primary <= 0
+        or _safe_float(_row_get(row, "horizon_minutes"), None) != primary
+    ):
+        return False
+    prediction = _local_ml_prediction_for_row(row, shadow)
+    scores = {
+        side: _safe_float(_safe_dict(prediction.get(side)).get("objective_net_return_pct"), None)
+        for side in ("long", "short")
+    }
+    if any(value is None for value in scores.values()):
+        return False
+    selected = positive_objective_entry_rows({
+        side: [{"decision_group": "frozen_prediction", "score": score}]
+        for side, score in scores.items()
+    })
+    side = _safe_str(prediction.get("best_side")).lower()
+    return bool(selected.get(side))
 
 
 def _cost_complete_shadow_return(
@@ -927,7 +955,7 @@ def _record_shadow_candidate(
     actual_side: str,
     symbol: str,
     accumulator: SpecialistShadowEvaluationAccumulator,
-) -> None:
+) -> bool:
     """Settle one decision-time candidate without reusing another source's PnL."""
 
     metric["sample_count"] += 1
@@ -950,17 +978,17 @@ def _record_shadow_candidate(
                 "market_regime": _market_regime(row),
             },
         )
-        return
+        return False
     legacy_mixed_shadow = bool(candidate.get("legacy_mixed_shadow"))
     if legacy_mixed_shadow:
         metric["legacy_mixed_shadow_count"] += 1
         metric["legacy_quarantined_count"] += 1
-        return
+        return False
     metric["actual_inference_count"] += 1
     predicted_side = _safe_str(candidate.get("direction")).lower()
     gross_return = _actual_return_for_side(row, predicted_side)
     if predicted_side not in {"long", "short"} or gross_return is None:
-        return
+        return False
     cost_complete_return = _cost_complete_shadow_return(
         row,
         side=predicted_side,
@@ -968,7 +996,7 @@ def _record_shadow_candidate(
     )
     if cost_complete_return is None:
         accumulator.skipped_reasons["shadow_execution_cost_incomplete"] += 1
-        return
+        return False
     actual_return, execution_cost = cost_complete_return
     metric["direction_count"] += 1
     metric["realized_return_sum_pct"] += actual_return
@@ -1022,6 +1050,7 @@ def _record_shadow_candidate(
     if expected is not None:
         metric["expected_return_sum_pct"] += expected
         metric["expected_return_count"] += 1
+    return True
 
 
 class SpecialistShadowEvaluationAccumulator:
@@ -1188,7 +1217,7 @@ class SpecialistShadowEvaluationAccumulator:
         )
         actual_side = _actual_best_side(row)
         symbol = _safe_str(_row_get(row, "symbol")) or _safe_str(_features(row).get("symbol"))
-        _record_shadow_candidate(
+        settled = _record_shadow_candidate(
             metric,
             row,
             tool_name="local_ml",
@@ -1198,6 +1227,18 @@ class SpecialistShadowEvaluationAccumulator:
             symbol=symbol,
             accumulator=self,
         )
+        entry_metric = metric.setdefault("entry_metric", _empty_metric("local_ml", model_name))
+        if settled and _local_ml_positive_entry(row, tool):
+            _record_shadow_candidate(
+                entry_metric,
+                row,
+                tool_name="local_ml",
+                model_name=model_name,
+                candidate=candidate,
+                actual_side=actual_side,
+                symbol=symbol,
+                accumulator=self,
+            )
 
 
 def summarize_specialist_shadow_evaluation(
@@ -1320,7 +1361,17 @@ def summarize_specialist_shadow_evaluation(
                 metric["authoritative_evidence"].append(evidence)
                 metric["authoritative_events"].append(evidence)
 
-    model_rows = [_finalize_metric(metric) for metric in metrics.values()]
+    model_rows = []
+    for metric in metrics.values():
+        model_row = _finalize_metric(metric)
+        if metric["tool"] == "local_ml":
+            entry_metric = metric.get("entry_metric") or _empty_metric("local_ml", metric["model"])
+            model_row["entry_return_evaluation"] = {
+                "version": ENTRY_COHORT_VERSION,
+                "scope": "decision_time_primary_positive_objective_after_cost",
+                **_finalize_metric(entry_metric),
+            }
+        model_rows.append(model_row)
     model_rows.sort(
         key=lambda item: (
             bool(item.get("promotion_ready")),

@@ -11,6 +11,7 @@ from services.continuous_model_weight import (
     ContinuousModelWeightPolicy,
     market_regime_name,
 )
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION
 
 
 def _bucket(pnls: list[float]) -> dict:
@@ -173,6 +174,13 @@ def test_local_model_quality_does_not_mix_replaced_model_returns() -> None:
                 "avg_shadow_return_after_all_cost_pct": average,
                 "shadow_return_lcb_pct": lower_bound,
                 "gross_profit_return_pct": profit, "gross_loss_return_pct": loss,
+                "entry_return_evaluation": {
+                    "version": ENTRY_COHORT_VERSION,
+                    "direction_count": 100,
+                    "avg_shadow_return_after_all_cost_pct": average,
+                    "shadow_return_lcb_pct": lower_bound,
+                    "gross_profit_return_pct": profit, "gross_loss_return_pct": loss,
+                },
             }
             for version, average, lower_bound, profit, loss in [
                 ("replaced", -2.0, -3.0, 10.0, 210.0),
@@ -202,6 +210,12 @@ def test_local_model_without_cost_complete_samples_cannot_borrow_other_model_pro
                 "avg_shadow_return_after_all_cost_pct": 5.0,
                 "shadow_return_lcb_pct": 4.0,
                 "gross_profit_return_pct": 150.0, "gross_loss_return_pct": 0.0,
+                "entry_return_evaluation": {
+                    "version": ENTRY_COHORT_VERSION, "direction_count": 30,
+                    "avg_shadow_return_after_all_cost_pct": 5.0,
+                    "shadow_return_lcb_pct": 4.0,
+                    "gross_profit_return_pct": 150.0, "gross_loss_return_pct": 0.0,
+                },
             },
             {"tool": "local_ml", "model": "current", "direction_count": 0},
         ]},
@@ -210,6 +224,52 @@ def test_local_model_without_cost_complete_samples_cannot_borrow_other_model_pro
     assert versions["replaced"]["paper_execution_permission"] is True
     assert versions["current"]["paper_execution_permission"] is False
     assert versions["current"]["paper_execution_evidence"]["sample_count"] == 0
+
+
+@pytest.mark.parametrize("entry_profitable", [False, True])
+def test_local_model_permission_uses_positive_entry_cohort_instead_of_all_predictions(entry_profitable):
+    entry_sign = 1 if entry_profitable else -1
+    report = _build(
+        ContinuousModelWeightPolicy(),
+        specialist={"models": [{
+            "tool": "local_ml", "model": "current", "direction_count": 1000,
+            "avg_shadow_return_after_all_cost_pct": -entry_sign,
+            "shadow_return_lcb_pct": -entry_sign - 0.1,
+            "gross_profit_return_pct": 1 if entry_profitable else 100,
+            "gross_loss_return_pct": 100 if entry_profitable else 1,
+            "entry_return_evaluation": {
+                "version": ENTRY_COHORT_VERSION, "direction_count": 20,
+                "avg_shadow_return_after_all_cost_pct": entry_sign,
+                "shadow_return_lcb_pct": entry_sign - 0.1,
+                "gross_profit_return_pct": 100 if entry_profitable else 1,
+                "gross_loss_return_pct": 1 if entry_profitable else 100,
+            },
+        }]},
+    )
+    local = report["quant_source_weights"]["local_ml"]
+    permission = local["model_quality_permissions"]["current"]
+    assert permission["paper_execution_permission"] is entry_profitable
+    assert permission["paper_execution_evidence"]["sample_count"] == 20
+    assert permission["paper_execution_evidence"]["average_return"] == entry_sign
+    assert permission["entry_cohort_version"] == ENTRY_COHORT_VERSION
+    assert local["shadow_fee_after_return"]["sample_count"] == 1000
+    assert local["shadow_fee_after_return"]["average_return"] == -entry_sign
+
+
+@pytest.mark.parametrize("version", [None, "old-entry-cohort"])
+def test_local_model_permission_cannot_fall_back_to_legacy_profitable_diagnostics(version):
+    row = {
+        "tool": "local_ml", "model": "current", "direction_count": 100,
+        "avg_shadow_return_after_all_cost_pct": 1.0,
+        "shadow_return_lcb_pct": 0.5,
+        "gross_profit_return_pct": 110.0, "gross_loss_return_pct": 10.0,
+    }
+    if version is not None:
+        row["entry_return_evaluation"] = {**row, "version": version}
+    report = _build(ContinuousModelWeightPolicy(), specialist={"models": [row]})
+    permission = report["quant_source_weights"]["local_ml"]["model_quality_permissions"]["current"]
+    assert permission["paper_execution_permission"] is False
+    assert permission["paper_execution_evidence"]["sample_count"] == 0
 
 
 def test_legacy_aggregate_without_trade_fact_provenance_cannot_authorize_execution() -> None:

@@ -208,6 +208,7 @@ async def main():
                         "paper_execution_blockers", "paper_execution_evidence_source",
                         "paper_execution_evidence", "shadow_fee_after_return",
                         "paper_execution_model_version", "evidence_scope",
+                        "entry_cohort_version",
                     )
                 })
             identities[str(signal.get("model_version") or "unavailable")] += 1
