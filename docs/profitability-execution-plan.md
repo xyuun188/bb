@@ -580,3 +580,20 @@ veto separately, preserving its candidate-reason counts. It continues complete
 execution-contract validation for executed or promoted records, conflicting
 permissions, existing sizing, missing evidence and different final reasons.
 Neither entry authorization nor profitability qualification changes.
+
+Commit `2e5472be` passed 211 focused regressions and repository-wide Ruff, was
+pushed to main and deployed with all 531 source hashes verified. Online replay
+of the same three frozen records now reports two observation vetoes and one
+fully validated executed entry, with zero execution-contract gaps. The fresh
+500-decision root-cause report also passed. Complete fresh report
+`observation-audit-acceptance-20261113-1831/latest.json` at
+`2026-11-13T18:32:39Z` finished all sections in 134.0083 seconds within the
+unchanged 180-second budget: 23 OK cards, two observation warnings and two
+profitability/promotion critical cards. There were no execution-contract
+violations across 85 executed entries and 286 exits in its historical window.
+The refreshed system window contains 94 settled positions, all shorts, with
+net `-37.54282267 USDT`; this is not exact attribution to the rebuilt model.
+The model's independent positive-objective cohort remains 23 shorts, PF
+`1.60354`, mean `+0.577111%`, and LCB `-0.400948%`. Live qualification still
+fails. Both auto-train timers and paper/dashboard/model-tunnel services were
+healthy after deployment; completed temporary acceptance units were recycled.
