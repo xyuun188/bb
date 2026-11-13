@@ -3459,7 +3459,7 @@ def test_train_from_frame_reports_training_window_composition() -> None:
     assert metadata["label_version"] == RETURN_LABEL_VERSION
     assert metadata["prediction_distribution"]["lower_bound"] == ("tree_prediction_lower_hinge")
     assert metadata["prediction_distribution"]["uncertainty_source"] == (
-        "random_forest_tree_empirical_order_statistics"
+        "tree_leaf_total_variance"
     )
     assert "expected_return_calibration" not in metadata
     assert "top_long_return_lcb_pct" in metadata["metrics"]

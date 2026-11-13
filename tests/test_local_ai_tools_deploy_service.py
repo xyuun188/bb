@@ -2127,6 +2127,65 @@ def test_local_ai_paired_comparison_uses_locked_costs_and_both_fit_boundaries(
     assert unavailable["sample_count"] == 1
 
 
+def test_local_ai_leaf_risk_matches_platform_and_runtime_comparison(
+    tmp_path: Path,
+) -> None:
+    import numpy as np
+    import pandas as pd
+    from sklearn.dummy import DummyClassifier, DummyRegressor
+
+    from services.ml_prediction_contract import regression_prediction_distribution
+
+    module = ModuleType("local_ai_tools_leaf_risk_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _configure_local_ai_registry(module, tmp_path)
+    x = [[0.0]] * 20
+    model = module.Pipeline([
+        ("imputer", module.SimpleImputer()),
+        ("model", module.ExtraTreesRegressor(n_estimators=4, random_state=42)),
+    ]).fit(x, [-2.0, 4.0] * 10)
+    distribution = module.regression_prediction_distribution(model, [[0.0]])
+    platform = regression_prediction_distribution(model, pd.DataFrame([[0.0]]))
+    assert distribution["expected"] == pytest.approx(1.0)
+    assert distribution["between_tree_std"] == pytest.approx(0.0)
+    assert distribution["within_leaf_std"] == pytest.approx(3.0)
+    assert distribution["std"] == pytest.approx(platform["std"][0])
+    assert distribution["distribution_ready"] is True
+    assert distribution["dispersion_basis"] == "tree_leaf_total_variance"
+
+    cost = DummyRegressor().fit(x, [0.1] * 20)
+    tail = module.Pipeline([("model", DummyClassifier())]).fit(x, [0] * 20)
+    bundle = {
+        "metadata": {
+            "training_data_sha256": "a" * 64,
+            "primary_prediction_horizon_minutes": 240,
+            "comparison_fit_label_end": "2026-07-14T00:00:00+00:00",
+            "tail_loss_scale_pct": {"long": 0.0, "short": 0.0},
+        },
+    }
+    for side in ("long", "short"):
+        bundle.update({f"{side}_return_model": model, f"{side}_cost_model": cost,
+                       f"{side}_loss_model": tail})
+    path = module.VERSIONS_ROOT / "champion" / "model.joblib"
+    module.dump_trusted_joblib_bundle(bundle, path)
+    start = datetime(2026, 7, 15, tzinfo=UTC)
+    rows = [{
+        "id": index, "decision_group": str(index), "symbol": "BTC/USDT",
+        "horizon": 240, "x": [0.0],
+        "decision_timestamp": (start + timedelta(hours=5 * index)).isoformat(),
+        "label_timestamp": (start + timedelta(hours=5 * index + 4)).isoformat(),
+        "long_total_cost_pct": 0.1, "short_total_cost_pct": 0.1,
+        "long_net_return": 0.9, "short_net_return": 0.9,
+    } for index in range(20)]
+    report = module._paired_artifact_return_evaluation(bundle, {"model_path": path}, rows)
+    assert report["ready"] is True
+    selected = report["candidate"]["short"]["worst_selected_rows"]
+    assert selected
+    assert all(row["score"] == pytest.approx(-2.1) for row in selected)
+    assert all(row["uncertainty_penalty_pct"] == pytest.approx(3.0) for row in selected)
+    assert np.isfinite([row["score"] for row in selected]).all()
+
+
 def test_local_ai_registry_replaces_only_incompatible_champion_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3955,6 +4014,30 @@ def test_local_ai_walk_forward_never_substitutes_gross_returns_for_missing_costs
     assert report["sides"]["short"]["cost_incomplete_sample_count"] > 0
     assert report["sides"]["short"]["avg_return_pct"] is None
     assert report["sides"]["short"]["promotion_math_ready"] is False
+
+
+def test_local_ai_walk_forward_deducts_within_leaf_outcome_risk(tmp_path: Path) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    module._make_regressor = lambda _count: module.Pipeline([
+        ("imputer", module.SimpleImputer()),
+        ("model", module.ExtraTreesRegressor(n_estimators=4, random_state=42)),
+    ])
+    rows = module._market_training_rows(_training_shadow_samples(count=20))
+    for index, row in enumerate(rows):
+        row["x"] = [0.0]
+        row["long_return"] = -2.0 if index % 2 else 4.0
+        row["long_total_cost_pct"] = 0.1
+        row["long_net_return"] = row["long_return"] - 0.1
+    costs = [{
+        "x": [0.0], "side": "long", "execution_cost": 0.1, "sample_weight": 1.0,
+        "label_timestamp": row["label_timestamp"],
+    } for row in rows[:10]]
+    evaluated, _ = module._fit_walk_forward_side(
+        rows[:10], rows[10:], side="long", authoritative_cost_rows=costs,
+    )
+    assert evaluated
+    assert all(row["score"] == pytest.approx(-2.1) for row in evaluated)
+    assert {row["return_pct"] for row in evaluated} == {-2.1, 3.9}
 
 
 @pytest.mark.parametrize("missing_cost", [False, True])

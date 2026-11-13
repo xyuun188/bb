@@ -1024,11 +1024,15 @@ def _fit_walk_forward_side(
         x_validation = []
     # Observed exit costs belong only in the realized label. Ranking uses a
     # cost forecast fitted on lifecycles settled before this validation fold.
-    scores = (
-        np.asarray(market_model.predict(x_validation), dtype=float)
-        - _predict_positive_probabilities(tail_model, x_validation) * tail_scale
-        - np.asarray(cost_model.predict(x_validation), dtype=float)
-    ) if cost_complete_rows else np.asarray([], dtype=float)
+    if cost_complete_rows:
+        moments = _regression_prediction_moments(market_model, x_validation)
+        scores = (
+            moments["expected"] - moments["std"]
+            - _predict_positive_probabilities(tail_model, x_validation) * tail_scale
+            - np.asarray(cost_model.predict(x_validation), dtype=float)
+        )
+    else:
+        scores = np.asarray([], dtype=float)
     evaluated_rows = [
         {
             "symbol": str(row.get("symbol") or ""),
@@ -2235,7 +2239,7 @@ def _paired_artifact_return_evaluation(
     holdout_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
     report = {
-        "version": "2026-11-11.common-unfitted-holdout.v1",
+        "version": "2026-11-13.predictive-variance-common-holdout.v2",
         "ready": False,
         "independent_profitability_exam": False,
         "return_semantics": "shadow_net_return_after_all_cost",
@@ -2294,7 +2298,9 @@ def _paired_artifact_return_evaluation(
         for role, bundle in bundles.items():
             sides = {}
             for side in ("long", "short"):
-                market = np.asarray(bundle[f"{side}_return_model"].predict(x), dtype=float)
+                moments = _regression_prediction_moments(bundle[f"{side}_return_model"], x)
+                market = moments["expected"]
+                dispersion = moments["std"]
                 cost_model = bundle.get(f"{side}_cost_model")
                 if cost_model is None and bundle["metadata"].get("paper_bootstrap") is not True:
                     raise ValueError("paired_artifact_cost_model_unavailable")
@@ -2313,7 +2319,7 @@ def _paired_artifact_return_evaluation(
                     if 1 in classes else np.zeros(len(rows), dtype=float)
                 )
                 scale = float(bundle["metadata"]["tail_loss_scale_pct"][side])
-                scores = market - cost - tail * scale
+                scores = market - cost - dispersion - tail * scale
                 if scores.shape != (len(rows),) or not np.isfinite(scores).all():
                     raise ValueError("paired_artifact_scores_invalid")
                 scored_rows = [
@@ -2328,6 +2334,7 @@ def _paired_artifact_return_evaluation(
                         "score": float(scores[index]),
                         "predicted_gross_return_pct": float(market[index]),
                         "predicted_cost_pct": float(cost[index]),
+                        "uncertainty_penalty_pct": float(dispersion[index]),
                         "locked_cost_pct": row.get(f"{side}_total_cost_pct"),
                         "tail_loss_probability": float(tail[index]),
                     }
@@ -3289,15 +3296,60 @@ def ordinary_loss_prediction(
     }
 
 
-def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) -> dict[str, Any]:
-    """Return a current tree-prediction distribution without a fixed cutoff."""
+def _regression_prediction_moments(model: Pipeline, x: list[list[float]]) -> dict[str, Any]:
+    """Preserve leaf outcome variance when combining tree predictions."""
 
-    expected = float(model.predict(x)[0])
-    named_steps = getattr(model, "named_steps", {})
-    estimator = named_steps.get("model") if hasattr(named_steps, "get") else None
-    imputer = named_steps.get("imputer") if hasattr(named_steps, "get") else None
+    expected = np.asarray(model.predict(x), dtype=float)
+    steps = getattr(model, "named_steps", {})
+    estimator = steps.get("model") if hasattr(steps, "get") else None
+    imputer = steps.get("imputer") if hasattr(steps, "get") else None
     trees = list(getattr(estimator, "estimators_", []) or [])
     if not trees or imputer is None:
+        return {
+            "expected": expected,
+            "members": np.empty((0, len(expected))),
+            "std": np.zeros(len(expected)),
+            "within_leaf_std": np.zeros(len(expected)),
+            "between_tree_std": np.zeros(len(expected)),
+            "dispersion_basis": "point_prediction",
+        }
+    transformed = imputer.transform(x)
+    members = np.asarray([tree.predict(transformed) for tree in trees], dtype=float)
+    leaf_variances = []
+    for tree in trees:
+        structure = getattr(tree, "tree_", None)
+        if (
+            structure is not None
+            and getattr(tree, "criterion", None) in {"squared_error", "friedman_mse"}
+        ):
+            leaf_variances.append(
+                np.maximum(np.asarray(structure.impurity[tree.apply(transformed)]), 0.0)
+            )
+    between = np.var(members, axis=0)
+    within = (
+        np.mean(leaf_variances, axis=0)
+        if len(leaf_variances) == len(trees) else np.zeros(len(expected))
+    )
+    return {
+        "expected": expected,
+        "members": members,
+        "std": np.sqrt(within + between),
+        "within_leaf_std": np.sqrt(within),
+        "between_tree_std": np.sqrt(between),
+        "dispersion_basis": (
+            "tree_leaf_total_variance"
+            if len(leaf_variances) == len(trees) else "tree_mean_disagreement_only"
+        ),
+    }
+
+
+def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) -> dict[str, Any]:
+    """Return tree-mean order statistics and total predictive dispersion."""
+
+    moments = _regression_prediction_moments(model, x)
+    expected = float(moments["expected"][0])
+    values = moments["members"][:, 0]
+    if values.size == 0:
         return {
             "expected": expected,
             "median": expected,
@@ -3309,8 +3361,6 @@ def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) ->
             "distribution_ready": False,
             "source_authority": "regressor_point_prediction_without_members",
         }
-    transformed = imputer.transform(x)
-    values = np.asarray([float(tree.predict(transformed)[0]) for tree in trees], dtype=float)
     values = values[np.isfinite(values)]
     if values.size == 0:
         return {
@@ -3337,10 +3387,13 @@ def regression_prediction_distribution(model: Pipeline, x: list[list[float]]) ->
         "median": float(np.median(values)),
         "lower_bound": float(np.median(ordered[:lower_tail_count])),
         "upper_bound": float(np.median(ordered[-lower_tail_count:])),
-        "std": float(np.std(values)),
+        "std": float(moments["std"][0]),
+        "between_tree_std": float(moments["between_tree_std"][0]),
+        "within_leaf_std": float(moments["within_leaf_std"][0]),
+        "dispersion_basis": moments["dispersion_basis"],
         "spread": spread,
         "sample_count": int(values.size),
-        "distribution_ready": spread > numerical_resolution,
+        "distribution_ready": max(spread, float(moments["std"][0])) > numerical_resolution,
         "source_authority": "extra_trees_empirical_distribution",
     }
 
@@ -6470,6 +6523,7 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
             train,
             _walk_forward_return_report,
             _fit_walk_forward_side,
+            _regression_prediction_moments,
             _return_evidence,
             _leave_one_symbol_out_stability,
             _authoritative_trade_return_evidence,
@@ -6483,6 +6537,11 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
     metadata = {
         "artifact_policy_id": PHASE3_ARTIFACT_POLICY_ID,
         "feature_probability_contract_version": FEATURE_PROBABILITY_CONTRACT_VERSION,
+        "prediction_distribution": {
+            "lower_bound": "tree_prediction_lower_hinge",
+            "uncertainty_source": "tree_leaf_total_variance",
+            "score_policy": "expected_minus_cost_dispersion_and_tail",
+        },
         "phase": "phase3_model_factory",
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "comparison_fit_label_end": max(

@@ -22,7 +22,7 @@ def regression_prediction_distribution(
     model: Pipeline,
     x: pd.DataFrame,
 ) -> dict[str, Any]:
-    """Return a point or empirical tree-member prediction distribution."""
+    """Include outcome variance inside leaves as well as tree disagreement."""
 
     expected = np.asarray(model.predict(x), dtype=float)
     named_steps = getattr(model, "named_steps", {})
@@ -42,6 +42,22 @@ def regression_prediction_distribution(
         }
     transformed = imputer.transform(x)
     tree_predictions = np.asarray([tree.predict(transformed) for tree in trees], dtype=float)
+    leaf_variances = []
+    for tree in trees:
+        structure = getattr(tree, "tree_", None)
+        if (
+            structure is not None
+            and getattr(tree, "criterion", None) in {"squared_error", "friedman_mse"}
+        ):
+            leaf_variances.append(
+                np.maximum(np.asarray(structure.impurity[tree.apply(transformed)]), 0.0)
+            )
+    between_variance = np.var(tree_predictions, axis=0)
+    within_variance = (
+        np.mean(leaf_variances, axis=0)
+        if len(leaf_variances) == len(trees)
+        else np.zeros(len(expected), dtype=float)
+    )
     ordered_tree_predictions = np.sort(tree_predictions, axis=0)
     lower_tail_count = max(int(np.sqrt(len(ordered_tree_predictions))), 1)
     return {
@@ -49,7 +65,15 @@ def regression_prediction_distribution(
         "median": np.median(tree_predictions, axis=0),
         "lower_quantile": np.median(ordered_tree_predictions[:lower_tail_count], axis=0),
         "upper_quantile": np.median(ordered_tree_predictions[-lower_tail_count:], axis=0),
-        "std": np.std(tree_predictions, axis=0),
+        # Total predictive variance = E[Var(Y | leaf)] + Var(E[Y | leaf]).
+        "std": np.sqrt(within_variance + between_variance),
+        "between_tree_std": np.sqrt(between_variance),
+        "within_leaf_std": np.sqrt(within_variance),
+        "dispersion_basis": (
+            "tree_leaf_total_variance"
+            if len(leaf_variances) == len(trees)
+            else "tree_mean_disagreement_only"
+        ),
         "member_count": len(trees),
         "source_authority": "random_forest_tree_empirical_distribution",
     }

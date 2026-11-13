@@ -2969,7 +2969,7 @@ def train_from_frame(
         ),
         "prediction_distribution": {
             "lower_bound": "tree_prediction_lower_hinge",
-            "uncertainty_source": "random_forest_tree_empirical_order_statistics",
+            "uncertainty_source": "tree_leaf_total_variance",
             "tail_risk_source": "tail_loss_classifier_diagnostic_risk_penalty",
         },
         "training_objective": (
