@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from core.model_topology import TARGET_SINGLE_MODEL_ID
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION
 from services.model_training_registry import build_model_training_registry
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
@@ -12,6 +15,26 @@ SHA256 = "a" * 64
 
 def _by_id(payload: dict) -> dict[str, dict]:
     return {row["model_id"]: row for row in payload["models"]}
+
+
+@pytest.mark.parametrize("version", [None, "old-rankings", ENTRY_COHORT_VERSION])
+def test_local_ml_registry_displays_entry_cohort_without_ranking_fallback(version) -> None:
+    status = {
+        "available": True,
+        "readiness": {"metrics": {"top_long_profit_factor": 99.0}},
+        "entry_return_evaluation": {
+            "version": version,
+            "sides": {
+                "long": {"count": 0, "profit_factor": 99.0},
+                "short": {"count": 4, "profit_factor": 0.4, "avg_return_pct": -0.1},
+            },
+            "portfolio": {"count": 4, "profit_factor": 0.4, "avg_return_pct": -0.1},
+        },
+    }
+    row = _by_id(build_model_training_registry(local_ml_status=status))["local_ml_profit_quality"]
+    assert row["profit_factor"] == (0.4 if version == ENTRY_COHORT_VERSION else None)
+    assert row["side_metrics"]["long"]["profit_factor"] is None
+    assert row["ranking_diagnostics"]["top_long_profit_factor"] == 99.0
 
 
 def test_registry_ignores_retired_model_inputs_without_target_slot_runtime() -> None:

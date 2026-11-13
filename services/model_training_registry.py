@@ -10,6 +10,7 @@ from collections import Counter
 from typing import Any
 
 from core.model_topology import TARGET_SINGLE_MODEL_ID, TARGET_SINGLE_MODEL_PROFILE
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 MODEL_TRAINING_REGISTRY_VERSION = "2026-07-12.v2"
@@ -154,6 +155,34 @@ def _finquant_specialization_verified(
     return True
 
 
+def local_ml_entry_profitability(status: dict[str, Any]) -> dict[str, Any]:
+    """Expose the frozen holdout's selected outcomes without falling back to ranks."""
+    report = _safe_dict(status.get("entry_return_evaluation"))
+    if report.get("version") != ENTRY_COHORT_VERSION:
+        report = {}
+
+    def metrics(row: dict[str, Any]) -> dict[str, Any]:
+        count = _safe_int(row.get("count"))
+        return {
+            "count": count,
+            "profit_factor": row.get("profit_factor") if count else None,
+            "return_lcb_pct": row.get("return_lcb_pct") if count else None,
+            "mean_return_pct": row.get("avg_return_pct") if count else None,
+            "max_drawdown_pct": row.get("max_drawdown_pct") if count else None,
+            "tail_loss_rate": row.get("tail_loss_rate") if count else None,
+        }
+
+    sides = _safe_dict(report.get("sides"))
+    return {
+        "entry_cohort_version": report.get("version"),
+        "evidence_scope": "holdout_positive_objective_entry_cohort",
+        "portfolio": metrics(_safe_dict(report.get("portfolio"))),
+        "side_metrics": {
+            side: metrics(_safe_dict(sides.get(side))) for side in ("long", "short")
+        },
+    }
+
+
 def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
     available = bool(status.get("available"))
     diagnostic_timeout = str(status.get("status") or "").lower() in {
@@ -182,29 +211,9 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
         lifecycle = "trained"
     else:
         lifecycle = "not_trained"
-    side_metrics = {
-        side: {
-            "profit_factor": _first_present(
-                metrics.get(f"top_{side}_profit_factor")
-            ),
-            "return_lcb_pct": _first_present(
-                metrics.get(f"top_{side}_return_lcb_pct")
-            ),
-            "mean_return_pct": _first_present(
-                metrics.get(f"top_{side}_avg_return_pct")
-            ),
-            "bottom_return_pct": _first_present(
-                metrics.get(f"bottom_{side}_avg_return_pct")
-            ),
-            "top_bottom_spread_pct": _first_present(
-                metrics.get(f"top_{side}_bottom_return_spread_pct")
-            ),
-            "tail_loss_rate": _first_present(
-                metrics.get(f"top_{side}_tail_loss_rate")
-            ),
-        }
-        for side in ("long", "short")
-    }
+    profitability = local_ml_entry_profitability(status)
+    side_metrics = profitability["side_metrics"]
+    portfolio = profitability["portfolio"]
     return {
         "model_id": "local_ml_profit_quality",
         "display_name": "Local ML profit quality",
@@ -225,24 +234,17 @@ def _local_ml_row(status: dict[str, Any]) -> dict[str, Any]:
         "live_ml_ready": live,
         "paper_model_eligible": status.get("paper_model_eligible") is True,
         "quality_state": "diagnostic_timeout" if diagnostic_timeout else readiness,
-        "return_lcb_pct": _first_present(
-            metrics.get("return_lcb_pct"),
-            metrics.get("top_long_return_lcb_pct"),
-            metrics.get("top_short_return_lcb_pct"),
-        ),
-        "profit_factor": _first_present(
-            metrics.get("profit_factor"),
-            metrics.get("top_long_profit_factor"),
-            metrics.get("top_short_profit_factor"),
-        ),
-        "max_drawdown": _first_present(
-            metrics.get("max_drawdown"), metrics.get("max_drawdown_pct")
-        ),
+        "return_lcb_pct": portfolio["return_lcb_pct"],
+        "profit_factor": portfolio["profit_factor"],
+        "max_drawdown": portfolio["max_drawdown_pct"],
+        "entry_cohort_version": profitability["entry_cohort_version"],
+        "evidence_scope": profitability["evidence_scope"],
+        "portfolio": portfolio,
+        "ranking_diagnostics": metrics,
         "out_of_sample": _safe_dict(status.get("walk_forward_report")).get("status")
         or status.get("evaluation_status"),
         "long_short_split": {
-            "long": metrics.get("top_long_return_lcb_pct"),
-            "short": metrics.get("top_short_return_lcb_pct"),
+            side: side_metrics[side]["return_lcb_pct"] for side in ("long", "short")
         },
         "side_metrics": side_metrics,
         "walk_forward_status": _safe_dict(status.get("walk_forward_report")).get(

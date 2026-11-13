@@ -49,7 +49,10 @@ from services.historical_trade_fact_audit import HistoricalTradeFactAuditService
 from services.ml_signal_service import MLSignalService
 from services.model_expert_competition import ModelExpertCompetitionService
 from services.model_expert_health import ModelExpertHealthService
-from services.model_training_registry import build_model_training_registry
+from services.model_training_registry import (
+    build_model_training_registry,
+    local_ml_entry_profitability,
+)
 from services.model_training_state import ModelTrainingStateStore
 from services.okx_authoritative_sync import OkxAuthoritativeSyncService
 from services.okx_integrity_gate import (
@@ -4185,25 +4188,9 @@ def _local_ml_profit_quality_details(
         if isinstance(row, dict) and row.get("model_id") == "local_ml_profit_quality":
             registry_row = row
             break
-    side_metrics: dict[str, dict[str, Any]] = {}
-    for side in ("long", "short"):
-        side_metrics[side] = {
-            "profit_factor": _safe_float_value(metrics.get(f"top_{side}_profit_factor")),
-            "return_lcb_pct": _safe_float_value(metrics.get(f"top_{side}_return_lcb_pct")),
-            "mean_return_pct": _safe_float_value(metrics.get(f"top_{side}_avg_return_pct")),
-            "tail_loss_rate": _safe_float_value(metrics.get(f"top_{side}_tail_loss_rate")),
-            "bottom_return_pct": _safe_float_value(metrics.get(f"bottom_{side}_avg_return_pct")),
-        }
-    side_pfs = [
-        side_metrics[side]["profit_factor"]
-        for side in ("long", "short")
-        if side_metrics[side]["profit_factor"] is not None
-    ]
-    side_lcbs = [
-        side_metrics[side]["return_lcb_pct"]
-        for side in ("long", "short")
-        if side_metrics[side]["return_lcb_pct"] is not None
-    ]
+    profitability = local_ml_entry_profitability(status)
+    side_metrics = profitability["side_metrics"]
+    portfolio = profitability["portfolio"]
     fallback_reason = str(governance.get("fallback_reason") or "")
     live_ml_ready = status.get("live_ml_ready") is True
     fallback_used = not live_ml_ready
@@ -4221,8 +4208,12 @@ def _local_ml_profit_quality_details(
         "readiness_state": readiness.get("state") or status.get("readiness_state"),
         "live_ml_ready": live_ml_ready,
         "paper_model_eligible": status.get("paper_model_eligible") is True,
-        "profit_factor": min(side_pfs) if side_pfs else None,
-        "return_lcb_pct": min(side_lcbs) if side_lcbs else None,
+        "profit_factor": portfolio["profit_factor"],
+        "return_lcb_pct": portfolio["return_lcb_pct"],
+        "entry_cohort_version": profitability["entry_cohort_version"],
+        "evidence_scope": profitability["evidence_scope"],
+        "portfolio": portfolio,
+        "ranking_diagnostics": metrics,
         "sides": side_metrics,
         "enabled_sides": enabled_sides,
         "side_profit_factors": {

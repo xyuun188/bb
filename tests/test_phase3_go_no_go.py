@@ -4,6 +4,7 @@ from copy import deepcopy
 
 import pytest
 
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION
 from services.phase3_go_no_go import evaluate_phase3_go_no_go_cards
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
@@ -360,6 +361,12 @@ def _local_ml_evidence(*, long_pf: float, short_pf: float) -> dict:
         "walk_forward_status": "complete",
         "walk_forward_stable": False,
         "fallback_used": True,
+        "entry_cohort_version": ENTRY_COHORT_VERSION,
+        "evidence_scope": "holdout_positive_objective_entry_cohort",
+        "portfolio": {
+            "count": 8, "profit_factor": min(long_pf, short_pf),
+            "return_lcb_pct": -3.9919, "mean_return_pct": -1.3916,
+        },
         "sides": {
             "long": {
                 "profit_factor": long_pf,
@@ -436,6 +443,25 @@ def test_phase3_go_no_go_blocks_when_local_ml_metrics_are_missing() -> None:
         "model_return_lcb_evidence_missing",
         "model_fee_after_return_evidence_missing",
     }.issubset(report["blocker_codes"])
+
+
+@pytest.mark.parametrize("mode", ["missing_version", "empty_portfolio", "losing_portfolio"])
+def test_go_no_go_cannot_replace_entry_portfolio_with_profitable_side_or_rankings(mode) -> None:
+    cards = deepcopy(_cards())
+    training = next(card for card in cards if card["key"] == "model_training")
+    evidence = _local_ml_evidence(long_pf=10.0, short_pf=20.0)
+    evidence["live_ml_ready"] = True
+    evidence["portfolio"].update({
+        "profit_factor": 0.5, "return_lcb_pct": -0.2, "mean_return_pct": -0.1,
+    })
+    if mode == "missing_version":
+        evidence.pop("entry_cohort_version")
+    elif mode == "empty_portfolio":
+        evidence["portfolio"]["count"] = 0
+    training["details"]["local_ml_profit_quality"] = evidence
+    report = evaluate_phase3_go_no_go_cards(cards)
+    assert report["status"] == "no_go"
+    assert report["summary"]["model_profit_factor"] == (0.5 if mode == "losing_portfolio" else None)
 
 
 def test_phase3_go_no_go_rejects_paper_resume_without_operator_safe_preflight() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from services.ml_prediction_contract import ENTRY_COHORT_VERSION
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
     NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
@@ -80,12 +81,13 @@ def _model_profitability_evidence(
             local_ml.get("sides")
             or local_ml.get("side_metrics")
         )
+        current_entry_cohort = local_ml.get("entry_cohort_version") == ENTRY_COHORT_VERSION
+        portfolio = _safe_dict(local_ml.get("portfolio")) if current_entry_cohort else {}
+        if _safe_int(portfolio.get("count")) <= 0:
+            portfolio = {}
         side_evidence: dict[str, dict[str, Any]] = {}
-        profit_factors: list[float] = []
-        return_lcbs: list[float] = []
-        mean_returns: list[float] = []
         for side in ("long", "short"):
-            metrics = _safe_dict(sides.get(side))
+            metrics = _safe_dict(sides.get(side)) if current_entry_cohort else {}
             profit_factor = _safe_float(metrics.get("profit_factor"))
             return_lcb = _safe_float(metrics.get("return_lcb_pct"))
             mean_return = _safe_float(metrics.get("mean_return_pct"))
@@ -94,14 +96,8 @@ def _model_profitability_evidence(
                 "return_lcb_pct": return_lcb,
                 "mean_return_pct": mean_return,
                 "tail_loss_rate": _safe_float(metrics.get("tail_loss_rate")),
-                "bottom_return_pct": _safe_float(metrics.get("bottom_return_pct")),
+                "count": _safe_int(metrics.get("count")),
             }
-            if profit_factor is not None:
-                profit_factors.append(profit_factor)
-            if return_lcb is not None:
-                return_lcbs.append(return_lcb)
-            if mean_return is not None:
-                mean_returns.append(mean_return)
         return (
             {
                 "source": "local_ml_profit_quality",
@@ -111,9 +107,11 @@ def _model_profitability_evidence(
                 "fallback_used": local_ml.get("fallback_used"),
                 "lifecycle": local_ml.get("lifecycle"),
                 "sides": side_evidence,
-                "profit_factor": min(profit_factors) if profit_factors else None,
-                "return_lcb_pct": min(return_lcbs) if return_lcbs else None,
-                "mean_return_pct": min(mean_returns) if mean_returns else None,
+                "evidence_scope": local_ml.get("evidence_scope"),
+                "count": _safe_int(portfolio.get("count")),
+                "profit_factor": _safe_float(portfolio.get("profit_factor")),
+                "return_lcb_pct": _safe_float(portfolio.get("return_lcb_pct")),
+                "mean_return_pct": _safe_float(portfolio.get("mean_return_pct")),
             },
             "local_ml_profit_quality",
         )
@@ -459,13 +457,13 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         training
     )
     profit_factor = _safe_float(profitability_evidence.get("profit_factor"))
-    if profit_factor is None:
+    if profit_factor is None and profitability_source != "local_ml_profit_quality":
         profit_factor = _first_nested_metric(
             profitability_evidence,
             ("profit_factor", "top_profit_factor", "top_long_profit_factor"),
         )
     return_lcb = _safe_float(profitability_evidence.get("return_lcb_pct"))
-    if return_lcb is None:
+    if return_lcb is None and profitability_source != "local_ml_profit_quality":
         return_lcb = _first_nested_metric(
             profitability_evidence,
             ("return_lcb_pct", "return_lcb", "return_lower_bound", "fee_after_return_lcb_pct"),
@@ -473,7 +471,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
     mean_fee_after_return = _safe_float(
         profitability_evidence.get("mean_return_pct")
     )
-    if mean_fee_after_return is None:
+    if mean_fee_after_return is None and profitability_source != "local_ml_profit_quality":
         mean_fee_after_return = _first_nested_metric(
             profitability_evidence,
             (
@@ -563,6 +561,8 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             "executed_dynamic_exit_contract_gap_count": exit_gaps,
             "live_ml_ready": live_ml_ready is True,
             "model_profitability_source": profitability_source,
+            "model_profitability_scope": profitability_evidence.get("evidence_scope"),
+            "model_profitability_sample_count": profitability_evidence.get("count"),
             "model_profitability_sides": profitability_evidence.get("sides"),
             "model_fallback_used": profitability_evidence.get("fallback_used"),
             "model_profit_factor": profit_factor,
