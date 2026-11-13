@@ -536,6 +536,47 @@ async def test_live_mode_never_activates_trained_strategy() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("validated_candidate_available", [False, True])
+async def test_obsolete_score_champion_cannot_delay_current_evidence_reconciliation(
+    tmp_path: Path, validated_candidate_available: bool,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'score_migration.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(StrategyProfileSnapshot.__table__.create)
+    legacy_blueprint = {
+        **_blueprint("v1"),
+        "strategy_id": "obsolete-score-strategy",
+        "prediction_score_policy_version": "legacy-score-policy",
+    }
+    async with sessions.begin() as session:
+        session.add(StrategyProfileSnapshot(
+            execution_mode="paper", profile_id="obsolete", version=1,
+            label="Obsolete score evidence", status="champion",
+            source="trained_model_strategy_blueprint", is_active=True, is_disabled=False,
+            params={"blueprint": legacy_blueprint},
+            promotion={"paper_execution_permission": True},
+            backtest_metrics={"champion_metrics": {"return_lcb_pct": 99.0}},
+            shadow_validation={}, probe_state={},
+        ))
+    async with sessions.begin() as session:
+        result = await PaperStrategyChampionService().reconcile(
+            mode="paper", blueprint=_blueprint("v1"),
+            candidates=[_candidate("side_long")] if validated_candidate_available else [],
+            session=session,
+        )
+    assert result["active"] is validated_candidate_available
+    assert result["paper_execution_permission"] is validated_candidate_available
+    async with sessions() as session:
+        legacy = (await session.execute(select(StrategyProfileSnapshot).where(
+            StrategyProfileSnapshot.profile_id == "obsolete"
+        ))).scalar_one()
+    assert legacy.is_active is False
+    assert legacy.scheduler_reason == "strategy_evidence_contract_changed"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_model_version_change_without_validated_strategy_retires_stale_champion(
     tmp_path: Path,
 ) -> None:

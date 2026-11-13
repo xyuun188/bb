@@ -378,6 +378,16 @@ class PaperStrategyChampionService:
             for candidate, row in zip(trained_candidates, rows, strict=True)
         }
         champion_row = await self._active_row(session, lock=True)
+        if champion_row is not None and not strategy_evidence_contract_matches(
+            _dict(_dict(champion_row.params).get("blueprint"))
+        ):
+            # Returns from a different entry population cannot benchmark this
+            # contract. Retire them before evaluating current validated evidence.
+            champion_row.is_active = False
+            champion_row.status = "rolled_back"
+            champion_row.scheduler_reason = "strategy_evidence_contract_changed"
+            await session.flush()
+            champion_row = None
         if champion_row is None:
             if not trained_candidates:
                 return self._inactive("no_validated_trained_model_strategy")

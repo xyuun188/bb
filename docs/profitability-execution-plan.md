@@ -361,3 +361,22 @@ nor refitting the unchanged recipe establishes an executable edge.
 The evidence-chain fixes do not establish profitability. Independent fee-after
 validation and completed execution-policy lifecycles remain required; failed
 evidence cannot be relabeled as a reason to authorize an order.
+
+Online acceptance of the new replay completed at `2026-11-13T14:54:35Z`.
+Of 1,641 replayed direction observations, 1,591 failed the current entry-return
+gate and are now diagnostic only. The executable cohort contains 50 entries:
+one development observation and 49 exam observations, including six forward
+observations. Three strategy candidates remain; none passes validation. These
+counts explain why the old 136-candidate report overstated strategy coverage.
+
+A recent ZRO rejection was traced to the size-aware cost pass: estimated cost
+rose from `0.109064%` to `0.630496%` and the final return lower bound became
+`-0.66591305%`. Its rejection is a current profitability failure. A separate
+final-risk check still used the permissive sizing validator, which omitted the
+strict entry lower-bound check. It now uses the same entry validator as order
+submission. Regression tests reproduce the former acceptance of a fingerprinted
+zero or negative bound after otherwise valid sizing and require rejection.
+Reconciliation also retires a persisted champion from an obsolete score or entry
+contract before considering current validated candidates. This prevents stale
+metrics or a rollback from deferring an otherwise eligible current candidate to
+the next evaluator cycle; it grants no permission when current validation fails.

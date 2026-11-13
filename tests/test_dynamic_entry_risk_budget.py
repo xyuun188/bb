@@ -21,6 +21,9 @@ from services.normal_paper_trade import (
     _contract_fingerprint_payload,
     build_normal_paper_trade_contract,
 )
+from services.normal_paper_trade import (
+    _fingerprint as normal_paper_fingerprint,
+)
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.return_objective import execution_cost_with_slippage_floor
 from tests.normal_paper_test_fixtures import paper_quality_permissions
@@ -1175,6 +1178,25 @@ async def test_negative_lcb_quality_observation_is_shadow_only() -> None:
     assert sizing["production_permission"] is False
     assessment = RiskEngine().assess(decision, [], _balance)
     assert assessment.approved is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("return_lcb", [0.0, -0.22])
+async def test_final_risk_rechecks_entry_return_bound_after_valid_sizing(return_lcb) -> None:
+    decision = _decision()
+    await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(decision, "paper", [])
+    assert RiskEngine().assess(decision, [], 1000.0).approved is True
+
+    contract = decision.raw_response["normal_paper_trade"]
+    contract["objective_net_return_pct"] = return_lcb
+    contract["contract_fingerprint"] = normal_paper_fingerprint(
+        _contract_fingerprint_payload(contract)
+    )
+
+    assessment = RiskEngine().assess(decision, [], 1000.0)
+
+    assert assessment.approved is False
+    assert "normal_paper_trade_return_lcb_not_positive" in assessment.rejection_reason
 
 
 @pytest.mark.asyncio

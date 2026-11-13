@@ -18,7 +18,7 @@ from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
     NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
-    normal_paper_trade_contract_reasons,
+    normal_paper_entry_contract_reasons,
 )
 
 logger = structlog.get_logger(__name__)
@@ -182,7 +182,7 @@ class RiskEngine:
             normal_trade = raw.get("normal_paper_trade")
             normal_trade = normal_trade if isinstance(normal_trade, dict) else {}
             equity = RiskEngine._safe_positive_float(sizing.get("account_equity_usdt"))
-            contract_reasons = normal_paper_trade_contract_reasons(normal_trade)
+            contract_reasons = normal_paper_entry_contract_reasons(normal_trade)
             if contract_reasons:
                 return f"Normal paper trade contract is invalid: {','.join(contract_reasons)}."
             if sizing.get("contract_version") != NORMAL_PAPER_TRADE_SIZING_VERSION:
