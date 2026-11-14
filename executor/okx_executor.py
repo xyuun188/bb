@@ -4833,7 +4833,9 @@ class OKXExecutor(AbstractExecutor):
             return native
         return str(okx_symbol or "").replace("/", "-").replace(":USDT", "-SWAP").upper()
 
-    async def _fetch_native_ticker(self, symbol: str) -> dict[str, Any]:
+    async def _fetch_native_ticker(
+        self, symbol: str, *, execution_market: bool = False,
+    ) -> dict[str, Any]:
         """Fetch OKX public ticker by native instId for execution sizing."""
 
         inst_id = okx_inst_id_from_symbol(symbol)
@@ -4845,9 +4847,17 @@ class OKXExecutor(AbstractExecutor):
         # expose every otherwise tradable SWAP through its single-instrument
         # ticker route, so using the demo public transport here creates false
         # 51001 rejections after the batch compatibility probe has succeeded.
-        fetch_ticker = getattr(ccxt, "publicGetMarketTicker", None)
+        fetch_ticker = getattr(
+            ccxt,
+            "executionGetMarketTicker" if execution_market else "publicGetMarketTicker",
+            None,
+        )
         if not callable(fetch_ticker):
-            fetch_ticker = getattr(ccxt, "executionGetMarketTicker", None)
+            fetch_ticker = getattr(
+                ccxt,
+                "publicGetMarketTicker" if execution_market else "executionGetMarketTicker",
+                None,
+            )
         if not callable(fetch_ticker):
             raise ExchangeAPIError("OKX native market ticker API is unavailable")
         response = await self._with_retry(fetch_ticker, {"instId": inst_id})
@@ -8551,7 +8561,9 @@ class OKXExecutor(AbstractExecutor):
     async def get_position_protection_reference_price(self, symbol: str) -> float:
         """Return the current OKX last price used to validate TP/SL direction."""
 
-        ticker = await self._fetch_native_ticker(symbol)
+        # Demo trades can differ from public prices; OKX validates algo triggers
+        # against the last trade in the account's execution environment.
+        ticker = await self._fetch_native_ticker(symbol, execution_market=True)
         return self._safe_float(ticker.get("last"), 0.0)
 
     async def get_contract_specs_strict(

@@ -942,7 +942,8 @@ async def rebalance_current_position_protection(
     replacement_input_fingerprint = ""
     action_names = {str(action.get("action") or "") for action in actions}
     initial_group_replacement = (
-        {"amend_size", "create_delta"}.issubset(action_names) or prices_reanchored
+        {"amend_size", "create_delta"}.issubset(action_names)
+        or (prices_reanchored and "amend_size" in action_names)
     )
     if prices_reanchored:
         fallback_reason = "stale_trigger_prices_reanchored"

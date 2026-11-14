@@ -223,6 +223,28 @@ async def test_stale_short_protection_is_rebuilt_before_okx_amend() -> None:
 
 
 @pytest.mark.asyncio
+async def test_missing_protection_uses_reanchored_plan_without_replacing_absent_orders() -> None:
+    executor = _Executor(
+        position_contracts="5", protection_contracts=(), reference_price=0.2,
+    )
+    result = await position_protection_rebalance.rebalance_current_position_protection(
+        executor, symbol="IRYS/USDT", side="short", observation_window="test",
+        missing_protection_plan={
+            "stop_loss_price": 0.16, "take_profit_price": 0.14,
+            "source": "persisted_local_dynamic_protection", "okx_position_side": "net",
+        },
+    )
+    assert result["verified"] is True
+    assert result["positions_unchanged"] is True
+    assert executor.amend_calls == []
+    assert executor.cancel_calls == []
+    assert len(executor.create_calls) == 1
+    created = executor.create_calls[0]
+    assert created["contracts"] == 5
+    assert created["take_profit_price"] < 0.2 < created["stop_loss_price"]
+
+
+@pytest.mark.asyncio
 async def test_partial_exit_resizes_split_oco_to_exact_exchange_position() -> None:
     executor = _Executor(position_contracts="5", protection_contracts=("6", "7"))
 

@@ -15,6 +15,39 @@ from executor.okx_executor import OKXExecutor
 from services.entry_profit_risk_sizing import reconcile_profit_risk_sizing
 
 
+@pytest.mark.asyncio
+async def test_protection_reference_uses_execution_price_without_changing_analysis_ticker() -> None:
+    class Exchange:
+        urls = {"api": {"rest": "https://www.okx.com"}}
+        hostname = "www.okx.com"
+
+        async def publicGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
+            return {"data": [{"last": "206.45"}]}
+
+        async def executionGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
+            return {"data": [{"last": "212.5"}]}
+
+    executor = _executor(Exchange())
+    assert await executor.get_position_protection_reference_price("BCH/USDT") == 212.5
+    assert (await executor._fetch_native_ticker("BCH/USDT"))["last"] == 206.45
+
+
+@pytest.mark.asyncio
+async def test_protection_reference_does_not_fall_back_when_execution_ticker_fails() -> None:
+    class Exchange:
+        urls = {"api": {"rest": "https://www.okx.com"}}
+        hostname = "www.okx.com"
+
+        async def publicGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
+            pytest.fail("An execution ticker failure must not silently use a public price")
+
+        async def executionGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
+            raise ExchangeAPIError("OKX API error [51001]: instrument unavailable")
+
+    with pytest.raises(ExchangeAPIError):
+        await _executor(Exchange()).get_position_protection_reference_price("BCH/USDT")
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     ((190.0, "190"), (10.0, "10"), (0.01, "0.01"), (1.2300, "1.23")),
