@@ -103,6 +103,39 @@ def protection_coverage_evidence(
     return complete, covered_contracts, overcoverage_contracts
 
 
+def _protection_direction_valid(
+    orders: list[dict[str, Any]], side: str, current_price: float,
+) -> bool:
+    for order in orders:
+        raw = _safe_dict(order.get("raw"))
+        info = _safe_dict(raw.get("info"))
+        stop = _safe_float(order.get("stop_loss_price"))
+        take = _safe_float(order.get("take_profit_price"))
+        for prefix, trigger in (("sl", stop), ("tp", take)):
+            trigger_type = str(
+                raw.get(f"{prefix}TriggerPxType")
+                or info.get(f"{prefix}TriggerPxType") or "last"
+            ).lower()
+            price_key = {"last": "last", "mark": "markPx", "index": "idxPx"}.get(
+                trigger_type,
+            )
+            if price_key is None:
+                return False
+            # Demo algo quotes can differ from the public mark used for valuation.
+            reference = (
+                _safe_float(raw.get(price_key))
+                or _safe_float(info.get(price_key)) or current_price
+            )
+            below = (side == "long" and prefix == "sl") or (
+                side == "short" and prefix == "tp"
+            )
+            if reference <= 0 or trigger <= 0 or not (
+                trigger < reference if below else trigger > reference
+            ):
+                return False
+    return bool(orders and side in {"long", "short"})
+
+
 def build_current_position_management_contract(
     facts: dict[str, Any],
     *,
@@ -310,10 +343,7 @@ def build_current_position_management_contract(
         blockers.append("okx_protection_evidence_incomplete")
     if stop_loss <= 0 or take_profit <= 0 or position_stressed_loss <= 0:
         blockers.append("current_oco_stressed_loss_incomplete")
-    elif not (
-        (side == "long" and stop_loss < entry_price < take_profit)
-        or (side == "short" and take_profit < entry_price < stop_loss)
-    ):
+    elif not _protection_direction_valid(protection_orders, side, current_price):
         blockers.append("current_oco_direction_invalid")
     if account_equity <= 0:
         blockers.append("current_account_equity_missing")
@@ -711,5 +741,8 @@ def current_position_management_contract_complete(
             abs_tol=1e-12,
         )
         and protection_rows_complete
+        and _protection_direction_valid(
+            protection_orders, position_side, _safe_float(value.get("current_price")),
+        )
         and scalar_protection_matches
     )

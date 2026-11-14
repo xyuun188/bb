@@ -134,6 +134,65 @@ async def test_partial_entry_records_cancel_pending_settlement() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("filled", [0.0, 2.0])
+async def test_interrupted_entry_cancels_exact_order_and_protects_partial_fill(
+    monkeypatch: pytest.MonkeyPatch, filled: float,
+) -> None:
+    executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+    protections = []
+
+    class Exchange(_CancelCcxt):
+        async def privateGetTradeOrder(self, params):
+            return {"code": "0", "data": [{
+                "instId": "XPL-USDT-SWAP", "ordId": "accepted-entry",
+                "clOrdId": "BBNP808102", "side": "sell", "sz": "805",
+                "accFillSz": str(filled), "avgPx": "0.0453" if filled else "",
+                "state": "canceled" if self.cancel_calls else "live",
+            }]}
+
+    async def protect(**kwargs):
+        protections.append(kwargs["filled_contracts"])
+        return {"verified": True}
+
+    monkeypatch.setattr(executor, "_ensure_partial_entry_protection", protect)
+    monkeypatch.setattr("executor.okx_executor.settings.okx_entry_post_only_enabled", False)
+    exchange = Exchange()
+    decision = DecisionOutput(model_name="ensemble_trader", symbol="XPL/USDT",
+                              action=Action.SHORT, confidence=0.7, reasoning="test")
+    await executor._cancel_interrupted_entry_orders(
+        exchange, decision, "XPL/USDT:USDT", {"clOrdId": "BBNP808102"},
+    )
+    assert exchange.cancel_calls == [{"instId": "XPL-USDT-SWAP", "ordId": "accepted-entry"}]
+    report = decision.raw_response["entry_interruption_cleanup"]["orders"][0]
+    assert report["finalization"]["terminal"] is True
+    assert report["finalization"]["cancelled_residual_contracts"] == 805.0 - filled
+    assert protections == ([filled] if filled else [])
+
+
+@pytest.mark.asyncio
+async def test_interrupted_entry_does_not_cancel_another_orders_identity() -> None:
+    executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
+
+    class Exchange(_CancelCcxt):
+        async def privateGetTradeOrder(self, _params):
+            return {"code": "0", "data": [{
+                "instId": "XPL-USDT-SWAP", "ordId": "other-order",
+                "clOrdId": "another-client", "state": "live",
+            }]}
+
+    exchange = Exchange()
+    decision = DecisionOutput(model_name="ensemble_trader", symbol="XPL/USDT",
+                              action=Action.SHORT, confidence=0.7, reasoning="test")
+    await executor._cancel_interrupted_entry_orders(
+        exchange, decision, "XPL/USDT:USDT", {"clOrdId": "BBNP808102"},
+    )
+    assert exchange.cancel_calls == []
+    assert decision.raw_response["entry_interruption_cleanup"]["orders"][0]["status"] == (
+        "order_identity_unconfirmed"
+    )
+
+
+@pytest.mark.asyncio
 async def test_terminal_partial_entry_rebuilds_exact_uncovered_oco(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

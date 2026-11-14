@@ -976,6 +976,7 @@ class OKXExecutor(AbstractExecutor):
         protection_submission: dict[str, Any] = {}
         attached_protection_recovery: dict[str, Any] = {}
         post_only_fact: dict[str, Any] = {}
+        entry_submit_started = False
 
         try:
             okx_symbol = await self._resolve_swap_symbol(decision.symbol)
@@ -2141,6 +2142,7 @@ class OKXExecutor(AbstractExecutor):
                 if decision.is_entry and params.get("attachAlgoOrds"):
                     protection_submit_requested_at = datetime.now(UTC)
                 if decision.is_entry:
+                    entry_submit_started = True
                     order, post_only_fact = await self._place_entry_with_post_only(
                         ccxt,
                         okx_symbol=okx_symbol,
@@ -2312,7 +2314,9 @@ class OKXExecutor(AbstractExecutor):
             )
             order = await self._confirm_market_order(ccxt, order, okx_symbol)
             if decision.is_entry:
-                order = await self._finalize_partial_entry_order(ccxt, order, okx_symbol)
+                order = await self._finalize_partial_entry_order(
+                    ccxt, order, okx_symbol, allow_unfilled=True,
+                )
                 finalization = order.get("entry_partial_fill_finalization")
                 passive_leg = order.get("post_only_passive_order")
                 passive_leg = passive_leg if isinstance(passive_leg, dict) else {}
@@ -2778,6 +2782,15 @@ class OKXExecutor(AbstractExecutor):
                 },
             )
 
+        except asyncio.CancelledError:
+            if decision.is_entry and entry_submit_started:
+                cleanup_params = attached_protection_recovery.get(
+                    "original_request_params",
+                ) or params
+                await self._cancel_interrupted_entry_orders(
+                    ccxt, decision, okx_symbol, cleanup_params,
+                )
+            raise
         except ExchangeAPIError as e:
             error_text = safe_error_text(e)
             if decision.is_exit and self._is_no_position_error(error_text):
@@ -2824,6 +2837,66 @@ class OKXExecutor(AbstractExecutor):
             error_text = safe_error_text(e)
             logger.error("order placement failed", error=error_text)
             raise OrderPlacementError(f"Failed to place order: {error_text}") from e
+
+    async def _cancel_interrupted_entry_orders(
+        self, ccxt: Any, decision: DecisionOutput, symbol: str,
+        params: dict[str, Any],
+    ) -> None:
+        client_id = str(params.get("clOrdId") or "").strip()
+        if not client_id or not decision.is_entry:
+            return
+        identities = [client_id]
+        if getattr(settings, "okx_entry_post_only_enabled", False):
+            identities.append(f"{client_id[:31]}P")
+        report: dict[str, Any] = {"source": "cancelled_entry_exact_client_identity", "orders": []}
+
+        async def cleanup() -> None:
+            inst_id = okx_inst_id_from_symbol(symbol)
+            for identity in identities:
+                item: dict[str, Any] = {"client_order_id": identity}
+                report["orders"].append(item)
+                try:
+                    response = await self._with_retry(
+                        ccxt.privateGetTradeOrder,
+                        {"instId": inst_id, "clOrdId": identity},
+                    )
+                    rows = response.get("data") if isinstance(response, dict) else None
+                    row = rows[0] if isinstance(rows, list) and rows else {}
+                    if not (
+                        isinstance(row, dict)
+                        and str(response.get("code", "0")) == "0"
+                        and row.get("clOrdId") == identity
+                        and row.get("instId") == inst_id
+                        and str(row.get("ordId") or "").strip()
+                    ):
+                        item["status"] = "order_identity_unconfirmed"
+                        continue
+                    order = self._native_order_detail_to_execution_order(row, symbol=symbol)
+                    finalized = await self._finalize_partial_entry_order(
+                        ccxt, order, symbol, allow_unfilled=True,
+                    )
+                    item.update(
+                        order_id=str(row["ordId"]),
+                        status=finalized.get("status"),
+                        finalization=finalized.get("entry_partial_fill_finalization"),
+                    )
+                    filled = self._safe_float(finalized.get("filled"))
+                    finalization = finalized.get("entry_partial_fill_finalization") or {}
+                    if filled > 0 and finalization.get("terminal") is True:
+                        item["protection"] = await self._ensure_partial_entry_protection(
+                            decision=decision, params=params, filled_contracts=filled,
+                        )
+                except Exception as exc:
+                    item.update(status="cleanup_unconfirmed", error=safe_error_text(exc))
+
+        try:
+            await asyncio.wait_for(cleanup(), timeout=OKX_REST_CALL_TIMEOUT * 2)
+        except TimeoutError:
+            report["error"] = "entry_cancellation_cleanup_timeout"
+        raw = dict(decision.raw_response or {})
+        raw["entry_interruption_cleanup"] = report
+        decision.raw_response = raw
+        logger.warning("interrupted entry exchange cleanup completed", symbol=symbol, cleanup=report)
 
     def _exit_submission_key(self, decision: DecisionOutput) -> tuple[str, str, str]:
         target_side = "long" if decision.action == Action.CLOSE_LONG else "short"

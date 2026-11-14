@@ -97,6 +97,53 @@ def test_takeover_contract_recomputes_protection_from_normalized_orders() -> Non
     assert "okx_protection_evidence_incomplete" not in contract["blockers"]
 
 
+@pytest.mark.parametrize(
+    ("side", "entry", "current", "stop", "take", "execution_last"),
+    [("long", 100.0, 106.0, 104.0, 110.0, 106.0),
+     ("short", 216.2, 206.5, 215.1, 210.7, 212.5)],
+)
+def test_profit_lock_protection_uses_execution_price_instead_of_entry(
+    side, entry, current, stop, take, execution_last,
+) -> None:
+    order = dict(_facts()["protection_orders"][0])
+    order.update(stop_loss_price=stop, take_profit_price=take,
+                 raw={"info": {"last": str(execution_last),
+                                "slTriggerPxType": "last", "tpTriggerPxType": "last"}})
+    contract = build_current_position_management_contract(_facts(
+        side=side, entry_price=entry, current_price=current,
+        stop_loss_price=stop, take_profit_price=take, protection_orders=[order],
+    ))
+    position = SimpleNamespace(
+        symbol="BTC/USDT", side=side, quantity=2.0, entry_price=entry,
+        entry_fee=0.12, stop_loss_price=stop, take_profit_price=take,
+        current_management_contract=contract,
+    )
+    assert contract["blockers"] == []
+    assert current_position_management_contract_complete(position) is True
+
+
+def test_protection_direction_rejects_invalid_native_order_even_with_valid_entry() -> None:
+    order = dict(_facts()["protection_orders"][0], raw={"last": "97"})
+    contract = build_current_position_management_contract(_facts(protection_orders=[order]))
+    assert "current_oco_direction_invalid" in contract["blockers"]
+    contract["management_eligible"] = True
+    contract["blockers"] = []
+    contract["policy_provenance"]["fallback_reason"] = ""
+    assert current_position_management_contract_complete({
+        "symbol": "BTC/USDT", "side": "long", "quantity": 2.0,
+        "entry_price": 100.0, "entry_fee": 0.12,
+        "stop_loss_price": 98.0, "take_profit_price": 110.0,
+    }, contract) is False
+
+
+def test_mark_trigger_does_not_validate_against_native_last_price() -> None:
+    order = dict(_facts()["protection_orders"][0], raw={
+        "last": "103", "markPx": "97", "slTriggerPxType": "mark",
+    })
+    contract = build_current_position_management_contract(_facts(protection_orders=[order]))
+    assert "current_oco_direction_invalid" in contract["blockers"]
+
+
 def test_takeover_contract_accepts_safe_protection_overcoverage() -> None:
     contract = build_current_position_management_contract(
         _facts(

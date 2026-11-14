@@ -2204,6 +2204,41 @@ async def test_execution_service_shields_exchange_submit_from_outer_timeout() ->
 
 
 @pytest.mark.asyncio
+async def test_outer_cancellation_then_exchange_timeout_cancels_detached_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    cleaned = asyncio.Event()
+    real_wait_for = asyncio.wait_for
+
+    def short_exchange_timeout(awaitable, timeout):
+        return real_wait_for(awaitable, timeout=0.03 if timeout > 10 else timeout)
+
+    class PendingExecutor:
+        async def place_order(self, *_args, **_kwargs):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cleaned.set()
+
+    async def provider(_mode):
+        return PendingExecutor()
+
+    monkeypatch.setattr("services.execution_service.asyncio.wait_for", short_exchange_timeout)
+    service = _test_execution_service(okx_executor_provider=provider)
+    task = asyncio.create_task(service.execute_candidate(
+        "BTC/USDT", "ensemble_trader", _profit_first_ready_position_review_decision(),
+        SimpleNamespace(warnings=[]), 993,
+        {"warnings": [], "decisions": [], "executions": []}, open_positions=[],
+    ))
+    await real_wait_for(started.wait(), timeout=1)
+    task.cancel()
+    await real_wait_for(task, timeout=1)
+    assert cleaned.is_set()
+
+
+@pytest.mark.asyncio
 async def test_execution_service_preserves_fill_when_cancelled_during_stage_recording() -> None:
     stages: list[tuple[str, str, str]] = []
     passed_stage_started = asyncio.Event()

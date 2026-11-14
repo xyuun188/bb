@@ -3570,6 +3570,61 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
 
 
 @pytest.mark.asyncio
+async def test_entry_cancellation_runs_exchange_cleanup_before_propagating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = _executor(_EntryMaxMarketSizeCcxt())
+    started = asyncio.Event()
+    cleanups = []
+
+    async def pending_submit(*_args, **_kwargs):
+        started.set()
+        await asyncio.Future()
+
+    async def cleanup(_ccxt, decision, symbol, _params):
+        cleanups.append((decision.symbol, symbol))
+
+    monkeypatch.setattr(executor, "_place_entry_with_post_only", pending_submit)
+    monkeypatch.setattr(executor, "_cancel_interrupted_entry_orders", cleanup)
+    task = asyncio.create_task(executor.place_order(_entry_decision(), override_balance=100.0))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleanups == [("BTC/USDT", "BTC/USDT:USDT")]
+
+
+@pytest.mark.asyncio
+async def test_unfilled_market_entry_is_cancelled_instead_of_left_resting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Exchange(_EntryMaxMarketSizeCcxt):
+        cancelled = False
+
+        async def create_order(self, *args, **kwargs):
+            order = await super().create_order(*args, **kwargs)
+            order.update(filled=0.0, average=None, status="open")
+            order["info"].update(state="live", accFillSz="0")
+            return order
+
+        async def privatePostTradeCancelOrder(self, params):
+            self.cancelled = True
+            order = self.orders[params["ordId"]]
+            order["status"] = "canceled"
+            order["info"]["state"] = "canceled"
+            return {"code": "0", "data": [{"ordId": params["ordId"], "sCode": "0"}]}
+
+    monkeypatch.setattr(okx_module.settings, "okx_entry_post_only_enabled", False)
+    exchange = Exchange()
+    result = await _executor(exchange).place_order(_entry_decision(), override_balance=100.0)
+    assert exchange.cancelled is True
+    assert result.status == OrderStatus.CANCELLED
+    assert result.quantity == 0.0
+    assert result.raw_response["entry_partial_fill_finalization"]["terminal"] is True
+    assert len(exchange.create_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_native_stop_risk_rejection_updates_authorization_before_minimum_rounding() -> None:
     exchange = _MovingEntryTickerCcxt()
     executor = _executor(exchange)

@@ -884,32 +884,29 @@ class ExecutionService:
                     override_balance=override_balance,
                 )
             )
-            try:
-                return await asyncio.wait_for(
-                    asyncio.shield(order_task),
-                    timeout=max(deadline - perf_counter(), 0.001),
-                )
-            except asyncio.CancelledError:
-                if order_task.done():
-                    return order_task.result()
-                logger.warning(
-                    "exchange place_order shielded from outer cancellation",
-                    model=model_name,
-                    symbol=symbol,
-                    action=decision.action.value,
-                    mode=model_mode,
-                    retry=retry,
-                )
-                return await asyncio.wait_for(
-                    asyncio.shield(order_task),
-                    timeout=max(deadline - perf_counter(), 0.001),
-                )
-            except TimeoutError:
-                if not order_task.done():
-                    order_task.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await order_task
-                raise
+            while True:
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(order_task),
+                        timeout=max(deadline - perf_counter(), 0.001),
+                    )
+                except asyncio.CancelledError:
+                    if order_task.done():
+                        return order_task.result()
+                    logger.warning(
+                        "exchange place_order shielded from outer cancellation",
+                        model=model_name,
+                        symbol=symbol,
+                        action=decision.action.value,
+                        mode=model_mode,
+                        retry=retry,
+                    )
+                except TimeoutError:
+                    if not order_task.done():
+                        order_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await order_task
+                    raise
 
         async def mark_stage(
             stage: str,
