@@ -3367,6 +3367,9 @@ def _apply_completed_submit_fill_recovery_to_decision(
     now: datetime,
 ) -> None:
     base_quantity = _fill_base_quantity(fill, contract_size)
+    exit_progress = str(getattr(decision, "action", "") or "").lower() in {
+        "close_long", "close_short",
+    }
     decision.was_executed = True
     decision.executed_at = fill.timestamp or now
     decision.execution_price = fill.avg_price
@@ -3376,6 +3379,13 @@ def _apply_completed_submit_fill_recovery_to_decision(
     raw = getattr(decision, "raw_llm_response", None)
     raw = dict(raw) if isinstance(raw, dict) else {}
     previous_execution_result = raw.get("execution_result")
+    previous_execution = previous_execution_result if isinstance(previous_execution_result, dict) else {}
+    previous_raw = previous_execution.get("raw_response")
+    receipt_raw = dict(previous_raw) if isinstance(previous_raw, dict) else {}
+    receipt_raw.update({
+        "recovered_from_completed_submit_stage": True,
+        "trade_ids": list(fill.trade_ids),
+    })
     recovery = {
         "version": "2026-07-26.completed-submit-fill-recovery.v1",
         "source_authority": "decision_submit_stage_plus_okx_native_fills",
@@ -3404,12 +3414,9 @@ def _apply_completed_submit_fill_recovery_to_decision(
         "fee": fill.fee_abs,
         "pnl": fill.fill_pnl,
         "exchange_confirmed": True,
-        "exit_progress": True,
+        "exit_progress": exit_progress,
         "okx_exit_position_mismatch_summary": None,
-        "raw_response": {
-            "recovered_from_completed_submit_stage": True,
-            "trade_ids": list(fill.trade_ids),
-        },
+        "raw_response": receipt_raw,
     }
     recommendation = raw.get("trade_recommendation_contract")
     if isinstance(recommendation, dict):
@@ -3418,7 +3425,7 @@ def _apply_completed_submit_fill_recovery_to_decision(
             "status": "filled",
             "source": "okx_native_fill_recovered_after_outer_cancellation",
             "exchange_confirmed": True,
-            "exit_progress": True,
+            "exit_progress": exit_progress,
             "order_id": fill.order_id,
             "exchange_order_id": fill.order_id,
             "filled_quantity": base_quantity,
@@ -3428,7 +3435,12 @@ def _apply_completed_submit_fill_recovery_to_decision(
             "recorded_at": now.isoformat(),
         }
         raw["trade_recommendation_contract"] = recommendation
-    decision.raw_llm_response = raw
+    decision.raw_llm_response = append_decision_stage(
+        raw, DecisionStage.EXCHANGE_CONFIRM, DecisionStageStatus.COMPLETED,
+        decision.execution_reason,
+        {"exchange_order_id": fill.order_id, "recovered_from_completed_submit_stage": True},
+        at=now,
+    )
 
 
 def _order_needs_local_stored_fact_recovery(order: Order) -> bool:
@@ -4174,9 +4186,15 @@ def _recover_confirmed_entry_decision(
     raw = raw if isinstance(raw, dict) else {}
     execution = raw.get("execution_result")
     execution = execution if isinstance(execution, dict) else {}
+    machine = raw.get("decision_state_machine")
+    machine = machine if isinstance(machine, dict) else {}
     if (
         getattr(decision, "was_executed", False)
         and execution.get("exchange_confirmed") is True
+        and execution.get("exit_progress") is not True
+        and machine.get("current_status") not in {
+            DecisionStageStatus.PENDING, DecisionStageStatus.UNKNOWN,
+        }
         and str(execution.get("exchange_order_id") or "")
         == str(getattr(order, "exchange_order_id", "") or "")
         and (

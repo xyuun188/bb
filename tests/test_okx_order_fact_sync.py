@@ -204,6 +204,27 @@ def test_matching_confirmed_fill_recovers_interrupted_entry_decision_once() -> N
     assert _recover_confirmed_entry_decision(order, decision, now=now) is False
 
 
+@pytest.mark.parametrize("stale_field", ["exit_progress", "stage"])
+def test_confirmed_entry_receipt_still_repairs_stale_execution_state(stale_field) -> None:
+    decision, order, fill, now = _interrupted_confirmed_entry()
+    decision.execution_reason = "OKX confirmed"
+    raw = dict(decision.raw_llm_response)
+    raw["execution_result"] = {
+        "status": "filled", "exchange_confirmed": True,
+        "exchange_order_id": fill.order_id, "exit_progress": stale_field == "exit_progress",
+    }
+    raw["decision_state_machine"] = {
+        "current_stage": "exchange_submit" if stale_field == "stage" else "exchange_confirm",
+        "current_status": "unknown" if stale_field == "stage" else "completed",
+    }
+    decision.raw_llm_response = raw
+
+    assert _recover_confirmed_entry_decision(order, decision, now=now) is True
+    assert decision.raw_llm_response["execution_result"]["exit_progress"] is False
+    assert decision.raw_llm_response["decision_state_machine"]["current_status"] == "completed"
+    assert _recover_confirmed_entry_decision(order, decision, now=now) is False
+
+
 @pytest.mark.parametrize("mismatch", ["client", "side", "symbol", "partial", "unverified", "live"])
 def test_entry_decision_recovery_rejects_unproven_or_mismatched_facts(mismatch) -> None:
     decision, order, _fill, now = _interrupted_confirmed_entry()
@@ -2482,9 +2503,12 @@ async def test_targeted_recent_fill_is_persisted_before_slow_account_history(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action,exit_progress", [("long", False), ("close_short", True)])
 async def test_completed_submit_stage_recovers_fill_overwritten_by_outer_timeout(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    exit_progress: bool,
 ) -> None:
     await _init_test_db(tmp_path, monkeypatch, "completed-submit-fill-recovery.db")
     now = datetime.now(UTC)
@@ -2497,7 +2521,7 @@ async def test_completed_submit_stage_recovers_fill_overwritten_by_outer_timeout
             decision = AIDecision(
                 model_name="ensemble_trader",
                 symbol="BTC/USDT",
-                action="long",
+                action=action,
                 confidence=0.5,
                 reasoning="test",
                 is_paper=True,
@@ -2526,7 +2550,9 @@ async def test_completed_submit_stage_recovers_fill_overwritten_by_outer_timeout
                         "source": "exchange_not_confirmed",
                         "status": "rejected",
                         "exchange_order_id": None,
+                        "raw_response": {"protection_submission": {"state": "confirmed"}},
                     },
+                    "trade_recommendation_contract": {"execution": {"status": "pending"}},
                 },
             )
             session.add(decision)
@@ -2569,6 +2595,12 @@ async def test_completed_submit_stage_recovers_fill_overwritten_by_outer_timeout
         assert order.okx_sync_status == OKX_SYNC_CONFIRMED
         assert recovered_decision.was_executed is True
         assert recovered_decision.raw_llm_response["execution_result"]["exchange_confirmed"] is True
+        raw = recovered_decision.raw_llm_response
+        assert raw["execution_result"]["exit_progress"] is exit_progress
+        assert raw["execution_result"]["raw_response"]["protection_submission"]["state"] == "confirmed"
+        assert raw["trade_recommendation_contract"]["execution"]["exit_progress"] is exit_progress
+        assert raw["decision_state_machine"]["current_stage"] == "exchange_confirm"
+        assert raw["decision_state_machine"]["current_status"] == "completed"
         assert (
             recovered_decision.raw_llm_response["completed_submit_fill_recovery"][
                 "exchange_order_id"
