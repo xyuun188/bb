@@ -186,7 +186,7 @@ def _profit_first_ready_position_review_decision() -> DecisionOutput:
             "production_eligible": True,
             "account_equity_usdt": 1000.0,
             "risk_budget_usdt": 0.5,
-            "portfolio_risk_budget_usdt": 1.5,
+            "portfolio_risk_limit_applied": False,
             "planned_stressed_loss_usdt": 0.4,
             "stressed_loss_fraction": 0.01,
             "target_notional_usdt": 40.0,

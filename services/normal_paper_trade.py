@@ -11,10 +11,11 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-10-31.normal-paper-strategy-trade.v22"
-NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-10-30.normal-paper-dynamic-risk.v11"
+NORMAL_PAPER_TRADE_VERSION = "2026-11-14.normal-paper-strategy-trade.v23"
+NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-11-14.normal-paper-dynamic-risk.v12"
 HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS = frozenset(
     {
+        "2026-10-30.normal-paper-dynamic-risk.v11",
         "2026-10-20.normal-paper-dynamic-risk.v10",
         "2026-10-14.normal-paper-dynamic-risk.v9",
         "2026-10-10.normal-paper-dynamic-risk.v8",
@@ -27,6 +28,7 @@ NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
 HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS = frozenset(
     {
+        "2026-10-31.normal-paper-strategy-trade.v22",
         "2026-10-30.normal-paper-strategy-trade.v21",
         "2026-10-21.normal-paper-strategy-trade.v20",
         "2026-10-21.normal-paper-strategy-trade.v19",
@@ -60,8 +62,9 @@ NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS = frozenset(
     {"strategy_edge_selected", "paper_training_entry"}
 )
 NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.005
-NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION = 0.0001
-NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION = 0.0003
+# Persisted training fills retain these caps for settlement only.
+HISTORICAL_PAPER_TRAINING_SINGLE_TRADE_RISK_FRACTION = 0.0001
+HISTORICAL_PAPER_TRAINING_PORTFOLIO_RISK_FRACTION = 0.0003
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
 NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD = 0.80
 NORMAL_PAPER_TRADE_LEVERAGE_POLICY = "dynamic_risk_and_okx_tier"
@@ -823,20 +826,7 @@ def build_normal_paper_trade_contract(
         "loss_probability": loss_probability,
         "quant_evidence_families": list(support.get("quant_evidence_families") or []),
         "strong_expert_opposition": bool(support.get("strong_expert_opposition") is True),
-        "single_trade_risk_fraction_cap": (
-            NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
-            if paper_training_only
-            else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-        ),
-        **(
-            {
-                "portfolio_risk_fraction_cap": (
-                    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION
-                )
-            }
-            if paper_training_only
-            else {}
-        ),
+        "single_trade_risk_fraction_cap": NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
         "model_leverage_role": "upper_bound_when_explicit",
         "uses_shared_order_pipeline": True,
@@ -1199,27 +1189,15 @@ def _normal_strategy_trade_contract_reasons(
     valid_for = _float(contract.get("valid_for_seconds"), 0.0) or 0.0
     if horizon <= 0.0 or not isclose(valid_for, horizon * 60.0, abs_tol=1e-8):
         reasons.append("normal_paper_trade_horizon_invalid")
-    expected_single_cap = (
-        NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
-        if training_mode
-        else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-    )
     single_cap = _float(contract.get("single_trade_risk_fraction_cap"), 0.0) or 0.0
     if not isclose(
         single_cap,
-        expected_single_cap,
+        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
         abs_tol=1e-12,
     ):
         reasons.append("normal_paper_trade_single_risk_cap_invalid")
     portfolio_cap = _float(contract.get("portfolio_risk_fraction_cap"), None)
-    if training_mode:
-        if portfolio_cap is None or not isclose(
-            portfolio_cap,
-            NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
-            abs_tol=1e-12,
-        ):
-            reasons.append("normal_paper_trade_training_portfolio_cap_invalid")
-    elif portfolio_cap is not None:
+    if portfolio_cap is not None:
         reasons.append("normal_paper_trade_validated_portfolio_cap_forbidden")
     if contract.get("leverage_policy") != NORMAL_PAPER_TRADE_LEVERAGE_POLICY:
         reasons.append("normal_paper_trade_leverage_policy_invalid")

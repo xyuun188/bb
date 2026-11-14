@@ -130,11 +130,11 @@ def test_dashboard_policy_cannot_drift_from_execution_policy() -> None:
     assert canonical["paper_training_entry_requires_finite_downside_stress"] is True
     assert canonical["paper_training_entry_production_permission"] is False
     assert canonical["paper_training_entry_single_trade_risk_fraction"] == pytest.approx(
-        0.0001
+        0.005
     )
-    assert canonical["paper_training_entry_portfolio_risk_fraction"] == pytest.approx(
-        0.0003
-    )
+    assert canonical["paper_training_entry_portfolio_risk_fraction"] is None
+    assert canonical["paper_training_entry_uses_normal_paper_risk_budget"] is True
+    assert canonical["paper_training_entry_portfolio_risk_limit_applied"] is False
 
 
 def test_removed_fixed_policy_and_global_fallback_tokens_cannot_return_to_production() -> None:
@@ -327,8 +327,10 @@ def _required_go_no_go_cards() -> list[dict[str, Any]]:
                     "paper_training_entry_allows_non_positive_fee_after_return": False,
                     "paper_training_entry_is_shadow_only": False,
                     "paper_training_entry_production_permission": False,
-                    "paper_training_entry_single_trade_risk_fraction": 0.0001,
-                    "paper_training_entry_portfolio_risk_fraction": 0.0003,
+                    "paper_training_entry_single_trade_risk_fraction": 0.005,
+                    "paper_training_entry_uses_normal_paper_risk_budget": True,
+                    "paper_training_entry_portfolio_risk_limit_applied": False,
+                    "paper_training_entry_portfolio_risk_fraction": None,
                     "paper_entry_requires_profit_factor": True,
                     "paper_entry_requires_positive_expected_net_return": True,
                     "paper_entry_requires_current_execution_cost": True,

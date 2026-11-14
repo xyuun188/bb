@@ -391,8 +391,8 @@ def test_positive_current_paper_mean_with_negative_lcb_uses_bounded_training() -
     assert contract["authorized"] is True
     assert contract["paper_training_only"] is True
     assert contract["production_permission"] is False
-    assert contract["single_trade_risk_fraction_cap"] == pytest.approx(0.0001)
-    assert contract["portfolio_risk_fraction_cap"] == pytest.approx(0.0003)
+    assert contract["single_trade_risk_fraction_cap"] == pytest.approx(0.005)
+    assert "portfolio_risk_fraction_cap" not in contract
     assert decision.raw_response["paper_trade_selection"]["selection_reason"] == (
         "paper_training_entry"
     )

@@ -8,8 +8,6 @@ from services.normal_paper_trade import (
     HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS,
     NORMAL_PAPER_ORDER_IDENTITY_VERSION,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_VERSION,
     _contract_fingerprint_payload,
     _fingerprint,
@@ -528,11 +526,9 @@ def test_current_positive_edge_with_denied_historical_quality_is_training_only()
     assert contract["paper_training_only"] is True
     assert contract["production_permission"] is False
     assert contract["single_trade_risk_fraction_cap"] == (
-        NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
+        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )
-    assert contract["portfolio_risk_fraction_cap"] == (
-        NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION
-    )
+    assert "portfolio_risk_fraction_cap" not in contract
     assert normal_paper_trade_contract_reasons(contract) == []
     assert normal_paper_trade_observation_contract_reasons(contract) == []
 
@@ -909,8 +905,8 @@ def test_positive_mean_negative_objective_uses_bounded_training(
         direction_support=selection["selected_support"],
     )
     assert normal_paper_entry_contract_reasons(contract) == []
-    assert contract["single_trade_risk_fraction_cap"] == 0.0001
-    assert contract["portfolio_risk_fraction_cap"] == 0.0003
+    assert contract["single_trade_risk_fraction_cap"] == 0.005
+    assert "portfolio_risk_fraction_cap" not in contract
     assert contract["production_permission"] is False
     assert contract["execution_scope"] == "paper_only"
     assert support.get("paper_training_only") is None

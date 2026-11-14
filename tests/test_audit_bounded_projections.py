@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
+from models.trade import Order
 from services.high_risk_review_audit import HighRiskReviewAuditService
 from services.shadow_missed_opportunity_closed_loop import (
     ShadowMissedOpportunityClosedLoopService,
@@ -21,6 +22,7 @@ async def audit_database():
     async with engine.begin() as connection:
         await connection.run_sync(AIDecision.__table__.create)
         await connection.run_sync(ShadowBacktest.__table__.create)
+        await connection.run_sync(Order.__table__.create)
     try:
         yield engine
     finally:
@@ -118,7 +120,9 @@ async def test_missed_opportunity_audit_reads_payloads_only_for_used_rows(audit_
     report = await ShadowMissedOpportunityClosedLoopService(
         session_context_factory=session_context,
     ).report(hours=24)
-    expected = summarize_shadow_missed_opportunities(shadows[:3], decisions=decisions)
+    expected = summarize_shadow_missed_opportunities(
+        shadows[:3], decisions=decisions, orders=[],
+    )
     assert report["summary"] == expected["summary"]
     assert report["blocked_reason_counts"] == expected["blocked_reason_counts"]
     assert report["return_observations"][0]["average_return_pct"] == (

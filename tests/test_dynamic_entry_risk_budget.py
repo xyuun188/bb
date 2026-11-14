@@ -16,8 +16,6 @@ from services.entry_profit_risk_sizing import (
 from services.execution_cost_model import execution_cost_estimate
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
     _contract_fingerprint_payload,
     build_normal_paper_trade_contract,
 )
@@ -228,10 +226,7 @@ def _use_bounded_training_entry(
             ],
             "authorized": True,
             "single_trade_risk_fraction_cap": (
-                NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
-            ),
-            "portfolio_risk_fraction_cap": (
-                NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION
+                NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
             ),
         }
     )
@@ -243,6 +238,26 @@ def _use_bounded_training_entry(
 
 async def _balance(_mode: str, _decision: DecisionOutput | None) -> float:
     return 1000.0
+
+
+@pytest.mark.asyncio
+async def test_training_and_validated_entry_share_the_same_risk_sizing() -> None:
+    ordinary = _decision()
+    training = deepcopy(ordinary)
+    _use_bounded_training_entry(training)
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(ordinary, "paper", [])
+    await policy.apply(training, "paper", [])
+
+    for key in (
+        "risk_budget_usdt", "single_trade_risk_fraction_cap",
+        "risk_limited_target_notional_usdt", "final_notional_usdt",
+        "final_leverage", "final_margin_usdt", "planned_stressed_loss_usdt",
+    ):
+        assert training.raw_response["profit_risk_sizing"][key] == pytest.approx(
+            ordinary.raw_response["profit_risk_sizing"][key]
+        )
 
 
 def test_okx_leverage_tier_tracks_target_notional_across_contract_size_bounds() -> None:
@@ -692,7 +707,7 @@ async def test_normal_paper_rejects_when_native_tier_has_no_remaining_capacity()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("return_lcb", [0.3, 0.0, -0.22, -3.0])
-async def test_bounded_training_entry_can_use_only_its_micro_risk_budget(return_lcb) -> None:
+async def test_training_entry_uses_normal_paper_risk_budget(return_lcb) -> None:
     decision = _quality_observation_decision(return_lcb_pct=return_lcb)
     _use_bounded_training_entry(decision)
     decision.raw_response["opportunity_score"]["return_distribution_contract"][
@@ -709,12 +724,12 @@ async def test_bounded_training_entry_can_use_only_its_micro_risk_budget(return_
     assert dynamic["policy_provenance"]["policy_scope"] == "paper"
     assert sizing["paper_training_entry_mode"] is True
     assert sizing["single_trade_risk_fraction_cap"] == pytest.approx(
-        NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
+        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )
-    assert sizing["risk_budget_usdt"] <= 0.1
-    assert sizing["portfolio_risk_limit_applied"] is True
-    assert sizing["portfolio_risk_budget_usdt"] == pytest.approx(0.3)
-    assert sizing["remaining_training_portfolio_risk_budget_usdt"] == pytest.approx(0.3)
+    assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
+    assert sizing["portfolio_risk_limit_applied"] is False
+    assert "portfolio_risk_budget_usdt" not in sizing
+    assert "remaining_training_portfolio_risk_budget_usdt" not in sizing
     assert sizing["production_permission"] is False
     assert dynamic["policy_provenance"]["effective_return_pct"] > 0.0
     assert sizing["final_leverage"] >= 1.0
@@ -725,7 +740,7 @@ async def test_bounded_training_entry_can_use_only_its_micro_risk_budget(return_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("lifecycle", [{}, {"selection_reason": "paper_training_entry"}])
-async def test_training_budget_counts_unclassified_and_known_paper_exposure(lifecycle) -> None:
+async def test_training_exposure_is_diagnostic_without_micro_portfolio_veto(lifecycle) -> None:
     decision = _quality_observation_decision(return_lcb_pct=0.3)
     _use_bounded_training_entry(decision)
     positions = [{
@@ -739,11 +754,11 @@ async def test_training_budget_counts_unclassified_and_known_paper_exposure(life
         decision, "paper", positions,
     )
     sizing = decision.raw_response["profit_risk_sizing"]
-    assert sizing["current_training_portfolio_stressed_loss_usdt"] == pytest.approx(2.0)
-    assert sizing["remaining_training_portfolio_risk_budget_usdt"] == 0.0
-    assert sizing["production_eligible"] is False
-    assert sizing["final_notional_usdt"] == 0.0
-    assert "normal_paper_training_portfolio_risk_budget_exhausted" in sizing["reason"]
+    assert sizing["current_portfolio_stressed_loss_usdt"] == pytest.approx(2.0)
+    assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
+    assert sizing["portfolio_risk_limit_applied"] is False
+    assert sizing["production_eligible"] is True
+    assert sizing["final_notional_usdt"] > 0.0
     assert "normal_paper_leverage_tier_incomplete" not in sizing["reason"]
     assert "exchange_system_max_leverage_missing" not in sizing["reason"]
     assert "target_notional_missing" not in sizing["reason"]
@@ -760,7 +775,7 @@ async def test_native_price_band_blocks_unaffordable_training_minimum_during_siz
     normal["contract_fingerprint"] = _fingerprint(_contract_fingerprint_payload(normal))
     decision.feature_snapshot.update(buy_price_limit=102.0, sell_price_limit=98.0)
     decision.raw_response["exchange_risk_facts"]["contract_specs"]["BTC-USDT-SWAP"].update(
-        minSz="0.1", lotSz="0.1", tickSz="0.01",
+        minSz="2", lotSz="2", tickSz="0.01",
     )
 
     await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(decision, "paper", [])
@@ -834,9 +849,9 @@ async def test_daily_extremes_do_not_expand_entry_protection_risk(side: str) -> 
 @pytest.mark.parametrize(
     ("key", "value"),
     [
-        ("portfolio_risk_limit_applied", False),
-        ("portfolio_risk_budget_usdt", 0.31),
-        ("current_training_portfolio_stressed_loss_usdt", None),
+        ("portfolio_risk_limit_applied", True),
+        ("risk_budget_usdt", 5.01),
+        ("contract_version", "2026-10-30.normal-paper-dynamic-risk.v11"),
     ],
 )
 async def test_training_risk_contract_tampering_fails_closed(
@@ -1027,7 +1042,7 @@ async def test_paper_training_uses_solved_return_for_execution_permission(
         assert sizing["expected_net_return_pct"] > 0.0
         assert solution["selected_notional_usdt"] >= sizing["minimum_order_notional_usdt"]
         assert sizing["final_notional_usdt"] >= sizing["minimum_order_notional_usdt"]
-        assert sizing["risk_budget_usdt"] <= 0.1
+        assert sizing["risk_budget_usdt"] == pytest.approx(5.0)
     else:
         assert sizing["expected_net_return_pct"] <= 0.0
         assert sizing["final_notional_usdt"] == 0.0

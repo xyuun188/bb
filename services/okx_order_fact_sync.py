@@ -366,6 +366,7 @@ class OkxOrderFactSyncService:
         since = self._effective_since(started_at)
         since_naive = _db_naive_since(since)
         local_orders = await self._load_local_orders(since_naive)
+        missing_entry_receipts = await self._load_missing_entry_receipt_targets(since_naive)
         submit_recovery_orders = [
             order for order in local_orders if _order_is_rejected_without_exchange_fill(order)
         ]
@@ -390,15 +391,18 @@ class OkxOrderFactSyncService:
             }
             | set(submit_recovery_target_order_ids)
             | set(self.recovery_order_ids)
+            | set(missing_entry_receipts)
         )
         order_inst_ids_by_id = _order_inst_ids_by_id(
             [*local_orders, *submit_recovery_orders],
             submit_recovery_decisions,
         )
+        order_inst_ids_by_id.update(missing_entry_receipts)
         priority_target_order_ids = tuple(
             dict.fromkeys(
                 [
                     *self.recovery_order_ids,
+                    *missing_entry_receipts,
                     *submit_recovery_target_order_ids,
                     *_prioritized_exchange_order_ids(
                         external_refresh_orders,
@@ -416,6 +420,7 @@ class OkxOrderFactSyncService:
             }
             | set(submit_recovery_target_order_ids)
             | set(self.recovery_order_ids)
+            | set(missing_entry_receipts)
         )
         if self.priority_only:
             priority_target_order_ids = tuple(
@@ -438,6 +443,7 @@ class OkxOrderFactSyncService:
             for order in [*external_refresh_orders, *submit_recovery_orders]
             if (inst_id := _order_inst_id(order))
         }
+        order_target_inst_ids.update(missing_entry_receipts.values())
         stored_fact_inst_ids = {
             inst_id
             for order in local_orders
@@ -591,7 +597,9 @@ class OkxOrderFactSyncService:
                 )
                 contract_sizes.update(dict(priority_contract_sizes or {}))
                 targeted_fill_ids = {fill.order_id for fill in fills if fill.order_id}
-                recovery_targeted_fill_ids = set(self.recovery_order_ids) & targeted_fill_ids
+                recovery_targeted_fill_ids = (
+                    set(self.recovery_order_ids) | set(missing_entry_receipts)
+                ) & targeted_fill_ids
                 if recovery_targeted_fill_ids:
                     (
                         priority_backfilled_count,
@@ -1524,6 +1532,55 @@ class OkxOrderFactSyncService:
                 for_update=False,
             )
             return _merge_local_order_rows(recent, stored_slippage_refresh)
+
+    async def _load_missing_entry_receipt_targets(
+        self,
+        since_naive: datetime,
+    ) -> dict[str, str]:
+        """Discover interrupted entries without requiring a local order row."""
+
+        has_local_order = exists(
+            select(Order.id).where(
+                Order.execution_mode == self.mode,
+                Order.decision_id == AIDecision.id,
+            )
+        )
+        # Bound candidates before extracting JSON from large decision transcripts.
+        candidates = (
+            select(AIDecision.id)
+            .where(
+                AIDecision.is_paper.is_(self.mode == "paper"),
+                AIDecision.was_executed.is_(False),
+                AIDecision.action.in_(("long", "short")),
+                AIDecision.created_at >= since_naive,
+                ~has_local_order,
+            )
+            .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
+            .limit(min(max(self.limit * 4, 4), 400))
+            .subquery("missing_entry_receipt_candidates")
+        )
+        receipt = AIDecision.raw_llm_response["execution_result"]
+        async with get_session_ctx() as session:
+            rows = await session.execute(
+                select(
+                    AIDecision.symbol,
+                    receipt["exchange_order_id"].as_string().label("exchange_order_id"),
+                    receipt["order_id"].as_string().label("order_id"),
+                )
+                .join(candidates, candidates.c.id == AIDecision.id)
+                .where(
+                    receipt["exchange_confirmed"].as_boolean().is_(True),
+                    receipt["status"].as_string().in_(("filled", "partial")),
+                )
+                .order_by(AIDecision.created_at.desc(), AIDecision.id.desc())
+            )
+            targets: dict[str, str] = {}
+            for row in rows:
+                order_id = str(row.exchange_order_id or row.order_id or "").strip()
+                inst_id = okx_inst_id_from_symbol(row.symbol)
+                if order_id and inst_id:
+                    targets[order_id] = inst_id
+            return targets
 
     async def _load_decisions_for_orders(
         self,

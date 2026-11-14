@@ -17,8 +17,7 @@ from services.current_position_management import (
 )
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
-    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_VERSION,
     _contract_fingerprint_payload,
     _fingerprint,
@@ -265,8 +264,7 @@ async def test_local_context_recovers_training_scope_from_exact_entry_snapshot(
             "continuous_training_after_trusted_settlement": True,
             "risk_override_permission": False,
             "valid_for_seconds": 1800.0,
-            "single_trade_risk_fraction_cap": NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
-            "portfolio_risk_fraction_cap": NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+            "single_trade_risk_fraction_cap": NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
                 "leverage_policy": NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
                 "model_leverage_role": "upper_bound_when_explicit",
         "loss_probability": 0.25,

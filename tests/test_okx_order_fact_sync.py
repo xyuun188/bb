@@ -1888,7 +1888,17 @@ async def test_order_fact_sync_timeout_defers_without_marking_missing_fill_unver
 ) -> None:
     await _init_test_db(tmp_path, monkeypatch, "order-fact-timeout.db")
     now = datetime.now(UTC)
-    ccxt = _FakeCcxt(delay_seconds=2.0)
+    cancelled = asyncio.Event()
+
+    class _SlowCcxt(_FakeCcxt):
+        async def privateGetTradeFillsHistory(self, _params):
+            self.calls.append("fills")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    ccxt = _SlowCcxt()
     try:
         async with get_session_ctx() as session:
             session.add(
@@ -1908,15 +1918,14 @@ async def test_order_fact_sync_timeout_defers_without_marking_missing_fill_unver
                 )
             )
 
-        started = time.monotonic()
-        report = await OkxOrderFactSyncService(
+        service = OkxOrderFactSyncService(
             mode="paper",
             timeout_seconds=0.5,
             executor_factory=_executor_factory(ccxt),
-        ).sync()
-        elapsed = time.monotonic() - started
+        )
+        report = await asyncio.wait_for(service.sync(), timeout=2.0)
 
-        assert elapsed < 1.2
+        assert cancelled.is_set()
         assert report["status"] == "deferred"
         assert "fills_history_account" in report["deferred_stages"]
         assert report["unverified_count"] == 0
@@ -2073,6 +2082,87 @@ async def test_old_targeted_fill_recovers_from_okx_historical_endpoint(
         assert report["unverified_count"] == 0
         assert order.okx_sync_status == OKX_SYNC_CONFIRMED
         assert order.okx_raw_fills["fills_history_confirmed"] is True
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_priority_sync_recovers_confirmed_entry_receipt_without_local_order(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "priority-missing-entry-order.db")
+    decision, _order, fill, now = _interrupted_confirmed_entry()
+    decision.was_executed = False
+    decision.created_at = now
+    decision.raw_llm_response = {
+        **decision.raw_llm_response,
+        "execution_result": {
+            "exchange_confirmed": True,
+            "status": "filled",
+            "exchange_order_id": fill.order_id,
+        },
+    }
+    ccxt = _FakeCcxt(fills=[dict(row) for row in fill.rows])
+    try:
+        async with get_session_ctx() as session:
+            session.add(decision)
+        service = OkxOrderFactSyncService(
+            mode="paper", priority_only=True, executor_factory=_executor_factory(ccxt),
+        )
+
+        report = await service.sync()
+
+        assert report["status"] == "ok"
+        assert report["backfilled_count"] == 1
+        assert "recovery_order_facts_persisted" in report["completed_stages"]
+        async with get_session_ctx() as session:
+            stored_order = (await session.execute(select(Order))).scalar_one()
+            stored_decision = await session.get(AIDecision, decision.id)
+            assert stored_order.exchange_order_id == fill.order_id
+            assert stored_order.decision_id == decision.id
+            assert stored_decision.was_executed is True
+            assert stored_decision.raw_llm_response["execution_result"]["exchange_confirmed"] is True
+
+        second = await service.sync()
+        assert second["backfilled_count"] == 0
+        async with get_session_ctx() as session:
+            assert len((await session.execute(select(Order))).scalars().all()) == 1
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed,status", [(False, "filled"), (True, "rejected")])
+async def test_priority_sync_does_not_promote_unconfirmed_entry_receipt(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    confirmed: bool,
+    status: str,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "priority-unconfirmed-entry.db")
+    decision, _order, fill, now = _interrupted_confirmed_entry()
+    decision.was_executed = False
+    decision.created_at = now
+    decision.raw_llm_response = {
+        **decision.raw_llm_response,
+        "execution_result": {
+            "exchange_confirmed": confirmed, "status": status,
+            "exchange_order_id": fill.order_id,
+        },
+    }
+    ccxt = _FakeCcxt(fills=[dict(row) for row in fill.rows])
+    try:
+        async with get_session_ctx() as session:
+            session.add(decision)
+        report = await OkxOrderFactSyncService(
+            mode="paper", priority_only=True, executor_factory=_executor_factory(ccxt),
+        ).sync()
+        assert report["completed_stages"] == ["priority_queue_idle"]
+        assert ccxt.calls == []
+        async with get_session_ctx() as session:
+            assert (await session.execute(select(Order))).scalars().all() == []
+            assert (await session.get(AIDecision, decision.id)).was_executed is False
     finally:
         await close_db()
 

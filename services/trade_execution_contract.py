@@ -15,11 +15,12 @@ from services.entry_profit_risk_sizing import confirmed_fill_has_valid_submissio
 from services.exchange_exit_decision_lineage import decision_exit_exchange_order_ids
 from services.normal_paper_trade import (
     HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS,
+    HISTORICAL_PAPER_TRAINING_PORTFOLIO_RISK_FRACTION,
+    HISTORICAL_PAPER_TRAINING_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD,
+    NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
-    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
     historical_normalized_contract_reasons,
     normal_paper_entry_contract_reasons,
     normal_paper_trade_observation_contract_reasons,
@@ -590,11 +591,11 @@ def trade_execution_policy() -> dict[str, Any]:
         "paper_training_entry_is_bounded_paper_only": True,
         "paper_training_entry_production_permission": False,
         "paper_training_entry_single_trade_risk_fraction": (
-            NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
+            NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
         ),
-        "paper_training_entry_portfolio_risk_fraction": (
-            NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION
-        ),
+        "paper_training_entry_uses_normal_paper_risk_budget": True,
+        "paper_training_entry_portfolio_risk_limit_applied": False,
+        "paper_training_entry_portfolio_risk_fraction": None,
         "paper_entry_requires_profit_factor": True,
         "paper_entry_requires_positive_expected_net_return": True,
         "paper_entry_requires_current_execution_cost": True,
@@ -1736,11 +1737,9 @@ def validate_normal_paper_entry_contract(
         or risk_budget > equity * settlement_single_cap + 1e-8
     ):
         reasons.append("normal_paper_single_trade_risk_cap_exceeded")
-    if normal_trade.get("selection_reason") == "paper_training_entry":
+    if historical_normal_trade and training_entry:
         portfolio_cap = settlement_portfolio_cap
-        training_single_cap = (
-            settlement_single_cap if historical_normal_trade else single_cap
-        )
+        training_single_cap = settlement_single_cap
         portfolio_budget = _safe_float(
             sizing.get("portfolio_risk_budget_usdt"),
             float("nan"),
@@ -1750,27 +1749,27 @@ def validate_normal_paper_entry_contract(
             float("nan"),
         )
         expected_portfolio_budget = (
-            equity * NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION
+            equity * HISTORICAL_PAPER_TRAINING_PORTFOLIO_RISK_FRACTION
         )
         if (
             sizing.get("portfolio_risk_limit_applied") is not True
             or not isclose(
                 portfolio_cap,
-                NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
+                HISTORICAL_PAPER_TRAINING_PORTFOLIO_RISK_FRACTION,
                 rel_tol=1e-12,
                 abs_tol=1e-12,
             )
             or not isclose(
-            portfolio_budget,
-            expected_portfolio_budget,
-            rel_tol=1e-8,
-            abs_tol=1e-8,
+                portfolio_budget,
+                expected_portfolio_budget,
+                rel_tol=1e-8,
+                abs_tol=1e-8,
             )
             or not isfinite(current_portfolio_risk)
             or current_portfolio_risk < 0.0
             or not isclose(
                 training_single_cap,
-                NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
+                HISTORICAL_PAPER_TRAINING_SINGLE_TRADE_RISK_FRACTION,
                 rel_tol=1e-12,
                 abs_tol=1e-12,
             )
@@ -1782,6 +1781,8 @@ def validate_normal_paper_entry_contract(
             > portfolio_budget - current_portfolio_risk + 1e-8
         ):
             reasons.append("normal_paper_training_portfolio_risk_cap_exceeded")
+    elif not historical_normal_trade and sizing.get("portfolio_risk_limit_applied") is not False:
+        reasons.append("normal_paper_unexpected_portfolio_risk_limit")
     if stress <= 0.0 or not persisted_product_isclose(
         planned_loss,
         final_notional,

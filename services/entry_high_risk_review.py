@@ -18,7 +18,6 @@ from core.safe_output import safe_error_text
 from services.entry_direction_metrics import selected_entry_metrics
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
     normal_paper_current_return_ready,
     normal_paper_entry_contract_reasons,
 )
@@ -194,11 +193,7 @@ class EntryHighRiskReviewGatePolicy:
             sizing.get("expected_net_return_pct"), sizing.get("return_lcb_pct")
         ):
             violations.append("sizing_current_return_contract_invalid")
-        advisory_risk_cap = (
-            NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
-            if training_mode
-            else NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
-        )
+        advisory_risk_cap = NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
         if not 0.0 < normal_risk_cap <= advisory_risk_cap:
             violations.append("normal_trade_risk_cap_exceeded")
         if not 0.0 < sizing_risk_cap <= advisory_risk_cap:

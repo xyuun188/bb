@@ -37,8 +37,10 @@ def _cards() -> list[dict]:
                     "paper_training_entry_allows_non_positive_fee_after_return": False,
                     "paper_training_entry_is_shadow_only": False,
                     "paper_training_entry_production_permission": False,
-                    "paper_training_entry_single_trade_risk_fraction": 0.0001,
-                    "paper_training_entry_portfolio_risk_fraction": 0.0003,
+                    "paper_training_entry_single_trade_risk_fraction": 0.005,
+                    "paper_training_entry_uses_normal_paper_risk_budget": True,
+                    "paper_training_entry_portfolio_risk_limit_applied": False,
+                    "paper_training_entry_portfolio_risk_fraction": None,
                     "paper_entry_requires_profit_factor": True,
                     "paper_entry_requires_positive_expected_net_return": True,
                     "paper_entry_requires_current_execution_cost": True,
@@ -106,7 +108,7 @@ def test_phase3_go_no_go_rejects_drifted_training_risk_caps() -> None:
     cards = deepcopy(_cards())
     trade = next(card for card in cards if card["key"] == "trade_execution_contract")
     trade["details"]["policy"]["paper_training_entry_single_trade_risk_fraction"] = (
-        0.005
+        0.0001
     )
 
     report = evaluate_phase3_go_no_go_cards(cards)

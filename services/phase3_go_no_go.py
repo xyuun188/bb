@@ -7,8 +7,7 @@ from typing import Any
 
 from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.normal_paper_trade import (
-    NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION,
-    NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION,
+    NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
 )
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
@@ -233,6 +232,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         "paper_training_entry_requires_positive_size_aware_net_return",
         "paper_training_entry_allows_non_positive_return_lcb",
         "paper_training_entry_requires_finite_downside_stress",
+        "paper_training_entry_uses_normal_paper_risk_budget",
         "paper_entry_requires_historical_fee_after_quality_permission",
         "paper_entry_requires_profit_factor",
         "paper_entry_requires_current_execution_cost",
@@ -253,6 +253,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         "paper_training_entry_requires_positive_return_lcb",
         "paper_training_entry_allows_non_positive_fee_after_return",
         "paper_training_entry_production_permission",
+        "paper_training_entry_portfolio_risk_limit_applied",
     )
     missing_policy = [
         key for key in required_true_trade_policy if trade_policy.get(key) is not True
@@ -262,10 +263,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
     )
     required_numeric_trade_policy = {
         "paper_training_entry_single_trade_risk_fraction": (
-            NORMAL_PAPER_TRADE_TRAINING_SINGLE_TRADE_RISK_FRACTION
-        ),
-        "paper_training_entry_portfolio_risk_fraction": (
-            NORMAL_PAPER_TRADE_TRAINING_PORTFOLIO_RISK_FRACTION
+            NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
         ),
     }
     invalid_numeric_policy = [
@@ -281,6 +279,8 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
             )
         )
     ]
+    if trade_policy.get("paper_training_entry_portfolio_risk_fraction") is not None:
+        invalid_numeric_policy.append("paper_training_entry_portfolio_risk_fraction")
     report_available = trade.get("report_available", True)
     if report_available is False:
         blockers.append(

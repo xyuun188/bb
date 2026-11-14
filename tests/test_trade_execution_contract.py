@@ -245,6 +245,7 @@ def _entry_raw() -> dict[str, object]:
         "profit_risk_sizing": {
             "production_eligible": True,
             "risk_budget_usdt": 3.0,
+            "portfolio_risk_limit_applied": False,
             "planned_stressed_loss_usdt": 2.4,
             "stressed_loss_fraction": 0.02,
             "target_notional_usdt": 150.0,
@@ -896,10 +897,14 @@ def test_missing_cost_or_provenance_fails_closed() -> None:
     assert reasons["dynamic_risk_budget_provenance_incomplete"] == 1
 
 
-def test_historical_training_settlement_uses_persisted_budget_caps() -> None:
+@pytest.mark.parametrize("version", [
+    "2026-10-30.normal-paper-strategy-trade.v21",
+    "2026-10-31.normal-paper-strategy-trade.v22",
+])
+def test_historical_training_settlement_uses_persisted_budget_caps(version) -> None:
     raw = _entry_raw()
     raw["normal_paper_trade"] = {
-        "version": "2026-10-30.normal-paper-strategy-trade.v21",
+        "version": version,
         "authorized": True,
         "trade_mode": "paper",
         "execution_scope": "paper_only",
