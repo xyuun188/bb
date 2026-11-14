@@ -9,7 +9,10 @@ from typing import Any
 
 from services.dynamic_policy_values import empirical_policy_value
 from services.profit_supervision import shadow_fee_after_return_labels
-from services.trade_execution_contract import validate_entry_execution_contract
+from services.trade_execution_contract import (
+    summarize_trade_execution_contract,
+    validate_entry_execution_contract,
+)
 
 DEFAULT_REPORT_WINDOW_HOURS = 24
 DEFAULT_REPORT_LIMIT = 200
@@ -25,6 +28,7 @@ class ShadowMissedOpportunityClosedLoopService:
         from db.session import get_read_session_ctx
         from models.decision import AIDecision
         from models.learning import ShadowBacktest
+        from models.trade import Order
 
         capped_hours = max(1, min(int(hours or DEFAULT_REPORT_WINDOW_HOURS), 168))
         capped_limit = max(1, min(int(limit or DEFAULT_REPORT_LIMIT), 1000))
@@ -42,7 +46,7 @@ class ShadowMissedOpportunityClosedLoopService:
             shadows = [dict(row) for row in result.mappings().all()]
             result = await session.execute(
                 select(
-                    AIDecision.id, AIDecision.created_at,
+                    AIDecision.id, AIDecision.created_at, AIDecision.symbol,
                     AIDecision.action, AIDecision.was_executed,
                 ).order_by(AIDecision.id.desc()).limit(capped_limit)
             )
@@ -72,15 +76,34 @@ class ShadowMissedOpportunityClosedLoopService:
                     )
                     for row in result.mappings().all():
                         rows_by_id[row["id"]][field] = row[field]
+        executed_entry_ids = [
+            row["id"] for row in decisions
+            if row["action"].lower() in {"long", "short"} and row["was_executed"]
+        ]
+        orders = []
+        if executed_entry_ids:
+            async with session_factory() as session:
+                result = await session.execute(
+                    select(
+                        Order.decision_id, Order.execution_mode, Order.symbol,
+                        Order.status, Order.quantity, Order.price,
+                        Order.exchange_order_id, Order.filled_at, Order.created_at,
+                        Order.okx_fill_contracts, Order.okx_sync_status, Order.okx_raw_fills,
+                    ).where(Order.decision_id.in_(executed_entry_ids))
+                )
+                orders = [dict(row) for row in result.mappings().all()]
         report = summarize_shadow_missed_opportunities(
-            shadows, decisions=decisions,
+            shadows, decisions=decisions, orders=orders,
         )
         report["window_hours"] = capped_hours
         report["query_policy"] = {"online_safe": True, "ordered_by_primary_key": True, "row_limit": capped_limit}
         return report
 
 
-def summarize_shadow_missed_opportunities(shadows: Sequence[Any], *, decisions: Sequence[Any] | None = None) -> dict[str, Any]:
+def summarize_shadow_missed_opportunities(
+    shadows: Sequence[Any], *, decisions: Sequence[Any] | None = None,
+    orders: Sequence[Any] | None = None,
+) -> dict[str, Any]:
     completed = [row for row in shadows if str(_row_get(row, "status") or "") == "completed"]
     missed = [row for row in completed if bool(_row_get(row, "missed_opportunity"))]
     groups: dict[tuple[str, str], list[float]] = defaultdict(list)
@@ -113,7 +136,7 @@ def summarize_shadow_missed_opportunities(shadows: Sequence[Any], *, decisions: 
             }
         )
 
-    executed_contract_gaps = _executed_return_contract_gaps(decisions or [])
+    executed_contract_gaps = _executed_return_contract_gaps(decisions or [], orders=orders)
     return {
         "audit_only": True,
         "read_only": True,
@@ -139,7 +162,26 @@ def summarize_shadow_missed_opportunities(shadows: Sequence[Any], *, decisions: 
     }
 
 
-def _executed_return_contract_gaps(decisions: Sequence[Any]) -> list[dict[str, Any]]:
+def _executed_return_contract_gaps(
+    decisions: Sequence[Any], *, orders: Sequence[Any] | None = None,
+) -> list[dict[str, Any]]:
+    if orders is not None:
+        entries = [
+            row for row in decisions
+            if str(_row_get(row, "action") or "").lower() in {"long", "short"}
+            and bool(_row_get(row, "was_executed"))
+        ]
+        audit = summarize_trade_execution_contract(entries, orders=orders)
+        return [
+            {
+                "decision_id": row["decision_id"],
+                "reason": f"executed_without_complete_{row['contract_lifecycle']}_entry_contract",
+                "contract_lifecycle": row["contract_lifecycle"],
+                "contract_blockers": row["effective_reasons"],
+            }
+            for row in audit["entry_contracts"]
+            if row["effective_reasons"]
+        ]
     gaps: list[dict[str, Any]] = []
     for row in decisions:
         action = str(_row_get(row, "action") or "").lower()

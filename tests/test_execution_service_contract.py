@@ -820,6 +820,35 @@ def test_historical_below_minimum_plan_uses_complete_authoritative_fill() -> Non
     assert "normal_paper_minimum_order_invalid" not in contract["reasons"]
 
 
+@pytest.mark.parametrize("verified_fill", [True, False])
+def test_shadow_return_audit_requires_authoritative_minimum_fill_evidence(
+    verified_fill: bool,
+) -> None:
+    from services.shadow_missed_opportunity_closed_loop import (
+        summarize_shadow_missed_opportunities,
+    )
+
+    decision = _historical_minimum_fill_decision()
+    audit_decision = SimpleNamespace(
+        id=510818, symbol=decision.symbol, action="short", was_executed=True,
+        raw_llm_response=decision.raw_response,
+    )
+    order = _authoritative_historical_fill_order()
+    order.okx_raw_fills["contract_size_verified"] = verified_fill
+
+    report = summarize_shadow_missed_opportunities(
+        [], decisions=[audit_decision], orders=[order],
+    )
+
+    assert report["summary"]["executed_return_contract_gap_count"] == (
+        0 if verified_fill else 1
+    )
+    if not verified_fill:
+        assert "filled_order_contract_size_not_okx_public_instruments" in (
+            report["executed_return_contract_gaps"][0]["contract_blockers"]
+        )
+
+
 @pytest.mark.parametrize(
     ("executed", "filled_order_present", "authoritative_fill_complete"),
     [
