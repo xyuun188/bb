@@ -39,7 +39,9 @@ def _blocking_reasons(snapshot: Any) -> list[str]:
         if str(item).strip()
     ]
     selection = _dict(payload.get("paper_trade_selection"))
-    selection_reason = str(selection.get("selection_reason") or "").strip()
+    selection_reason = str(
+        selection.get("diagnostic_status") or selection.get("selection_reason") or ""
+    ).strip()
     if selection.get("selected") is not True and selection_reason:
         reasons.append(f"paper_trade_selection:{selection_reason}")
     return reasons

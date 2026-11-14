@@ -44,6 +44,30 @@ def test_blocking_reasons_reads_permission_and_selection() -> None:
     ]
 
 
+def test_blocking_reasons_prefers_profit_gate_diagnostic_to_no_direction() -> None:
+    module = _load_module()
+
+    reasons = module._blocking_reasons(
+        {
+            "entry_permission": {
+                "blocking_reasons": [
+                    "direction_support_risk_adjusted_return_not_positive"
+                ]
+            },
+            "paper_trade_selection": {
+                "selected": False,
+                "selection_reason": "no_direction",
+                "diagnostic_status": "profit_gate_blocked",
+            },
+        }
+    )
+
+    assert reasons == [
+        "direction_support_risk_adjusted_return_not_positive",
+        "paper_trade_selection:profit_gate_blocked",
+    ]
+
+
 def test_blocking_reasons_is_empty_for_non_mapping_snapshot() -> None:
     module = _load_module()
 

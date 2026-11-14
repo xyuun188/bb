@@ -231,7 +231,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         "paper_training_entry_is_bounded_paper_only",
         "paper_training_entry_authorizes_normal_entry",
         "paper_training_entry_requires_positive_size_aware_net_return",
-        "paper_training_entry_requires_positive_return_lcb",
+        "paper_training_entry_allows_non_positive_return_lcb",
         "paper_training_entry_requires_finite_downside_stress",
         "paper_entry_requires_historical_fee_after_quality_permission",
         "paper_entry_requires_profit_factor",
@@ -250,7 +250,7 @@ def evaluate_phase3_go_no_go_cards(cards: list[dict[str, Any]]) -> dict[str, Any
         "paper_entry_requires_model_promotion",
         "paper_quality_observation_authorizes_normal_entry",
         "paper_training_entry_is_shadow_only",
-        "paper_training_entry_allows_non_positive_return_lcb",
+        "paper_training_entry_requires_positive_return_lcb",
         "paper_training_entry_allows_non_positive_fee_after_return",
         "paper_training_entry_production_permission",
     )

@@ -87,12 +87,13 @@ def normal_paper_current_return_ready(expected_net: Any, downside_return: Any) -
     return expected is not None and expected > 0.0 and downside is not None
 
 
-def normal_paper_entry_return_ready(expected_net: Any, downside_return: Any) -> bool:
-    """Require positive mean and positive downside bound before a new order.
+def normal_paper_entry_return_ready(
+    expected_net: Any, downside_return: Any, *, paper_training_only: bool = False,
+) -> bool:
+    """Keep ordinary entries strict; bounded paper training uses positive mean.
 
-    ``normal_paper_current_return_ready`` remains intentionally permissive for
-    sizing and observation records. New order authorization is stricter: a
-    positive mean with a non-positive lower bound remains observation-only.
+    Training still needs a finite downside estimate for stress sizing. Its
+    separate contract enforces paper-only scope, loss probability and budgets.
     """
 
     expected = _float(expected_net, None)
@@ -101,7 +102,7 @@ def normal_paper_entry_return_ready(expected_net: Any, downside_return: Any) -> 
         expected is not None
         and expected > 0.0
         and downside is not None
-        and downside > 0.0
+        and (paper_training_only or downside > 0.0)
     )
 
 
@@ -499,18 +500,11 @@ def select_normal_paper_trade_side(
         )
         current_edge = bool(
             support.get("current_edge_validated") is True
-            and normal_paper_entry_return_ready(expected_net, objective_net)
+            and normal_paper_current_return_ready(expected_net, objective_net)
         )
-        if (
-            support.get("current_edge_validated") is True
-            and expected_net is not None
-            and expected_net > 0.0
-            and objective_net is not None
-            and objective_net <= 0.0
-        ):
-            support["blocking_reasons"].append(
-                "direction_support_risk_adjusted_return_not_positive"
-            )
+        ordinary_return_ready = normal_paper_entry_return_ready(
+            expected_net, objective_net,
+        )
         families = sorted(
             {
                 str(item).strip()
@@ -526,21 +520,23 @@ def select_normal_paper_trade_side(
         )
         training_candidate = bool(
             current_edge
-            and quality_permissions
+            and _quality_permissions_well_formed(quality_permissions)
             and expected_net is not None
             and expected_net > 0.0
             and raw_expected is not None
             and raw_expected > 0.0
-            and loss_probability <= NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
+            and 0.0 <= loss_probability <= NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
             and not support["blocking_reasons"]
             and support.get("strong_expert_opposition") is not True
             and (
                 observation_only
                 or quality_permission_denied
+                or not ordinary_return_ready
             )
         )
         validated_edge = bool(
             current_edge
+            and ordinary_return_ready
             and expected_net is not None
             and expected_net > 0.0
             and not support["blocking_reasons"]
@@ -564,7 +560,14 @@ def select_normal_paper_trade_side(
                     {
                         "paper_training_only": True,
                         "paper_training_reasons": [
-                            "historical_quality_gate_is_observation_only",
+                            *(
+                                ["historical_quality_gate_is_observation_only"]
+                                if observation_only or quality_permission_denied else []
+                            ),
+                            *(
+                                ["positive_mean_with_non_positive_risk_adjusted_return"]
+                                if not ordinary_return_ready else []
+                            ),
                             "current_directional_evidence_is_training_eligible",
                         ],
                     }
@@ -579,6 +582,10 @@ def select_normal_paper_trade_side(
                     "quant_evidence_families": families,
                     "selection_reason": selection_reason,
                 }
+            )
+        elif current_edge and not ordinary_return_ready:
+            support["blocking_reasons"].append(
+                "direction_support_risk_adjusted_return_not_positive"
             )
 
     candidates.sort(
@@ -750,7 +757,7 @@ def build_normal_paper_trade_contract(
         or support.get("selected_side") != normalized_side
         or horizon <= 0.0
         or expected_net is None
-        or (expected_net <= 0.0 and not paper_training_only)
+        or expected_net <= 0.0
         or (paper_training_only and (current_raw_expected is None or current_raw_expected <= 0.0))
         or objective_net is None
         or loss_probability is None
@@ -919,7 +926,9 @@ def reconcile_normal_paper_trade_contract(
         and contract["current_edge_validated"]
         and current_raw is not None
         and current_raw > 0.0
-        and normal_paper_entry_return_ready(expected_net, return_lcb)
+        and normal_paper_entry_return_ready(
+            expected_net, return_lcb, paper_training_only=True,
+        )
         and current_loss_probability is not None
         and 0.0 <= current_loss_probability <= (
             NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
@@ -944,7 +953,7 @@ def reconcile_normal_paper_trade_contract(
         else "current_execution_return_lcb_missing"
         if return_lcb is None
         else "current_execution_return_lcb_not_positive"
-        if return_lcb <= 0.0
+        if return_lcb <= 0.0 and not training_entry
         else "current_execution_loss_probability_missing"
         if current_loss_probability is None
         else "current_execution_loss_probability_invalid"
@@ -972,9 +981,11 @@ def reconcile_normal_paper_trade_contract(
             ),
             "return_lcb_pct": round(return_lcb, 8) if return_lcb is not None else None,
             "new_entry_return_ready": (
-                normal_paper_entry_return_ready(expected_net, return_lcb)
+                normal_paper_entry_return_ready(
+                    expected_net, return_lcb, paper_training_only=training_entry,
+                )
             ),
-            "positive_return_lcb_required": True,
+            "positive_return_lcb_required": not training_entry,
             "gross_expected_return_pct": (
                 round(gross_expected, 8) if gross_expected is not None else None
             ),
@@ -1239,6 +1250,7 @@ def normal_paper_entry_contract_reasons(value: Any) -> list[str]:
     return_ready = normal_paper_entry_return_ready(
         contract.get("expected_net_return_pct"),
         contract.get("objective_net_return_pct"),
+        paper_training_only=contract.get("selection_reason") == "paper_training_entry",
     )
     if not return_ready:
         reasons.append("normal_paper_trade_return_lcb_not_positive")

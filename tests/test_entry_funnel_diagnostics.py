@@ -4,6 +4,21 @@ from services.entry_funnel_diagnostics import (
 )
 
 
+def test_stale_profit_diagnostic_cannot_hide_actual_risk_or_execution_block() -> None:
+    raw = {
+        "paper_trade_selection": {"selected": False, "diagnostic_status": "profit_gate_blocked"},
+        "execution_trace": {"reason_code": "RISK_BUDGET"},
+    }
+    assert classify_entry_funnel_reason(
+        raw=raw, action="hold", was_executed=False, has_order=False,
+        reason="risk_budget_exhausted",
+    ) == "risk_blocked"
+    raw.pop("execution_trace")
+    assert classify_entry_funnel_reason(
+        raw=raw, action="short", was_executed=False, has_order=True,
+    ) == "execution_blocked"
+
+
 def test_funnel_classifies_structured_funding_block() -> None:
     assert classify_entry_funnel_reason(
         raw={
@@ -74,6 +89,33 @@ def test_funnel_distinguishes_selected_quality_observation() -> None:
         was_executed=False,
         has_order=False,
     ) == "quality_observation"
+
+
+def test_funnel_reports_profit_gate_instead_of_no_candidate() -> None:
+    assert classify_entry_funnel_reason(
+        raw={
+            "paper_trade_selection": {
+                "selected": False,
+                "selection_reason": "no_direction",
+                "diagnostic_status": "profit_gate_blocked",
+                "blocking_category": "profit_gate",
+                "blocking_reasons": [
+                    "direction_support_risk_adjusted_return_not_positive"
+                ],
+            },
+            "entry_permission": {
+                "granted": False,
+                "diagnostic_status": "profit_gate_blocked",
+            },
+            "analysis_quality_contract": {
+                "analysis_complete": True,
+                "decision_eligible": True,
+            },
+        },
+        action="hold",
+        was_executed=False,
+        has_order=False,
+    ) == "profit_gate_blocked"
 
 
 def test_funnel_does_not_treat_normal_funding_diagnostics_as_a_block() -> None:

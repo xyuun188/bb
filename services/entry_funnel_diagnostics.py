@@ -7,6 +7,7 @@ from typing import Any
 
 ENTRY_FUNNEL_REASONS = (
     "no_candidate",
+    "profit_gate_blocked",
     "insufficient_evidence",
     "direction_conflict",
     "shadow_training",
@@ -161,6 +162,7 @@ def classify_entry_funnel_reason(
     high_risk_review = _dict(payload.get("high_risk_review"))
     paper_selection = _dict(payload.get("paper_trade_selection"))
     normal_paper_trade = _dict(payload.get("normal_paper_trade"))
+    entry_permission = _dict(payload.get("entry_permission"))
     quality_complete = bool(
         quality.get("analysis_complete") is True
         and quality.get("decision_eligible") is True
@@ -323,6 +325,11 @@ def classify_entry_funnel_reason(
 
     if has_order or action_text in {"long", "short"}:
         return "execution_blocked"
+    if paper_selection.get("selected") is not True and (
+        paper_selection.get("diagnostic_status") == "profit_gate_blocked"
+        or entry_permission.get("diagnostic_status") == "profit_gate_blocked"
+    ):
+        return "profit_gate_blocked"
     return "no_candidate"
 
 

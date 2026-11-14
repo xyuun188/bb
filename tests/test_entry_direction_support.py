@@ -88,7 +88,7 @@ def test_qualified_model_keeps_normal_entry_with_unqualified_observation_tools(
     )
 
 
-def test_model_quality_cannot_replace_current_positive_downside_requirement() -> None:
+def test_negative_objective_with_unproven_history_only_selects_bounded_training() -> None:
     row = _row("local_ml", raw=0.6, objective=-0.2)
     row["paper_return_quality_governance"] = {"paper_execution_permission": True}
     support = assess_paper_model_trade_support(
@@ -101,10 +101,10 @@ def test_model_quality_cannot_replace_current_positive_downside_requirement() ->
 
     selection = select_normal_paper_trade_side({"long": support})
 
-    assert selection["selected"] is False
-    assert "direction_support_risk_adjusted_return_not_positive" in selection[
-        "blocking_reasons"
-    ]
+    assert selection["selected"] is True
+    assert selection["selection_reason"] == "paper_training_entry"
+    assert selection["selected_support"]["paper_training_only"] is True
+    assert selection["production_permission"] is False
 
 
 def test_governed_candidate_still_requires_positive_objective_evidence() -> None:
@@ -619,7 +619,7 @@ def test_negative_objective_family_cannot_veto_cost_complete_training_entry(side
     assert competition[side]["evidence"] == [positive, negative]
 
 
-def test_two_negative_objective_families_still_cannot_authorize_entry() -> None:
+def test_negative_objective_families_without_quality_contract_cannot_authorize_entry() -> None:
     competition = {
         "long": {"evidence": [
             _row("local_ml", raw=0.6, objective=-0.2),

@@ -691,8 +691,9 @@ async def test_normal_paper_rejects_when_native_tier_has_no_remaining_capacity()
 
 
 @pytest.mark.asyncio
-async def test_bounded_training_entry_can_use_only_its_micro_risk_budget() -> None:
-    decision = _quality_observation_decision(return_lcb_pct=0.3)
+@pytest.mark.parametrize("return_lcb", [0.3, 0.0, -0.22, -3.0])
+async def test_bounded_training_entry_can_use_only_its_micro_risk_budget(return_lcb) -> None:
+    decision = _quality_observation_decision(return_lcb_pct=return_lcb)
     _use_bounded_training_entry(decision)
     decision.raw_response["opportunity_score"]["return_distribution_contract"][
         "raw_expected_return_pct"
@@ -717,6 +718,8 @@ async def test_bounded_training_entry_can_use_only_its_micro_risk_budget() -> No
     assert sizing["production_permission"] is False
     assert dynamic["policy_provenance"]["effective_return_pct"] > 0.0
     assert sizing["final_leverage"] >= 1.0
+    assert sizing["stressed_loss_fraction"] >= max(-return_lcb / 100.0, 0.0)
+    assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"] + 1e-8
     assert RiskEngine().assess(decision, [], 1000.0).approved is True
 
 
