@@ -315,9 +315,13 @@ def test_runtime_retention_timer_runs_as_bb_with_low_priority_runtime_env() -> N
     assert "run_runtime_data_retention.py --apply --confirm compact-runtime-data-v1" in service
     assert "--max-rows-per-table 5000" in service
     assert "--skip-byte-estimate" in service
-    assert "OnCalendar=*-*-* 18:20:00 UTC" in timer
+    assert "OnCalendar=*-*-* *:20:00 UTC" in timer
     assert "Persistent=true" in timer
     assert "Unit=bb-runtime-data-retention.service" in timer
+    journal = timer_script.render_journal_limits()
+    assert "SystemMaxUse=512M" in journal
+    assert "SystemKeepFree=4G" in journal
+    assert "RuntimeMaxUse=128M" in journal
 
 
 def test_runtime_retention_timer_dry_run_does_not_connect(

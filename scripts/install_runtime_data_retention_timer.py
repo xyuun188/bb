@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the low-priority daily runtime data-retention systemd timer."""
+"""Install bounded hourly runtime retention and journal storage limits."""
 
 from __future__ import annotations
 
@@ -26,7 +26,16 @@ TIMER_NAME = "bb-runtime-data-retention.timer"
 REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
 REPORT_DIR_REL = "data/runtime_data_retention_reports"
 REMOTE_STAGING_DIR_REL = "tmp/systemd-unit-stage"
-DEFAULT_ON_CALENDAR = "*-*-* 18:20:00 UTC"
+DEFAULT_ON_CALENDAR = "*-*-* *:20:00 UTC"
+JOURNAL_LIMITS_PATH = "/etc/systemd/journald.conf.d/60-bb-storage-limits.conf"
+
+
+def render_journal_limits() -> str:
+    return """[Journal]
+SystemMaxUse=512M
+SystemKeepFree=4G
+RuntimeMaxUse=128M
+"""
 
 
 def _remote_quote(value: str) -> str:
@@ -64,7 +73,7 @@ ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then
 
 def render_timer(*, on_calendar: str = DEFAULT_ON_CALENDAR) -> str:
     return f"""[Unit]
-Description=Run BB bounded runtime data retention daily
+Description=Run BB bounded runtime data retention hourly
 
 [Timer]
 OnCalendar={on_calendar}
@@ -97,10 +106,12 @@ def install_timer(
 ) -> None:
     service = render_service(remote_app_dir=remote_app_dir, owner=owner)
     timer = render_timer(on_calendar=on_calendar)
+    journal_limits = render_journal_limits()
     safe_print({"service": SERVICE_NAME, "timer": TIMER_NAME, "on_calendar": on_calendar})
     if dry_run:
         safe_print(service)
         safe_print(timer)
+        safe_print(journal_limits)
         return
 
     user, group = _owner_parts(owner)
@@ -109,6 +120,7 @@ def install_timer(
     nonce = secrets.token_hex(12)
     staged_service = posixpath.join(staging_dir, f"{SERVICE_NAME}.{nonce}")
     staged_timer = posixpath.join(staging_dir, f"{TIMER_NAME}.{nonce}")
+    staged_journal = posixpath.join(staging_dir, f"journald-storage.{nonce}")
     ssh = connect_remote_ssh(ROOT, timeout=20)
     try:
         run_remote_text(
@@ -125,14 +137,21 @@ def install_timer(
         )
         _upload_text(ssh, staged_service, service)
         _upload_text(ssh, staged_timer, timer)
+        _upload_text(ssh, staged_journal, journal_limits)
         commands = [
             f"install -m 0644 {_remote_quote(staged_service)} /etc/systemd/system/{SERVICE_NAME}",
             f"install -m 0644 {_remote_quote(staged_timer)} /etc/systemd/system/{TIMER_NAME}",
+            "install -d -m 0755 /etc/systemd/journald.conf.d",
+            f"install -m 0644 {_remote_quote(staged_journal)} {JOURNAL_LIMITS_PATH}",
             "systemctl daemon-reload",
+            "systemctl restart systemd-journald.service",
+            "journalctl --rotate",
+            "journalctl --vacuum-size=512M",
             f"systemctl enable --now {TIMER_NAME}",
+            f"systemctl restart {TIMER_NAME}",
             f"systemctl is-enabled {TIMER_NAME}",
             f"systemctl is-active {TIMER_NAME}",
-            f"rm -f -- {_remote_quote(staged_service)} {_remote_quote(staged_timer)}",
+            f"rm -f -- {_remote_quote(staged_service)} {_remote_quote(staged_timer)} {_remote_quote(staged_journal)}",
         ]
         if run_now:
             commands.append(f"systemctl start {SERVICE_NAME}")

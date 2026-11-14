@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import shutil
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -136,6 +137,39 @@ def _check_item(
         "repairable": repairable,
         "repair_action": repair_action,
     }
+
+
+def _platform_storage_item() -> dict[str, Any]:
+    """Report storage independently of database and model availability."""
+    try:
+        usage = shutil.disk_usage(settings.data_dir.resolve())
+    except OSError as exc:
+        return _check_item(
+            "platform_storage", "平台磁盘空间", "warning",
+            "无法读取数据目录磁盘空间，请检查挂载和目录权限。",
+            details={"error": safe_error_text(exc, limit=180)},
+        )
+    free_gib = usage.free / 1024**3
+    free_pct = usage.free / usage.total * 100 if usage.total else 0.0
+    status = (
+        "critical" if free_gib < 5 or free_pct < 5
+        else "warning" if free_gib < 10 or free_pct < 10
+        else "ok"
+    )
+    return _check_item(
+        "platform_storage", "平台磁盘空间", status,
+        f"数据目录磁盘剩余 {free_gib:.1f} GiB（{free_pct:.1f}%）。"
+        + (
+            "空间不足可能导致数据库停止、分析和 OKX 同步失败；请清理过期文件并检查数据维护积压。"
+            if status != "ok" else "数据库和运行日志有可用空间。"
+        ),
+        details={
+            "path": str(settings.data_dir.resolve()),
+            "free_bytes": usage.free,
+            "total_bytes": usage.total,
+            "free_pct": round(free_pct, 2),
+        },
+    )
 
 
 def _order_status(row: Any) -> str:
@@ -1689,7 +1723,9 @@ async def _model_training_identity_item() -> dict[str, Any]:
 
 
 async def _collect_system_self_check() -> dict[str, Any]:
-    items: list[dict[str, Any]] = [_okx_config_item("paper"), _okx_config_item("live")]
+    items: list[dict[str, Any]] = [
+        _platform_storage_item(), _okx_config_item("paper"), _okx_config_item("live"),
+    ]
     trading_task = asyncio.create_task(_run_self_check_section(_trading_service_running_item()))
     monitor_task = asyncio.create_task(
         _run_self_check_section(

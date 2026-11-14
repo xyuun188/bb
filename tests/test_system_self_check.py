@@ -15,6 +15,35 @@ from tests.paper_canary_fixtures import complete_paper_canary_raw
 from web_dashboard.api import dashboard, system_health
 
 
+@pytest.mark.parametrize(
+    ("total_gib", "free_gib", "expected"),
+    [(272, 0, "critical"), (272, 9, "critical"), (272, 20, "warning"),
+     (272, 40, "ok"), (50, 4, "critical"), (50, 8, "warning")],
+)
+def test_platform_storage_reports_absolute_and_relative_space(
+    monkeypatch: pytest.MonkeyPatch, total_gib: int, free_gib: int, expected: str,
+) -> None:
+    monkeypatch.setattr(
+        system_health.shutil, "disk_usage",
+        lambda _path: SimpleNamespace(total=total_gib * 1024**3, free=free_gib * 1024**3),
+    )
+    item = system_health._platform_storage_item()
+    assert item["status"] == expected
+    assert item["details"]["free_bytes"] == free_gib * 1024**3
+    if expected != "ok":
+        assert "数据库停止" in item["message"]
+
+
+def test_platform_storage_read_failure_remains_visible(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(_path: Any) -> Any:
+        raise OSError("mount unavailable")
+
+    monkeypatch.setattr(system_health.shutil, "disk_usage", fail)
+    item = system_health._platform_storage_item()
+    assert item["status"] == "warning"
+    assert "mount unavailable" in item["details"]["error"]
+
+
 def test_self_check_endpoint_contract_flags_wrong_model_ports(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
