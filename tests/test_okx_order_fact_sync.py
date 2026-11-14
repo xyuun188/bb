@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.dialects import postgresql
 
 from ai_brain.base_model import Action, DecisionOutput
@@ -223,6 +223,62 @@ def test_entry_decision_recovery_rejects_unproven_or_mismatched_facts(mismatch) 
     assert _recover_confirmed_entry_decision(order, decision, now=now) is False
     assert "execution_result" not in decision.raw_llm_response
     assert "超时" in decision.execution_reason
+
+
+@pytest.mark.asyncio
+async def test_priority_fill_recovery_does_not_load_unrelated_decision_payloads(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "targeted-decision-payloads.db")
+    decision, order, fill, now = _interrupted_confirmed_entry()
+    decision.was_executed = False
+    decision.created_at = now
+    loaded_decision_ids = []
+
+    def record_loaded_decision(value, _context):
+        loaded_decision_ids.append(value.id)
+
+    try:
+        async with get_session_ctx() as session:
+            session.add_all([
+                decision,
+                order,
+                AIDecision(
+                    id=89, model_name="ensemble_trader", symbol="BTC/USDT",
+                    action="long", confidence=0.7, is_paper=True, was_executed=False,
+                    created_at=now, raw_llm_response={"unrelated_transcript": "untouched"},
+                ),
+                Order(
+                    id=89, decision_id=89, model_name="ensemble_trader", execution_mode="paper",
+                    symbol="BTC/USDT", side="buy", order_type="market", quantity=1.0,
+                    price=100.0, status="filled", created_at=now, filled_at=now,
+                    exchange_order_id="unrelated-order",
+                ),
+            ])
+        event.listen(AIDecision, "load", record_loaded_decision)
+        try:
+            report = await OkxOrderFactSyncService(mode="paper")._persist_priority_fill_facts(
+                since=now - timedelta(minutes=1),
+                since_naive=(now - timedelta(minutes=1)).replace(tzinfo=None),
+                target_order_ids={fill.order_id}, fills=[fill],
+                contract_sizes={"BTC-USDT-SWAP": 1.0},
+            )
+        finally:
+            event.remove(AIDecision, "load", record_loaded_decision)
+
+        assert loaded_decision_ids == [decision.id]
+        assert any(row["kind"] == "confirmed_entry_decision_recovered" for row in report[-1])
+        async with get_session_ctx() as session:
+            recovered = await session.get(AIDecision, decision.id)
+            unrelated = await session.get(AIDecision, 89)
+            assert recovered.was_executed is True
+            assert recovered.raw_llm_response["execution_result"]["exchange_confirmed"] is True
+            assert "超时" not in recovered.execution_reason
+            assert unrelated.was_executed is False
+            assert unrelated.raw_llm_response == {"unrelated_transcript": "untouched"}
+    finally:
+        await close_db()
 
 
 class _ScalarResult:

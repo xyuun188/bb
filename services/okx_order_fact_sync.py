@@ -1730,9 +1730,18 @@ class OkxOrderFactSyncService:
                 authoritative_fill_order_ids=set(fills_by_order_id),
             )
             canonical_orders_by_exchange_id = authoritative_orders_by_exchange_id(writable_orders)
+            # Historical protection rows may be writable too. Do not load their
+            # multi-megabyte decision payloads for a bounded targeted fill pull.
+            candidate_orders = [
+                order
+                for order in writable_orders
+                if _split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+                & target_order_ids
+                or _order_is_rejected_without_exchange_fill(order)
+            ]
             decision_ids = {
                 int(decision_id)
-                for order in writable_orders
+                for order in candidate_orders
                 if (decision_id := getattr(order, "decision_id", None))
             }
             decisions_by_id: dict[int, AIDecision] = {}
@@ -1745,7 +1754,7 @@ class OkxOrderFactSyncService:
                 }
             priority_orders = [
                 order
-                for order in writable_orders
+                for order in candidate_orders
                 if _order_exchange_ids_with_completed_submit(
                     order,
                     decisions_by_id.get(int(getattr(order, "decision_id", 0) or 0)),
