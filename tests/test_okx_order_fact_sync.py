@@ -46,6 +46,7 @@ from services.okx_order_fact_sync import (
     _dedupe_fills_by_order_id,
     _prioritized_exchange_order_ids,
     _rebuild_stored_slippage_fact,
+    _recover_confirmed_entry_decision,
     _repair_stored_fill_contract_size_from_instruments,
     _stored_slippage_fact_needs_refresh,
     _target_fill_query_requires_historical,
@@ -130,6 +131,98 @@ def test_normal_paper_client_identity_recovers_exact_decision_lineage() -> None:
         )
         is None
     )
+
+
+def _interrupted_confirmed_entry():
+    now = datetime.now(UTC)
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT", side="long", selection_reason="strategy_edge_selected",
+        direction_support={
+            "eligible": True, "selected_side": "long", "prediction_horizon_minutes": 30.0,
+            "expected_net_return_pct": 0.2, "objective_net_return_pct": 0.1,
+            "loss_probability": 0.4, "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
+            "strong_expert_opposition": False,
+        },
+    )
+    output = DecisionOutput(
+        model_name="ensemble_trader", symbol="BTC/USDT", action=Action.LONG,
+        confidence=0.7, reasoning="test", raw_response={"normal_paper_trade": contract},
+    )
+    identity = attach_normal_paper_order_identity(output, model_mode="paper", decision_id=88)
+    decision = AIDecision(
+        id=88, model_name="ensemble_trader", symbol="BTC/USDT", action="long",
+        confidence=0.7, is_paper=True, was_executed=True,
+        execution_reason="本轮执行仍在处理中：开仓执行交接超时。",
+        raw_llm_response=output.raw_response,
+    )
+    row = {
+        "ordId": "okx-entry-88", "tradeId": "trade-88", "instId": "BTC-USDT-SWAP",
+        "clOrdId": identity["client_order_id"], "side": "buy", "posSide": "net",
+        "fillSz": "2", "fillPx": "100", "fee": "-0.01", "fillPnl": "0",
+        "ts": str(int(now.timestamp() * 1000)),
+    }
+    fill = OkxNativeFillGroup(
+        order_id="okx-entry-88", trade_ids=("trade-88",), inst_id="BTC-USDT-SWAP",
+        symbol="BTC/USDT", side="buy", pos_side="net", contracts=2.0,
+        avg_price=100.0, fee_abs=0.01, fill_pnl=0.0,
+        timestamp_ms=now.timestamp() * 1000, timestamp=now, raw_count=1, rows=(row,),
+    )
+    order = Order(
+        id=88, decision_id=88, model_name="ensemble_trader", execution_mode="paper",
+        symbol="BTC/USDT", side="buy", order_type="market", quantity=2.0,
+        price=100.0, status="filled", created_at=now,
+        okx_raw_fills={"protection_submission": {"state": "confirmed"}},
+    )
+    OkxOrderFactSyncService._apply_fill_to_order(
+        order, fill, now=now, sync_status=OKX_SYNC_CONFIRMED,
+        contract_size=1.0, contract_size_source="okx_public_instruments",
+    )
+    return decision, order, fill, now
+
+
+def test_matching_confirmed_fill_recovers_interrupted_entry_decision_once() -> None:
+    decision, order, fill, now = _interrupted_confirmed_entry()
+    original_contract = decision.raw_llm_response["normal_paper_trade"]
+    report = OkxOrderFactSyncService(mode="paper")._apply_local_order_facts(
+        [order], fills=[fill], fills_by_order_id={fill.order_id: fill},
+        order_rows_by_id={}, protection_execution_by_order_id={},
+        contract_sizes={"BTC-USDT-SWAP": 1.0}, decisions_by_id={88: decision},
+        now=now, since=now - timedelta(minutes=1), authoritative_absence_order_ids=set(),
+    )
+
+    assert any(row["kind"] == "confirmed_entry_decision_recovered" for row in report[-1])
+    receipt = decision.raw_llm_response["execution_result"]
+    assert receipt["exchange_confirmed"] is True
+    assert receipt["exchange_order_id"] == fill.order_id
+    assert receipt["quantity"] == order.quantity
+    assert receipt["raw_response"]["protection_submission"]["state"] == "confirmed"
+    assert decision.raw_llm_response["normal_paper_trade"] == original_contract
+    assert "结果未知" not in decision.execution_reason
+    assert "超时" not in decision.execution_reason
+    assert decision.raw_llm_response["decision_state_machine"]["current_stage"] == "exchange_confirm"
+    assert _recover_confirmed_entry_decision(order, decision, now=now) is False
+
+
+@pytest.mark.parametrize("mismatch", ["client", "side", "symbol", "partial", "unverified", "live"])
+def test_entry_decision_recovery_rejects_unproven_or_mismatched_facts(mismatch) -> None:
+    decision, order, _fill, now = _interrupted_confirmed_entry()
+    if mismatch == "client":
+        order.okx_raw_fills["rows"][0]["clOrdId"] = "BBNP89"
+    elif mismatch == "side":
+        decision.action = "short"
+    elif mismatch == "symbol":
+        decision.symbol = "ETH/USDT"
+    elif mismatch == "partial":
+        order.okx_raw_fills["fills_pagination_complete"] = False
+    elif mismatch == "unverified":
+        order.okx_raw_fills["contract_size_verified"] = False
+    elif mismatch == "live":
+        decision.is_paper = False
+
+    assert _recover_confirmed_entry_decision(order, decision, now=now) is False
+    assert "execution_result" not in decision.raw_llm_response
+    assert "超时" in decision.execution_reason
 
 
 class _ScalarResult:

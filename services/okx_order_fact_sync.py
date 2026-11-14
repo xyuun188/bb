@@ -32,6 +32,7 @@ from db.session import get_engine, get_session_ctx
 from executor.okx_executor import OKXExecutor
 from models.decision import AIDecision
 from models.trade import Order, Position
+from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
 from services.exchange_exit_decision_lineage import (
     ExitDecisionLineageAmbiguous,
     recover_exit_decision_lineage_from_order_fact,
@@ -49,6 +50,7 @@ from services.okx_native_facts import (
     OkxNativeFactsClient,
     OkxNativeFillGroup,
     build_okx_protection_execution_lifecycle,
+    group_okx_native_fill_rows,
     validated_okx_order_detail,
 )
 from services.okx_protection_position_recovery import (
@@ -65,6 +67,7 @@ from services.paper_training import (
     paper_training_decision_id_from_client_order_id,
 )
 from services.phase3_boundary import PHASE3_CLEAN_START_LOCAL
+from services.stale_entry_candidate_expirer import is_pending_execution_reason
 
 logger = structlog.get_logger(__name__)
 
@@ -2164,6 +2167,10 @@ class OkxOrderFactSyncService:
                     ),
                 )
             )
+        for order in orders:
+            decision = (decisions_by_id or {}).get(int(getattr(order, "decision_id", 0) or 0))
+            if _recover_confirmed_entry_decision(order, decision, now=now):
+                samples.append(_sample(order, kind="confirmed_entry_decision_recovered"))
         return (
             confirmed_count,
             unverified_count,
@@ -2295,6 +2302,7 @@ class OkxOrderFactSyncService:
                     client_order_id=_fill_client_order_id(fill, order_row),
                     now=now,
                 )
+                _recover_confirmed_entry_decision(order, decision, now=now)
             existing_exchange_ids.add(fill.order_id)
             if created:
                 backfilled += 1
@@ -4078,6 +4086,90 @@ def _decision_for_order_fact(
     ):
         return None
     return decision
+
+
+def _recover_confirmed_entry_decision(
+    order: Order,
+    decision: AIDecision | None,
+    *,
+    now: datetime,
+) -> bool:
+    """Finish an interrupted paper entry using exact, complete OKX fill identity."""
+
+    if (
+        decision is None
+        or getattr(order, "execution_mode", None) != "paper"
+        or getattr(order, "decision_id", None) != decision.id
+    ) or not _order_has_confirmed_okx_fill_fact(
+        order, require_verified_contract_size=True,
+    ):
+        return False
+    raw = getattr(decision, "raw_llm_response", None)
+    raw = raw if isinstance(raw, dict) else {}
+    execution = raw.get("execution_result")
+    execution = execution if isinstance(execution, dict) else {}
+    if (
+        getattr(decision, "was_executed", False)
+        and execution.get("exchange_confirmed") is True
+        and str(execution.get("exchange_order_id") or "")
+        == str(getattr(order, "exchange_order_id", "") or "")
+        and (
+            not getattr(decision, "execution_reason", None)
+            or not is_pending_execution_reason(decision.execution_reason)
+        )
+    ):
+        return False
+    fact = order.okx_raw_fills
+    fills = group_okx_native_fill_rows(fact.get("rows") or [])
+    if len(fills) != 1:
+        return False
+    fill = fills[0]
+    contract_size = _safe_float(fact.get("contract_size"), 0.0)
+    if not _stored_order_matches_native_fill(
+        order, fill, contract_size=contract_size,
+        contract_size_source=str(fact.get("contract_size_source") or ""),
+    ):
+        return False
+    order_row = next(
+        (row for row in fact.get("order_rows") or []
+         if isinstance(row, dict) and _order_row_id(row) == fill.order_id),
+        None,
+    )
+    if _decision_for_order_fact(
+        fill=fill, order_row=order_row,
+        decisions_by_id={int(decision.id): decision},
+    ) is not decision:
+        return False
+    _apply_exchange_recovery_to_decision(
+        decision, fill=fill, client_order_id=_fill_client_order_id(fill, order_row), now=now,
+    )
+    raw = dict(decision.raw_llm_response)
+    receipt = dict(execution)
+    receipt.update({
+        "source": "okx_native_fills_and_client_order_identity",
+        "order_id": fill.order_id,
+        "exchange_order_id": fill.order_id,
+        "status": "filled",
+        "quantity": _fill_base_quantity(fill, contract_size),
+        "price": fill.avg_price,
+        "fee": fill.fee_abs,
+        "pnl": fill.fill_pnl,
+        "exchange_confirmed": True,
+        "exit_progress": False,
+    })
+    receipt_raw = receipt.get("raw_response")
+    receipt_raw = dict(receipt_raw) if isinstance(receipt_raw, dict) else {}
+    receipt_raw["recovered_from_authoritative_order_fact"] = True
+    if isinstance(fact.get("protection_submission"), dict):
+        receipt_raw["protection_submission"] = dict(fact["protection_submission"])
+    receipt["raw_response"] = receipt_raw
+    raw["execution_result"] = receipt
+    decision.raw_llm_response = append_decision_stage(
+        raw, DecisionStage.EXCHANGE_CONFIRM, DecisionStageStatus.COMPLETED,
+        decision.execution_reason,
+        {"exchange_order_id": fill.order_id, "recovered_from_authoritative_order_fact": True},
+    )
+    return True
 
 
 def _apply_exchange_recovery_to_decision(

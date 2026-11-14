@@ -1597,6 +1597,43 @@ async def test_execution_service_recovers_when_confirmed_order_fact_write_fails(
 
 
 @pytest.mark.asyncio
+async def test_execution_service_saves_confirmed_receipt_before_local_sync_cancellation() -> None:
+    raw_updates: list[dict[str, Any] | None] = []
+
+    class FilledExecutor:
+        async def place_order(self, decision, **_kwargs):
+            return ExecutionResult(
+                order_id="okx-cancelled-sync", exchange_order_id="okx-cancelled-sync",
+                symbol=decision.symbol, side="sell", order_type="market",
+                quantity=2.0, price=100.0, status=OrderStatus.FILLED,
+                raw_response={"protection_submission": {"state": "confirmed"}},
+            )
+
+    async def executor_provider(_mode):
+        return FilledExecutor()
+
+    async def cancelled_trade_write(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    service = _test_execution_service(
+        okx_executor_provider=executor_provider,
+        trade_logger=cancelled_trade_write,
+        raw_updates=raw_updates,
+    )
+    decision = _profit_first_ready_position_review_decision()
+    with pytest.raises(asyncio.CancelledError):
+        await service.execute_candidate(
+            decision.symbol, "ensemble_trader", decision, SimpleNamespace(warnings=[]),
+            992, {"warnings": [], "decisions": [], "executions": []}, open_positions=[],
+        )
+
+    receipt = raw_updates[-1]["execution_result"]
+    assert receipt["exchange_confirmed"] is True
+    assert receipt["exchange_order_id"] == "okx-cancelled-sync"
+    assert receipt["raw_response"]["protection_submission"]["state"] == "confirmed"
+
+
+@pytest.mark.asyncio
 async def test_execution_service_keeps_fill_and_recovers_failed_position_write() -> None:
     recovery_requests = []
     memory_updates = []

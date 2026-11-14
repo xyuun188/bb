@@ -1431,6 +1431,17 @@ class ExecutionService:
                         executor,
                         timeout_seconds=execution_timeout,
                     )
+                    if is_exchange_confirmed_execution(execution_result):
+                        # Keep the receipt before slower local synchronization can be cancelled.
+                        attach_execution_result_snapshot(
+                            "exchange_confirmed_before_local_sync",
+                            exchange_confirmed=True,
+                            exit_progress=is_exit_progress_execution(execution_result),
+                        )
+                        if decision_db_id is not None:
+                            await mark_decision_raw_response(
+                                decision_db_id, decision.raw_response,
+                            )
             if submitted_to_exchange and (decision.is_entry or decision.is_exit):
                 await mark_stage(
                     DecisionStage.EXCHANGE_SUBMIT,
