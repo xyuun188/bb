@@ -3532,9 +3532,9 @@ async def _position_capacity_release_audit() -> dict[str, Any]:
     except Exception as exc:
         return _audit_card(
             "position_capacity_release",
-            "Position economics and dynamic exit",
+            "持仓经济性与动态退出",
             "warning",
-            "Position economics audit is unavailable; production remains fail-closed.",
+            "持仓经济性审计读取失败，暂时无法核验；该提示不代表已确认交易违规。",
             details={
                 "error": safe_error_text(exc, limit=180),
                 "read_only": True,
@@ -3758,9 +3758,9 @@ async def _strategy_closed_loop_audit() -> dict[str, Any]:
         if contract_report.get("report_available") is False:
             return _audit_card(
                 "strategy_closed_loop",
-                "dynamic return closed-loop audit",
+                "动态费后收益闭环审计",
                 "warning",
-                "Contract audit is unavailable; do not interpret the failure as missing contract fields.",
+                "执行契约审计读取失败，暂时无法核验；不能据此判断契约字段缺失。",
                 details={
                     "audit_only": True,
                     "read_only": True,
@@ -3980,9 +3980,9 @@ async def _trade_execution_contract_audit() -> dict[str, Any]:
         if raw_report.get("report_available") is False:
             return _audit_card(
                 "trade_execution_contract",
-                "dynamic return execution contract",
+                "动态费后收益执行契约",
                 "warning",
-                "Contract audit is unavailable; timeout or database errors are not contract-field violations.",
+                "执行契约审计读取失败；查询超时或数据库错误不代表已确认契约违规。",
                 details={
                     "error": raw_report.get("error"),
                     "error_type": raw_report.get("error_type"),

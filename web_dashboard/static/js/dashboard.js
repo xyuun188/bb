@@ -5533,6 +5533,7 @@ const DASHBOARD_REASON_TEXT = Object.freeze({
     chronological_market_training_identity_incomplete: '市场机会样本缺少完整时间身份',
     chronological_cost_training_identity_incomplete: '权威执行成本样本缺少完整生命周期时间身份',
     authoritative_slippage_distribution_missing: '缺少权威真实滑点分布',
+    average_net_return_after_all_cost_not_positive: '平均费后收益不为正',
     average_fee_after_return_not_positive: '平均费后收益不为正',
     empirical_return_lower_hinge_not_positive: '费后收益经验下界不为正',
     direction_support_expected_net_not_positive: '当前方向扣费后预期净收益不为正，收益门禁拦截开仓',
@@ -5735,7 +5736,7 @@ function dashboardReasonText(value) {
     if (/no trained local quant bundle/i.test(rawText)) return '本地量化模型产物尚未生成或尚未注册';
     if (rawText && /[\u3400-\u9fff]/.test(rawText)) return rawText;
     if (/^[a-z][a-z0-9_:-]*$/i.test(code)) {
-        return `系统发现一项未确认的结算数据，已暂不纳入训练（诊断编号：${code}）`;
+        return `系统诊断代码：${code}`;
     }
     if (/[A-Za-z]{4}/.test(rawText)) return '系统返回了未中文化的异常说明，已按问题处理';
     return rawText || '原因尚未返回';

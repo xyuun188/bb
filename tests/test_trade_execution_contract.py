@@ -195,6 +195,54 @@ async def test_contract_report_bounds_decision_ids_before_loading_json_payloads(
     assert "LIMIT" in statements[1]
 
 
+@pytest.mark.asyncio
+async def test_contract_report_batches_exact_entry_evidence_without_reading_exit_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sqlalchemy.dialects import postgresql
+
+    statements = []
+
+    class _Result:
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self.rows
+
+    class _Session:
+        async def execute(self, statement):
+            statements.append(statement)
+            if len(statements) == 2:
+                return _Result([{"id": index} for index in range(1, 122)])
+            return _Result()
+
+    @asynccontextmanager
+    async def session_factory():
+        yield _Session()
+
+    monkeypatch.setattr(
+        trade_execution_contract_module,
+        "load_training_epoch_start",
+        lambda: datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    await TradeExecutionContractService(session_factory).report()
+
+    detail_queries = statements[2:5]
+    assert len(statements) == 7
+    assert [len(query.compile().params["id_1"]) for query in detail_queries] == [50, 50, 21]
+    for query in detail_queries:
+        sql = str(query.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+        assert "CASE WHEN (ai_decisions.action IN" in sql
+        assert "'short'" in sql
+        assert "'close_short'" not in sql
+        assert "execution_reconciliations" in sql
+        assert "END AS execution_reconciliations" in sql
+
+
 def _provenance(*, samples: int = 8, fallback_reason: str = "") -> dict[str, object]:
     return {
         "source": "live_return_distribution",

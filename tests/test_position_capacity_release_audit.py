@@ -576,6 +576,7 @@ async def test_capacity_audit_exhaustive_report_paginates_decisions_and_orders(
             self.calls = 0
 
         async def execute(self, _statement: object) -> _Result:
+            statements.append(str(_statement))
             self.calls += 1
             if self.calls == 1:
                 return _Result([_position()])
@@ -588,6 +589,7 @@ async def test_capacity_audit_exhaustive_report_paginates_decisions_and_orders(
             return _Result([])
 
     session = _Session()
+    statements = []
 
     @asynccontextmanager
     async def _session_factory():
@@ -609,3 +611,6 @@ async def test_capacity_audit_exhaustive_report_paginates_decisions_and_orders(
     assert report["coverage"]["page_count"] == 2
     assert report["coverage"]["order_row_count"] == 3
     assert report["dynamic_exit_decision_count"] == 3
+    assert "CASE WHEN" in statements[1]
+    assert "decision_learning_snapshot_version" in statements[1]
+    assert "ELSE ai_decisions.raw_llm_response END AS raw_llm_response" in statements[1]

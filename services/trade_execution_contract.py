@@ -101,7 +101,7 @@ class TradeExecutionContractService:
         limit: int = 500,
         since: datetime | None = None,
     ) -> dict[str, Any]:
-        from sqlalchemy import func, or_, select
+        from sqlalchemy import case, func, or_, select
 
         from db.session import get_read_session_ctx
         from models.decision import AIDecision
@@ -173,8 +173,11 @@ class TradeExecutionContractService:
             decision_truncated = len(decision_id_rows) > capped_limit
             decision_ids = decision_id_rows[:capped_limit]
             decisions = []
-            if decision_ids:
-                decisions = [
+            # Exact reconciliation fingerprints belong to entry sizing. Exit
+            # audits use the learning snapshot and must not detoast the original
+            # model payload just to retrieve an unrelated entry field.
+            for offset in range(0, len(decision_ids), 50):
+                decisions.extend(
                     _decision_report_projection(row)
                     for row in (
                         await session.execute(
@@ -186,17 +189,23 @@ class TradeExecutionContractService:
                                 AIDecision.decision_learning_snapshot.label(
                                     "raw_llm_response"
                                 ),
-                                AIDecision.raw_llm_response["profit_risk_sizing"][
-                                    "execution_reconciliations"
-                                ].label("execution_reconciliations"),
+                                case(
+                                    (
+                                        AIDecision.action.in_(ENTRY_ACTIONS),
+                                        AIDecision.raw_llm_response["profit_risk_sizing"][
+                                            "execution_reconciliations"
+                                        ],
+                                    ),
+                                    else_=None,
+                                ).label("execution_reconciliations"),
                             )
-                            .where(AIDecision.id.in_(decision_ids))
+                            .where(AIDecision.id.in_(decision_ids[offset : offset + 50]))
                             .order_by(AIDecision.id.desc())
                         )
                     )
                     .mappings()
                     .all()
-                ]
+                )
             # The contract validator only needs a narrow, immutable projection.
             # Loading full ORM rows (especially JSON blobs) made this read-only
             # audit contend with the trading loop and occasionally exceed its

@@ -1459,13 +1459,17 @@ def test_dashboard_localizes_okx_settlement_reconciliation_gaps() -> None:
     assert "close_fill_contract_history_mismatch: 'OKX 平仓成交数量与仓位历史记录不一致" in script
     assert "order_fee_total_mismatch: 'OKX 成交单手续费合计与仓位历史手续费不一致" in script
     assert "证据未完整：" in script
-    assert "系统发现一项未确认的结算数据，已暂不纳入训练" in script
+    assert "average_net_return_after_all_cost_not_positive: '平均费后收益不为正'" in script
+    assert "系统诊断代码：${code}" in script
+    assert "系统发现一项未确认的结算数据，已暂不纳入训练" not in script
 
 
 def test_dashboard_static_bundle_version_tracks_local_ml_evidence_renderer() -> None:
     html = (PROJECT_ROOT / "web_dashboard/static/index.html").read_text(encoding="utf-8")
 
     assert "/static/js/dashboard.js?v=20261029-model-permission-v3" in html
+    assert "audit-copy=20261114" in html
+    assert "/static/js/charts.js?v=20261114-pnl-dates" in html
 
 
 def test_dashboard_splits_legacy_comma_delimited_execution_diagnostics() -> None:

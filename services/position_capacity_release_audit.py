@@ -8,7 +8,7 @@ from math import isclose, isfinite
 from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import JSON, case, cast, or_, select
 
 from core.symbols import normalize_trading_symbol
 from db.session import get_read_session_ctx
@@ -70,7 +70,14 @@ class PositionCapacityReleaseAuditService:
                         AIDecision.id,
                         AIDecision.symbol,
                         AIDecision.action,
-                        AIDecision.raw_llm_response,
+                        case(
+                            (
+                                (AIDecision.decision_learning_snapshot_version >= 1)
+                                & AIDecision.decision_learning_snapshot.is_not(None),
+                                cast(AIDecision.decision_learning_snapshot, JSON),
+                            ),
+                            else_=AIDecision.raw_llm_response,
+                        ).label("raw_llm_response"),
                         AIDecision.created_at,
                         AIDecision.was_executed,
                     )

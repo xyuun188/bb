@@ -175,6 +175,7 @@ class DashboardCharts {
         const date = new Date(value);
         if (Number.isNaN(date.getTime())) return String(value);
         return date.toLocaleString('zh-CN', {
+            timeZone: 'Asia/Shanghai',
             month: '2-digit',
             day: '2-digit',
             hour: '2-digit',
@@ -317,7 +318,7 @@ class DashboardCharts {
                 : []
         );
         chart.data.labels = labels.map(label => (
-            typeof label === 'number' ? label : this.formatClockLabel(label)
+            typeof label === 'number' ? label : this.formatTimeLabel(label)
         ));
         this.setBalancedYAxis(chart, chart.data.datasets.flatMap(ds => ds.data), 0.005);
         chart.update();
