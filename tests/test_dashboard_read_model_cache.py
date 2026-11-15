@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -14,6 +15,65 @@ from models.decision import AIDecision
 from models.trade import Position
 from services import okx_position_history_store as position_history_store
 from web_dashboard.api import dashboard
+
+
+@pytest.mark.asyncio
+async def test_position_history_manual_refresh_rebuilds_fresh_cache_once_and_polls_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from db import session as session_module
+
+    cache_key = dashboard._dashboard_closed_ledger_cache_key("paper", None)
+    old_row = {"id": 1, "closed_at": "2026-11-15T10:00:00+00:00"}
+    fresh_row = {"id": 2, "closed_at": "2026-11-15T10:01:00+00:00"}
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache", {
+        cache_key: (datetime.now(UTC), ([old_row], 1, 1, 1, "okx_authoritative")),
+    })
+    monkeypatch.setattr(dashboard, "_dashboard_closed_ledger_refresh_tasks", {})
+    monkeypatch.setattr(position_history_store, "load_okx_position_history_watermark", lambda _: None)
+    finished = asyncio.Event()
+    builds = 0
+
+    @asynccontextmanager
+    async def fake_session():
+        yield object()
+
+    async def no_pending(*_args: Any, **_kwargs: Any):
+        return []
+
+    async def rebuild(key: tuple[Any, ...], **kwargs: Any):
+        nonlocal builds
+        builds += 1
+        assert kwargs["force"] is True
+        await finished.wait()
+        payload = ([fresh_row, old_row], 2, 1, 1, "okx_authoritative")
+        dashboard._dashboard_heavy_cache[key] = (datetime.now(UTC), payload)
+        return payload
+
+    monkeypatch.setattr(session_module, "get_read_session_ctx", fake_session)
+    monkeypatch.setattr(dashboard, "_dashboard_pending_closed_position_rows", no_pending)
+    monkeypatch.setattr(dashboard, "_rebuild_dashboard_closed_ledger_cache", rebuild)
+
+    first = await dashboard.get_positions(mode="paper", closed_only=True, refresh=True)
+    task = dashboard._dashboard_closed_ledger_refresh_tasks[cache_key]
+    try:
+        again = await dashboard.get_positions(mode="paper", closed_only=True, refresh=True)
+        await asyncio.sleep(0)
+        assert first["positions"][0]["id"] == old_row["id"]
+        assert first["refresh_in_progress"] is True
+        assert again["refresh_in_progress"] is True
+        assert dashboard._dashboard_closed_ledger_refresh_tasks[cache_key] is task
+        assert builds == 1
+        finished.set()
+        await task
+        await asyncio.sleep(0)
+        latest = await dashboard.get_positions(mode="paper", closed_only=True)
+        assert [row["id"] for row in latest["positions"]] == [2, 1]
+        assert latest["refresh_in_progress"] is False
+        assert builds == 1
+    finally:
+        finished.set()
+        await task
 
 
 @pytest.mark.asyncio

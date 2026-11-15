@@ -104,6 +104,8 @@ let systemAuditRefreshInFlight = null;
 let systemAuditRefreshPollTimer = null;
 const THEME_STORAGE_KEY = 'dashboardTheme';
 const pageReadRetryTimers = new Map();
+const pageRefreshRequests = new Map();
+const settingsDrafts = new Map();
 
 function isPageActive(page) {
     return document.getElementById(`page-${page}`)?.classList.contains('active');
@@ -140,6 +142,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initModalActionButtons();
     initServerMonitorTabs();
     initPaginationControls();
+    initPageRefreshButtons();
     updateAutoStatus({});
     fetchDashboardSummary();
     fetchPnlHistory();
@@ -170,6 +173,9 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(() => {
         if (!document.hidden && isPageActive('trades')) fetchTrades();
     }, 60000);
+    setInterval(() => {
+        if (!document.hidden && isPageActive('position-history')) fetchPositionHistory();
+    }, 30000);
     setInterval(fetchDashboardAuthStatus, 60000);
     setInterval(() => {
         if (isPageActive('positions')) {
@@ -1813,6 +1819,13 @@ function initSettingsTabs() {
     buttons.forEach(btn => {
         btn.addEventListener('click', () => activateSettingsTab(btn.dataset.settingsTab || 'okx'));
     });
+    const rememberDraft = event => {
+        const input = event.target;
+        if (!input?.matches('input, select, textarea') || !input.closest('#page-settings')) return;
+        settingsDrafts.set(input, { value: input.value, checked: input.checked });
+    };
+    document.addEventListener('input', rememberDraft);
+    document.addEventListener('change', rememberDraft);
 }
 
 function initDashboardUserActions() {
@@ -1902,65 +1915,116 @@ function activateSettingsTab(name = 'okx') {
     document.querySelectorAll('.settings-section[data-settings-section]').forEach(section => {
         section.classList.toggle('active', section.dataset.settingsSection === selected);
     });
-    if (selected === 'trading') fetchTradingParams();
-    if (selected === 'models') {
-        fetchAIModels();
-        fetchTradingParams();
-        fetchHighRiskReviewerSettings();
-    }
-    if (selected === 'external-events') fetchDataCollectionSettings({ silent: true });
-    if (selected === 'vector-memory') refreshVectorMemoryStatus({ silent: true });
+    const loaders = [];
+    if (selected === 'trading') loaders.push(fetchTradingParams);
+    if (selected === 'models') loaders.push(fetchAIModels, fetchTradingParams, fetchHighRiskReviewerSettings);
+    if (selected === 'external-events') loaders.push(() => fetchDataCollectionSettings({ silent: true }));
+    if (selected === 'vector-memory') loaders.push(() => refreshVectorMemoryStatus({ silent: true }));
+    void loadSettingsData(loaders);
 }
 
-function loadPageData(page) {
+async function loadSettingsData(loaders) {
+    settingsDrafts.forEach((_draft, input) => {
+        settingsDrafts.set(input, { value: input.value, checked: input.checked });
+    });
+    try {
+        return await Promise.allSettled(loaders.map(load => load()));
+    } finally {
+        // Drafts stay in this tab's memory, including edits made during the read.
+        settingsDrafts.forEach((draft, input) => {
+            if (!input.isConnected) {
+                settingsDrafts.delete(input);
+                return;
+            }
+            input.value = draft.value;
+            if (typeof draft.checked === 'boolean') input.checked = draft.checked;
+        });
+    }
+}
+
+function loadPageData(page, options = {}) {
     if (page === 'dashboard') {
-        fetchDashboardSummary();
-        fetchPnlHistory();
-        fetchRecentDecisions();
-        fetchRecentExecutions();
+        return Promise.allSettled([
+            fetchDashboardSummary(), fetchPnlHistory(), fetchRecentDecisions(), fetchRecentExecutions(),
+        ]);
     }
     if (page === 'trades') {
         const label = document.getElementById('trade-mode-label');
         if (label) label.textContent = state.mode === 'paper' ? '模拟盘' : '实盘';
-        fetchTrades();
+        return fetchTrades();
     }
     if (page === 'positions') {
         const label = document.getElementById('positions-mode-label');
         if (label) label.textContent = state.mode === 'paper' ? '模拟盘' : '实盘';
-        fetchPositions();
+        return fetchPositions();
     }
     if (page === 'position-history') {
         const label = document.getElementById('position-history-mode-label');
         if (label) label.textContent = state.mode === 'paper' ? '模拟盘' : '实盘';
-        fetchPositionHistory();
+        return fetchPositionHistory({ refresh: options.refresh === true });
     }
-    if (page === 'daily-pnl') fetchDailyPnlRecords();
-    if (page === 'decisions') { populateDecisionModelFilter(); fetchAllDecisions(); }
-    if (page === 'opening-funnel') fetchOpeningFunnel();
-    if (page === 'profit-attribution') fetchProfitAttribution();
-    if (page === 'strategy-learning') fetchStrategyLearning();
-    if (page === 'analysis') fetchAnalysisRecords();
-    if (page === 'alerts') fetchRiskEvents();
+    if (page === 'daily-pnl') return fetchDailyPnlRecords();
+    if (page === 'decisions') return Promise.allSettled([populateDecisionModelFilter(), fetchAllDecisions()]);
+    if (page === 'opening-funnel') return fetchOpeningFunnel();
+    if (page === 'profit-attribution') return fetchProfitAttribution();
+    if (page === 'strategy-learning') return fetchStrategyLearning();
+    if (page === 'analysis') return fetchAnalysisRecords();
+    if (page === 'alerts') return fetchRiskEvents();
     if (page === 'expert-memory') {
-        fetchExpertMemories();
-        fetchTrainingEffectivenessReport();
+        return Promise.allSettled([fetchExpertMemories(), fetchTrainingEffectivenessReport()]);
     }
-    if (page === 'shadow-backtest') fetchShadowBacktests();
-    if (page === 'ml-signal') fetchMLSignalDashboard();
-    if (page === 'data-collection') fetchDataCollectionStatus();
-    if (page === 'system-audit') fetchSystemAudit();
+    if (page === 'shadow-backtest') return fetchShadowBacktests();
+    if (page === 'ml-signal') return fetchMLSignalDashboard();
+    if (page === 'data-collection') return fetchDataCollectionStatus();
+    if (page === 'system-audit') return fetchSystemAudit({ force: options.refresh === true });
     if (page === 'server-monitor') {
-        refreshServerMonitorPage();
+        return refreshServerMonitorPage();
     }
     if (page === 'settings') {
-        fetchDashboardAccountSettings();
-        fetchModelServerSettings();
-        fetchOKXSettings();
-        fetchExecutionAccountSettings();
-        fetchAIModels();
-        fetchTradingParams();
-        fetchDataCollectionSettings({ silent: true });
+        return loadSettingsData([
+            fetchDashboardAccountSettings, fetchModelServerSettings, fetchOKXSettings,
+            fetchExecutionAccountSettings, fetchAIModels, fetchTradingParams,
+            fetchHighRiskReviewerSettings, () => fetchDataCollectionSettings({ silent: true }),
+            () => refreshVectorMemoryStatus({ silent: true }),
+        ]);
     }
+}
+
+function initPageRefreshButtons() {
+    document.querySelectorAll('[data-page-refresh]').forEach(button => {
+        button.addEventListener('click', () => refreshPage(button.dataset.pageRefresh));
+    });
+}
+
+function refreshPage(page = state.activePage) {
+    if (pageRefreshRequests.has(page)) return pageRefreshRequests.get(page);
+    const buttons = Array.from(document.querySelectorAll('[data-page-refresh]'))
+        .filter(button => button.dataset.pageRefresh === page);
+    const section = document.getElementById(`page-${page}`);
+    section?.querySelector('.page-refresh-error')?.remove();
+    buttons.forEach(button => {
+        button.disabled = true;
+        button.setAttribute('aria-busy', 'true');
+    });
+    const request = Promise.resolve().then(() => loadPageData(page, { refresh: true })).then(results => {
+        const failed = Array.isArray(results) ? results.find(result => result.status === 'rejected') : null;
+        if (failed) throw failed.reason;
+    }).catch(error => {
+        if (!section) return;
+        const message = document.createElement('div');
+        message.className = 'page-refresh-error';
+        message.setAttribute('role', 'alert');
+        message.textContent = `刷新失败：${error?.message || '请求失败'}，请重试。`;
+        section.prepend(message);
+    }).finally(() => {
+        buttons.forEach(button => {
+            button.disabled = false;
+            button.removeAttribute('aria-busy');
+        });
+        pageRefreshRequests.delete(page);
+    });
+    pageRefreshRequests.set(page, request);
+    return request;
 }
 
 function activatePage(page) {
@@ -1976,17 +2040,27 @@ function activatePage(page) {
 }
 
 function openPage(page, options = {}) {
-    const selected = page || 'dashboard';
-    if (state.activePage === selected && options.force !== true) return;
+    const selected = document.getElementById(`page-${page}`)?.classList.contains('page-section')
+        ? page : 'dashboard';
     state.activePage = selected;
     activatePage(selected);
-    loadPageData(selected);
+    if (options.updateUrl !== false && location.hash !== `#${selected}`) {
+        history.pushState(null, '', `#${selected}`);
+    }
+    return refreshPage(selected);
 }
 
 function initSidebarNav() {
     document.querySelectorAll('.nav-item').forEach(item => {
         item.addEventListener('click', () => openPage(item.dataset.page));
     });
+    const restorePage = () => {
+        const requested = location.hash.slice(1) || 'dashboard';
+        if (requested !== state.activePage) openPage(requested, { updateUrl: false });
+    };
+    window.addEventListener('popstate', restorePage);
+    window.addEventListener('hashchange', restorePage);
+    openPage(location.hash.slice(1) || 'dashboard', { updateUrl: false });
 }
 
 // --- Mode Controls ---
@@ -9759,11 +9833,11 @@ function positionProtectionInventoryWarnings(inventory) {
     ])];
 }
 
-async function fetchPositionHistory() {
+async function fetchPositionHistory({ refresh = false } = {}) {
     try {
         const data = await fetchLatestPageJSON(
             'position-history',
-            `/api/dashboard/positions?mode=${state.mode}&page=${state.positionHistoryPage}&page_size=${PAGE_SIZE}&closed_only=true`,
+            `/api/dashboard/positions?mode=${state.mode}&page=${state.positionHistoryPage}&page_size=${PAGE_SIZE}&closed_only=true${refresh ? '&refresh=true' : ''}`,
         );
         if (!data) return;
         const tbody = document.getElementById('position-history-tbody');
@@ -9780,13 +9854,13 @@ async function fetchPositionHistory() {
         state.positionHistoryPage = data.page || state.positionHistoryPage;
         state.positionHistoryTotal = data.total || 0;
         const label = document.getElementById('position-history-mode-label');
-        const stale = String(data.ledger_source || '').includes('_stale');
+        const stale = String(data.ledger_source || '').includes('_stale') || data.refresh_in_progress === true;
         if (label) {
             const freshness = stale ? ' · 历史数据正在后台刷新' : '';
             label.textContent = `${state.mode === 'paper' ? '模拟盘' : '实盘'} · ${Number(data.settled_count || 0)} 已结算 / ${Number(data.pending_settlement_count || 0)} 待结算${freshness}`;
         }
         renderClosedPositionsTable(data.positions || [], state.positionHistoryPage, data.total_pages || 1, data.total || 0);
-        if (stale) schedulePageReadRetry('position-history', fetchPositionHistory, 15000);
+        if (stale) schedulePageReadRetry('position-history', fetchPositionHistory, 3000);
     } catch (error) {
         const tbody = document.getElementById('position-history-tbody');
         if (tbody && isPageActive('position-history')) {

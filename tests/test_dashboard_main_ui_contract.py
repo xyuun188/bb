@@ -753,7 +753,7 @@ def test_execution_detail_fetches_step_timeline_and_self_check_ui_exists() -> No
     style = (PROJECT_ROOT / "web_dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
 
     assert "system-self-check-panel" in html
-    assert "refreshServerMonitorPage()" in html
+    assert 'data-page-refresh="server-monitor"' in html
     assert "repairSystemSelfCheck()" in html
     assert "fetchJSON(`/api/trades/${encodeURIComponent(Number(tradeId))}`)" in script
     assert "function renderExecutionTimeline" in script
@@ -913,12 +913,12 @@ def test_system_audit_root_cause_radar_is_wired() -> None:
     assert "system-audit-grid" in html
     assert "system-audit-card-grid" in html
     assert "只做只读巡检" in html
-    assert "fetchSystemAudit()" in html
+    assert 'data-page-refresh="system-audit"' in html
     assert "systemAuditStatus: null" in script
     assert "let systemAuditRefreshInFlight = null" in script
     assert "const warming = String(data?.status || '').toLowerCase() === 'warming'" in script
     assert "Cold starts and explicit refreshes need a short poll interval" in script
-    assert "if (page === 'system-audit') fetchSystemAudit();" in script
+    assert "if (page === 'system-audit') return fetchSystemAudit({ force: options.refresh === true });" in script
     assert "if (isPageActive('system-audit'))" in script
     assert "fetchJSON('/api/system-audit/status')" in script
     assert "function renderSystemAudit" in script
@@ -1028,7 +1028,7 @@ def test_trading_settings_show_threshold_governance_catalog() -> None:
 
     assert "function fetchThresholdCatalog" in script
     assert "fetchJSON('/api/settings/threshold-catalog')" in script
-    assert "if (selected === 'trading') fetchTradingParams();" in script
+    assert "if (selected === 'trading') loaders.push(fetchTradingParams);" in script
     assert "renderThresholdCatalogList('threshold-manual-editable'" in script
     assert "renderThresholdCatalogList('threshold-auto-tunable'" in script
     assert "renderThresholdCatalogList('threshold-removed-deprecated'" in script
@@ -1096,12 +1096,12 @@ def test_data_collection_page_is_wired_to_api_and_safe_layout() -> None:
     assert "\u5411\u91cf\u8bb0\u5fc6\u8bbe\u7f6e" in vector_settings_html
     assert 'id="vector-memory-enabled"' in vector_settings_html
     assert 'id="vector-memory-status-panel"' in vector_settings_html
-    assert "fetchDataCollectionStatus()" in html
+    assert 'data-page-refresh="data-collection"' in html
     assert "saveDataCollectionSettings()" in html
-    assert "if (page === 'data-collection') fetchDataCollectionStatus();" in script
+    assert "if (page === 'data-collection') return fetchDataCollectionStatus();" in script
     assert "if (isPageActive('data-collection'))" in script
     assert "fetchDataCollectionStatus({ silent: true });" in script
-    assert "fetchDataCollectionSettings({ silent: true });" in script
+    assert "() => fetchDataCollectionSettings({ silent: true })" in script
     assert "selected === 'external-events'" in script
     assert "selected === 'vector-memory'" in script
     assert "selected === 'models') fetchDataCollectionStatus" not in script

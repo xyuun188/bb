@@ -18,7 +18,7 @@
             } catch (e) {}
         })();
     </script>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260828-training-effectiveness-layout-v1">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=20260828-training-effectiveness-layout-v1&page-refresh=20261115">
 <link rel="stylesheet" href="/static/css/strategy_learning.css?v=20260715-profit-evidence">
     <link rel="icon" type="image/svg+xml" href="/static/img/cangxiao-icon.svg">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -118,6 +118,7 @@
                     <span class="auto-scan-pill">自动扫描 · 系统调度</span>
                 </div>
                 <div class="topbar-right">
+                    <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="dashboard" title="刷新主面板" aria-label="刷新主面板">↻</button>
                     <div class="dashboard-user-chip" id="dashboard-user-chip" title="当前登录账号">
                         <span class="dashboard-user-dot"></span>
                         <span id="dashboard-current-user">未登录</span>
@@ -325,6 +326,7 @@
                 <div class="card-header">
                     <span class="card-title">执行记录</span>
                     <span class="card-subtitle" id="trade-mode-label">模拟盘</span>
+                    <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="trades" title="刷新执行记录" aria-label="刷新执行记录">↻</button>
                 </div>
                 <div class="table-wrap">
                     <table>
@@ -356,6 +358,7 @@
                 <div class="card-header">
                     <span class="card-title">持仓记录</span>
                     <span class="card-subtitle" id="positions-mode-label">模拟盘</span>
+                    <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="positions" title="刷新持仓记录" aria-label="刷新持仓记录">↻</button>
                     <button class="btn btn-sm" id="close-all-positions-btn" onclick="closeAllOpenPositions()" style="margin-left:auto;color:var(--red);border-color:var(--red);">一键平仓</button>
                 </div>
                 <div class="table-wrap">
@@ -390,6 +393,7 @@
                 <div class="card-header">
                     <span class="card-title">历史持仓</span>
                     <span class="card-subtitle" id="position-history-mode-label">模拟盘</span>
+                    <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="position-history" title="刷新历史持仓" aria-label="刷新历史持仓">↻</button>
                 </div>
                 <div class="table-wrap">
                     <table>
@@ -455,7 +459,7 @@
                             <option value="30" selected>近 30 天</option>
                             <option value="90">近 90 天</option>
                         </select>
-                        <button class="btn btn-sm" onclick="fetchDailyPnlRecords()">刷新</button>
+                        <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="daily-pnl" title="刷新每日盈亏" aria-label="刷新每日盈亏">↻</button>
                     </div>
                 </div>
                 <div style="font-size:12px;color:var(--text-muted);padding:8px 12px;border-bottom:1px solid var(--border);">
@@ -500,6 +504,7 @@
                     <span class="card-title">AI 决策记录</span>
                     <div style="display:flex;align-items:center;gap:10px;">
                         <span class="card-subtitle" id="all-decisions-count">0 条</span>
+                        <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="decisions" title="刷新 AI 决策" aria-label="刷新 AI 决策">↻</button>
                         <button class="btn btn-sm" onclick="clearAllDecisions()" style="color:var(--red);border-color:var(--red);">清空记录</button>
                     </div>
                 </div>
@@ -576,7 +581,7 @@
                             <option value="72">最近 3 天</option>
                             <option value="168">最近 7 天</option>
                         </select>
-                        <button class="btn btn-sm" onclick="fetchOpeningFunnel()">刷新</button>
+                        <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="opening-funnel" title="刷新开仓漏斗" aria-label="刷新开仓漏斗">↻</button>
                     </div>
                 </div>
                 <div class="opening-funnel-body">
@@ -644,7 +649,7 @@
                             <option value="72">最近 3 天</option>
                             <option value="168">最近 7 天</option>
                         </select>
-                        <button class="btn btn-sm" onclick="fetchProfitAttribution()">刷新</button>
+                        <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="profit-attribution" title="刷新策略复盘" aria-label="刷新策略复盘">↻</button>
                     </div>
                 </div>
                 <div class="card-tabs">
@@ -724,7 +729,7 @@
                             <option value="168">最近 7 天</option>
                             <option value="720">最近 30 天</option>
                         </select>
-                        <button class="btn btn-sm" onclick="fetchStrategyLearning()">刷新</button>
+                        <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="strategy-learning" title="刷新策略调度" aria-label="刷新策略调度">↻</button>
                     </div>
                 </div>
                 <div class="strategy-learning-body">
@@ -839,7 +844,7 @@
                             <button class="trade-tab" data-analysis-view="position" onclick="setAnalysisView('position')">持仓分析 <span id="analysis-position-count">0</span></button>
                         </div>
                         <span class="card-subtitle" id="analysis-count">0 条</span>
-                        <button class="btn btn-sm" onclick="fetchAnalysisRecords()">刷新</button>
+                        <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="analysis" title="刷新分析记录" aria-label="刷新分析记录">↻</button>
                     </div>
                 </div>
                 <div class="table-wrap">
@@ -872,6 +877,7 @@
                 <div class="card-header">
                     <span class="card-title">风控告警</span>
                     <span class="card-subtitle" id="alert-count">0</span>
+                    <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="alerts" title="刷新风控告警" aria-label="刷新风控告警">↻</button>
                 </div>
                 <div class="risk-alert-panel">
                     <div class="risk-alert-summary" id="risk-alert-summary"></div>
@@ -893,7 +899,7 @@
                 <div class="card-header">
                     <span class="card-title">专家记忆</span>
                     <div style="display:flex;align-items:center;gap:10px;">
-                        <button class="btn btn-sm" onclick="fetchExpertMemories()">刷新</button>
+                        <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="expert-memory" title="刷新专家记忆" aria-label="刷新专家记忆">↻</button>
                     </div>
                 </div>
                 <div class="card-tabs">
@@ -988,7 +994,7 @@
                     <span class="card-title">影子复盘</span>
                     <div style="display:flex;align-items:center;gap:10px;">
                         <span class="card-subtitle" id="shadow-backtest-count">0 条</span>
-                        <button class="btn btn-sm" onclick="fetchShadowBacktests()">刷新</button>
+                        <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="shadow-backtest" title="刷新影子复盘" aria-label="刷新影子复盘">↻</button>
                     </div>
                 </div>
                 <div style="display:flex;gap:8px;padding:8px 12px;flex-wrap:wrap;align-items:center;border-bottom:1px solid var(--border);">
@@ -1045,7 +1051,7 @@
                     <span class="card-title">本地 ML 盈亏质量</span>
                     <div style="display:flex;align-items:center;gap:10px;">
                         <span class="card-subtitle" id="ml-signal-updated">等待加载</span>
-                        <button class="btn btn-sm" onclick="fetchMLSignalDashboard()">刷新</button>
+                        <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="ml-signal" title="刷新本地 ML" aria-label="刷新本地 ML">↻</button>
                     </div>
                 </div>
                 <div id="ml-signal-overview">
@@ -1101,7 +1107,7 @@
                     </div>
                     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
                         <span class="card-subtitle" id="data-collection-updated">等待加载</span>
-                        <button class="btn btn-sm" onclick="fetchDataCollectionStatus()">刷新</button>
+                        <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="data-collection" title="刷新数据采集" aria-label="刷新数据采集">↻</button>
                     </div>
                 </div>
                 <div id="data-collection-overview">
@@ -1148,7 +1154,7 @@
                     </div>
                     <div class="system-audit-toolbar">
                         <span id="system-audit-updated">等待巡检</span>
-                        <button class="btn btn-sm" data-system-audit-force="true" onclick="fetchSystemAudit()">立即巡检</button>
+                        <button class="btn btn-sm" type="button" data-system-audit-force="true" data-page-refresh="system-audit">立即巡检</button>
                     </div>
                 </div>
                 <div id="system-audit-overview">
@@ -1205,7 +1211,7 @@
                     </div>
                     <div style="display:flex;align-items:center;gap:10px;">
                         <span class="card-subtitle" id="server-monitor-updated">等待加载</span>
-                        <button class="btn btn-sm" onclick="refreshServerMonitorPage()">刷新</button>
+                        <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="server-monitor" title="刷新服务器监控" aria-label="刷新服务器监控">↻</button>
                     </div>
                 </div>
                 <div class="server-monitor-tabs" role="tablist" aria-label="服务器监控类型">
@@ -1221,7 +1227,7 @@
                         </div>
                         <div class="server-monitor-self-check-actions">
                             <span class="card-subtitle" id="system-self-check-updated">等待自检</span>
-                            <button class="btn btn-sm" onclick="refreshServerMonitorPage()">立即检查</button>
+                            <button class="btn btn-sm" type="button" data-page-refresh="server-monitor">立即检查</button>
                             <button class="btn btn-sm" onclick="repairSystemSelfCheck()">安全修复</button>
                         </div>
                     </div>
@@ -1270,6 +1276,7 @@
         <div class="page-section" id="page-settings">
             <div class="settings-shell">
                 <aside class="settings-menu" aria-label="系统设置菜单">
+                    <button class="btn btn-sm page-refresh-button" type="button" data-page-refresh="settings" title="刷新系统设置" aria-label="刷新系统设置">↻</button>
                     <button class="settings-menu-item active" data-settings-tab="okx">OKX 账户</button>
                     <button class="settings-menu-item" data-settings-tab="model-server">模型服务器</button>
                     <button class="settings-menu-item" data-settings-tab="trading">交易参数</button>
@@ -1844,7 +1851,7 @@
 
 <script src="/static/js/ws_client.js?v=20260523c"></script>
 <script src="/static/js/charts.js?v=20261114-pnl-dates"></script>
-                    <script src="/static/js/dashboard.js?v=20261029-model-permission-v3&cache-bust=20260919-daily-pnl-accounting-v1&quality-contract-v6&opening-funnel-copy-v1&daily-pnl-split-v2&memory-funnel-visibility-v1&execution-position-state=20261014&pnl-ledger=20261016&audit-copy=20261114"></script>
+<script src="/static/js/dashboard.js?v=20261029-model-permission-v3&cache-bust=20260919-daily-pnl-accounting-v1&quality-contract-v6&opening-funnel-copy-v1&daily-pnl-split-v2&memory-funnel-visibility-v1&execution-position-state=20261014&pnl-ledger=20261016&audit-copy=20261114&page-refresh=20261115"></script>
     <script src="/static/js/strategy_learning_view.js?v=20260714-runtime-prior-clarity"></script>
 </body>
 </html>

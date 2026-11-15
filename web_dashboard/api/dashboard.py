@@ -10136,6 +10136,7 @@ async def get_positions(
     page_size: int = 20,
     open_only: bool = False,
     closed_only: bool = False,
+    refresh: bool = False,
 ):
     """All positions (open + closed) — 持仓记录. Optional mode filter (paper/live)."""
     from sqlalchemy import select
@@ -10289,6 +10290,9 @@ async def get_positions(
         repo = TradeRepository(session)
         is_open_filter = True if open_only else False if closed_only else None
         if closed_only:
+            cache_key = _dashboard_closed_ledger_cache_key(mode, None)
+            if refresh:
+                _start_dashboard_closed_ledger_refresh(cache_key, mode=mode, model_names=None)
             (
                 positions,
                 display_total,
@@ -10315,6 +10319,7 @@ async def get_positions(
                 "page_size": page_size,
                 "total_pages": display_total_pages,
                 "ledger_source": ledger_source,
+                "refresh_in_progress": cache_key in _dashboard_closed_ledger_refresh_tasks,
             }
         total = await repo.count_positions(execution_mode=mode, is_open=is_open_filter)
         open_count = await repo.count_positions(execution_mode=mode, is_open=True)

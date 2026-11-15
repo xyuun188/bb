@@ -2253,6 +2253,30 @@ body {
 .btn-ghost { background: transparent; border-color: transparent; color: var(--text-dim); }
 .btn-ghost:hover { color: var(--text); background: var(--bg-hover); }
 .btn-sm { padding: 4px 10px; font-size: 11px; border-radius: 5px; }
+.page-refresh-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 30px;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    font-size: 21px;
+    line-height: 1;
+    letter-spacing: 0;
+}
+[data-page-refresh]:disabled { opacity: 0.55; cursor: wait; }
+.page-refresh-error { color: var(--red); padding: 8px 0; font-size: 12px; }
+#page-position-history .card-header,
+#page-trades .card-header,
+#page-positions .card-header,
+#page-alerts .card-header { gap: 10px; flex-wrap: wrap; }
+#page-position-history .card-title,
+#page-trades .card-title,
+#page-alerts .card-title { margin-right: auto; }
+#page-position-history .card-header { flex-wrap: nowrap; }
+#page-position-history .card-title { flex-shrink: 0; }
+#page-position-history .card-subtitle { min-width: 0; line-height: 1.5; text-align: right; }
 
 /* ── Badges ── */
 .badge {

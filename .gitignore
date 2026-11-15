@@ -66,6 +66,8 @@ tmp_*.log
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.playwright-cli/
+/output/playwright/
 .claude/
 .codex-memory/
 PROJECT_MEMORY.md

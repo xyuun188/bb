@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-MAIN_PANEL_SHA256 = "22547eba275ac6d9d9406f980a3e554256b0e206023d2be27c34531d5c2f70d2"
+MAIN_PANEL_SHA256 = "04b4a0827cf769b534e283e3621cec2c2e07b7330714c9886d79770a30faf700"
 
 
 def test_continuous_training_remediation_does_not_change_main_panel_markup() -> None:
