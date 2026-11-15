@@ -71,6 +71,7 @@ SHADOW_SAMPLE_RECOVERY_MAX_BATCH = 4
 # contention. Keep headroom while the outer recovery pass remains bounded.
 SHADOW_SAMPLE_RECOVERY_PER_DECISION_BUDGET_SECONDS = 6.0
 SHADOW_SAMPLE_RECOVERY_TOTAL_BUDGET_SECONDS = 12.0
+SHADOW_SAMPLE_RECOVERY_MIN_WRITE_BUDGET_SECONDS = 1.0
 # Leave time for the write transaction before TradingService's 30s deadline.
 SHADOW_RESULT_COLLECTION_BUDGET_SECONDS = 20.0
 SHADOW_HISTORICAL_RETRY_COOLDOWN_SECONDS = 300.0
@@ -794,20 +795,35 @@ class ShadowBacktestService:
 
         since = datetime.now(UTC) - timedelta(minutes=max(int(lookback_minutes or 1), 1))
         query_started_at = monotonic()
+        # Database contention consumes the same budget as recovery writes.
+        deadline = query_started_at + SHADOW_SAMPLE_RECOVERY_TOTAL_BUDGET_SECONDS
         batch_limit = min(
             max(int(limit or 1), 1),
             SHADOW_SAMPLE_RECOVERY_MAX_BATCH,
         )
-        async with self.session_factory() as session:
-            repo = self.repository_factory(session)
-            finder = getattr(repo, "get_market_decisions_missing_shadow_samples", None)
-            if not callable(finder):
-                return {"scanned": 0, "recovered": 0, "failed": 0}
-            rows = await finder(
-                since=since,
-                horizon_count=len(self.horizons_minutes),
-                limit=batch_limit,
+        async def find_candidates() -> list[Any]:
+            async with self.session_factory() as session:
+                repo = self.repository_factory(session)
+                finder = getattr(repo, "get_market_decisions_missing_shadow_samples", None)
+                if not callable(finder):
+                    return []
+                return await finder(
+                    since=since,
+                    horizon_count=len(self.horizons_minutes),
+                    limit=batch_limit,
+                )
+
+        try:
+            rows = await asyncio.wait_for(
+                find_candidates(),
+                timeout=max(deadline - monotonic(), 0.0),
             )
+        except TimeoutError:
+            logger.warning(
+                "shadow sample recovery query timed out; retrying next pass",
+                query_seconds=round(monotonic() - query_started_at, 3),
+            )
+            return {"scanned": 0, "recovered": 0, "failed": 1}
         query_seconds = monotonic() - query_started_at
 
         recovered = 0
@@ -815,10 +831,12 @@ class ShadowBacktestService:
         scanned = 0
         deferred = 0
         started_at = monotonic()
-        deadline = started_at + SHADOW_SAMPLE_RECOVERY_TOTAL_BUDGET_SECONDS
         for index, row in enumerate(rows):
             remaining = deadline - monotonic()
-            if remaining < SHADOW_SAMPLE_RECOVERY_PER_DECISION_BUDGET_SECONDS:
+            if remaining < min(
+                SHADOW_SAMPLE_RECOVERY_MIN_WRITE_BUDGET_SECONDS,
+                SHADOW_SAMPLE_RECOVERY_PER_DECISION_BUDGET_SECONDS,
+            ):
                 deferred = len(rows) - index
                 logger.warning(
                     "shadow sample recovery budget deferred remaining candidates",

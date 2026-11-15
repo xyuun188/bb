@@ -494,6 +494,63 @@ async def test_shadow_backtest_recovery_defers_when_remaining_budget_is_too_smal
 
 
 @pytest.mark.asyncio
+async def test_recovery_includes_query_time_and_returns_committed_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _FakeRepo()
+    elapsed = [0.0]
+    created_ids = []
+    rows = [
+        SimpleNamespace(id=decision_id, feature_snapshot={"current_price": 100.0})
+        for decision_id in (459, 460)
+    ]
+
+    async def finder(**_kwargs: Any) -> list[Any]:
+        elapsed[0] = 5.0
+        return rows
+
+    async def create(_self, decision_id, *_args, **_kwargs) -> bool:
+        created_ids.append(decision_id)
+        elapsed[0] = 11.5
+        return True
+
+    repo.get_market_decisions_missing_shadow_samples = finder  # type: ignore[attr-defined]
+    monkeypatch.setattr(shadow_backtest_module, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(ShadowBacktestService, "create", create)
+
+    result = await _service(repo).recover_missing_market_samples(limit=10)
+
+    assert result == {"scanned": 1, "recovered": 1, "failed": 0}
+    assert created_ids == [459]
+
+
+@pytest.mark.asyncio
+async def test_recovery_cancels_a_query_that_exhausts_the_pass_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _FakeRepo()
+    query_cancelled = asyncio.Event()
+
+    async def finder(**_kwargs: Any) -> list[Any]:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            query_cancelled.set()
+        return []
+
+    repo.get_market_decisions_missing_shadow_samples = finder  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        shadow_backtest_module, "SHADOW_SAMPLE_RECOVERY_TOTAL_BUDGET_SECONDS", 0.01,
+    )
+
+    result = await _service(repo).recover_missing_market_samples(limit=10)
+
+    assert result == {"scanned": 0, "recovered": 0, "failed": 1}
+    assert query_cancelled.is_set()
+    assert repo.created == []
+
+
+@pytest.mark.asyncio
 async def test_shadow_backtest_persists_explicit_model_side_for_rules_canary() -> None:
     repo = _FakeRepo()
     feature_vector = SimpleNamespace(current_price=100.0, close=99.0)
