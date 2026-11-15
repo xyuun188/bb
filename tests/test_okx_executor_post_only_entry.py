@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -22,6 +23,7 @@ class _FakeCCXT:
         self.detail_sequence: list[float] = []
         # Reject the first post-only submit when set (OKX 51016 style).
         self.reject_post_only = False
+        self.reject_post_only_code = "51016"
         self.amount = 10.0
         # ordId -> {"type", "amount", "filled", "cancelled"}
         self.orders: dict[str, dict[str, Any]] = {}
@@ -55,7 +57,12 @@ class _FakeCCXT:
         )
         if order_type == "post_only" and self.reject_post_only:
             self.reject_post_only = False
-            raise ExchangeAPIError("OKX API error [51016]: post only order would cross")
+            message = (
+                "Order price is not within the price limit"
+                if self.reject_post_only_code == "51006"
+                else "post only order would cross"
+            )
+            raise ExchangeAPIError(f"OKX API error [{self.reject_post_only_code}]: {message}")
         # A market order is acknowledged as fully filled, matching OKX.
         filled = 0.0 if order_type == "post_only" else amount
         order_id = f"order-{len(self.create_order_calls)}"
@@ -181,18 +188,80 @@ async def test_post_only_full_fill_never_touches_the_market() -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_only_rejection_falls_back_to_market() -> None:
+@pytest.mark.parametrize("rejection_code", ("51016", "51006"))
+async def test_post_only_rejection_falls_back_to_market(rejection_code: str) -> None:
     executor = _executor()
     ccxt = _FakeCCXT()
     ccxt.reject_post_only = True
+    ccxt.reject_post_only_code = rejection_code
+    params = {
+        "tdMode": "cross", "clOrdId": "BBNP123456",
+        "attachAlgoOrds": [{"tpTriggerPx": "110", "slTriggerPx": "90"}],
+    }
 
-    order, fact = await _place(executor, ccxt)
+    order, fact = await executor._place_entry_with_post_only(
+        ccxt, okx_symbol=SYMBOL, side="buy", quantity=10.0, params=params,
+        market={"info": {"tickSz": "0.1"}}, ticker={"bid": 99.0, "ask": 101.0},
+    )
 
     assert [call["type"] for call in ccxt.create_order_calls] == ["post_only", "market"]
     assert fact["post_only_outcome"] == "rejected"
-    assert fact["fallback_reason"] == "post_only_rejected_51016"
+    assert fact["fallback_reason"] == f"post_only_rejected_{rejection_code}"
     assert fact["taker_fill_contracts"] == pytest.approx(10.0)
     assert order["status"] == "filled"
+    assert ccxt.create_order_calls[1]["params"] == params
+    assert ccxt.create_order_calls[1]["amount"] == 10.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("side", "buy_limit", "sell_limit", "expected_price"),
+    (("sell", "110", "102.04", 102.1), ("buy", "98.96", "90", 98.9)),
+)
+async def test_passive_price_uses_execution_bands_with_directional_tick_rounding(
+    side: str, buy_limit: str, sell_limit: str, expected_price: float,
+) -> None:
+    executor = _executor()
+    ccxt = _FakeCCXT()
+    ccxt.detail_sequence = [10.0]
+    fetch_limit = AsyncMock(return_value={"data": [{
+        "buyLmt": buy_limit, "sellLmt": sell_limit, "ts": "1794759551774",
+    }]})
+    ccxt.executionGetPublicPriceLimit = fetch_limit
+
+    order, fact = await _place(executor, ccxt, side=side)
+
+    fetch_limit.assert_awaited_once_with({"instId": SYMBOL})
+    assert len(ccxt.create_order_calls) == 1
+    assert ccxt.create_order_calls[0]["price"] == pytest.approx(expected_price)
+    assert ccxt.create_order_calls[0]["amount"] == 10.0
+    assert fact["post_only_execution_price_limit"]["source"] == "okx_execution_public_price_limit"
+    assert order["status"] == "filled"
+
+
+@pytest.mark.asyncio
+async def test_execution_band_failure_skips_passive_order() -> None:
+    executor = _executor()
+    ccxt = _FakeCCXT()
+    ccxt.executionGetPublicPriceLimit = AsyncMock(return_value={"data": []})
+
+    order, fact = await _place(executor, ccxt)
+
+    assert [call["type"] for call in ccxt.create_order_calls] == ["market"]
+    assert fact["post_only_plan_reason"] == "post_only_price_limit_unavailable"
+    assert order["status"] == "filled"
+
+
+@pytest.mark.asyncio
+async def test_other_passive_rejections_do_not_trigger_market_fallback() -> None:
+    executor = _executor()
+    ccxt = _FakeCCXT()
+    reject = AsyncMock(side_effect=ExchangeAPIError("OKX API error [51008]: insufficient margin"))
+    ccxt.create_order = reject
+    with pytest.raises(ExchangeAPIError, match="51008"):
+        await _place(executor, ccxt)
+    reject.assert_awaited_once()
+    assert reject.await_args.args[1] == "post_only"
 
 
 @pytest.mark.asyncio

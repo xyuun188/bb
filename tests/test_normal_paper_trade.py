@@ -1099,6 +1099,9 @@ def test_normal_paper_order_identity_round_trips_exact_decision() -> None:
 
     assert identity["client_order_id"] == "BBNP137947"
     assert normal_paper_decision_id_from_client_order_id("BBNP137947") == 137947
+    assert normal_paper_decision_id_from_client_order_id("BBNP137947P") == 137947
+    for invalid in ("BBNP137947PP", "BBNP137947X", "BBNPP", "BBNP0P"):
+        assert normal_paper_decision_id_from_client_order_id(invalid) is None
     assert normal_paper_order_identity_reasons(
         identity,
         decision_id=137947,

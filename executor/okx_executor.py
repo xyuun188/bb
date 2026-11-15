@@ -4544,11 +4544,54 @@ class OKXExecutor(AbstractExecutor):
             )
             return order, post_only_execution_fact(plan=plan, outcome="not_attempted")
 
+        # Analysis uses public quotes; demo orders can have different price
+        # bands. Apply the execution account's bands only to the passive leg.
+        execution_price_limit: dict[str, Any] = {}
+        fetch_execution_limit = getattr(ccxt, "executionGetPublicPriceLimit", None)
+        if callable(fetch_execution_limit):
+            try:
+                response = await self._with_retry(
+                    fetch_execution_limit,
+                    {"instId": okx_inst_id_from_symbol(okx_symbol)},
+                )
+                rows = response.get("data") if isinstance(response, dict) else None
+                row = rows[0] if isinstance(rows, list) and rows else {}
+                row = row if isinstance(row, dict) else {}
+                buy_limit = self._safe_float(row.get("buyLmt"), 0.0)
+                sell_limit = self._safe_float(row.get("sellLmt"), 0.0)
+                if buy_limit <= 0 or sell_limit <= 0:
+                    raise ExchangeAPIError("OKX execution price limit has no positive bounds")
+                execution_price_limit = {
+                    "buy_price_limit": buy_limit,
+                    "sell_price_limit": sell_limit,
+                    "timestamp_ms": row.get("ts"),
+                    "source": "okx_execution_public_price_limit",
+                }
+            except Exception as exc:
+                logger.warning(
+                    "OKX passive entry price bands unavailable; using market fallback",
+                    symbol=okx_symbol,
+                    error=safe_error_text(exc),
+                )
+                order = await self._create_order_with_client_recovery(
+                    ccxt, okx_symbol, side, quantity, params,
+                )
+                return order, post_only_execution_fact(
+                    plan={**plan, "eligible": False, "reason": "post_only_price_limit_unavailable"},
+                    outcome="not_attempted",
+                )
+        planned_price = self._safe_float(plan.get("price"), 0.0)
+        if execution_price_limit:
+            planned_price = (
+                min(planned_price, execution_price_limit["buy_price_limit"])
+                if str(side).lower() in {"buy", "long"}
+                else max(planned_price, execution_price_limit["sell_price_limit"])
+            )
         passive_price = self._passive_limit_price(
             ccxt,
             okx_symbol,
             side=side,
-            price=self._safe_float(plan.get("price"), 0.0),
+            price=planned_price,
             market=market,
         )
         best_bid = self._safe_float(ticker.get("bid"), 0.0)
@@ -4573,7 +4616,7 @@ class OKXExecutor(AbstractExecutor):
                 plan={**plan, "eligible": False, "reason": "post_only_price_would_cross"},
                 outcome="not_attempted",
             )
-        plan = {**plan, "price": passive_price}
+        plan = {**plan, "price": passive_price, "execution_price_limit": execution_price_limit}
 
         passive_params = dict(params)
         client_order_id = str(passive_params.get("clOrdId") or "").strip()
@@ -4594,9 +4637,9 @@ class OKXExecutor(AbstractExecutor):
         except ExchangeAPIError as exc:
             error_text = safe_error_text(exc)
             rejection_code = self._exchange_error_code(exc, error_text)
-            if rejection_code == "51016" or "post only" in error_text.lower():
+            if rejection_code in {"51006", "51016"} or "post only" in error_text.lower():
                 logger.info(
-                    "OKX rejected post-only entry at the touch; using market fallback",
+                    "OKX rejected passive entry price; using market fallback",
                     symbol=okx_symbol,
                     side=side,
                     error=error_text,

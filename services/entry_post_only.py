@@ -192,4 +192,9 @@ def post_only_execution_fact(
         "maker_fill_contracts": round(max(_number(maker_fill_contracts), 0.0), 12),
         "taker_fill_contracts": round(max(_number(taker_fill_contracts), 0.0), 12),
         "post_only_order_id": str(post_only_order_id or "").strip() or None,
+        **(
+            {"post_only_execution_price_limit": dict(payload["execution_price_limit"])}
+            if payload.get("execution_price_limit")
+            else {}
+        ),
     }

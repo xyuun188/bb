@@ -56,7 +56,8 @@ from services.okx_order_fact_sync import (
 from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
-def test_normal_paper_client_identity_recovers_exact_decision_lineage() -> None:
+@pytest.mark.parametrize("suffix", ["", "P"])
+def test_normal_paper_client_identity_recovers_exact_decision_lineage(suffix: str) -> None:
     contract = build_normal_paper_trade_contract(
         symbol="BTC/USDT",
         side="long",
@@ -110,13 +111,13 @@ def test_normal_paper_client_identity_recovers_exact_decision_lineage() -> None:
         timestamp_ms=0.0,
         timestamp=datetime.now(UTC),
         raw_count=1,
-        rows=({"clOrdId": identity["client_order_id"]},),
+        rows=({"clOrdId": identity["client_order_id"] + suffix},),
     )
 
     assert (
         _decision_for_order_fact(
             fill=fill,
-            order_row={"clOrdId": identity["client_order_id"]},
+            order_row={"clOrdId": identity["client_order_id"] + suffix},
             decisions_by_id={88: decision},
         )
         is decision
@@ -126,7 +127,7 @@ def test_normal_paper_client_identity_recovers_exact_decision_lineage() -> None:
     assert (
         _decision_for_order_fact(
             fill=wrong_side_fill,
-            order_row={"clOrdId": identity["client_order_id"]},
+            order_row={"clOrdId": identity["client_order_id"] + suffix},
             decisions_by_id={88: decision},
         )
         is None
@@ -181,8 +182,13 @@ def _interrupted_confirmed_entry():
     return decision, order, fill, now
 
 
-def test_matching_confirmed_fill_recovers_interrupted_entry_decision_once() -> None:
+@pytest.mark.parametrize("orphan_passive", [False, True])
+def test_matching_confirmed_fill_recovers_interrupted_entry_decision_once(orphan_passive) -> None:
     decision, order, fill, now = _interrupted_confirmed_entry()
+    if orphan_passive:
+        order.decision_id = None
+        order.model_name = "okx_authoritative_sync"
+        order.okx_raw_fills["rows"][0]["clOrdId"] += "P"
     original_contract = decision.raw_llm_response["normal_paper_trade"]
     report = OkxOrderFactSyncService(mode="paper")._apply_local_order_facts(
         [order], fills=[fill], fills_by_order_id={fill.order_id: fill},
@@ -192,6 +198,8 @@ def test_matching_confirmed_fill_recovers_interrupted_entry_decision_once() -> N
     )
 
     assert any(row["kind"] == "confirmed_entry_decision_recovered" for row in report[-1])
+    assert order.decision_id == decision.id
+    assert order.model_name == decision.model_name
     receipt = decision.raw_llm_response["execution_result"]
     assert receipt["exchange_confirmed"] is True
     assert receipt["exchange_order_id"] == fill.order_id

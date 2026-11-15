@@ -2235,6 +2235,28 @@ class OkxOrderFactSyncService:
             )
         for order in orders:
             decision = (decisions_by_id or {}).get(int(getattr(order, "decision_id", 0) or 0))
+            if (
+                decision is None
+                and not getattr(order, "decision_id", None)
+                and getattr(order, "execution_mode", None) == "paper"
+                and _order_has_confirmed_okx_fill_fact(order, require_verified_contract_size=True)
+            ):
+                fact = order.okx_raw_fills
+                stored_fills = group_okx_native_fill_rows(fact.get("rows") or [])
+                if len(stored_fills) == 1:
+                    stored_fill = stored_fills[0]
+                    stored_order_row = next(
+                        (row for row in fact.get("order_rows") or []
+                         if isinstance(row, dict) and _order_row_id(row) == stored_fill.order_id),
+                        None,
+                    )
+                    decision = _decision_for_order_fact(
+                        fill=stored_fill, order_row=stored_order_row,
+                        decisions_by_id=decisions_by_id or {},
+                    )
+                    if decision is not None:
+                        order.decision_id = int(decision.id)
+                        order.model_name = decision.model_name
             if _recover_confirmed_entry_decision(order, decision, now=now):
                 samples.append(_sample(order, kind="confirmed_entry_decision_recovered"))
         return (
@@ -4141,7 +4163,10 @@ def _decision_for_order_fact(
         if (
             identity_reasons
             or shared_reasons
-            or str(identity.get("client_order_id") or "").strip() != client_order_id
+            or client_order_id not in {
+                str(identity.get("client_order_id") or "").strip(),
+                str(identity.get("client_order_id") or "").strip() + "P",
+            }
         ):
             return None
         return decision

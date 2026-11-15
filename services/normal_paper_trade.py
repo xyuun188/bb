@@ -188,6 +188,9 @@ def normal_paper_decision_id_from_client_order_id(value: Any) -> int | None:
     if not client_order_id.startswith(NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX):
         return None
     raw_decision_id = client_order_id[len(NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX) :]
+    # The passive entry leg appends exactly one P to the canonical decision id.
+    if raw_decision_id.endswith("P"):
+        raw_decision_id = raw_decision_id[:-1]
     if not raw_decision_id.isdigit():
         return None
     decision_id = int(raw_decision_id)
