@@ -321,6 +321,10 @@ async def test_authoritative_outcome_backfill_runs_when_prompt_memory_is_disable
         processed.append(outcome["lifecycle_key"])
         return True
 
+    async def reflections(_repo, _ids):
+        return {}
+
+    monkeypatch.setattr(expert_memory_module.MemoryRepository, "get_reflections_by_position_ids", reflections)
     monkeypatch.setattr(service, "_record_authoritative_outcome_in_session", record)
     monkeypatch.setattr(
         "services.expert_memory_service.load_training_epoch_start",
@@ -341,3 +345,97 @@ async def test_authoritative_outcome_backfill_runs_when_prompt_memory_is_disable
     assert loader_calls[0]["include_decision_evidence"] is False
     assert report["batches"] == 1
     assert report["batch_size"] == 25
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_only_committed_matching_feedback(monkeypatch) -> None:
+    outcomes = [
+        {"position_id": index, "outcome_fingerprint": f"fact-{index}",
+         "settlement_fact_trusted": True, "outcome_complete": True}
+        for index in range(1, 4)
+    ]
+    processed = []
+
+    @asynccontextmanager
+    async def sessions():
+        yield object()
+
+    async def loader(**_kwargs):
+        return outcomes
+
+    service = ExpertMemoryService(session_factory=sessions, authoritative_outcome_loader=loader)
+    markers = {
+        1: SimpleNamespace(expert_lessons={"authoritative_feedback": service._feedback_marker(outcomes[0])}),
+        2: SimpleNamespace(expert_lessons={"authoritative_feedback": {
+            **service._feedback_marker(outcomes[1]), "outcome_fingerprint": "old-facts",
+        }}),
+    }
+
+    async def reflections(_repo, ids):
+        assert ids == [1, 2, 3]
+        return markers
+
+    async def record(_session, outcome):
+        processed.append(outcome["position_id"])
+        return True
+
+    monkeypatch.setattr(expert_memory_module.MemoryRepository, "get_reflections_by_position_ids", reflections)
+    monkeypatch.setattr(service, "_record_authoritative_outcome_in_session", record)
+    report = await service.backfill_trade_reflections("paper")
+    assert report["status"] == "completed"
+    assert report["unchanged"] == 1
+    assert report["processed"] == 2
+    assert processed == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_backfill_commits_marker_with_memories_and_applies_settlement_correction(monkeypatch) -> None:
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from models.base import Base
+    from models.learning import ExpertMemory, TradeReflection
+    from services.authoritative_trade_outcome import AUTHORITATIVE_TRADE_OUTCOME_VERSION
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    @asynccontextmanager
+    async def session_factory():
+        async with sessions.begin() as session:
+            yield session
+
+    outcome = {
+        "position_id": 1, "symbol": "BTC/USDT", "side": "short", "execution_mode": "paper",
+        "outcome_id": "ato:test", "outcome_version": AUTHORITATIVE_TRADE_OUTCOME_VERSION,
+        "outcome_fingerprint": "first-facts", "realized_pnl": 2.0,
+        "net_return_after_all_cost_pct": 1.0, "settlement_fact_trusted": True,
+        "outcome_complete": True, "label_timestamp": datetime.now(UTC).isoformat(),
+    }
+
+    async def loader(**_kwargs):
+        return [dict(outcome)]
+
+    monkeypatch.setattr(expert_memory_module, "build_authoritative_trade_outcome", lambda value, **_kwargs: value)
+    service = ExpertMemoryService(
+        session_factory=session_factory, authoritative_outcome_loader=loader,
+        model_slots=[{"name": "risk"}, {"name": "timeseries"}],
+    )
+    try:
+        assert (await service.backfill_trade_reflections("paper"))["processed"] == 1
+        assert (await service.backfill_trade_reflections("paper"))["unchanged"] == 1
+        outcome.update(outcome_fingerprint="corrected-facts", realized_pnl=-1.0,
+                       net_return_after_all_cost_pct=-0.5)
+        assert (await service.backfill_trade_reflections("paper"))["processed"] == 1
+        async with sessions() as session:
+            memories = (await session.execute(select(ExpertMemory))).scalars().all()
+            assert len(memories) == 2
+            assert all((row.evidence_count, row.success_count, row.failure_count) == (1, 0, 1) for row in memories)
+            reflection = (await session.execute(select(TradeReflection))).scalar_one()
+            assert reflection.realized_pnl == -1
+            assert reflection.expert_lessons["authoritative_feedback"]["outcome_fingerprint"] == "corrected-facts"
+        assert (await service.backfill_trade_reflections("paper"))["unchanged"] == 1
+    finally:
+        await engine.dispose()

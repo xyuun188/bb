@@ -28,8 +28,10 @@ from core.training_contracts import (
     compact_shadow_label_contract,
     shadow_label_timing,
 )
+from core.training_feature_snapshot import compact_training_feature_snapshot
 from db.repositories.memory_repo import MemoryRepository
 from db.session import get_session_ctx
+from models.decision import _compact_decision_learning_snapshot
 from services.execution_cost_model import (
     EXECUTION_COST_FACT_FIELDS,
     SHADOW_SETTLEMENT_COST_VERSION,
@@ -735,6 +737,10 @@ class ShadowBacktestService:
                 feature_snapshot["training_market_fact_contract"] = (
                     compact_market_fact_contract(market_contract)
                 )
+                # Horizons share one bounded copy of the sealed inputs and
+                # decision contract, rather than repeating all runtime context.
+                feature_snapshot = compact_training_feature_snapshot(feature_snapshot)
+                shadow_response = _compact_decision_learning_snapshot(raw_response)
                 rows = [
                     {
                         "decision_id": decision_id,
@@ -746,7 +752,7 @@ class ShadowBacktestService:
                         "decision_confidence": float(decision.confidence or 0.0),
                         "entry_price": entry_price,
                         "feature_snapshot": feature_snapshot,
-                        "raw_llm_response": raw_response,
+                        "raw_llm_response": shadow_response,
                         "status": "pending",
                         "created_at": observed_at,
                         "due_at": observed_at + timedelta(minutes=int(horizon)),

@@ -13,6 +13,39 @@ BAD_REASON = "AI 选择观望，未提交订单。?"
 GOOD_REASON = "AI 选择观望，未提交订单。"
 
 
+@pytest.mark.asyncio
+async def test_persisted_diagnostics_are_bounded_without_changing_execution_contracts() -> None:
+    from copy import deepcopy
+
+    normal_contract = {"paper_training_only": True, "objective_net_return_pct": -0.12,
+                       "evidence": {"nested": {"exact": [1, 2, 3]}}}
+    execution = {"suggested_leverage": 3, "position_size_pct": 2, "stop_loss_pct": 0.01}
+    raw = {
+        "normal_paper_trade": normal_contract, "execution_parameters": execution,
+        "decision_state_machine": {"summary": {"final_stage": "exchange_confirm"}},
+        "profit_risk_sizing": {"risk_budget_usdt": 50, "final_notional_usdt": 1000},
+        "local_ai_tools": {"available": True, "prediction": {"history": [1] * 100_000}},
+        "opportunity_score": {"score": 0.72, "diagnostics": {"transcript": "x" * 200_000}},
+    }
+    original = deepcopy(raw)
+    session = FakeSession()
+    repo = DecisionRepository(session)
+    row = await repo.log_decision({"raw_llm_response": raw})
+    assert row.raw_llm_response["normal_paper_trade"] == normal_contract
+    assert row.raw_llm_response["execution_parameters"] == execution
+    assert row.raw_llm_response["profit_risk_sizing"] == raw["profit_risk_sizing"]
+    assert row.raw_llm_response["decision_state_machine"] == raw["decision_state_machine"]
+    assert row.raw_llm_response["local_ai_tools"]["available"] is True
+    assert "prediction" not in row.raw_llm_response["local_ai_tools"]
+    assert row.raw_llm_response["opportunity_score"]["score"] == 0.72
+    session.row = row
+    await repo.update_raw_response(1, raw)
+    assert row.suggested_leverage == 3
+    assert row.position_size_pct == 2
+    assert row.stop_loss_pct == 0.01
+    assert raw == original
+
+
 class FakeSession:
     def __init__(self, row: Any | None = None, rows: list[Any] | None = None) -> None:
         self.row = row

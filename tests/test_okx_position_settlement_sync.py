@@ -1666,6 +1666,82 @@ def test_shared_lifecycle_is_quarantined_when_fragment_contracts_do_not_conserve
     assert [member.allocation_complete for member in group] == [False, False]
 
 
+def test_shared_close_order_partitions_contracts_and_economics_once() -> None:
+    from services.okx_position_settlement_sync import (
+        SettlementSuccess,
+        _candidate_with_order_facts,
+        _shared_close_order_ratios,
+    )
+    from services.position_settlement import build_position_settlement_snapshot
+
+    now = datetime.now(UTC)
+    common = {
+        "execution_mode": "paper", "symbol": "INJ/USDT", "side": "short",
+        "okx_inst_id": "INJ-USDT-SWAP", "okx_pos_id": "inj-pos",
+        "entry_exchange_order_id": "entry-inj", "close_exchange_order_id": "close-inj",
+        "entry_price": 5.0, "current_price": 4.9, "leverage": 2.0,
+        "entry_fee": 0.0, "close_fee": 0.0, "is_open": False,
+        "created_at": now - timedelta(minutes=20), "closed_at": now,
+        "settlement_status": "settling", "settlement_raw": {},
+    }
+    rows = [Position(id=1, quantity=53.4, **common), Position(id=2, quantity=3.1, **common)]
+    facts = {
+        "entry-inj": {"contracts": 565.0, "base_quantity": 56.5, "fee": 0.08},
+        "close-inj": {
+            "contracts": 565.0, "base_quantity": 56.5,
+            "fee": 0.078874, "fill_pnl": 1.3601,
+        },
+    }
+    history = {
+        "instId": "INJ-USDT-SWAP", "posId": "inj-pos", "posSide": "short",
+        "cTime": _ms(common["created_at"]), "uTime": _ms(now),
+        "closeTotalPos": "565", "realizedPnl": "1.201226", "fundingFee": "0",
+    }
+    snapshot = build_position_settlement_snapshot(
+        close_fill_pnl=1.3601, entry_fee=0.08, close_fee=0.078874, funding_fee=0.0,
+    )
+    for _ in range(2):
+        ratios = _shared_close_order_ratios(rows, facts)
+        candidates = [
+            _candidate_with_order_facts(row, facts, shared_close_ratios=ratios) for row in rows
+        ]
+        _prepare_lifecycle_allocations(candidates, [history])
+        assert all(member.allocation_complete for member in candidates)
+        assert [member.close_contracts for member in candidates] == pytest.approx([534, 31])
+        results = [
+            _scale_settlement_success(
+                SettlementSuccess(history, snapshot, "test", "test", "test"), member,
+            ).snapshot
+            for member in candidates
+        ]
+        assert sum(item.close_fill_pnl for item in results) == pytest.approx(1.3601)
+        assert sum(item.entry_fee for item in results) == pytest.approx(0.08)
+        assert sum(item.close_fee for item in results) == pytest.approx(0.078874)
+        assert sum(item.realized_pnl for item in results) == pytest.approx(1.201226)
+        assert results[0].raw["lifecycle_allocation"]["shared_close_order_ratio"] == pytest.approx(53.4 / 56.5)
+
+
+@pytest.mark.parametrize("override", [
+    {"quantity": 4.0}, {"okx_pos_id": "other-pos"},
+    {"entry_exchange_order_id": "other-entry"}, {"execution_mode": "live"},
+    {"is_open": True}, {"close_exchange_order_id": "shared,other-close"},
+])
+def test_shared_close_order_does_not_guess_incomplete_or_cross_lifecycle_allocation(override) -> None:
+    from services.okx_position_settlement_sync import _shared_close_order_ratios
+
+    common = {
+        "execution_mode": "paper", "symbol": "INJ/USDT", "side": "short",
+        "okx_inst_id": "INJ-USDT-SWAP", "okx_pos_id": "inj-pos",
+        "entry_exchange_order_id": "entry", "close_exchange_order_id": "shared",
+        "is_open": False, "settlement_raw": {},
+    }
+    rows = [
+        Position(id=1, quantity=53.4, **common),
+        Position(id=2, **({**common, "quantity": 3.1} | override)),
+    ]
+    assert _shared_close_order_ratios(rows, {"shared": {"base_quantity": 56.5}}) == {}
+
+
 def test_authoritative_contract_size_flags_local_fragment_quantity_drift() -> None:
     position = Position(
         quantity=520.0,

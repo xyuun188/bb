@@ -18,7 +18,7 @@ from sqlalchemy.orm import load_only
 from config.settings import ENSEMBLE_TRADER_NAME
 from core.safe_output import safe_error_text
 from db.session import get_read_session_ctx, get_session_ctx
-from models.decision import AIDecision
+from models.decision import AIDecision, _compact_decision_learning_snapshot
 from models.learning import ShadowBacktest, StrategyLearningEvent
 from models.trade import Position
 from services.authoritative_trade_outcome import (
@@ -2016,7 +2016,7 @@ class StrategyLearningService:
                             or learning.get("current_production_strategy")
                         ),
                         "matched_historical_prior": matched_prior,
-                        "runtime": runtime,
+                        "runtime": _compact_decision_learning_snapshot(runtime),
                         "production_permission": False,
                     }
                 )
@@ -2028,7 +2028,8 @@ class StrategyLearningService:
                     {
                         "advisory_only": True,
                         "can_authorize_entry": False,
-                        "raw": raw_response or {},
+                        "raw": _compact_decision_learning_snapshot(raw_response or {}),
+                        "diagnostic_payload_compacted": True,
                     }
                 )
             ),

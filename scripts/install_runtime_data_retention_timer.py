@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install bounded hourly runtime retention and journal storage limits."""
+"""Install bounded runtime retention and journal storage limits."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ TIMER_NAME = "bb-runtime-data-retention.timer"
 REMOTE_RUNTIME_ENV_PATH = "/etc/bb/bb-runtime.env"
 REPORT_DIR_REL = "data/runtime_data_retention_reports"
 REMOTE_STAGING_DIR_REL = "tmp/systemd-unit-stage"
-DEFAULT_ON_CALENDAR = "*-*-* *:20:00 UTC"
+DEFAULT_ON_CALENDAR = "*-*-* *:00/15:00 UTC"
 JOURNAL_LIMITS_PATH = "/etc/systemd/journald.conf.d/60-bb-storage-limits.conf"
 
 
@@ -67,18 +67,18 @@ Nice=10
 IOSchedulingClass=idle
 CPUWeight=10
 TimeoutStartSec=45min
-ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then PY=.venv/bin/python; elif [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=python3; fi; exec "$PY" scripts/run_runtime_data_retention.py --apply --confirm {RUNTIME_DATA_RETENTION_APPLY_CONFIRMATION} --batch-size 250 --max-rows-per-table 5000 --batch-pause-seconds 0.05 --skip-byte-estimate --json-indent 0'
+ExecStart=/bin/bash -lc 'cd {remote_app_dir} && if [ -x .venv/bin/python ]; then PY=.venv/bin/python; elif [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=python3; fi; exec "$PY" scripts/run_runtime_data_retention.py --apply --confirm {RUNTIME_DATA_RETENTION_APPLY_CONFIRMATION} --batch-size 250 --max-rows-per-table 50000 --batch-pause-seconds 0.1 --skip-byte-estimate --json-indent 0'
 """
 
 
 def render_timer(*, on_calendar: str = DEFAULT_ON_CALENDAR) -> str:
     return f"""[Unit]
-Description=Run BB bounded runtime data retention hourly
+Description=Run BB bounded runtime data retention every 15 minutes
 
 [Timer]
 OnCalendar={on_calendar}
 Persistent=true
-RandomizedDelaySec=600
+RandomizedDelaySec=60
 Unit={SERVICE_NAME}
 
 [Install]

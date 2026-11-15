@@ -137,6 +137,7 @@ async def test_build_briefing_counts_full_paper_window_and_only_entry_executions
     from models.base import Base
     from models.decision import AIDecision
     from models.learning import ShadowBacktest
+    from models.trade import OkxPositionHistory
 
     module = _load_module()
     now = datetime.now(UTC)
@@ -165,7 +166,7 @@ async def test_build_briefing_counts_full_paper_window_and_only_entry_executions
             await connection.run_sync(
                 lambda sync_connection: Base.metadata.create_all(
                     sync_connection,
-                    tables=[AIDecision.__table__, ShadowBacktest.__table__],
+                    tables=[AIDecision.__table__, ShadowBacktest.__table__, OkxPositionHistory.__table__],
                 )
             )
             await connection.execute(AIDecision.__table__.insert(), [
@@ -240,3 +241,45 @@ def test_model_status_distinguishes_running_artifact_from_rejected_candidate(
     assert model["latest_training_version"] == "rejected-candidate"
     assert "运行版本：running-champion" in text
     assert "最近候选：rejected-candidate（未替换运行模型）" in text
+
+
+@pytest.mark.asyncio
+async def test_settled_profit_separates_new_entries_from_old_positions() -> None:
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from models.base import Base
+    from models.trade import OkxPositionHistory
+
+    module = _load_module()
+    now = datetime.now(UTC)
+    since = now - timedelta(hours=12)
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            for index, (opened, pnl, mode, status) in enumerate([
+                (since - timedelta(hours=1), 100, "paper", "full"),
+                (since + timedelta(hours=1), -8, "paper", "full"),
+                (since + timedelta(hours=1), 3, "paper", "full"),
+                (since + timedelta(hours=1), 200, "live", "full"),
+                (since + timedelta(hours=1), 300, "paper", "partial"),
+            ]):
+                session.add(OkxPositionHistory(
+                    mode=mode, row_identity=f"history-{index}", inst_id="BTC-USDT-SWAP",
+                    symbol="BTC/USDT", opened_at=opened, updated_at_okx=now,
+                    realized_pnl=pnl, close_status=status, sync_status="synced",
+                ))
+            await session.flush()
+            report = await module._settled_profit_cohorts(session, since=since, now=now)
+        assert report["closed_in_window"]["count"] == 3
+        assert report["closed_in_window"]["realized_net_pnl_usdt"] == 95
+        cohort = report["opened_and_closed_in_window"]
+        assert cohort["count"] == 2
+        assert cohort["realized_net_pnl_usdt"] == -5
+        assert cohort["profit_factor"] == pytest.approx(3 / 8)
+        text = module.render_text({"settled_profit": report})
+        assert "新开且完整平仓 2 笔，净收益 -5.0000 USDT" in text
+    finally:
+        await engine.dispose()

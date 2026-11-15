@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy import func, or_, select
 
 from db.repositories.base import BaseRepository
-from models.decision import AIDecision
+from models.decision import AIDecision, compact_runtime_decision_payload
 from services.decision_state import (
     DecisionStage,
     decision_state_from_raw,
@@ -214,7 +214,7 @@ class DecisionRepository(BaseRepository):
     ) -> AIDecision | None:
         decision = await self.get(decision_id)
         if decision:
-            clean_response = sanitize_runtime_text(raw_response)
+            clean_response = sanitize_runtime_text(compact_runtime_decision_payload(raw_response))
             decision.raw_llm_response = clean_response
             _sync_execution_parameters(decision, clean_response)
             await self.session.flush()
@@ -279,7 +279,7 @@ class DecisionRepository(BaseRepository):
             }:
                 continue
             clean_reason = sanitize_runtime_text(reason)
-            clean_response = sanitize_runtime_text(raw_response)
+            clean_response = sanitize_runtime_text(compact_runtime_decision_payload(raw_response))
             row.execution_reason = clean_reason
             row.raw_llm_response = clean_response
             _sync_execution_parameters(row, clean_response)
@@ -356,7 +356,10 @@ def _sanitize_decision_payload(data: dict) -> dict:
             clean[key] = sanitize_runtime_text(clean.get(key))
     for key in ("feature_snapshot", "raw_llm_response"):
         if key in clean:
-            clean[key] = sanitize_runtime_text(clean.get(key))
+            value = clean.get(key)
+            if key == "raw_llm_response":
+                value = compact_runtime_decision_payload(value)
+            clean[key] = sanitize_runtime_text(value)
     return clean
 
 

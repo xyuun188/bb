@@ -927,7 +927,18 @@ async def load_authoritative_trade_outcomes(
             list(
                 (
                     await session.execute(
-                        select(TradeReflection).where(TradeReflection.position_id.in_(position_ids))
+                        select(TradeReflection)
+                        .where(TradeReflection.position_id.in_(position_ids))
+                        .options(load_only(
+                            TradeReflection.id,
+                            TradeReflection.position_id,
+                            TradeReflection.source,
+                            TradeReflection.outcome,
+                            TradeReflection.mistake_summary,
+                            TradeReflection.improvement_summary,
+                            TradeReflection.created_at,
+                            raiseload=True,
+                        ))
                     )
                 )
                 .scalars()

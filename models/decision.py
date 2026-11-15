@@ -226,6 +226,24 @@ def _compact_decision_learning_snapshot(raw: object) -> dict[str, object]:
     return compact
 
 
+_RUNTIME_DIAGNOSTIC_BRANCHES = frozenset({
+    "local_ai_tools", "opportunity_score", "strategy_learning_context", "ml_signal",
+    "local_ml_signal", "continuous_strategy_routing", "market_candidate_funnel",
+    "direction_competition", "continuous_model_weights",
+})
+
+
+def compact_runtime_decision_payload(raw: object) -> object:
+    """Bound copied diagnostics while preserving execution contracts verbatim."""
+    if not isinstance(raw, dict):
+        return raw
+    compact = dict(raw)
+    for key in _RUNTIME_DIAGNOSTIC_BRANCHES.intersection(raw):
+        projection = _compact_decision_learning_snapshot({key: raw[key]})
+        compact[key] = projection.get(key, {})
+    return compact
+
+
 @event.listens_for(AIDecision, "before_insert")
 @event.listens_for(AIDecision, "before_update")
 def _sync_model_health_snapshot(_mapper, _connection, target: AIDecision) -> None:

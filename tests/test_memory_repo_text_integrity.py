@@ -352,7 +352,62 @@ async def test_upsert_memory_updates_existing_authoritative_observation() -> Non
     assert updated is existing
     assert existing.lesson == "new observation"
     assert existing.market_pattern == "new pattern"
-    assert existing.evidence_count == 2
+    assert existing.evidence_count == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_replay_repairs_inflated_counts_and_then_does_not_write() -> None:
+    from models.base import Base
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    data = {
+        "expert_name": "risk", "memory_key": "risk:BTC:short", "lesson": "outcome",
+        "market_pattern": "BTC|short", "success_count": 1, "failure_count": 0,
+        "extra": _outcome_extra(position_id=1, outcome_id="ato:1", pnl=2.0, return_pct=1.0),
+    }
+    try:
+        async with sessions() as session:
+            repo = MemoryRepository(session)
+            row = await repo.upsert_memory(data)
+            row.evidence_count = 42
+            row.success_count = 42
+            await session.flush()
+            await repo.upsert_memory(data)
+            assert (row.evidence_count, row.success_count, row.failure_count) == (1, 1, 0)
+            updated_at = row.updated_at
+            await repo.upsert_memory(data)
+            assert row.updated_at == updated_at
+            assert row not in session.dirty
+    finally:
+        await engine.dispose()
+
+
+def test_memory_outcome_correction_replaces_one_contribution_without_double_counting() -> None:
+    first = memory_repo_module._merge_memory_outcomes(
+        None, _outcome_extra(position_id=1, outcome_id="ato:1", pnl=-5, return_pct=-10),
+    )
+    second = memory_repo_module._merge_memory_outcomes(
+        first, _outcome_extra(position_id=2, outcome_id="ato:2", pnl=2, return_pct=4),
+    )
+    corrected = memory_repo_module._merge_memory_outcomes(
+        second, _outcome_extra(position_id=1, outcome_id="ato:1", pnl=1, return_pct=2),
+    )
+    aggregate = corrected["outcome_aggregation"]
+    assert aggregate["count"] == 2
+    assert aggregate["positive_count"] == 2
+    assert aggregate["negative_count"] == 0
+    assert aggregate["total_realized_net_pnl_usdt"] == 3
+    assert aggregate["total_net_return_pct"] == 6
+    assert aggregate["squared_net_return_sum_pct2"] == 20
+    assert aggregate["worst_net_return_pct"] == 2
+    assert aggregate["gross_loss_usdt"] == 0
+    assert aggregate["source_outcome_ids"] == ["ato:1", "ato:2"]
+    assert memory_repo_module._merge_memory_outcomes(
+        corrected, _outcome_extra(position_id=1, outcome_id="ato:1", pnl=1, return_pct=2),
+    ) == corrected
 
 
 @pytest.mark.asyncio

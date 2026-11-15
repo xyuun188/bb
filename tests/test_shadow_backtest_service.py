@@ -345,6 +345,35 @@ async def test_shadow_backtest_service_creates_pending_horizons() -> None:
 
 
 @pytest.mark.asyncio
+async def test_shadow_storage_drops_repeated_diagnostics_and_preserves_label_inputs() -> None:
+    from copy import deepcopy
+
+    from core.training_feature_snapshot import compact_training_feature_snapshot
+
+    decision = _decision()
+    decision.feature_snapshot["unused_transcript"] = "x" * 200_000
+    decision.raw_response.update({
+        "transcript": "x" * 200_000,
+        "normal_paper_trade": {"paper_training_only": True, "objective_net_return_pct": -0.12},
+    })
+    original = deepcopy(decision.feature_snapshot)
+    repo = _FakeRepo()
+    await _service(repo).create(123, decision, SimpleNamespace(current_price=100.0), "paper")
+    stored = repo.created[0]
+    assert "unused_transcript" not in stored["feature_snapshot"]
+    assert "transcript" not in stored["raw_llm_response"]
+    assert stored["raw_llm_response"]["normal_paper_trade"] == decision.raw_response["normal_paper_trade"]
+    assert stored["feature_snapshot"]["shadow_label_inputs"]["stop_loss_fraction"] == decision.stop_loss_pct
+    assert stored["feature_snapshot"]["market_fact"]["fact_id"] == original["market_fact"]["fact_id"]
+    expected = compact_training_feature_snapshot(original)
+    for key in ("current_price", "adx_14", "market_fact"):
+        assert stored["feature_snapshot"][key] == expected[key]
+    assert decision.feature_snapshot == original
+    assert len(decision.raw_response["transcript"]) == 200_000
+    assert len(json.dumps(stored, default=str).encode("utf-8")) < 40_000
+
+
+@pytest.mark.asyncio
 async def test_shadow_backtest_service_recovers_missing_horizons_from_persisted_decision() -> None:
     repo = _FakeRepo()
     finder_kwargs: dict[str, Any] = {}

@@ -127,6 +127,7 @@ class SettlementCandidate:
     entry_fee_authoritative: float | None = None
     close_fee_authoritative: float | None = None
     close_fill_pnl_authoritative: float | None = None
+    shared_close_order_ratio: float = 1.0
     history_row_identity: str = ""
     history_record_id: int = 0
     allocation_error: str = ""
@@ -655,6 +656,7 @@ class OkxPositionSettlementSyncService:
                     for row in rows
                     if int(getattr(row, "id", 0) or 0) not in duplicate_ids
                 ]
+            shared_close_ratios = _shared_close_order_ratios(rows, order_facts)
             candidates: list[SettlementCandidate] = []
             restored_superseded = bool(duplicate_rows or exact_projection_duplicates)
             terminal_repair_keys: set[tuple[str, ...]] = set()
@@ -663,7 +665,9 @@ class OkxPositionSettlementSyncService:
                 if _has_superseded_position_metadata(row, _safe_dict(row.settlement_raw)):
                     continue
                 evidence_groups.setdefault(_position_lifecycle_group_key(row), []).append(
-                    _candidate_with_order_facts(row, order_facts)
+                    _candidate_with_order_facts(
+                        row, order_facts, shared_close_ratios=shared_close_ratios,
+                    )
                 )
             terminal_groups = [
                 (key, group) for key, group in evidence_groups.items()
@@ -749,7 +753,9 @@ class OkxPositionSettlementSyncService:
                 if lifecycle_key not in selected_lifecycle_keys:
                     continue
                 if lifecycle_key:
-                    candidates.append(_candidate_with_order_facts(row, order_facts))
+                    candidates.append(_candidate_with_order_facts(
+                        row, order_facts, shared_close_ratios=shared_close_ratios,
+                    ))
             if restored_superseded:
                 await session.flush()
         return candidates
@@ -1644,26 +1650,84 @@ def _candidate_from_position(position: Position, raw: dict[str, Any]) -> Settlem
     )
 
 
+def _shared_close_order_ratios(
+    rows: list[Position], order_facts: dict[str, dict[str, float | None]],
+) -> dict[int, float]:
+    """Split one close fill only when a complete local partition proves it."""
+
+    owners: dict[str, list[Position]] = {}
+    close_sets: dict[int, frozenset[str]] = {}
+    for row in rows:
+        if _has_superseded_position_metadata(row, _safe_dict(row.settlement_raw)):
+            continue
+        close_ids = frozenset(_split_exchange_order_ids(row.close_exchange_order_id))
+        close_sets[int(row.id)] = close_ids
+        for order_id in close_ids:
+            owners.setdefault(order_id, []).append(row)
+    ratios: dict[int, float] = {}
+    checked: set[frozenset[str]] = set()
+    for members in owners.values():
+        close_ids = close_sets[int(members[0].id)]
+        if len(members) <= 1 or close_ids in checked:
+            continue
+        checked.add(close_ids)
+        first = members[0]
+        key = _position_lifecycle_group_key(first)
+        member_ids = {int(row.id) for row in members}
+        if (
+            not first.okx_pos_id
+            or not first.entry_exchange_order_id
+            or any(
+                _position_lifecycle_group_key(row) != key
+                or close_sets[int(row.id)] != close_ids
+                or row.is_open
+                or _safe_float(row.quantity, 0.0) <= 0
+                for row in members
+            )
+            or any(
+                {int(row.id) for row in owners[close_id]} != member_ids
+                for close_id in close_ids
+            )
+        ):
+            continue
+        base_quantities = [
+            _safe_float(order_facts.get(close_id, {}).get("base_quantity"), 0.0)
+            for close_id in close_ids
+        ]
+        total_base = sum(base_quantities)
+        local_base = sum(float(row.quantity) for row in members)
+        if not all(value > 0 for value in base_quantities) or not _quantities_close(
+            local_base, total_base,
+        ):
+            continue
+        for row in members:
+            ratios[int(row.id)] = float(row.quantity) / total_base
+    return ratios
+
+
 def _candidate_with_order_facts(
     position: Position, order_facts: dict[str, dict[str, float | None]],
+    *, shared_close_ratios: dict[int, float] | None = None,
 ) -> SettlementCandidate:
     candidate = _candidate_from_position(position, _safe_dict(position.settlement_raw))
     entry_ids = _split_exchange_order_ids(candidate.entry_exchange_order_id)
     close_ids = _split_exchange_order_ids(candidate.close_exchange_order_id)
 
-    def sum_fact(order_ids: set[str], field: str) -> float | None:
+    def sum_fact(order_ids: set[str], field: str, ratio: float = 1.0) -> float | None:
         values = [order_facts.get(order_id, {}).get(field) for order_id in order_ids]
         if not values or any(value is None for value in values):
             return None
-        return sum(float(value) for value in values)
+        return sum(float(value) for value in values) * ratio
 
+    close_ratio = (shared_close_ratios or {}).get(candidate.position_id, 1.0)
     return replace(
         candidate,
         entry_contracts=sum_fact(entry_ids, "contracts") or 0.0,
-        close_contracts=sum_fact(close_ids, "contracts") or 0.0,
+        close_contracts=sum_fact(close_ids, "contracts", close_ratio) or 0.0,
         entry_fee_authoritative=sum_fact(entry_ids, "fee"),
-        close_fee_authoritative=sum_fact(close_ids, "fee"),
-        close_fill_pnl_authoritative=sum_fact(close_ids, "fill_pnl"),
+        close_fee_authoritative=sum_fact(close_ids, "fee", close_ratio),
+        close_fill_pnl_authoritative=sum_fact(close_ids, "fill_pnl", close_ratio),
+        shared_close_order_ratio=close_ratio,
     )
 
 
@@ -1958,6 +2022,7 @@ def _scale_settlement_success(
                 "ratio": ratio,
                 "basis": candidate.allocation_basis,
                 "allocated_contracts": candidate.close_contracts,
+                "shared_close_order_ratio": candidate.shared_close_order_ratio,
                 "group_position_ids": list(candidate.lifecycle_group_position_ids),
                 "entry_fee_authoritative": candidate.entry_fee_authoritative,
                 "close_fee_authoritative": candidate.close_fee_authoritative,

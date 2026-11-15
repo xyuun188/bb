@@ -129,15 +129,22 @@ class MemoryRepository(BaseRepository):
             existing = result.scalar_one_or_none()
 
         if existing:
-            existing.evidence_count = int(existing.evidence_count or 0) + int(
-                data.get("evidence_count", 1) or 1
+            merged_extra = _merge_memory_outcomes(existing.extra, data.get("extra"))
+            aggregation = _memory_outcome_aggregation(merged_extra)
+            counts = (
+                int(aggregation.get("count") or 0),
+                int(aggregation.get("positive_count") or 0),
+                int(aggregation.get("negative_count") or 0),
             )
-            existing.success_count = int(existing.success_count or 0) + int(
-                data.get("success_count", 0) or 0
-            )
-            existing.failure_count = int(existing.failure_count or 0) + int(
-                data.get("failure_count", 0) or 0
-            )
+            if (
+                merged_extra == existing.extra
+                and counts == (existing.evidence_count, existing.success_count, existing.failure_count)
+                and data.get("is_active") is not False
+            ):
+                return existing
+            # Canonical outcome IDs, rather than the number of backfill runs,
+            # determine sample counts. This also repairs previously inflated counts.
+            existing.evidence_count, existing.success_count, existing.failure_count = counts
             existing.confidence_score = existing.evidence_count / (existing.evidence_count + 1.0)
             existing.lesson = str(data.get("lesson") or existing.lesson or "")
             existing.market_pattern = str(
@@ -149,7 +156,7 @@ class MemoryRepository(BaseRepository):
             existing.source_position_id = (
                 data.get("source_position_id") or existing.source_position_id
             )
-            existing.extra = _merge_memory_outcomes(existing.extra, data.get("extra"))
+            existing.extra = merged_extra
             if data.get("is_active") is False:
                 existing.is_active = False
             existing.updated_at = datetime.now(UTC)
@@ -189,19 +196,37 @@ class MemoryRepository(BaseRepository):
         )
         return result.scalar_one_or_none()
 
+    async def get_reflections_by_position_ids(
+        self, position_ids: list[int],
+    ) -> dict[int, TradeReflection]:
+        ids = sorted({int(value) for value in position_ids if int(value) > 0})
+        if not ids:
+            return {}
+        result = await self.session.execute(
+            select(TradeReflection).where(TradeReflection.position_id.in_(ids))
+            .order_by(TradeReflection.id.desc())
+        )
+        rows: dict[int, TradeReflection] = {}
+        for row in result.scalars().all():
+            rows.setdefault(int(row.position_id), row)
+        return rows
+
     async def update_reflection(
         self,
         reflection: TradeReflection,
         data: dict[str, Any],
     ) -> TradeReflection:
         normalized = _normalize_reflection_payload(dict(data or {}))
+        changed = False
         for key, value in normalized.items():
             if key in {"id", "position_id", "created_at"}:
                 continue
-            if hasattr(reflection, key):
+            if hasattr(reflection, key) and getattr(reflection, key) != value:
                 setattr(reflection, key, value)
-        reflection.updated_at = datetime.now(UTC)
-        await self.session.flush()
+                changed = True
+        if changed:
+            reflection.updated_at = datetime.now(UTC)
+            await self.session.flush()
         return reflection
 
     async def create_shadow_backtest(self, data: dict[str, Any]) -> ShadowBacktest:
@@ -776,20 +801,40 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
         for value in previous.get("source_outcome_ids", [])
         if str(value or "").strip()
     ]
-    if outcome_id and outcome_id in source_outcome_ids:
-        return {**existing, **incoming, "outcome_aggregation": previous}
+    contributions = dict(previous.get("outcome_values") or {})
+    previous_value = contributions.get(outcome_id)
+    repeated = bool(outcome_id and outcome_id in source_outcome_ids)
+    if repeated and previous_value is None and existing.get("outcome_id") == outcome_id:
+        previous_value = {
+            "pnl": existing.get("realized_pnl"),
+            "return_pct": existing.get(PROFIT_TRAINING_TARGET),
+        }
+    if repeated and (
+        not isinstance(previous_value, dict)
+        or (
+            _finite_float(previous_value.get("pnl"), None) == realized_pnl
+            and _finite_float(previous_value.get("return_pct"), None) == net_return
+        )
+    ):
+        return existing
     if not outcome_id and source_position_id > 0 and source_position_id in source_position_ids:
-        return {**existing, **incoming, "outcome_aggregation": previous}
+        return existing
+
+    old_pnl = float(previous_value.get("pnl") or 0.0) if repeated else 0.0
+    old_return = float(previous_value.get("return_pct") or 0.0) if repeated else 0.0
+    if outcome_id:
+        contributions[outcome_id] = {"pnl": realized_pnl, "return_pct": net_return}
+        contributions = dict(list(contributions.items())[-2000:])
 
     previous_count = int(previous.get("count") or 0)
-    count = previous_count + 1
-    total_pnl = float(previous.get("total_realized_net_pnl_usdt") or 0.0) + float(
+    count = previous_count + int(not repeated)
+    total_pnl = float(previous.get("total_realized_net_pnl_usdt") or 0.0) - old_pnl + float(
         realized_pnl or 0.0
     )
-    total_return = float(previous.get("total_net_return_pct") or 0.0) + float(
+    total_return = float(previous.get("total_net_return_pct") or 0.0) - old_return + float(
         net_return or 0.0
     )
-    squared_return_sum = float(previous.get("squared_net_return_sum_pct2") or 0.0) + float(
+    squared_return_sum = max(0.0, float(previous.get("squared_net_return_sum_pct2") or 0.0) - old_return**2) + float(
         net_return or 0.0
     ) ** 2
     avg_return = total_return / count
@@ -806,16 +851,18 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
         float(net_return or 0.0),
         float(previous_worst) if previous_worst is not None else float(net_return or 0.0),
     )
-    positive_count = int(previous.get("positive_count") or 0) + int(
+    if len(contributions) == count:
+        worst_return = min(float(value["return_pct"]) for value in contributions.values())
+    positive_count = int(previous.get("positive_count") or 0) - int(old_pnl > 0) + int(
         (realized_pnl or 0.0) > 0
     )
-    negative_count = int(previous.get("negative_count") or 0) + int(
+    negative_count = int(previous.get("negative_count") or 0) - int(old_pnl < 0) + int(
         (realized_pnl or 0.0) < 0
     )
-    gross_profit = float(previous.get("gross_profit_usdt") or 0.0) + max(
+    gross_profit = max(0.0, float(previous.get("gross_profit_usdt") or 0.0) - max(old_pnl, 0.0)) + max(
         float(realized_pnl or 0.0), 0.0
     )
-    gross_loss = float(previous.get("gross_loss_usdt") or 0.0) + max(
+    gross_loss = max(0.0, float(previous.get("gross_loss_usdt") or 0.0) - max(-old_pnl, 0.0)) + max(
         -float(realized_pnl or 0.0), 0.0
     )
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
@@ -839,13 +886,14 @@ def _merge_memory_outcomes(existing_extra: Any, new_extra: Any) -> dict[str, Any
         "profit_factor": round(profit_factor, 8) if profit_factor is not None else None,
         "profit_factor_defined": profit_factor is not None,
         "latest_source_position_id": incoming.get("source_position_id"),
+        "outcome_values": contributions,
         "source_position_ids": [
             *source_position_ids,
-            *([source_position_id] if source_position_id > 0 else []),
+            *([source_position_id] if source_position_id > 0 and source_position_id not in source_position_ids else []),
         ][-2000:],
         "source_outcome_ids": [
             *source_outcome_ids,
-            *([outcome_id] if outcome_id else []),
+            *([outcome_id] if outcome_id and outcome_id not in source_outcome_ids else []),
         ][-2000:],
     }
     return {**existing, **incoming, "outcome_aggregation": aggregation}

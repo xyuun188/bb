@@ -39,6 +39,41 @@ def test_strategy_samples_use_feature_based_market_regime() -> None:
     ) == "trend_up"
 
 
+@pytest.mark.asyncio
+async def test_strategy_event_storage_does_not_duplicate_full_model_diagnostics(monkeypatch) -> None:
+    from contextlib import asynccontextmanager
+
+    captured = []
+
+    class Session:
+        def add(self, row):
+            row.id = 7
+            captured.append(row)
+
+        async def flush(self):
+            pass
+
+    @asynccontextmanager
+    async def sessions():
+        yield Session()
+
+    monkeypatch.setattr(strategy_learning_module, "get_session_ctx", sessions)
+    raw = {"transcript": "x" * 200_000, "policy_blocker": "test",
+           "normal_paper_trade": {"paper_training_only": True, "objective_net_return_pct": -0.12}}
+    result = await StrategyLearningService().record_event(
+        mode="paper", event_type="entry_decision", action="short", decision_id=123,
+        raw_response=raw,
+        strategy_context={"strategy_learning": {"runtime": {"enabled": True, "records": [1] * 100_000}}},
+    )
+    assert result == 7
+    event = captured[0]
+    assert event.decision_id == 123
+    assert event.strategy_snapshot["runtime"] == {"enabled": True}
+    assert event.expert_integrity["raw"]["normal_paper_trade"] == raw["normal_paper_trade"]
+    assert "transcript" not in event.expert_integrity["raw"]
+    assert len(raw["transcript"]) == 200_000
+
+
 def test_strategy_learning_json_payload_replaces_nested_non_finite_values() -> None:
     payload = _json_safe(
         {

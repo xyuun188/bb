@@ -71,8 +71,11 @@ def test_timer_units_use_private_random_project_staging(
 
     timer_script.install_timer()
 
-    assert len(uploaded_paths) == 2
-    assert len(set(uploaded_paths)) == 2
+    expected_count = 3 if timer_script is install_runtime_data_retention_timer else 2
+    assert len(uploaded_paths) == expected_count
+    assert len(set(uploaded_paths)) == expected_count
+    if timer_script is install_runtime_data_retention_timer:
+        assert any(posixpath.basename(path).startswith("journald-storage.") for path in uploaded_paths)
     assert all(path.startswith("/data/bb/app/tmp/systemd-unit-stage/") for path in uploaded_paths)
     global_temp_prefix = f"{posixpath.join('/', 'tmp')}/"
     assert all(not path.startswith(global_temp_prefix) for path in uploaded_paths)

@@ -300,6 +300,7 @@ class ExpertMemoryService:
                 and outcome.get("outcome_complete") is True
             ]
             processed = 0
+            unchanged = 0
             batch_size = max(int(AUTHORITATIVE_BACKFILL_BATCH_SIZE), 1)
             batches = 0
             for start in range(0, len(complete_outcomes), batch_size):
@@ -307,7 +308,20 @@ class ExpertMemoryService:
                 # A fresh context commits this small batch and promptly returns
                 # its connection before the next batch is loaded.
                 async with self.session_factory() as session:
+                    reflections = await MemoryRepository(session).get_reflections_by_position_ids(
+                        [int(outcome.get("position_id") or 0) for outcome in batch]
+                    )
                     for outcome in batch:
+                        reflection = reflections.get(int(outcome.get("position_id") or 0))
+                        marker = _safe_dict(getattr(reflection, "expert_lessons", None)).get(
+                            "authoritative_feedback",
+                        )
+                        if (
+                            outcome.get("outcome_fingerprint")
+                            and marker == self._feedback_marker(outcome)
+                        ):
+                            unchanged += 1
+                            continue
                         processed += int(
                             await self._record_authoritative_outcome_in_session(
                                 session, outcome
@@ -324,6 +338,7 @@ class ExpertMemoryService:
                 ),
                 "complete_before_reflection_sync": len(complete_outcomes),
                 "processed": processed,
+                "unchanged": unchanged,
                 "batches": batches,
                 "batch_size": batch_size,
                 "truncated": len(outcomes) >= AUTHORITATIVE_BACKFILL_LIMIT,
@@ -334,6 +349,13 @@ class ExpertMemoryService:
         except Exception as exc:
             logger.warning("failed to backfill trade reflections", error=safe_error_text(exc))
             return {"status": "error", "processed": 0, "error": safe_error_text(exc)}
+
+    def _feedback_marker(self, outcome: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "outcome_fingerprint": outcome.get("outcome_fingerprint"),
+            "experts": sorted({str(slot.get("name")) for slot in self.model_slots if slot.get("name")}),
+        }
 
     async def _record_authoritative_outcome_in_session(
         self,
@@ -431,6 +453,14 @@ class ExpertMemoryService:
                     },
                 }
             )
+        # This marker commits atomically with every expert update. A cancelled
+        # batch rolls it back, so retries cannot skip partially applied feedback.
+        await repo.update_reflection(reflection, {
+            "expert_lessons": {
+                **_safe_dict(getattr(reflection, "expert_lessons", None)),
+                "authoritative_feedback": self._feedback_marker(outcome),
+            },
+        })
         return True
 
 

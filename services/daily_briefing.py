@@ -72,6 +72,39 @@ def _model_status() -> dict[str, Any]:
         return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
 
 
+async def _settled_profit_cohorts(session: Any, *, since: datetime, now: datetime) -> dict[str, Any]:
+    from sqlalchemy import case, func, select
+
+    from models.trade import OkxPositionHistory
+
+    results = {}
+    for name, extra_filters in (
+        ("closed_in_window", ()),
+        ("opened_and_closed_in_window", (OkxPositionHistory.opened_at >= since,)),
+    ):
+        pnl = OkxPositionHistory.realized_pnl
+        row = (await session.execute(select(
+            func.count().label("count"),
+            func.coalesce(func.sum(pnl), 0.0).label("net_pnl"),
+            func.coalesce(func.sum(case((pnl > 0, pnl), else_=0.0)), 0.0).label("profit"),
+            func.coalesce(func.sum(case((pnl < 0, -pnl), else_=0.0)), 0.0).label("loss"),
+        ).where(
+            OkxPositionHistory.mode == "paper",
+            OkxPositionHistory.close_status == "full",
+            OkxPositionHistory.sync_status == "synced",
+            OkxPositionHistory.updated_at_okx >= since,
+            OkxPositionHistory.updated_at_okx <= now,
+            *extra_filters,
+        ))).one()
+        loss = float(row.loss or 0.0)
+        results[name] = {
+            "count": int(row.count or 0),
+            "realized_net_pnl_usdt": round(float(row.net_pnl or 0.0), 8),
+            "profit_factor": round(float(row.profit or 0.0) / loss, 8) if loss > 0 else None,
+        }
+    return {"source": "okx_position_history", "entry_cohort_since": since.isoformat(), **results}
+
+
 async def build_briefing(
     *,
     window_hours: int = DEFAULT_WINDOW_HOURS,
@@ -145,6 +178,7 @@ async def build_briefing(
                 )
             )
         ).scalar()
+        report["settled_profit"] = await _settled_profit_cohorts(session, since=since, now=now)
 
     actions: Counter[str] = Counter()
     executed = 0
@@ -194,6 +228,22 @@ def render_text(report: dict[str, Any]) -> str:
     if actions:
         lines.append("动作分布：" + "，".join(f"{k or '未知'} {v}" for k, v in actions.items()))
     lines.append("")
+
+    profit = report.get("settled_profit") or {}
+    if profit:
+        closed = profit.get("closed_in_window") or {}
+        new_entries = profit.get("opened_and_closed_in_window") or {}
+        lines.append("【权威费后收益】")
+        lines.append(
+            f"窗口内完整平仓 {closed.get('count', 0)} 笔，净收益 "
+            f"{closed.get('realized_net_pnl_usdt', 0):+.4f} USDT"
+        )
+        lines.append(
+            f"其中窗口内新开且完整平仓 {new_entries.get('count', 0)} 笔，净收益 "
+            f"{new_entries.get('realized_net_pnl_usdt', 0):+.4f} USDT"
+        )
+        lines.append("尚未完整平仓的交易不计入上述已结算收益。")
+        lines.append("")
 
     lines.append("【不开仓原因】")
     if decisions.get("reasons_sampled"):
