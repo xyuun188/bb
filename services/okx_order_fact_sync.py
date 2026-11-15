@@ -4169,6 +4169,17 @@ def _decision_for_order_fact(
             }
         ):
             return None
+        receipt = raw.get("execution_result")
+        receipt = receipt if isinstance(receipt, dict) else {}
+        if (
+            client_order_id.endswith("P")
+            and receipt.get("exchange_confirmed") is True
+            and str(receipt.get("exchange_order_id") or "").strip()
+            and str(receipt.get("exchange_order_id")).strip() != str(fill.order_id)
+        ):
+            # A passive partial fill cannot replace the confirmed aggregate
+            # receipt owned by the subsequent market leg of the same entry.
+            return None
         return decision
 
     contract = raw.get("paper_training")

@@ -212,6 +212,25 @@ def test_matching_confirmed_fill_recovers_interrupted_entry_decision_once(orphan
     assert _recover_confirmed_entry_decision(order, decision, now=now) is False
 
 
+def test_passive_fill_does_not_replace_confirmed_market_fallback_receipt() -> None:
+    decision, order, _fill, now = _interrupted_confirmed_entry()
+    order.okx_raw_fills["rows"][0]["clOrdId"] += "P"
+    order.decision_id = None
+    raw = dict(decision.raw_llm_response)
+    raw["execution_result"] = {
+        "exchange_confirmed": True, "status": "filled",
+        "exchange_order_id": "market-fallback-order", "quantity": 5.0,
+    }
+    decision.raw_llm_response = raw
+
+    assert _recover_confirmed_entry_decision(order, decision, now=now) is False
+    stored_fill = order_fact_sync_module.group_okx_native_fill_rows(order.okx_raw_fills["rows"])[0]
+    assert _decision_for_order_fact(
+        fill=stored_fill, order_row=None, decisions_by_id={88: decision},
+    ) is None
+    assert decision.raw_llm_response["execution_result"]["quantity"] == 5.0
+
+
 @pytest.mark.parametrize("stale_field", ["exit_progress", "stage"])
 def test_confirmed_entry_receipt_still_repairs_stale_execution_state(stale_field) -> None:
     decision, order, fill, now = _interrupted_confirmed_entry()
