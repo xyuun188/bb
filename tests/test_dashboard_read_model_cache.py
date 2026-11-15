@@ -17,6 +17,115 @@ from services import okx_position_history_store as position_history_store
 from web_dashboard.api import dashboard
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, set()),
+        (" 123 ", {"123"}),
+        ("a,b; c|d\ne\tf  a", {"a", "b", "c", "d", "e", "f"}),
+        (["a,b", ("c", "a"), None], {"a", "b", "c"}),
+        ("a\rb", {"a\rb"}),
+    ],
+)
+def test_exchange_order_id_tokenization_preserves_legacy_separators(value, expected) -> None:
+    assert dashboard._dashboard_split_exchange_order_ids(value) == expected
+
+
+def test_indexed_order_lookup_preserves_aliases_duplicates_and_ties() -> None:
+    now = datetime.now(UTC)
+    orders = [
+        SimpleNamespace(exchange_order_id="a,b", created_at=now, okx_sync_status=""),
+        SimpleNamespace(exchange_order_id="a", created_at=now, okx_sync_status="confirmed"),
+        SimpleNamespace(exchange_order_id="c", created_at=now, okx_sync_status=""),
+    ]
+    index = dashboard._dashboard_order_exchange_id_index(orders)
+    for order_ids in ({"a"}, {"b", "a"}, {"a", "c"}, {"missing"}, set()):
+        expected = dashboard._dashboard_orders_by_exchange_ids(orders, order_ids)
+        actual = dashboard._dashboard_orders_by_exchange_ids([], order_ids, order_index=index)
+        assert [id(order) for order in actual] == [id(order) for order in expected]
+
+
+@pytest.mark.asyncio
+async def test_closed_ledger_pagination_copies_only_visible_rows_and_isolates_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnreadPage(dict):
+        def __deepcopy__(self, memo):
+            raise AssertionError("unrequested history page was copied")
+
+    visible = {"id": 1, "linked_fills": [{"quantity": 2}]}
+    payload = ([visible, UnreadPage(id=2)], 2, 1, 1, "okx_authoritative")
+    cache_key = dashboard._dashboard_closed_ledger_cache_key("paper", None)
+    monkeypatch.setattr(dashboard, "_dashboard_heavy_cache", {cache_key: (datetime.now(UTC), payload)})
+    monkeypatch.setattr(position_history_store, "load_okx_position_history_watermark", lambda _: None)
+
+    response = await dashboard._dashboard_closed_position_ledger_rows(
+        object(), object(), mode="paper", page_size=1
+    )
+    response[0][0]["linked_fills"][0]["quantity"] = 99
+    assert visible["linked_fills"][0]["quantity"] == 2
+
+
+@pytest.mark.asyncio
+async def test_history_page_copies_only_returned_rows_and_isolates_cached_fills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnreadPage(dict):
+        def __deepcopy__(self, memo):
+            raise AssertionError("unrequested fill details were copied")
+
+    visible = {"id": 1, "closed_at": "2026-11-16T01:00:00Z", "linked_fills": [{"quantity": 2}]}
+    hidden = {"id": 2, "closed_at": "2026-11-15T01:00:00Z", "detail": UnreadPage()}
+
+    async def ledger(*args, **kwargs):
+        assert kwargs["copy_rows"] is False
+        return [visible, hidden], 2, 1, 1, "okx_authoritative"
+
+    async def pending(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(dashboard, "_dashboard_closed_position_ledger_rows", ledger)
+    monkeypatch.setattr(dashboard, "_dashboard_pending_closed_position_rows", pending)
+    response = await dashboard._dashboard_position_history_rows(
+        object(), object(), mode="paper", page=1, page_size=1
+    )
+    assert response[1:4] == (2, 1, 2)
+    response[0][0]["linked_fills"][0]["quantity"] = 99
+    assert visible["linked_fills"][0]["quantity"] == 2
+
+
+@pytest.mark.asyncio
+async def test_history_projection_runs_outside_http_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    main_thread = threading.get_ident()
+
+    class Session:
+        async def execute(self, statement):
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+
+    class Repo:
+        async def get_position_records(self, **kwargs):
+            return []
+
+    async def records(*args, **kwargs):
+        return [{"instId": "BTC-USDT-SWAP"}]
+
+    def projection(*args, **kwargs):
+        assert threading.get_ident() != main_thread
+        return [{"id": 1}]
+
+    monkeypatch.setattr(position_history_store, "load_okx_position_history_records", records)
+    monkeypatch.setattr(position_history_store, "okx_position_history_records_to_rows", lambda rows: rows)
+    monkeypatch.setattr(dashboard, "_dashboard_position_history_official_rows_as_groups", projection)
+    response = await dashboard._dashboard_closed_position_ledger_rows_uncached(
+        Session(), Repo(), mode="paper"
+    )
+    assert response[0] == [{"id": 1}]
+
+
 @pytest.mark.asyncio
 async def test_position_history_manual_refresh_rebuilds_fresh_cache_once_and_polls_result(
     monkeypatch: pytest.MonkeyPatch,

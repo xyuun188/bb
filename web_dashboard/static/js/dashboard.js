@@ -33,6 +33,7 @@ const state = {
     protectionInventory: null,
     positionHistoryPage: 1,
     positionHistoryTotal: 0,
+    positionHistorySnapshot: null,
     dailyPnlRecords: [],
     allDecisions: [],
     decisionsPage: 1,
@@ -422,8 +423,13 @@ async function fetchLatestPageJSON(requestKey, url) {
     const key = String(requestKey);
     const version = Number(paginatedRequestVersions.get(key) || 0) + 1;
     paginatedRequestVersions.set(key, version);
-    const data = await fetchJSON(url);
-    return paginatedRequestVersions.get(key) === version ? data : null;
+    try {
+        const data = await fetchJSON(url);
+        return paginatedRequestVersions.get(key) === version ? data : null;
+    } catch (error) {
+        if (paginatedRequestVersions.get(key) !== version) return null;
+        throw error;
+    }
 }
 
 function redirectToLogin(message = '') {
@@ -9834,19 +9840,30 @@ function positionProtectionInventoryWarnings(inventory) {
 }
 
 async function fetchPositionHistory({ refresh = false } = {}) {
+    const mode = state.mode;
+    const requestedPage = state.positionHistoryPage;
+    const tbody = document.getElementById('position-history-tbody');
+    const pagination = document.getElementById('position-history-pagination');
+    const readStatus = document.getElementById('position-history-read-status');
+    if (state.positionHistorySnapshot && state.positionHistorySnapshot.mode !== mode) {
+        state.positionHistorySnapshot = null;
+        if (tbody) tbody.innerHTML = '<tr><td colspan="12" style="color:var(--text-muted);text-align:center;padding:24px;">加载历史持仓中...</td></tr>';
+        if (pagination) pagination.style.display = 'none';
+        if (readStatus) readStatus.style.display = 'none';
+    }
     try {
         const data = await fetchLatestPageJSON(
             'position-history',
-            `/api/dashboard/positions?mode=${state.mode}&page=${state.positionHistoryPage}&page_size=${PAGE_SIZE}&closed_only=true${refresh ? '&refresh=true' : ''}`,
+            `/api/dashboard/positions?mode=${mode}&page=${requestedPage}&page_size=${PAGE_SIZE}&closed_only=true${refresh ? '&refresh=true' : ''}`,
         );
-        if (!data) return;
-        const tbody = document.getElementById('position-history-tbody');
-        const pagination = document.getElementById('position-history-pagination');
+        if (!data || mode !== state.mode || requestedPage !== state.positionHistoryPage) return;
         if (String(data.ledger_source || '').includes('warming')) {
-            if (tbody) {
+            if (state.positionHistorySnapshot) {
+                showPositionHistoryReadStatus('历史持仓正在后台更新');
+            } else if (tbody) {
                 tbody.innerHTML = '<tr><td colspan="12" style="color:var(--text-muted);text-align:center;padding:24px;">历史持仓账本正在后台生成，稍后自动更新...</td></tr>';
             }
-            if (pagination) pagination.style.display = 'none';
+            if (pagination && !state.positionHistorySnapshot) pagination.style.display = 'none';
             schedulePageReadRetry('position-history', fetchPositionHistory);
             return;
         }
@@ -9860,15 +9877,36 @@ async function fetchPositionHistory({ refresh = false } = {}) {
             label.textContent = `${state.mode === 'paper' ? '模拟盘' : '实盘'} · ${Number(data.settled_count || 0)} 已结算 / ${Number(data.pending_settlement_count || 0)} 待结算${freshness}`;
         }
         renderClosedPositionsTable(data.positions || [], state.positionHistoryPage, data.total_pages || 1, data.total || 0);
+        state.positionHistorySnapshot = {
+            mode,
+            page: state.positionHistoryPage,
+            receivedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        };
+        if (readStatus) readStatus.style.display = 'none';
         if (stale) schedulePageReadRetry('position-history', fetchPositionHistory, 3000);
     } catch (error) {
-        const tbody = document.getElementById('position-history-tbody');
-        if (tbody && isPageActive('position-history')) {
+        if (mode !== state.mode || requestedPage !== state.positionHistoryPage) return;
+        if (isPageActive('position-history')) {
             const message = String(error?.message || '请求失败').slice(0, 180);
-            tbody.innerHTML = `<tr><td colspan="12" style="color:var(--red);text-align:center;padding:24px;">历史持仓加载失败：${escHtml(message)}，稍后自动重试</td></tr>`;
+            showPositionHistoryReadStatus(`历史持仓加载失败：${message}`);
+            if (tbody && !state.positionHistorySnapshot) {
+                tbody.innerHTML = '<tr><td colspan="12" style="color:var(--text-muted);text-align:center;padding:24px;">历史持仓暂时无法读取，稍后自动重试</td></tr>';
+                if (pagination) pagination.style.display = 'none';
+            }
         }
         schedulePageReadRetry('position-history', fetchPositionHistory, 5000);
     }
+}
+
+function showPositionHistoryReadStatus(message) {
+    const status = document.getElementById('position-history-read-status');
+    if (!status) return;
+    const snapshot = state.positionHistorySnapshot;
+    const previous = snapshot
+        ? `；显示 ${snapshot.receivedAt} 上次读取的数据（第 ${snapshot.page} 页），尚未更新`
+        : '';
+    status.textContent = `${message}${previous}，稍后自动重试`;
+    status.style.display = '';
 }
 
 function renderOpenPositionsTable(positions, page = 1, totalPages = 1, totalItems = 0) {

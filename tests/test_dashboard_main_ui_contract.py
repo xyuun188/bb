@@ -1317,7 +1317,7 @@ def test_training_dashboard_prefers_latest_training_quality_version() -> None:
 def test_fetch_json_throws_errors_so_page_fallbacks_run() -> None:
     script = (PROJECT_ROOT / "web_dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
     fetch_block = script[
-        script.index("async function fetchJSON") : script.index("function redirectToLogin")
+        script.index("async function fetchJSON") : script.index("function cancelInflightJSONRequest")
     ]
 
     assert "const data = await res.json().catch(() => ({}));" in fetch_block

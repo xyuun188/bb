@@ -4577,15 +4577,10 @@ def _dashboard_split_exchange_order_ids(value: Any) -> set[str]:
         for item in value:
             result.update(_dashboard_split_exchange_order_ids(item))
         return result
-    tokens = {str(value or "").strip()}
-    if not next(iter(tokens), ""):
+    text = str(value or "").strip()
+    if not text:
         return set()
-    for separator in (",", ";", "|", "\n", "\t", " "):
-        pieces: set[str] = set()
-        for token in tokens:
-            pieces.update(part.strip() for part in token.split(separator) if part.strip())
-        tokens = pieces
-    return {token for token in tokens if token}
+    return {token for part in re.split(r"[,;|\n\t ]+", text) if (token := part.strip())}
 
 
 async def _dashboard_closed_position_ledger_rows(
@@ -4598,6 +4593,7 @@ async def _dashboard_closed_position_ledger_rows(
     page_size: int = 20,
     paginate: bool = True,
     serve_stale: bool = False,
+    copy_rows: bool = True,
 ) -> tuple[list[dict[str, Any]], int, int, int, str]:
     from services.okx_position_history_store import load_okx_position_history_watermark
 
@@ -4643,9 +4639,9 @@ async def _dashboard_closed_position_ledger_rows(
                     )
                 if serve_stale and stale_reason:
                     source = f"{payload[4]}_stale"
-                    ledger_payload = (*copy.deepcopy(payload[:4]), source)
+                    ledger_payload = (*payload[:4], source)
                 else:
-                    ledger_payload = copy.deepcopy(payload)
+                    ledger_payload = payload
             else:
                 _dashboard_heavy_cache.pop(cache_key, None)
                 cached = None
@@ -4680,9 +4676,9 @@ async def _dashboard_closed_position_ledger_rows(
                 )
             if serve_stale and stale_reason:
                 source = f"{persisted_payload[4]}_stale"
-                ledger_payload = (*copy.deepcopy(persisted_payload[:4]), source)
+                ledger_payload = (*persisted_payload[:4], source)
             else:
-                ledger_payload = copy.deepcopy(persisted_payload)
+                ledger_payload = persisted_payload
         else:
             if serve_stale:
                 _start_dashboard_closed_ledger_refresh(
@@ -4711,10 +4707,12 @@ async def _dashboard_closed_position_ledger_rows(
     total_pages = max(1, (total + normalized_page_size - 1) // normalized_page_size)
     normalized_page = min(max(int(page or 1), 1), total_pages)
     if not paginate:
-        return full_rows, total, normalized_page, total_pages, source
+        rows = copy.deepcopy(full_rows) if copy_rows else full_rows
+        return rows, total, normalized_page, total_pages, source
     start = (normalized_page - 1) * normalized_page_size
+    rows = full_rows[start : start + normalized_page_size]
     return (
-        full_rows[start : start + normalized_page_size],
+        copy.deepcopy(rows) if copy_rows else rows,
         total,
         normalized_page,
         total_pages,
@@ -5061,7 +5059,10 @@ async def _dashboard_closed_position_ledger_rows_uncached(
             }
         ]
     if position_history_rows:
-        official_rows = _dashboard_position_history_official_rows_as_groups(
+        # This pure projection can scan thousands of loaded orders. Keep it off
+        # the event loop so a background refresh cannot stall HTTP responses.
+        official_rows = await asyncio.to_thread(
+            _dashboard_position_history_official_rows_as_groups,
             position_history_rows,
             [],
             mode=mode,
@@ -5511,6 +5512,7 @@ async def _dashboard_position_history_rows(
         page_size=5000,
         paginate=False,
         serve_stale=serve_stale,
+        copy_rows=False,
     )
     settled_rows = [
         {
@@ -5550,7 +5552,7 @@ async def _dashboard_position_history_rows(
     if pending_rows:
         ledger_source = f"{settled_source}_plus_okx_confirmed_pending_settlement"
     return (
-        combined_rows[start : start + page_size],
+        copy.deepcopy(combined_rows[start : start + page_size]),
         total,
         page,
         total_pages,
@@ -6445,6 +6447,7 @@ def _dashboard_position_history_order_payload(
     *,
     side: str,
     order_rows: list[Any],
+    order_index: dict[str, list[tuple[int, Any]]] | None = None,
 ) -> dict[str, Any]:
     inst_id = str(row.get("instId") or row.get("inst_id") or "").strip().upper()
     opened_at = _dashboard_ms_datetime(row.get("cTime") or row.get("createdTime"))
@@ -6487,10 +6490,12 @@ def _dashboard_position_history_order_payload(
         selected_entries = _dashboard_orders_by_exchange_ids(
             order_rows,
             hinted_entry_ids or (hinted_linked_ids - hinted_close_ids),
+            order_index=order_index,
         )
         selected_closes = _dashboard_orders_by_exchange_ids(
             order_rows,
             hinted_close_ids or (hinted_linked_ids - hinted_entry_ids),
+            order_index=order_index,
         )
         selected_entries = [
             order
@@ -6503,7 +6508,9 @@ def _dashboard_position_history_order_payload(
             if str(getattr(order, "exchange_order_id", "") or "").strip() in close_candidate_ids
         ]
         if not selected_entries and not selected_closes and hinted_linked_ids:
-            hinted_orders = _dashboard_orders_by_exchange_ids(order_rows, hinted_linked_ids)
+            hinted_orders = _dashboard_orders_by_exchange_ids(
+                order_rows, hinted_linked_ids, order_index=order_index
+            )
             selected_entries = [
                 order
                 for order in hinted_orders
@@ -6636,18 +6643,41 @@ def _dashboard_position_history_order_payload(
     )
 
 
-def _dashboard_orders_by_exchange_ids(order_rows: list[Any], order_ids: set[str]) -> list[Any]:
+def _dashboard_order_exchange_id_index(
+    order_rows: list[Any],
+) -> dict[str, list[tuple[int, Any]]]:
+    index: dict[str, list[tuple[int, Any]]] = {}
+    for position, order in enumerate(order_rows):
+        for order_id in _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None)):
+            index.setdefault(order_id, []).append((position, order))
+    return index
+
+
+def _dashboard_orders_by_exchange_ids(
+    order_rows: list[Any],
+    order_ids: set[str],
+    *,
+    order_index: dict[str, list[tuple[int, Any]]] | None = None,
+) -> list[Any]:
     if not order_ids:
         return []
+    if order_index is None:
+        matches = [
+            order
+            for order in order_rows
+            if _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None))
+            & order_ids
+        ]
+    else:
+        # Preserve source order for equal-time/quality facts, including aliases.
+        indexed = {
+            position: order
+            for order_id in order_ids
+            for position, order in order_index.get(order_id, [])
+        }
+        matches = [indexed[position] for position in sorted(indexed)]
     return sorted(
-        _dashboard_dedupe_orders_by_exchange_id(
-            [
-                order
-                for order in order_rows
-                if _dashboard_split_exchange_order_ids(getattr(order, "exchange_order_id", None))
-                & order_ids
-            ]
-        ),
+        _dashboard_dedupe_orders_by_exchange_id(matches),
         key=lambda order: _dashboard_order_time(order) or datetime.max.replace(tzinfo=UTC),
     )
 
@@ -7014,6 +7044,15 @@ def _dashboard_position_history_official_rows_as_groups(
         ):
             orders_by_exchange_id.setdefault(order_id, []).append(order)
 
+    orders_by_inst_id = {
+        inst_id: _dashboard_dedupe_orders_by_exchange_id(orders)
+        for inst_id, orders in orders_by_inst_id.items()
+    }
+    order_indexes = {
+        inst_id: _dashboard_order_exchange_id_index(orders)
+        for inst_id, orders in orders_by_inst_id.items()
+    }
+
     positions_by_inst_id: dict[str, list[Any]] = {}
     for position in closed_rows:
         inst_id = (
@@ -7041,13 +7080,19 @@ def _dashboard_position_history_official_rows_as_groups(
             _dashboard_split_exchange_order_ids(row.get("_dashboard_linked_order_ids")),
         )
         seen_orders = {id(order) for order in relevant_order_rows}
+        has_extra_orders = False
         for order_id in hinted_order_ids:
             for order in orders_by_exchange_id.get(order_id, []):
                 if id(order) not in seen_orders:
                     relevant_order_rows.append(order)
                     seen_orders.add(id(order))
+                    has_extra_orders = True
 
-        relevant_order_rows = _dashboard_dedupe_orders_by_exchange_id(relevant_order_rows)
+        if has_extra_orders or not inst_id:
+            relevant_order_rows = _dashboard_dedupe_orders_by_exchange_id(relevant_order_rows)
+            order_index = _dashboard_order_exchange_id_index(relevant_order_rows)
+        else:
+            order_index = order_indexes.get(inst_id, {})
 
         side = _dashboard_position_history_local_side(
             row,
@@ -7058,6 +7103,7 @@ def _dashboard_position_history_official_rows_as_groups(
             row,
             side=side,
             order_rows=relevant_order_rows,
+            order_index=order_index,
         )
         status, status_label = _dashboard_position_history_close_status(row)
         authoritative_full = _dashboard_position_history_is_authoritative_full(row)
