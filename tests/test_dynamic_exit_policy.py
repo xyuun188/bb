@@ -148,6 +148,35 @@ def test_execution_last_crossed_stop_cannot_be_hidden_by_profitable_mark() -> No
     assert result.close_fraction == 1.0
 
 
+def test_current_taker_exit_fee_prevents_false_profit_after_discounted_entry() -> None:
+    position = _position(
+        current_price=100.05, notional_usdt=1000.5, unrealized_pnl=0.5,
+        peak_unrealized_pnl=0.5, entry_fee_usdt=0.2, exit_fee_rate=0.0005,
+    )
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.fee_after_unrealized_pnl_usdt == pytest.approx(-0.20025)
+    assert result.profit_lock_pressure == 0.0
+    assert result.eligible is False
+    assert "fee_after_profit_not_positive" in result.reason
+
+
+def test_missing_account_exit_fee_cannot_block_a_crossed_planned_stop() -> None:
+    position = _position(
+        current_price=97.0, notional_usdt=970.0, unrealized_pnl=-30.0,
+        peak_unrealized_pnl=0.0,
+    )
+    position["current_management_contract"]["management_eligible"] = False
+    position["current_management_contract"]["blockers"] = ["current_account_exit_fee_missing"]
+
+    result = apply_dynamic_exit(_decision(), [position])
+
+    assert result.hard_risk is True
+    assert result.eligible is True
+    assert result.close_fraction == 1.0
+
+
 def test_dynamic_exit_execution_contract_rejects_unexplained_hard_risk() -> None:
     contract = evaluate_dynamic_exit_execution_contract(
         SimpleNamespace(

@@ -294,6 +294,51 @@ async def test_place_order_uses_native_reduce_order_for_position_only_market() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hard_risk", [False, True])
+async def test_profitable_exit_with_adverse_funding_uses_ioc_unless_hard_risk(
+    hard_risk: bool,
+) -> None:
+    executor = OKXExecutor("paper")
+    exchange = _MissingLabMarketExchange()
+    exchange.privateGetAccountFeeRates = _FeeSnapshotExchange().privateGetAccountFeeRates
+    exchange.market = lambda _symbol: {
+        "id": "LAB-USDT-SWAP", "symbol": "LAB/USDT:USDT", "type": "swap",
+        "contractSize": 0.1, "limits": {"amount": {"min": 1.0}},
+        "info": {"instId": "LAB-USDT-SWAP", "instType": "SWAP", "tickSz": "0.001"},
+    }
+    executor._exchange = exchange
+    executor._connected = True
+    executor._markets_loaded = True
+    decision = DecisionOutput(
+        model_name="position_review", symbol="LAB/USDT", action=Action.CLOSE_LONG,
+        confidence=0.95, reasoning="fee-after profit reduction", position_size_pct=0.5,
+        raw_response={"dynamic_exit_policy": {
+            "eligible": True, "gross_unrealized_pnl_usdt": 0.8293,
+            "lifecycle_net_pnl_usdt": 0.75, "profit_lock_pressure": 0.3,
+            "stop_risk_usage": 0.01, "settled_funding_fee": -0.01,
+            "funding_fee_included": True, "entry_fee_usdt": 0.003,
+            "hard_risk": hard_risk, "planned_stop_crossed": hard_risk,
+        }},
+    )
+    if not hard_risk:
+        exchange.detail_overrides = {"ordType": "ioc"}
+
+    result = await executor.place_order(decision)
+
+    assert result.status == OrderStatus.FILLED
+    assert len(exchange.native_order_requests) == 1
+    request = exchange.native_order_requests[0]
+    assert request["reduceOnly"] == "true"
+    assert request["ordType"] == ("market" if hard_risk else "ioc")
+    assert exchange.create_order_calls == []
+    if not hard_risk:
+        guard = decision.raw_response["profit_lock_execution"]
+        assert guard["adverse_funding_usdt"] == pytest.approx(0.01)
+        assert float(request["px"]) == pytest.approx(guard["limit_price"])
+        assert result.price >= guard["limit_price"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("overrides", "client_id_only", "expected_quantity", "confirmed"),
     [

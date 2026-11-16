@@ -85,6 +85,23 @@ def test_takeover_contract_is_reduce_only_and_preserves_historical_gap() -> None
     assert contract["policy_provenance"]["contract_fingerprint"]
 
 
+def test_takeover_prices_market_exit_with_account_taker_fee_after_maker_entry() -> None:
+    contract = build_current_position_management_contract(_facts(
+        entry_fee_usdt=0.04,
+        full_entry_fee_usdt=0.08,
+        exit_fee_rate=0.0005,
+        exit_fee_rate_source="okx_account_trade_fee.takerU",
+        account_fee_received_at="2026-11-16T08:00:00+00:00",
+    ))
+
+    assert contract["entry_fee_usdt"] == pytest.approx(0.04)
+    assert contract["exit_fee_rate_proxy"] == pytest.approx(0.0005)
+    assert contract["exit_fee_rate_source"] == "okx_account_trade_fee.takerU"
+    assert contract["account_fee_received_at"] == "2026-11-16T08:00:00+00:00"
+    assert contract["estimated_exit_fee_usdt"] == pytest.approx(206.0 * 0.0005)
+    assert contract["current_lifecycle_net_pnl"] == pytest.approx(6.0 - 0.04 - 0.103)
+
+
 def test_takeover_contract_recomputes_protection_from_normalized_orders() -> None:
     contract = build_current_position_management_contract(
         _facts(protection_evidence_complete=False)
@@ -95,6 +112,19 @@ def test_takeover_contract_recomputes_protection_from_normalized_orders() -> Non
     assert contract["protection_overcoverage_contracts"] == pytest.approx(0.0)
     assert contract["management_eligible"] is True
     assert "okx_protection_evidence_incomplete" not in contract["blockers"]
+
+
+def test_missing_account_exit_fee_cannot_reuse_discounted_maker_entry_fee() -> None:
+    contract = build_current_position_management_contract(_facts(
+        entry_fee_usdt=0.04, full_entry_fee_usdt=0.08,
+        exit_fee_evidence_required=True,
+    ))
+
+    assert contract["management_eligible"] is False
+    assert "current_account_exit_fee_missing" in contract["blockers"]
+    assert contract["exit_fee_rate"] == 0.0
+    assert contract["exit_fee_rate_source"] == "current_account_exit_fee_unavailable"
+    assert contract["protection_evidence_complete"] is True
 
 
 @pytest.mark.parametrize(

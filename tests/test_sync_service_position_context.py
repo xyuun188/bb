@@ -687,7 +687,20 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
     async def balance(_mode):
         return {"equity": 1_000.0}
 
-    service = OkxSyncService(account_equity_provider=balance)
+    fee_calls = []
+
+    async def account_fee():
+        fee_calls.append("fees")
+        return {
+            "taker_fee_rate": 0.0005,
+            "fee_rate_source": "okx_account_trade_fee.takerU",
+            "account_fee_received_at": "2026-11-16T08:00:00+00:00",
+        }
+
+    async def executor(_mode):
+        return SimpleNamespace(fetch_account_fee_snapshot=account_fee)
+
+    service = OkxSyncService(account_equity_provider=balance, okx_executor_provider=executor)
     refreshed = await service._refresh_current_position_management_contracts(
         session=Session(),
         positions=[first, second],
@@ -730,6 +743,15 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
     assert contract["original_entry_contract_status"] == "complete_at_entry"
     assert contract["original_entry_contract_gaps"] == []
     assert contract["entry_fee_usdt"] == pytest.approx(0.3)
+    assert fee_calls == ["fees"]
+    assert contract["exit_fee_rate"] == pytest.approx(0.0005)
+    assert contract["exit_fee_rate_source"] == "okx_account_trade_fee.takerU"
+    context = normalized_open_position_context(
+        {"symbol": "BTC/USDT", "side": "long", "quantity": 3.0,
+         "entry_price": 100.0, "current_management_contract": contract},
+        symbol_normalizer=normalize_trading_symbol, float_parser=_float,
+    )
+    assert context["exit_fee_rate"] == pytest.approx(0.0005)
     assert first.entry_fee == pytest.approx(0.2)
     assert second.entry_fee == pytest.approx(0.1)
     assert contract["contracts"] == pytest.approx(3.0)
@@ -750,6 +772,55 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
         ),
         contract,
     )
+
+
+@pytest.mark.asyncio
+async def test_management_fee_cache_preserves_receipt_and_bounds_stale_fallback() -> None:
+    calls = []
+
+    async def fees():
+        calls.append("fees")
+        if len(calls) > 1:
+            raise RuntimeError("temporary fee endpoint failure")
+        return {
+            "taker_fee_rate": 0.0005,
+            "fee_rate_source": "okx_account_trade_fee.takerU",
+            "account_fee_received_at": "2026-11-16T08:00:00+00:00",
+        }
+
+    async def executor(_mode):
+        return SimpleNamespace(fetch_account_fee_snapshot=fees)
+
+    service = OkxSyncService(okx_executor_provider=executor)
+    first = await service._current_management_exit_fee_facts()
+    first["exit_fee_rate"] = 0.0
+    second = await service._current_management_exit_fee_facts()
+    assert second["exit_fee_rate"] == 0.0005
+    assert calls == ["fees"]
+
+    cached_at, cached = service._management_exit_fee_snapshot
+    service._management_exit_fee_snapshot = (cached_at - 61.0, cached)
+    fallback = await service._current_management_exit_fee_facts()
+    assert fallback == second
+    assert service._management_exit_fee_snapshot[0] == cached_at - 61.0
+
+    service._management_exit_fee_snapshot = (cached_at - 301.0, cached)
+    assert await service._current_management_exit_fee_facts() == {}
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("rate", [None, 0.0, -0.0005, float("nan"), float("inf")])
+@pytest.mark.asyncio
+async def test_management_fee_cache_rejects_invalid_account_rate(rate) -> None:
+    async def fees():
+        return {"taker_fee_rate": rate, "account_fee_received_at": "2026-11-16T08:00:00Z"}
+
+    async def executor(_mode):
+        return SimpleNamespace(fetch_account_fee_snapshot=fees)
+
+    service = OkxSyncService(okx_executor_provider=executor)
+    assert await service._current_management_exit_fee_facts() == {}
+    assert service._management_exit_fee_snapshot is None
 
 
 @pytest.mark.parametrize("mark_price", [101.0, 99.0])

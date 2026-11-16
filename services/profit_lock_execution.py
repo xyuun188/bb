@@ -20,16 +20,24 @@ def profit_lock_execution_required(raw: dict[str, Any]) -> bool:
     ):
         return False
     try:
+        gross_pnl = float(policy.get("gross_unrealized_pnl_usdt", float("nan")))
+        price_loss_risk = bool(
+            float(policy.get("stop_risk_usage") or 0.0) > 0.0
+            and (not isfinite(gross_pnl) or gross_pnl < 0.0)
+        )
         return bool(
             float(policy.get("lifecycle_net_pnl_usdt") or 0.0) > 0.0
             and max(
                 float(policy.get("profit_lock_pressure") or 0.0),
                 float(policy.get("profit_retrace_ratio") or 0.0),
             ) > 0.0
+            # Settled funding alone is not urgent price-loss evidence when
+            # both the remaining price PnL and fee-after total are positive.
+            and not price_loss_risk
             and not any(
                 float(policy.get(key) or 0.0) > 0.0
                 for key in (
-                    "stop_risk_usage", "continuation_deterioration",
+                    "continuation_deterioration",
                     "opposite_pressure", "model_exit_pressure",
                 )
             )

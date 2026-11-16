@@ -868,7 +868,9 @@ def normalized_open_position_context(
     current_management_contract = _dict_value(position_payload.get("current_management_contract"))
     entry_fee = abs(float_parser(position_payload.get("entry_fee"), 0.0))
     exit_fee_rate = float_parser(
-        current_management_contract.get("exit_fee_rate_proxy"),
+        current_management_contract.get(
+            "exit_fee_rate", current_management_contract.get("exit_fee_rate_proxy"),
+        ),
         0.0,
     )
     snapshot = parse_exchange_position_snapshot(
@@ -1250,6 +1252,7 @@ class OkxSyncService:
         self._authoritative_position_snapshots: dict[
             tuple[str, int], tuple[float, list[dict[str, Any]]]
         ] = {}
+        self._management_exit_fee_snapshot: tuple[float, dict[str, Any]] | None = None
 
     @staticmethod
     def _copy_position_snapshot(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -2452,6 +2455,35 @@ class OkxSyncService:
             )
             return {"lookup_unavailable": True, "error": error_text}
 
+    async def _current_management_exit_fee_facts(self) -> dict[str, Any]:
+        cached = self._management_exit_fee_snapshot
+        if cached is not None and time.monotonic() - cached[0] < 60.0:
+            return dict(cached[1])
+        if self.okx_executor_provider is None:
+            return {}
+        try:
+            executor = await asyncio.wait_for(self.okx_executor_provider("paper"), timeout=5.0)
+            snapshot = await asyncio.wait_for(executor.fetch_account_fee_snapshot(), timeout=5.0)
+            rate = _float_value(snapshot.get("taker_fee_rate"), 0.0)
+            if not 0.0 < rate < 1.0 or not snapshot.get("account_fee_received_at"):
+                raise ValueError("current_position_exit_fee_evidence_missing")
+            facts = {
+                "exit_fee_rate": rate,
+                "exit_fee_rate_source": snapshot.get("fee_rate_source"),
+                "account_fee_received_at": snapshot["account_fee_received_at"],
+            }
+            self._management_exit_fee_snapshot = (time.monotonic(), facts)
+            return dict(facts)
+        except Exception as exc:
+            logger.warning(
+                "current-position account exit fee refresh unavailable",
+                error=safe_error_text(exc),
+            )
+            # Preserve the original receipt on a short exchange interruption.
+            if cached is not None and time.monotonic() - cached[0] < 300.0:
+                return dict(cached[1])
+            return {}
+
     async def _refresh_current_position_management_contracts(
         self,
         *,
@@ -2501,6 +2533,11 @@ class OkxSyncService:
             )
             if key in exchange_by_key:
                 local_by_key.setdefault(key, []).append(position)
+
+        exit_fee_facts = (
+            await self._current_management_exit_fee_facts() if local_by_key else {}
+        )
+        exit_fee_facts["exit_fee_evidence_required"] = self.okx_executor_provider is not None
 
         entry_order_ids = {
             order_id
@@ -2848,6 +2885,7 @@ class OkxSyncService:
                 "entry_fee_usdt": current_entry_fee,
                 "full_entry_fee_usdt": full_entry_fee,
                 "full_entry_notional_usdt": full_entry_notional,
+                **exit_fee_facts,
                 "entry_fee_evidence_complete": entry_fee_evidence_complete,
                 "entry_fee_source": "okx_fills_history",
                 "stop_loss_price": row["protection"].get("stop_loss_price"),

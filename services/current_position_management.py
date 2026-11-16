@@ -369,8 +369,23 @@ def build_current_position_management_contract(
         if open_position_count > 1
         else 0.0
     )
-    exit_fee_rate_proxy = (
-        full_entry_fee / full_entry_notional if full_entry_notional > 0 else 0.0
+    account_exit_fee_rate = max(_safe_float(facts.get("exit_fee_rate")), 0.0)
+    exit_fee_evidence_required = facts.get("exit_fee_evidence_required") is True
+    exit_fee_rate_proxy = account_exit_fee_rate or (
+        full_entry_fee / full_entry_notional
+        if full_entry_notional > 0 and not exit_fee_evidence_required else 0.0
+    )
+    if exit_fee_evidence_required and account_exit_fee_rate <= 0.0:
+        blockers.append("current_account_exit_fee_missing")
+    exit_fee_rate_source = (
+        str(facts.get("exit_fee_rate_source") or "okx_account_trade_fee")
+        if account_exit_fee_rate > 0.0
+        else "current_account_exit_fee_unavailable"
+        if exit_fee_evidence_required
+        else "authoritative_entry_fill_fee_rate_proxy"
+    )
+    account_fee_received_at = (
+        str(facts.get("account_fee_received_at") or "").strip() or None
     )
     if facts.get("entry_fee_evidence_complete") is True and full_entry_notional <= 0:
         blockers.append("entry_fee_rate_basis_missing")
@@ -440,6 +455,10 @@ def build_current_position_management_contract(
         "entry_fee_usdt": entry_fee,
         "full_entry_fee_usdt": full_entry_fee,
         "full_entry_notional_usdt": full_entry_notional,
+        "exit_fee_rate": exit_fee_rate_proxy,
+        "exit_fee_rate_source": exit_fee_rate_source,
+        "exit_fee_evidence_required": exit_fee_evidence_required,
+        "account_fee_received_at": account_fee_received_at,
         "stop_loss_price": stop_loss,
         "take_profit_price": take_profit,
         "position_stressed_loss_usdt": position_stressed_loss,
@@ -535,7 +554,9 @@ def build_current_position_management_contract(
         "settled_funding_evidence_status": settled_funding_evidence_status,
         "future_funding_evidence_status": future_funding_evidence_status,
         "exit_fee_rate_proxy": round(exit_fee_rate_proxy, 12),
-        "exit_fee_rate_source": "authoritative_entry_fill_fee_rate_proxy",
+        "exit_fee_rate": round(exit_fee_rate_proxy, 12),
+        "exit_fee_rate_source": exit_fee_rate_source,
+        "account_fee_received_at": account_fee_received_at,
         "stop_loss_price": round(stop_loss, 12),
         "take_profit_price": round(take_profit, 12),
         "protection_evidence_complete": protection_evidence_complete,
