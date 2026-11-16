@@ -507,6 +507,26 @@ async def test_final_paper_budget_cannot_use_missing_or_rebased_price(field: str
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action,latest", [(Action.LONG, 102.1), (Action.SHORT, 97.9)])
+async def test_quote_outside_venue_band_keeps_the_actual_rejection_reason(
+    action: Action, latest: float,
+) -> None:
+    decision = _paper_decision(action=action, price=100.0, expected=5.0)
+    assert await _paper_policy(latest=latest, final_expected=5.0).prepare_dynamic_risk_contract(
+        decision, "paper", [],
+    ) is None
+
+    guard = paper_entry_execution_price_limit(
+        decision, "paper", latest_price=latest, tick_size=0.1,
+        price_limit={"buy_price_limit": 102.0, "sell_price_limit": 98.0},
+    )
+
+    assert guard["eligible"] is False
+    assert guard["reason"] == "paper_execution_quote_outside_venue_price_limit"
+    assert guard["remaining_expected_net_return_pct"] > 0.0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "price,checked,submit,expected,tick",
     [

@@ -207,6 +207,10 @@ def paper_entry_execution_price_limit(
             decision.action, (limit - price) / price,
         )
         remaining = expected - adverse * 100.0
+        quote_outside_venue = bool(
+            price_limit is not None and venue_ready
+            and (latest > buy_limit if long else latest < sell_limit)
+        )
         eligible = (
             venue_ready and protection_ready and limit > 0.0
             and (latest <= limit if long else latest >= limit)
@@ -217,6 +221,7 @@ def paper_entry_execution_price_limit(
                 "paper_execution_venue_price_limit_incompatible" if not venue_ready
                 else "paper_execution_protection_incompatible" if not protection_ready
                 else "paper_execution_return_budget_ready" if eligible
+                else "paper_execution_quote_outside_venue_price_limit" if quote_outside_venue
                 else "paper_execution_quote_consumed_return_budget"
             ),
             "limit_price": limit,
