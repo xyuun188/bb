@@ -3943,6 +3943,33 @@ def test_short_stop_widening_reduces_quantity_without_expanding_risk_budget() ->
     assert decision.raw_response["profit_risk_sizing"]["risk_budget_usdt"] == 20.0
 
 
+@pytest.mark.parametrize(
+    ("side", "stop", "worst_entry"),
+    [("buy", 0.138, 1.4), ("sell", 0.142, 0.0143)],
+)
+def test_wide_execution_price_band_does_not_bypass_stop_risk(side, stop, worst_entry) -> None:
+    executor = OKXExecutor(mode="paper")
+    decision = _entry_decision()
+    decision.raw_response["profit_risk_sizing"].update(
+        risk_budget_usdt=20.0,
+        stressed_loss_fraction=0.02,
+    )
+    result = executor._entry_protection_risk(
+        decision=decision,
+        side=side,
+        reference_price=0.14,
+        price_limit={"buy_price_limit": 1.4, "sell_price_limit": 0.0143},
+        stop_loss_price=stop,
+        planned_notional_usdt=1000.0,
+    )
+
+    assert result["stop_price_same_scale"] is False
+    assert result["stressed_loss_fraction"] == pytest.approx(abs(stop - worst_entry) / worst_entry)
+    maximum_quantity = result["maximum_notional_usdt"] / worst_entry
+    assert maximum_quantity * abs(stop - worst_entry) <= 20.0 + 1e-9
+    assert decision.raw_response["profit_risk_sizing"]["risk_budget_usdt"] == 20.0
+
+
 def test_okx_entry_fill_integrity_quarantines_cross_scale_price_and_underlying() -> None:
     executor = OKXExecutor(mode="paper")
 

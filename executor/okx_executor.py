@@ -5841,7 +5841,7 @@ class OKXExecutor(AbstractExecutor):
         )
         stop_distance = (
             abs(stop - worst_entry)
-            if stop_is_same_scale and stop_direction_valid
+            if stop > 0 and worst_entry > 0 and stop_direction_valid
             else 0.0
         )
         stop_stress = stop_distance / worst_entry if worst_entry > 0 else 0.0
