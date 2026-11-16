@@ -914,7 +914,7 @@ def _select_top_return_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 ENTRY_COHORT_VERSION = "2026-11-13.positive-objective-entry-cohort.v1"
 PREDICTION_SCORE_POLICY_VERSION = "2026-11-13.leaf-total-risk-objective.v1"
-SHADOW_FORECAST_COMPARISON_VERSION = "2026-11-17.shadow-no-entry-forecast-comparison.v1"
+SHADOW_FORECAST_COMPARISON_VERSION = "2026-11-17.shadow-forecast-comparison.v2"
 
 
 def positive_objective_entry_rows(
@@ -2506,7 +2506,7 @@ def _replaceable_current_artifact(
         return None, str(exc)
 
 
-def _shadow_no_entry_forecast_comparison(evaluation: dict[str, Any]) -> dict[str, Any]:
+def _shadow_forecast_comparison(evaluation: dict[str, Any]) -> dict[str, Any]:
     """Update observation forecasts without manufacturing entry return evidence."""
 
     report: dict[str, Any] = {
@@ -2524,10 +2524,20 @@ def _shadow_no_entry_forecast_comparison(evaluation: dict[str, Any]) -> dict[str
     ):
         return {**report, "blocking_reasons": ["common_unfitted_forecast_evidence_unavailable"]}
     forecasts = {}
+    empty_entry_cohorts = []
     for role in ("candidate", "champion"):
         entry = _comparison_entry_evidence(evaluation, role)
-        if entry.get("count") != 0 or entry.get("profit_factor_status") != "no_observations":
-            return {**report, "blocking_reasons": ["shadow_forecast_requires_both_empty_entry_cohorts"]}
+        count = entry.get("count")
+        if (
+            not isinstance(count, int) or isinstance(count, bool)
+            or not 0 <= count <= evaluation["sample_count"]
+            or entry.get("profit_factor_status") not in (
+                {"no_observations"} if count == 0 else {"defined", "no_loss_denominator"}
+            )
+        ):
+            return {**report, "blocking_reasons": ["shadow_entry_evidence_invalid"]}
+        if count == 0:
+            empty_entry_cohorts.append(role)
         forecast = evaluation.get(f"{role}_forecast_evaluation") or {}
         if (
             forecast.get("version") != SHADOW_FORECAST_COMPARISON_VERSION
@@ -2535,6 +2545,12 @@ def _shadow_no_entry_forecast_comparison(evaluation: dict[str, Any]) -> dict[str
         ):
             return {**report, "blocking_reasons": ["common_unfitted_forecast_evidence_unavailable"]}
         forecasts[role] = forecast.get("sides") or {}
+    # An empty entry cohort makes paired trading-return comparison undefined,
+    # even when the other model selects trades. Only observation forecasts may
+    # refresh here; comparable entry cohorts retain their return-based policy.
+    if not empty_entry_cohorts:
+        return {**report, "blocking_reasons": ["shadow_forecast_requires_unpaired_entry_evidence"]}
+    report["empty_entry_cohorts"] = empty_entry_cohorts
     blockers = []
     for side in ("long", "short"):
         for metric in ("gross_return_mse", "net_return_mse", "ordinary_loss_brier"):
@@ -2645,7 +2661,7 @@ def _compare_candidate_to_current(
     report["candidate_metrics"] = candidate
     report["champion_metrics"] = champion
     if candidate_stage == current_stage == "shadow":
-        forecast_comparison = _shadow_no_entry_forecast_comparison(evaluation)
+        forecast_comparison = _shadow_forecast_comparison(evaluation)
         report["shadow_forecast_comparison"] = forecast_comparison
         if forecast_comparison.get("accepted") is True:
             return {

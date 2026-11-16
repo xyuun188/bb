@@ -4817,7 +4817,7 @@ def test_both_no_entry_models_can_only_refresh_shadow_forecasts(
 
 @pytest.mark.parametrize(
     "defect",
-    ["overlap", "small", "missing_forecast", "wrong_version", "different_rows", "nonempty", "bad_count"],
+    ["overlap", "small", "missing_forecast", "wrong_version", "different_rows", "bad_status", "bad_count"],
 )
 def test_shadow_forecast_refresh_requires_complete_common_no_entry_evidence(defect: str) -> None:
     module = ModuleType("local_ai_tools_no_entry_evidence_test")
@@ -4833,12 +4833,37 @@ def test_shadow_forecast_refresh_requires_complete_common_no_entry_evidence(defe
         evaluation["candidate_forecast_evaluation"]["version"] = "old"
     elif defect == "different_rows":
         evaluation["candidate_forecast_evaluation"]["sample_count"] = 19
-    elif defect == "nonempty":
+    elif defect == "bad_status":
         evaluation["champion_entry_evaluation"]["portfolio"]["count"] = 1
     else:
         evaluation["candidate_entry_evaluation"]["portfolio"]["count"] = None
 
-    assert module._shadow_no_entry_forecast_comparison(evaluation)["accepted"] is False
+    assert module._shadow_forecast_comparison(evaluation)["accepted"] is False
+
+
+@pytest.mark.parametrize("empty_role", ["candidate", "champion", None])
+def test_shadow_forecasts_refresh_when_either_entry_cohort_is_empty(empty_role: str | None) -> None:
+    module = ModuleType("local_ai_tools_unpaired_entry_forecast_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    evaluation = _shadow_no_entry_comparison_fixture(module)
+    for role in ("candidate", "champion"):
+        if role != empty_role:
+            evaluation[f"{role}_entry_evaluation"] = module._entry_return_evaluation(
+                {
+                    "long": [{"decision_group": "one", "score": -1.0, "return_pct": 0.4}],
+                    "short": [{"decision_group": "one", "score": 1.0, "return_pct": -0.64}],
+                },
+            )
+
+    report = module._shadow_forecast_comparison(evaluation)
+
+    assert report["accepted"] is (empty_role is not None)
+    assert report["paper_execution_permission"] is False
+    assert report["production_permission"] is False
+    if empty_role is not None:
+        assert report["empty_entry_cohorts"] == [empty_role]
+    else:
+        assert report["blocking_reasons"] == ["shadow_forecast_requires_unpaired_entry_evidence"]
 
 
 @pytest.mark.parametrize("side", ["long", "short"])
@@ -4857,7 +4882,7 @@ def test_shadow_forecast_refresh_requires_each_direction_and_error_to_improve(
     }[defect]
     evaluation["candidate_forecast_evaluation"]["sides"][side][metric] = value
 
-    assert module._shadow_no_entry_forecast_comparison(evaluation)["accepted"] is False
+    assert module._shadow_forecast_comparison(evaluation)["accepted"] is False
 
 
 def test_common_holdout_scores_all_forecasts_without_inventing_entry_returns(tmp_path: Path) -> None:
@@ -4913,7 +4938,7 @@ def test_common_holdout_scores_all_forecasts_without_inventing_entry_returns(tmp
             assert error["gross_return_mse"] == pytest.approx(1.0)
             assert error["net_return_mse"] == pytest.approx(1.0)
             assert error["ordinary_loss_brier"] == pytest.approx(0.25)
-    assert module._shadow_no_entry_forecast_comparison(report)["accepted"] is False
+    assert module._shadow_forecast_comparison(report)["accepted"] is False
 
 
 def test_entry_comparison_pools_chronological_outcomes_without_averaging_sides() -> None:
