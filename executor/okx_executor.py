@@ -3753,6 +3753,7 @@ class OKXExecutor(AbstractExecutor):
         if isinstance(profit_guard, dict) and profit_guard.get("eligible") is True:
             request_params["ordType"] = "ioc"
             request_params["px"] = self._format_okx_number(profit_guard["limit_price"])
+        execution_order_type = "limit" if request_params["ordType"] == "ioc" else "market"
         if position_side and position_side != "net":
             request_params["posSide"] = target_side
 
@@ -3820,14 +3821,14 @@ class OKXExecutor(AbstractExecutor):
                     order_id="no_position",
                     symbol=decision.symbol,
                     side=side,
-                    order_type="market",
+                    order_type=execution_order_type,
                     quantity=0.0,
                     price=price,
                     status=OrderStatus.REJECTED,
                     timestamp=datetime.now(UTC),
                     raw_response={
                         "error": error_text,
-                        "okx_native_reduce_market_order": True,
+                        "okx_native_reduce_market_order": execution_order_type == "market",
                         "okx_exit_position_mismatch": diagnostics,
                         "request_params": request_params,
                         "fallback_market_order_params": params,
@@ -3857,14 +3858,14 @@ class OKXExecutor(AbstractExecutor):
                 order_id="native_reduce_rejected",
                 symbol=decision.symbol,
                 side=side,
-                order_type="market",
+                order_type=execution_order_type,
                 quantity=0.0,
                 price=price,
                 status=OrderStatus.REJECTED,
                 timestamp=datetime.now(UTC),
                 raw_response={
                     "error": error_text,
-                    "okx_native_reduce_market_order": True,
+                    "okx_native_reduce_market_order": execution_order_type == "market",
                     "request_params": request_params,
                     "fallback_market_order_params": params,
                     "okx_symbol": okx_symbol,
@@ -3984,7 +3985,7 @@ class OKXExecutor(AbstractExecutor):
         raw_response = {
             **(response if isinstance(response, dict) else {"response": response}),
             "exit_tracking": True,
-            "okx_native_reduce_market_order": True,
+            "okx_native_reduce_market_order": execution_order_type == "market",
             "exit_order_replace_note": exit_order_replace_note,
             "profit_lock_execution": profit_guard,
             "request_params": request_params,
@@ -4016,7 +4017,7 @@ class OKXExecutor(AbstractExecutor):
                 order_id=order_id or "native_reduce_rejected",
                 symbol=decision.symbol,
                 side=side,
-                order_type="market",
+                order_type=execution_order_type,
                 quantity=0.0,
                 price=price,
                 status=OrderStatus.REJECTED,
@@ -4046,7 +4047,7 @@ class OKXExecutor(AbstractExecutor):
                     order_id="native_reduce_unconfirmed",
                     symbol=decision.symbol,
                     side=side,
-                    order_type="market",
+                    order_type=execution_order_type,
                     quantity=0.0,
                     price=price,
                     status=OrderStatus.PENDING,
@@ -4072,7 +4073,7 @@ class OKXExecutor(AbstractExecutor):
                 order_id=order_id,
                 symbol=decision.symbol,
                 side=side,
-                order_type="market",
+                order_type=execution_order_type,
                 quantity=(
                     position_delta_contracts * contract_size
                     if position_delta_unattributed
@@ -4130,7 +4131,7 @@ class OKXExecutor(AbstractExecutor):
             order_id=order_id or "native_reduce_market",
             symbol=decision.symbol,
             side=side,
-            order_type="market",
+            order_type=execution_order_type,
             quantity=order_scoped_fill * contract_size,
             price=final_price,
             status=(
