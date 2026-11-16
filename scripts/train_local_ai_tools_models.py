@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 import httpx
-from sqlalchemy import BigInteger, case, cast, func, select
+from sqlalchemy import func, select
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -935,9 +935,9 @@ async def _load_shadow_samples(
 ) -> list[dict[str, Any]]:
     """Separate executable training from explicitly requested historical research.
 
-    Scope the fitted horizon before bounding raw identities and inspecting
-    provenance. Historical rejection must never refill a time stratum according
-    to its realized return or label quality.
+    Bound the latest raw identities before inspecting provenance, then retain
+    stable identities within that rolling window. Rejected rows must never
+    refill the window from older history or realized winners.
     """
 
     before_id: int | None = None
@@ -974,37 +974,7 @@ async def _load_shadow_samples(
         _EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER
         if executable_only and not recent_only else 1
     )
-    if requested_limit and executable_only and not recent_only:
-        async with _training_read_session_ctx() as session:
-            bounds = await session.execute(
-                select(func.min(ShadowBacktest.id), func.max(ShadowBacktest.id))
-                .where(*filters)
-            )
-            first_id, last_id = bounds.one()
-            if first_id is None or last_id is None:
-                return []
-            # Stable integer priorities prevent a new completion from moving
-            # every historical rank. Both operations use only raw identities.
-            identity_id = cast(ShadowBacktest.id, BigInteger)
-            priority = (
-                (identity_id % _SHADOW_IDENTITY_MODULUS)
-                * _SHADOW_IDENTITY_MULTIPLIER % _SHADOW_IDENTITY_MODULUS
-            )
-            stmt = (
-                select(*_shadow_sample_columns())
-                .where(*filters, ShadowBacktest.id <= last_id)
-                .order_by(
-                    case((ShadowBacktest.id.in_((first_id, last_id)), 0), else_=1),
-                    priority,
-                    ShadowBacktest.id,
-                )
-                .limit(candidate_limit)
-            )
-            result = await session.stream(stmt)
-            async for row in result.mappings():
-                append_sample(_shadow_sample_from_mapping(row))
-        return _stable_identity_shadow_rows(samples, requested_limit)
-    if requested_limit and not recent_only:
+    if requested_limit and not executable_only and not recent_only:
         async with _training_read_session_ctx() as session:
             total_result = await session.execute(
                 select(func.count(ShadowBacktest.id)).where(*filters)
@@ -1071,6 +1041,8 @@ async def _load_shadow_samples(
         if len(rows) < page_limit:
             break
     samples.reverse()
+    if requested_limit and executable_only and not recent_only:
+        return _stable_identity_shadow_rows(samples, requested_limit)
     return _evenly_spaced_rows(samples, requested_limit) if requested_limit else samples
 
 
@@ -1445,7 +1417,7 @@ async def _main() -> None:
     )
     training_transport_report["comparison_view"] = comparison_report
     training_transport_report["shadow_sampling"] = {
-        "policy": "stable_raw_identity_priority_with_history_endpoints",
+        "policy": "latest_raw_identity_window_with_stable_priority_and_endpoints",
         "trading_universe_policy": OKX_CRYPTO_UNIVERSE_POLICY,
         "universe_basis": "explicit_asset_class_in_frozen_market_fact",
         "outcome_dependent": False,

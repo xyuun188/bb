@@ -412,7 +412,7 @@ async def test_executable_shadow_loader_bounds_provenance_reads_before_filtering
 
     assert selected == []
     assert len(reads) <= 8
-    assert min(reads) == 1
+    assert min(reads) == 33
     assert max(reads) == 40
 
 
@@ -488,7 +488,7 @@ def test_stable_shadow_identity_sample_keeps_history_when_new_rows_complete() ->
 
 
 @pytest.mark.asyncio
-async def test_executable_shadow_loader_preserves_sample_after_new_completion(
+async def test_executable_shadow_loader_preserves_rolling_sample_after_new_completion(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -526,9 +526,58 @@ async def test_executable_shadow_loader_preserves_sample_after_new_completion(
             await session.commit()
         after = await train_script._load_shadow_samples(sample_budget=16)
         assert len(before) == len(after) == 16
-        assert len({row["id"] for row in before} - {row["id"] for row in after}) <= 2
-        assert before[0]["decision_id"] == after[0]["decision_id"] == 1
+        assert len({row["id"] for row in before} - {row["id"] for row in after}) <= 3
+        assert before[0]["decision_id"] == 169
+        assert after[0]["decision_id"] == 170
         assert after[-1]["decision_id"] == 201
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_rolling_training_window_never_refills_rejected_rows_from_old_history(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    await _use_temp_db(monkeypatch, tmp_path)
+    start = PHASE3_CLEAN_START_UTC + timedelta(minutes=5)
+    monkeypatch.setattr(train_script, "_EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER", 2)
+    async with get_session_ctx() as session:
+        session.add_all([
+            ShadowBacktest(
+                decision_id=index + 1, model_name="ensemble_trader",
+                execution_mode="paper", symbol="BTC/USDT", status="completed",
+                horizon_minutes=train_script.PRIMARY_PREDICTION_HORIZON_MINUTES,
+                created_at=start + timedelta(minutes=index),
+                due_at=start + timedelta(minutes=index + 240),
+                long_return_pct=0.2 if index % 2 else -0.2,
+                short_return_pct=-0.2 if index % 2 else 0.2,
+                feature_snapshot={
+                    "current_price": 100.0,
+                    "historical_market_path_only": index >= 15,
+                    "training_market_fact_contract": {
+                        "version": MARKET_FACT_CONTRACT_VERSION, "status": "clean",
+                        "violation_count": 0, "native_instrument_identity_verified": True,
+                        "same_contract_price_path_verified": True,
+                        "executable_market_fact_verified": True,
+                    },
+                },
+            )
+            for index in range(20)
+        ])
+        await session.commit()
+    try:
+        selected = await train_script._load_shadow_samples(sample_budget=4)
+        assert [row["decision_id"] for row in selected] == [13, 14, 15]
+        from sqlalchemy import update
+
+        async with get_session_ctx() as session:
+            await session.execute(update(ShadowBacktest).values(
+                long_return_pct=999.0, short_return_pct=-999.0, best_action="long"
+            ))
+            await session.commit()
+        changed = await train_script._load_shadow_samples(sample_budget=4)
+        assert [row["id"] for row in changed] == [row["id"] for row in selected]
     finally:
         await close_db()
 
@@ -1465,6 +1514,14 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
     assert comparison["used_for_fitting"] is False
     assert comparison["independent_profitability_exam"] is False
     assert comparison["sample_count"] == 0
+    sampling = payload["training_transport_report"]["shadow_sampling"]
+    assert sampling["policy"] == "latest_raw_identity_window_with_stable_priority_and_endpoints"
+    assert sampling["candidate_limit"] == (
+        train_script._REMOTE_TRAINING_MAX_SHADOW_SAMPLES
+        * train_script._EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER
+    )
+    assert sampling["outcome_dependent"] is False
+    assert sampling["raw_identity_candidate_refill_allowed"] is False
     assert "evaluation_policy" not in payload
     assert "model_stage" not in payload
 
