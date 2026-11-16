@@ -1289,7 +1289,18 @@ class OKXExecutor(AbstractExecutor):
                         existing_exit.get("average") or existing_exit.get("price") or price or 0
                     )
                     order_age = self._order_age_seconds(existing_exit)
-                    if order_id and order_age >= EXIT_ORDER_REPLACE_AFTER_SECONDS:
+                    exit_liquidity: dict[str, Any] = {}
+                    if (
+                        order_age >= EXIT_ORDER_REPLACE_AFTER_SECONDS
+                        and str(info.get("ordType") or existing_exit.get("type") or "").lower()
+                        == "market"
+                    ):
+                        exit_liquidity = await self._pending_exit_liquidity(decision.symbol, side)
+                    liquidity_blocked = exit_liquidity.get("blocked") is True
+                    if (
+                        order_id and order_age >= EXIT_ORDER_REPLACE_AFTER_SECONDS
+                        and not liquidity_blocked
+                    ):
                         cancel_result = await self._cancel_stale_exit_order(
                             ccxt,
                             existing_exit,
@@ -1422,6 +1433,12 @@ class OKXExecutor(AbstractExecutor):
                             f"OKX 已有平仓订单正在追单或部分成交，已等待约 {order_age:.0f} 秒；"
                             f"若约 {wait_seconds:.0f} 秒后仍未成交，系统会撤单并按最新仓位重提平仓。"
                         )
+                        if liquidity_blocked:
+                            wait_note = (
+                                "OKX 执行盘在允许价格范围内暂无对手盘，市价平仓尚未成交。"
+                                "系统保留原 reduce-only 委托并继续检查行情和成交，"
+                                "不再反复撤销同一笔未成交委托。"
+                            )
                         return ExecutionResult(
                             order_id=order_id or "exit_tracking",
                             symbol=decision.symbol,
@@ -1437,6 +1454,10 @@ class OKXExecutor(AbstractExecutor):
                                 **existing_exit,
                                 "exit_tracking": True,
                                 "existing_exit_order": True,
+                                "exit_liquidity": exit_liquidity,
+                                "execution_blocker": (
+                                    "okx_exit_price_limit_liquidity" if liquidity_blocked else None
+                                ),
                                 "exit_replace_after_seconds": EXIT_ORDER_REPLACE_AFTER_SECONDS,
                                 "exit_order_age_seconds": order_age,
                                 "message": wait_note,
@@ -3262,7 +3283,7 @@ class OKXExecutor(AbstractExecutor):
         client_order_id = str(first_item.get("clOrdId") or "").strip()
         response_code = str(response.get("code") if isinstance(response, dict) else "")
         s_code = str(first_item.get("sCode") or "")
-        success_code = response_code == "0" or s_code in {"", "0"}
+        success_code = response_code == "0" and s_code in {"", "0"}
         raw_response = {
             **(response if isinstance(response, dict) else {"response": response}),
             "exit_tracking": True,
@@ -3319,6 +3340,25 @@ class OKXExecutor(AbstractExecutor):
             )
             return None
         if closed_contracts <= tolerance:
+            # close-position may acknowledge without an ordId. Recover the
+            # actual pending order so later cycles can track the same request.
+            try:
+                pending = await self._find_active_exit_order(ccxt, okx_symbol, side)
+                info = (pending or {}).get("info") or {}
+                created_ms = self._safe_float((pending or {}).get("timestamp") or info.get("cTime"))
+                if pending and created_ms >= submitted_at_ms - 1000:
+                    order_id = str(pending.get("id") or info.get("ordId") or order_id)
+                    raw_response["native_close_pending_order"] = pending
+            except Exception as exc:
+                raw_response["pending_order_lookup_error"] = safe_error_text(exc, limit=180)
+            exit_liquidity = await self._pending_exit_liquidity(decision.symbol, side)
+            raw_response["exit_liquidity"] = exit_liquidity
+            if exit_liquidity.get("blocked") is True:
+                raw_response["execution_blocker"] = "okx_exit_price_limit_liquidity"
+                raw_response["message"] = (
+                    "OKX 执行盘在允许价格范围内暂无对手盘，平仓委托仍未成交；"
+                    "继续追踪原委托和实际剩余仓位。"
+                )
             return ExecutionResult(
                 order_id=order_id or client_order_id or "okx_native_full_close_not_confirmed",
                 symbol=decision.symbol,
@@ -3331,7 +3371,7 @@ class OKXExecutor(AbstractExecutor):
                 timestamp=datetime.now(UTC),
                 raw_response={
                     **raw_response,
-                    "error": snapshot_error
+                    "error": snapshot_error or raw_response.get("message")
                     or "OKX native full close was submitted but position is not flat yet.",
                 },
             )
@@ -5079,16 +5119,20 @@ class OKXExecutor(AbstractExecutor):
             "info": dict(row),
         }
 
-    async def _fetch_native_price_limit(self, symbol: str) -> dict[str, Any]:
+    async def _fetch_native_price_limit(
+        self, symbol: str, *, execution_market: bool = False,
+    ) -> dict[str, Any]:
         """Fetch OKX market-order price bounds used by attached TP validation."""
 
         inst_id = okx_inst_id_from_symbol(symbol)
         if not inst_id:
             raise ExchangeAPIError(f"Cannot resolve OKX instId for price limit: {symbol}")
         ccxt = await self._get_ccxt()
-        fetch_price_limit = getattr(ccxt, "publicGetPublicPriceLimit", None)
+        endpoint = "executionGetPublicPriceLimit" if execution_market else "publicGetPublicPriceLimit"
+        fetch_price_limit = getattr(ccxt, endpoint, None)
         if not callable(fetch_price_limit):
-            fetch_price_limit = getattr(ccxt, "executionGetPublicPriceLimit", None)
+            endpoint = "publicGetPublicPriceLimit" if execution_market else "executionGetPublicPriceLimit"
+            fetch_price_limit = getattr(ccxt, endpoint, None)
         if not callable(fetch_price_limit):
             if isinstance(ccxt, OkxPerpetualSdkExchange):
                 raise ExchangeAPIError("OKX SDK price-limit API is unavailable")
@@ -5109,7 +5153,55 @@ class OKXExecutor(AbstractExecutor):
             "sell_price_limit": sell_limit,
             "price_limit_timestamp_ms": int(self._safe_float(row.get("ts"), 0.0)),
             "price_limit_info": dict(row),
+            "price_limit_source_endpoint": endpoint,
         }
+
+    async def _pending_exit_liquidity(self, symbol: str, side: str) -> dict[str, Any]:
+        """Explain an unfilled market close using only its execution venue."""
+        try:
+            ccxt = await self._get_ccxt()
+            fetch_book = getattr(ccxt, "executionFetchOrderBook", None)
+            if not callable(fetch_book):
+                return {}
+            book, limits = await asyncio.gather(
+                self._with_retry(fetch_book, self._to_swap_symbol(symbol)),
+                self._fetch_native_price_limit(symbol, execution_market=True),
+            )
+            if limits.get("price_limit_source_endpoint") != "executionGetPublicPriceLimit":
+                return {}
+            if (limits.get("price_limit_info") or {}).get("enabled") in (False, "false"):
+                return {}
+            prices = [
+                self._safe_float(level[0]) for level in book.get("asks" if side == "buy" else "bids") or []
+                if isinstance(level, (list, tuple)) and len(level) >= 2
+                and self._safe_float(level[0]) > 0 and self._safe_float(level[1]) > 0
+            ]
+            if not prices:
+                return {}
+            quote = min(prices) if side == "buy" else max(prices)
+            bound = self._safe_float(limits.get("buy_price_limit" if side == "buy" else "sell_price_limit"))
+            if quote <= 0 or bound <= 0:
+                return {}
+            now_ms = time.time() * 1000
+            for stamp in (book.get("timestamp"), limits.get("price_limit_timestamp_ms")):
+                if not 0 <= now_ms - self._safe_float(stamp) <= 10000:
+                    return {}
+            blocked = quote > bound if side == "buy" else quote < bound
+            return {
+                "blocked": blocked,
+                "reason": "no_quote_inside_execution_price_limit" if blocked else "quote_inside_execution_price_limit",
+                "side": side,
+                "opposing_quote": quote,
+                "allowed_price_bound": bound,
+                "quote_timestamp_ms": book.get("timestamp"),
+                "price_limit_timestamp_ms": limits.get("price_limit_timestamp_ms"),
+                "source": "okx_execution_market",
+                "quote_source": "okx_execution_order_book",
+                "checked_at": datetime.now(UTC).isoformat(),
+            }
+        except Exception as exc:
+            logger.warning("pending exit liquidity check unavailable", symbol=symbol, error=safe_error_text(exc, limit=180))
+            return {}
 
     @staticmethod
     def _format_okx_number(value: float) -> str:

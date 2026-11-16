@@ -184,6 +184,9 @@ def _complete_lineage() -> dict:
                         "exchange_confirmation_recorded": True,
                         "source_authority": "local_submit_plus_okx_create_order_response",
                         "exchange_confirmed_at": "2026-07-11T01:00:00+00:00",
+                        "requested_attach_algo_orders": [{
+                            "slTriggerPx": "98000", "tpTriggerPx": "104000",
+                        }],
                     },
                 },
             ),
@@ -241,6 +244,9 @@ def _complete_lineage() -> dict:
         },
         "decision_feature_by_order_id": {
             "entry-1": entry_features,
+        },
+        "decision_execution_by_order_id": {
+            "entry-1": {"stop_loss_pct": 0.02, "take_profit_pct": 0.04},
         },
     }
 
@@ -1639,6 +1645,7 @@ def test_authoritative_sample_uses_exact_entry_order_decision_evidence() -> None
 
 def test_exact_entry_decision_recovers_missing_planned_protection_prices() -> None:
     lineage = _complete_lineage()
+    lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills["protection_submission"].pop("requested_attach_algo_orders")
     lineage["positions_by_id"][7].stop_loss_price = None
     lineage["positions_by_id"][7].take_profit_price = None
     lineage["decision_execution_by_order_id"] = {
@@ -1655,6 +1662,77 @@ def test_exact_entry_decision_recovers_missing_planned_protection_prices() -> No
     assert sample["planned_take_profit_price"] == pytest.approx(104_000.0)
     assert "missing_planned_stop_loss_lineage" not in sample["strategy_lineage_gaps"]
     assert "missing_planned_take_profit_lineage" not in sample["strategy_lineage_gaps"]
+
+
+@pytest.mark.parametrize("receipt_key", ["requested_attach_algo_orders", "response_attach_algo_orders"])
+def test_original_entry_protection_overrides_later_position_adjustments(receipt_key) -> None:
+    lineage = _complete_lineage()
+    position = lineage["positions_by_id"][7]
+    position.stop_loss_price = 95_000.0
+    position.take_profit_price = 100_400.0
+    submission = lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills["protection_submission"]
+    submission.pop("requested_attach_algo_orders", None)
+    submission[receipt_key] = [{"slTriggerPx": "98000", "tpTriggerPx": "104000"}]
+    lineage["decision_execution_by_order_id"] = {
+        "entry-1": {"stop_loss_pct": 0.03, "take_profit_pct": 0.05}
+    }
+    sample = build_okx_history_training_sample(_history(), **lineage)
+    assert sample["planned_stop_loss_price"] == 98_000.0
+    assert sample["planned_take_profit_price"] == 104_000.0
+    assert sample["planned_protection_price_sources"]["stop_loss_price"] == "entry_order_protection_submission"
+    assert position.stop_loss_price == 95_000.0
+    assert position.take_profit_price == 100_400.0
+
+
+def test_exact_entry_plan_overrides_changed_position_when_receipt_has_no_prices() -> None:
+    lineage = _complete_lineage()
+    lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills["protection_submission"].pop("requested_attach_algo_orders")
+    lineage["positions_by_id"][7].stop_loss_price = 95_000.0
+    lineage["positions_by_id"][7].take_profit_price = 100_400.0
+    lineage["decision_execution_by_order_id"] = {
+        "entry-1": {"stop_loss_pct": 0.02, "take_profit_pct": 0.04}
+    }
+    sample = build_okx_history_training_sample(_history(), **lineage)
+    assert sample["planned_stop_loss_price"] == 98_000.0
+    assert sample["planned_take_profit_price"] == 104_000.0
+    assert sample["planned_protection_price_sources"]["stop_loss_price"] == "exact_entry_decision"
+
+
+def test_conflicting_entry_protection_is_quarantined_instead_of_using_later_stop() -> None:
+    lineage = _complete_lineage()
+    submission = lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills["protection_submission"]
+    submission["requested_attach_algo_orders"] = [
+        {"slTriggerPx": "98000", "tpTriggerPx": "104000"},
+        {"slTriggerPx": "97000", "tpTriggerPx": "104000"},
+    ]
+    sample = build_okx_history_training_sample(_history(), **lineage)
+    assert sample["planned_stop_loss_price"] is None
+    assert "conflicting_planned_stop_loss_submissions" in sample["strategy_lineage_gaps"]
+    assert sample["planned_take_profit_price"] == 104_000.0
+
+
+@pytest.mark.parametrize("malformed", [12, {}, "bad", [None, "bad", {"slTriggerPx": "nan"}]])
+def test_invalid_submission_prices_preserve_exact_decision_fallback(malformed) -> None:
+    lineage = _complete_lineage()
+    submission = lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills["protection_submission"]
+    submission["requested_attach_algo_orders"] = malformed
+    lineage["decision_execution_by_order_id"] = {
+        "entry-1": {"stop_loss_pct": 0.02, "take_profit_pct": 0.04}
+    }
+    sample = build_okx_history_training_sample(_history(), **lineage)
+    assert sample["planned_stop_loss_price"] == 98_000.0
+    assert sample["planned_take_profit_price"] == 104_000.0
+
+
+def test_mutable_position_prices_are_not_fabricated_as_original_entry_plan() -> None:
+    lineage = _complete_lineage()
+    lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills["protection_submission"] = {}
+    lineage["decision_execution_by_order_id"] = {}
+    sample = build_okx_history_training_sample(_history(), **lineage)
+    assert sample["planned_stop_loss_price"] is None
+    assert sample["planned_take_profit_price"] is None
+    assert lineage["positions_by_id"][7].stop_loss_price == 98_000.0
+    assert "missing_planned_stop_loss_lineage" in sample["strategy_lineage_gaps"]
 
 
 def test_missing_official_funding_and_contract_spec_are_quarantined_with_reasons() -> None:

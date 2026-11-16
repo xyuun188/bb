@@ -1543,6 +1543,122 @@ class _NativeFullCloseUnconfirmedCcxt(_ExitMaxMarketSizeCcxt):
         return {"code": "0", "data": [{"clOrdId": "native-close-client", "sCode": "0"}]}
 
 
+class _PriceLimitedExitCcxt(_NativeFullCloseUnconfirmedCcxt):
+    def __init__(self, *, pending: bool = True, blocked: bool = True, stale: bool = False):
+        super().__init__(position_contracts=100.0)
+        self.pending = pending
+        self.blocked = blocked
+        self.stale = stale
+        self.cancel_calls: list[dict[str, Any]] = []
+        self.pending_timestamp = int(datetime.now(UTC).timestamp() * 1000) - 60000
+
+    async def executionGetMarketTicker(self, params):
+        pytest.fail("pending exit liquidity must use the execution book")
+
+    async def executionFetchOrderBook(self, _symbol):
+        return {
+            "bids": [[3.0, 100.0]], "asks": [[3.01, 100.0]],
+            "timestamp": int(datetime.now(UTC).timestamp() * 1000) - (60000 if self.stale else 0),
+        }
+
+    async def executionGetPublicPriceLimit(self, params):
+        return {"data": [{
+            "instId": params["instId"], "enabled": True,
+            "buyLmt": "2.9" if self.blocked else "3.1",
+            "sellLmt": "3.1" if self.blocked else "2.9",
+            "ts": str(int(datetime.now(UTC).timestamp() * 1000)),
+        }]}
+
+    async def publicGetPublicPriceLimit(self, params):
+        return {"data": [{
+            "instId": params["instId"], "enabled": True,
+            "buyLmt": "3.2", "sellLmt": "2.8",
+            "ts": str(int(datetime.now(UTC).timestamp() * 1000)),
+        }]}
+
+    async def privateGetTradeOrdersPending(self, _params):
+        return {"data": [{
+            "ordId": "pending-close", "instId": "USAR-USDT-SWAP", "side": "sell",
+            "posSide": "long", "reduceOnly": "true", "ordType": "market",
+            "state": "live", "sz": "100", "accFillSz": "0", "cTime": str(self.pending_timestamp),
+        }] if self.pending else []}
+
+    async def privatePostTradeCancelOrder(self, params):
+        self.cancel_calls.append(dict(params))
+        self.pending = False
+        return {"code": "0", "data": [{"ordId": "pending-close", "sCode": "0"}]}
+
+    async def privatePostTradeClosePosition(self, params):
+        result = await super().privatePostTradeClosePosition(params)
+        self.pending = True
+        self.pending_timestamp = int(datetime.now(UTC).timestamp() * 1000)
+        return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["buy", "sell"])
+async def test_pending_exit_liquidity_uses_execution_bounds_for_both_sides(side):
+    executor = _executor(_PriceLimitedExitCcxt())
+    report = await executor._pending_exit_liquidity("USAR/USDT", side)
+    assert report["blocked"] is True
+    assert report["source"] == "okx_execution_market"
+    assert report["allowed_price_bound"] == (2.9 if side == "buy" else 3.1)
+    assert (await executor._fetch_native_price_limit("USAR/USDT"))["buy_price_limit"] == 3.2
+
+
+@pytest.mark.asyncio
+async def test_pending_exit_does_not_replace_a_market_order_without_legal_liquidity():
+    exchange = _PriceLimitedExitCcxt()
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    result = await executor.place_order(decision)
+    assert result.status == OrderStatus.OPEN
+    assert result.exchange_order_id == "pending-close"
+    assert result.quantity == 0.0
+    assert result.raw_response["execution_blocker"] == "okx_exit_price_limit_liquidity"
+    assert exchange.cancel_calls == []
+    assert exchange.close_position_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale", [False, True])
+async def test_pending_exit_retries_when_liquidity_returns_or_quote_is_stale(monkeypatch, stale):
+    exchange = _PriceLimitedExitCcxt(blocked=stale, stale=stale)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+
+    async def no_sleep(_seconds):
+        pass
+
+    monkeypatch.setattr(okx_module.asyncio, "sleep", no_sleep)
+    result = await executor.place_order(decision)
+    assert len(exchange.cancel_calls) == 1
+    assert len(exchange.close_position_calls) == 1
+    assert result.status == OrderStatus.OPEN
+    assert result.exchange_order_id == "pending-close"
+
+
+@pytest.mark.asyncio
+async def test_native_full_close_recovers_real_pending_id_and_liquidity_reason(monkeypatch):
+    exchange = _PriceLimitedExitCcxt(pending=False)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+
+    async def no_sleep(_seconds):
+        pass
+
+    monkeypatch.setattr(okx_module.asyncio, "sleep", no_sleep)
+    result = await executor.place_order(decision)
+    assert result.status == OrderStatus.OPEN
+    assert result.exchange_order_id == "pending-close"
+    assert result.quantity == 0
+    assert result.raw_response["execution_blocker"] == "okx_exit_price_limit_liquidity"
+    assert len(exchange.close_position_calls) == 1
+
+
 class _NativeFullCloseAccountWideFillsCcxt(_NativeFullCloseFillsHistoryCcxt):
     async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
         if params.get("instId"):

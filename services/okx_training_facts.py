@@ -602,6 +602,46 @@ def _first_protection_submission(orders: Iterable[Any]) -> dict[str, Any]:
     )
 
 
+def _planned_protection_prices(
+    *, entry_orders: list[Any], exact_execution: dict[str, Any],
+    entry_price: float, side: str,
+) -> tuple[dict[str, float | None], dict[str, str], list[str]]:
+    prices: dict[str, float | None] = {}
+    sources: dict[str, str] = {}
+    gaps: list[str] = []
+    for name, trigger_key in (("stop_loss", "slTriggerPx"), ("take_profit", "tpTriggerPx")):
+        submitted: set[float] = set()
+        for order in entry_orders:
+            submission = _protection_submission(order)
+            for rows_key in ("requested_attach_algo_orders", "response_attach_algo_orders"):
+                rows = submission.get(rows_key)
+                if not isinstance(rows, list):
+                    continue
+                values = {
+                    value for row in rows if isinstance(row, dict)
+                    if (value := _safe_float(row.get(trigger_key), None)) is not None and value > 0
+                }
+                if values:
+                    submitted.update(values)
+                    break
+        price_key = f"{name}_price"
+        if submitted:
+            prices[price_key] = next(iter(submitted)) if len(submitted) == 1 else None
+            sources[price_key] = "entry_order_protection_submission"
+            if len(submitted) > 1:
+                gaps.append(f"conflicting_planned_{name}_submissions")
+            continue
+        pct = _safe_float(exact_execution.get(f"{name}_pct"), None)
+        if entry_price > 0 and side in {"long", "short"} and pct is not None and pct > 0:
+            direction = 1 if (side == "long") == (name == "take_profit") else -1
+            prices[price_key] = entry_price * (1 + direction * pct)
+            sources[price_key] = "exact_entry_decision"
+        else:
+            prices[price_key] = None
+            sources[price_key] = "unavailable"
+    return prices, sources, gaps
+
+
 def _iso_from_ms(value: Any) -> str | None:
     timestamp_ms = _safe_float(value, None)
     if timestamp_ms is None or timestamp_ms <= 0:
@@ -1243,8 +1283,6 @@ def build_okx_history_training_sample(
         if raw_llm_response:
             decision_lineage_source = "position_time_fallback_payload"
 
-    stop_loss_price = _safe_float(_value(local_position, "stop_loss_price"), None)
-    take_profit_price = _safe_float(_value(local_position, "take_profit_price"), None)
     exact_execution = next(
         (
             decision_execution_by_order_id[order_id]
@@ -1253,29 +1291,14 @@ def build_okx_history_training_sample(
         ),
         {},
     )
-    if entry_price > 0 and side in {"long", "short"}:
-        stop_loss_pct = _safe_float(exact_execution.get("stop_loss_pct"), None)
-        take_profit_pct = _safe_float(exact_execution.get("take_profit_pct"), None)
-        if (
-            (stop_loss_price is None or stop_loss_price <= 0)
-            and stop_loss_pct
-            and stop_loss_pct > 0
-        ):
-            stop_loss_price = (
-                entry_price * (1 - stop_loss_pct)
-                if side == "long"
-                else entry_price * (1 + stop_loss_pct)
-            )
-        if (
-            (take_profit_price is None or take_profit_price <= 0)
-            and take_profit_pct
-            and take_profit_pct > 0
-        ):
-            take_profit_price = (
-                entry_price * (1 + take_profit_pct)
-                if side == "long"
-                else entry_price * (1 - take_profit_pct)
-            )
+    # Position protection is mutable after entry. Preserve the original plan
+    # from the accepted entry receipt before consulting later position state.
+    planned_prices, planned_price_sources, planned_price_gaps = _planned_protection_prices(
+        entry_orders=entry_orders, exact_execution=exact_execution,
+        entry_price=entry_price, side=side,
+    )
+    stop_loss_price = planned_prices["stop_loss_price"]
+    take_profit_price = planned_prices["take_profit_price"]
     protection_execution = _first_protection_execution(close_orders)
     protection_submission = _first_protection_submission(entry_orders)
     stop_loss_fill_confirmed = bool(
@@ -1336,7 +1359,7 @@ def build_okx_history_training_sample(
         raw_llm_response=raw_llm_response,
         realized_pnl=realized_pnl,
     )
-    lineage_gaps: list[str] = []
+    lineage_gaps: list[str] = list(planned_price_gaps)
     if not entry_order_ids:
         lineage_gaps.append("missing_position_history_entry_orders")
     elif not entry_orders:
@@ -1519,6 +1542,7 @@ def build_okx_history_training_sample(
         "position_history_pnl_ratio": _safe_float(_value(history, "pnl_ratio"), None),
         "planned_stop_loss_price": stop_loss_price,
         "planned_take_profit_price": take_profit_price,
+        "planned_protection_price_sources": planned_price_sources,
         "stop_loss_fill_confirmed": stop_loss_fill_confirmed,
         "slippage": canonical_slippage,
         "slippage_source": canonical_slippage_source,

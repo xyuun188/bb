@@ -22,7 +22,7 @@ from models.decision import AIDecision
 from models.trade import OkxPositionHistory, Order, Position
 
 REPAIR_SOURCE = "okx_authoritative_lifecycle_fragment_recovery"
-REPAIR_VERSION = "2026-10-20.okx-lifecycle-recovery.v4"
+REPAIR_VERSION = "2026-11-16.okx-lifecycle-recovery.v5"
 REPAIR_TRAINING_POLICY = "exclude_until_authoritative_settlement"
 REPAIR_REASON = "missing_local_position_for_authoritative_closed_lifecycle"
 ORDER_CONFIRMATION_STATES = {
@@ -181,6 +181,20 @@ async def repair_missing_okx_lifecycle_fragments(
                 samples.append(link_sample)
                 for order_id in _split_ids(row.get("_dashboard_close_order_ids")):
                     close_owners.setdefault(order_id, set()).add(identity)
+            close_link_sample = await _repair_missing_lifecycle_close_link(
+                session, lifecycle, positions=all_positions, orders_by_id=orders_by_id,
+                entry_owners=entry_owners, close_owners=close_owners, now=checked_at,
+            )
+            if close_link_sample is not None:
+                repaired_order_links += 1
+                samples.append(close_link_sample)
+                position = next(
+                    p for p in positions if int(p.id) == close_link_sample["position_id"]
+                )
+                close_id = position.close_exchange_order_id
+                positions_by_close_id.setdefault(close_id, []).append(position)
+                globally_linked_close_ids.add(close_id)
+                close_owners.setdefault(close_id, set()).add(identity)
         identity_samples = []
         if lifecycle_row_counts.get(identity, 0) == 1 and all(
             len(entry_owners.get(order_id, set())) == 1
@@ -431,6 +445,125 @@ def _summary() -> dict[str, Any]:
         "repaired_order_link_count": 0,
         "skipped_count": 0,
         "samples": [],
+    }
+
+
+async def _repair_missing_lifecycle_close_link(
+    session: Any,
+    lifecycle: tuple[tuple[str, str, str, str, tuple[str, ...]], dict[str, Any]],
+    *,
+    positions: list[Position],
+    orders_by_id: dict[str, Order],
+    entry_owners: dict[str, set[tuple[Any, ...]]],
+    close_owners: dict[str, set[tuple[Any, ...]]],
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Recover a single full close from official identity, never estimated PnL."""
+    _key, facts = lifecycle
+    row = facts["row"]
+    record = await _history_record(session, row)
+    if (
+        record is None or record.sync_status != "synced" or record.close_status != "full"
+        or record.mode != facts["mode"]
+        or record.row_identity != _text(row.get("_dashboard_history_row_identity"))
+        or not _close_enough(facts["close_contracts"], facts["open_contracts"])
+    ):
+        return None
+    entry_ids = _split_ids(record.entry_order_ids)
+    close_ids = _split_ids(record.close_order_ids)
+    position_ids = _split_ids(record.position_ids)
+    if not entry_ids or len(close_ids) > 1 or len(position_ids) != 1:
+        return None
+    close_side = "buy" if facts["side"] == "short" else "sell"
+    if not close_ids:
+        # Order-fact backfill may precede both local links. Exact official
+        # close time, price and contracts identify a fill without model names.
+        candidates = [
+            order for order in orders_by_id.values()
+            if order.execution_mode == facts["mode"]
+            and _text(order.okx_inst_id).upper() == facts["inst_id"]
+            and _order_is_authoritative(order, expected_side=close_side, position_side=facts["side"])
+            and order.filled_at is not None
+            and abs((_aware_utc(order.filled_at) - facts["closed_at"]).total_seconds()) <= 0.001
+            and _close_enough(_order_contracts(order), facts["close_contracts"])
+            and _close_enough(order.price, record.close_avg_px)
+        ]
+        if len(candidates) != 1:
+            return None
+        close_ids = {_text(candidates[0].exchange_order_id)}
+    close_id = next(iter(close_ids))
+    position = next((p for p in positions if str(p.id) in position_ids), None)
+    if (
+        position is None or position.is_open or _text(position.close_exchange_order_id)
+        or position.settlement_status in POSITION_SETTLEMENT_SUPERSEDED
+        or position.execution_mode != facts["mode"]
+        or _text(position.okx_inst_id).upper() != facts["inst_id"]
+        or _text(position.okx_pos_id) != facts["pos_id"]
+        or normalize_trading_symbol(position.symbol) != facts["symbol"]
+        or _text(position.side).lower() != facts["side"]
+        or _split_ids(position.entry_exchange_order_id) != entry_ids
+        or position.closed_at is None
+        or abs((_aware_utc(position.closed_at) - facts["closed_at"]).total_seconds())
+        > TIME_TOLERANCE_SECONDS
+        or any(close_id in _split_ids(p.close_exchange_order_id) for p in positions)
+    ):
+        return None
+    owner = (facts["inst_id"], facts["pos_id"], facts["side"], facts["opened_at"])
+    if (
+        any(entry_owners.get(order_id) != {owner} for order_id in entry_ids)
+        or close_owners.get(close_id, set()) - {owner}
+        or entry_owners.get(close_id, set())
+        or entry_ids.intersection(close_ids)
+    ):
+        return None
+    entry_side = "sell" if facts["side"] == "short" else "buy"
+    entry_orders = [orders_by_id.get(order_id) for order_id in entry_ids]
+    close_order = orders_by_id.get(close_id)
+    for group, side, target in (
+        (entry_orders, entry_side, facts["open_contracts"]),
+        ([close_order], close_side, facts["close_contracts"]),
+    ):
+        if any(
+            order is None or order.execution_mode != facts["mode"]
+            or _text(order.okx_inst_id).upper() != facts["inst_id"]
+            or not _order_is_authoritative(order, expected_side=side, position_side=facts["side"])
+            or order.filled_at is None
+            or not facts["opened_at"] <= _aware_utc(order.filled_at) <= facts["closed_at"]
+            for order in group
+        ) or not _close_enough(sum(_order_contracts(order) for order in group), target):
+            return None
+    if (
+        abs((_aware_utc(close_order.filled_at) - facts["closed_at"]).total_seconds()) > 0.001
+        or not _close_enough(close_order.price, record.close_avg_px)
+        or not _close_enough(_weighted_price(entry_orders), record.open_avg_px)
+        or not _close_enough(
+            _safe_float(position.quantity),
+            _order_base_quantity(close_order, _order_contract_size(close_order, row)),
+        )
+    ):
+        return None
+    position.close_exchange_order_id = close_id
+    _merge_history_record_links(
+        record, position_id=int(position.id), entry_ids=entry_ids,
+        close_ids=close_ids, match_status=record.match_status,
+    )
+    record.evidence_gaps = [
+        gap for gap in record.evidence_gaps or [] if gap != "missing_position_history_close_orders"
+    ]
+    row["_dashboard_close_order_ids"] = list(record.close_order_ids)
+    position.settlement_raw = {
+        **_dict(position.settlement_raw),
+        "close_link_recovery": {
+            "source": REPAIR_SOURCE, "version": REPAIR_VERSION,
+            "history_record_id": record.id, "exchange_order_id": close_id,
+            "repaired_at": now.isoformat(),
+        },
+        "next_settlement_retry_at": now.isoformat(),
+    }
+    return {
+        "kind": "okx_lifecycle_close_link_recovered",
+        "position_id": int(position.id), "symbol": facts["symbol"],
+        "exchange_order_id": close_id,
     }
 
 

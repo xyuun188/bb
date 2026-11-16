@@ -277,6 +277,87 @@ async def _seed_missing_full_lifecycle(session, *, failure: str | None = None):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing_history_link", [False, True])
+@pytest.mark.parametrize("failure", [
+    None, "wrong_position", "wrong_quantity", "unconfirmed", "other_owner",
+    "wrong_price", "wrong_time", "partial", "wrong_entry", "wrong_mode",
+])
+async def test_missing_close_link_uses_official_lifecycle_instead_of_estimated_price(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, failure: str | None, missing_history_link: bool,
+) -> None:
+    await close_db()
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{tmp_path / 'links.db'}")
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            row, history, opened_at, closed_at = await _seed_missing_full_lifecycle(session)
+            position = Position(
+                model_name="ensemble_trader", execution_mode="paper", symbol="SLX/USDT",
+                side="long", quantity=1040.0, entry_price=0.07, current_price=0.071,
+                leverage=2.0, realized_pnl=-0.09254275, is_open=False,
+                created_at=opened_at, closed_at=closed_at,
+                okx_inst_id="SLX-USDT-SWAP", okx_pos_id="pos-full",
+                entry_exchange_order_id="entry-full-lifecycle",
+            )
+            session.add(position)
+            await session.flush()
+            history.position_ids = [str(position.id)]
+            row["_dashboard_position_ids"] = [str(position.id)]
+            if missing_history_link:
+                history.close_order_ids = []
+                row["_dashboard_close_order_ids"] = []
+            close_order = (await session.execute(
+                select(Order).where(Order.exchange_order_id == "close-full-lifecycle")
+            )).scalar_one()
+            if failure == "wrong_position":
+                position.okx_pos_id = "unrelated"
+            elif failure == "wrong_quantity":
+                position.quantity = 1050.0
+            elif failure == "unconfirmed":
+                close_order.okx_raw_fills = {**close_order.okx_raw_fills, "fills_history_confirmed": False}
+            elif failure == "other_owner":
+                session.add(Position(
+                    model_name="other", execution_mode="paper", symbol="SLX/USDT",
+                    side="long", quantity=1040.0, entry_price=0.07, leverage=2.0,
+                    is_open=False, closed_at=closed_at,
+                    close_exchange_order_id="close-full-lifecycle",
+                ))
+            elif failure == "wrong_price":
+                close_order.price = 0.073
+            elif failure == "wrong_time":
+                close_order.filled_at = closed_at - timedelta(seconds=1)
+            elif failure == "partial":
+                history.close_status = "partial"
+            elif failure == "wrong_entry":
+                position.entry_exchange_order_id = "different-entry"
+            elif failure == "wrong_mode":
+                close_order.execution_mode = "live"
+            await session.flush()
+            result = await repair_missing_okx_lifecycle_fragments(
+                session, mode="paper", position_history_rows=[row],
+                now=closed_at + timedelta(minutes=1),
+            )
+            recovered = [s for s in result["samples"] if s["kind"] == "okx_lifecycle_close_link_recovered"]
+            assert bool(recovered) is (failure is None)
+            assert position.close_exchange_order_id == (
+                "close-full-lifecycle" if failure is None else None
+            )
+            assert position.realized_pnl == -0.09254275
+            assert position.current_price == 0.071
+            if failure is None:
+                assert result["created_count"] == 0
+                assert history.close_order_ids == ["close-full-lifecycle"]
+                assert position.settlement_raw["close_link_recovery"]["history_record_id"] == history.id
+                repeat = await repair_missing_okx_lifecycle_fragments(
+                    session, mode="paper", position_history_rows=[row],
+                    now=closed_at + timedelta(minutes=2),
+                )
+                assert repeat["repaired_order_link_count"] == 0
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_missing_full_lifecycle_is_recovered_once_and_waits_for_settlement(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
