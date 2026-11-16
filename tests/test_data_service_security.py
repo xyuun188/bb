@@ -225,24 +225,74 @@ async def test_derivatives_background_refresh_concurrency_is_bounded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_background_derivatives_refresh_skips_funding_and_open_interest() -> None:
+@pytest.mark.parametrize("require_funding", [False, True])
+async def test_background_derivatives_refresh_only_requires_funding_for_positions(
+    require_funding: bool,
+) -> None:
     service = _service()
-    calls: list[tuple[str, bool]] = []
+    calls: list[tuple[str, bool, bool]] = []
 
     async def refresh(
         symbol: str,
         *,
         required_only: bool = False,
+        require_funding: bool = False,
     ) -> dict[str, Any]:
-        calls.append((symbol, required_only))
+        calls.append((symbol, required_only, require_funding))
         return {"symbol": symbol}
 
     service._refresh_derivatives_snapshot = refresh  # type: ignore[method-assign]
 
-    result = await service._refresh_derivatives_snapshot_in_background("ETH/USDT")
+    result = await service._refresh_derivatives_snapshot_in_background(
+        "ETH/USDT", require_funding=require_funding,
+    )
 
     assert result == {"symbol": "ETH/USDT"}
-    assert calls == [("ETH/USDT", True)]
+    assert calls == [("ETH/USDT", True, require_funding)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cache_age", [None, 1, 60])
+@pytest.mark.parametrize("funding_available", [False, True])
+async def test_position_funding_refresh_is_nonblocking_even_with_fresh_price_cache(
+    cache_age: int | None,
+    funding_available: bool,
+) -> None:
+    service = _service()
+    service._derivatives_update_interval = 20.0
+    if cache_age is not None:
+        service._derivatives_cache["ETH/USDT"] = {
+            "updated_at": datetime.now(UTC) - timedelta(seconds=cache_age),
+            "data": {
+                "funding_data_available": funding_available,
+                "funding_rate": 0.001,
+                "funding_interval_minutes": 480,
+                "next_funding_time": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+                "funding_rate_observed_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+                "funding_rate_received_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+            },
+        }
+    service._derivatives_cache_has_required_facts = lambda _data: True
+    release = asyncio.Event()
+    calls = []
+
+    async def refresh(symbol, **kwargs):
+        calls.append((symbol, kwargs))
+        await release.wait()
+        return {"funding_data_available": True}
+
+    service._refresh_derivatives_snapshot = refresh
+    result = await asyncio.wait_for(
+        service._get_derivatives_snapshot(
+            "ETH/USDT", block_on_remote=False, require_funding=True,
+        ),
+        timeout=0.1,
+    )
+    assert result["derivatives_refresh_in_background"] is True
+    task = service._derivatives_refresh_tasks["ETH/USDT"]
+    release.set()
+    await task
+    assert calls == [("ETH/USDT", {"required_only": True, "require_funding": True})]
 
 
 @pytest.mark.asyncio
@@ -2512,7 +2562,7 @@ def test_last_trade_outside_current_book_is_not_cache_corruption() -> None:
 async def test_market_batch_does_not_schedule_derivatives_refresh() -> None:
     service = _service()
     scheduled: list[str] = []
-    service._schedule_derivatives_background_refresh = scheduled.append  # type: ignore[method-assign]
+    service._schedule_derivatives_background_refresh = lambda symbol, **_kwargs: scheduled.append(symbol)  # type: ignore[method-assign]
 
     result = await service._get_derivatives_snapshot(
         "PROS/USDT",
@@ -2656,7 +2706,7 @@ async def test_recent_incomplete_derivatives_cache_suppresses_retry_storm() -> N
         },
     }
     scheduled: list[str] = []
-    service._schedule_derivatives_background_refresh = scheduled.append  # type: ignore[method-assign]
+    service._schedule_derivatives_background_refresh = lambda symbol, **_kwargs: scheduled.append(symbol)  # type: ignore[method-assign]
 
     result = await service._get_derivatives_snapshot(
         "PROS/USDT",
@@ -2682,7 +2732,7 @@ async def test_incomplete_derivatives_cache_retries_after_backoff() -> None:
         },
     }
     scheduled: list[str] = []
-    service._schedule_derivatives_background_refresh = scheduled.append  # type: ignore[method-assign]
+    service._schedule_derivatives_background_refresh = lambda symbol, **_kwargs: scheduled.append(symbol)  # type: ignore[method-assign]
 
     result = await service._get_derivatives_snapshot(
         "PROS/USDT",

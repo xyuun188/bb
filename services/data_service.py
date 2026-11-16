@@ -4360,7 +4360,9 @@ class DataService:
                 and not block_on_remote
             ):
                 if allow_background_refresh:
-                    self._schedule_derivatives_background_refresh(normalized)
+                    self._schedule_derivatives_background_refresh(
+                        normalized, require_funding=require_funding,
+                    )
                 data = cached_data
                 if data:
                     data["derivatives_snapshot_stale"] = True
@@ -4368,7 +4370,9 @@ class DataService:
                 return data
             if not block_on_remote:
                 if allow_background_refresh:
-                    self._schedule_derivatives_background_refresh(normalized)
+                    self._schedule_derivatives_background_refresh(
+                        normalized, require_funding=require_funding,
+                    )
                 data = cached_data
                 if data:
                     data["derivatives_snapshot_stale"] = True
@@ -4413,7 +4417,9 @@ class DataService:
                 return {"derivatives_refresh_in_background": True}
         if not block_on_remote:
             if allow_background_refresh:
-                self._schedule_derivatives_background_refresh(normalized)
+                self._schedule_derivatives_background_refresh(
+                    normalized, require_funding=require_funding,
+                )
                 return {"derivatives_refresh_in_background": True}
             return {}
         # Market scans only need executable facts. Funding is fetched for a
@@ -4540,7 +4546,9 @@ class DataService:
                 return False
         return True
 
-    def _schedule_derivatives_background_refresh(self, symbol: str) -> None:
+    def _schedule_derivatives_background_refresh(
+        self, symbol: str, *, require_funding: bool = False,
+    ) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -4555,7 +4563,9 @@ class DataService:
         if existing_task and not existing_task.done():
             return
         task = loop.create_task(
-            self._refresh_derivatives_snapshot_in_background(normalized)
+            self._refresh_derivatives_snapshot_in_background(
+                normalized, require_funding=require_funding,
+            )
         )
         tasks[normalized] = task
 
@@ -4575,18 +4585,27 @@ class DataService:
     async def _refresh_derivatives_snapshot_in_background(
         self,
         symbol: str,
+        *,
+        require_funding: bool = False,
     ) -> dict[str, Any]:
         async with self._derivatives_background_refresh_gate():
             refresh_fn = self._refresh_derivatives_snapshot
-            try:
-                # Broad discovery refreshes executable facts only. Funding and
-                # open interest are fetched for final candidates, not fanned
-                # out across the entire scan universe.
-                return await refresh_fn(symbol, required_only=True)
-            except TypeError as exc:
-                if "required_only" not in safe_error_text(exc):
-                    raise
-                return await refresh_fn(symbol)
+            # Position reviews also need a current funding receipt, without
+            # blocking exits or expanding optional requests to broad scans.
+            refresh_kwargs = {"required_only": True, "require_funding": require_funding}
+            for _attempt in range(2):
+                try:
+                    return await refresh_fn(symbol, **refresh_kwargs)
+                except TypeError as exc:
+                    error_text = safe_error_text(exc)
+                    unsupported = next(
+                        (key for key in ("require_funding", "required_only") if key in error_text),
+                        None,
+                    )
+                    if unsupported is None:
+                        raise
+                    refresh_kwargs.pop(unsupported)
+            return await refresh_fn(symbol)
 
     async def _refresh_derivatives_snapshot(
         self,

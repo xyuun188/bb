@@ -1342,6 +1342,7 @@ def test_market_auto_feature_fetch_can_build_cached_indicator_snapshots() -> Non
         "allow_cached_indicator_build": True,
         "allow_indicator_background_refresh": False,
         "allow_derivatives_background_refresh": True,
+        "require_funding": False,
     }
 
 
@@ -1357,6 +1358,7 @@ def test_position_discovery_refreshes_derivatives_without_blocking_round() -> No
     assert options["allow_cached_indicator_build"] is True
     assert options["allow_indicator_background_refresh"] is True
     assert options["allow_derivatives_background_refresh"] is True
+    assert options["require_funding"] is True
 
 
 @pytest.mark.asyncio
@@ -11639,6 +11641,11 @@ async def test_current_position_management_refresh_bulk_loads_entry_orders_once(
 
         async def execute(self, _statement):
             self.execute_count += 1
+            if "FOR UPDATE" in str(_statement):
+                position_ids = _statement.compile().params["id_1"]
+                return FakeScalarResult([
+                    position for position in positions if position.id in position_ids
+                ])
             return FakeScalarResult(orders if self.execute_count == 1 else decisions)
 
     monkeypatch.setattr(
@@ -11710,7 +11717,7 @@ async def test_current_position_management_refresh_bulk_loads_entry_orders_once(
     )
 
     assert refreshed == 2
-    assert session.execute_count == 2
+    assert session.execute_count == 4
     assert positions[0].current_management_contract["original_entry_contract_status"] == "complete_at_entry"
     assert positions[1].current_management_contract["original_entry_contract_status"] == "complete_at_entry"
     assert positions[0].current_management_contract["entry_fee_usdt"] == 0.2

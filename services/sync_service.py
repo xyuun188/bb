@@ -2916,12 +2916,31 @@ class OkxSyncService:
                     ),
                 }
             )
-            previous = _dict_value(fragments[0].current_management_contract)
+            # Exit submission updates these rows independently while exchange
+            # facts are fetched. Read its latest state under the same row lock
+            # before replacing the management JSON.
+            locked_rows = (
+                await session.execute(
+                    select(Position.id, Position.current_management_contract)
+                    .where(Position.id.in_([position.id for position in fragments]))
+                    .order_by(Position.id)
+                    .with_for_update()
+                )
+            ).all()
+            locked_contracts = {
+                row.id: _dict_value(row.current_management_contract)
+                for row in locked_rows
+            }
+            if any(position.id not in locked_contracts for position in fragments):
+                raise RuntimeError("current-position management refresh lost its lifecycle rows")
+            previous = locked_contracts[fragments[0].id]
             contract = build_current_position_management_contract(
                 facts,
                 previous_contract=previous,
             )
-            contract = preserve_exit_execution_intent(previous, contract)
+            contract = preserve_exit_execution_intent(
+                [locked_contracts[position.id] for position in fragments], contract,
+            )
             for position, authoritative_entry_fee in fragment_entry_fees:
                 if entry_fee_evidence_complete:
                     position.entry_fee = authoritative_entry_fee

@@ -498,12 +498,33 @@ def preserve_exit_execution_intent(
     previous_contract: Any,
     refreshed_contract: dict[str, Any],
 ) -> dict[str, Any]:
-    """Keep the lifecycle lease when periodic position facts rebuild the contract."""
+    """Keep the latest lease and confirmed profit fills across lifecycle fragments."""
 
     merged = dict(refreshed_contract)
-    previous = previous_contract if isinstance(previous_contract, dict) else {}
+    contracts = previous_contract if isinstance(previous_contract, list) else [previous_contract]
     for key in (EXIT_INTENT_KEY, PROFIT_LOCK_LEDGER_KEY):
-        value = previous.get(key)
-        if isinstance(value, dict) and value:
-            merged[key] = dict(value)
+        values = [
+            contract[key]
+            for contract in contracts
+            if isinstance(contract, dict)
+            and isinstance(contract.get(key), dict)
+            and contract[key]
+        ]
+        if not values:
+            continue
+        def updated_at(value: dict[str, Any]) -> datetime:
+            return ExitExecutionSingleFlightService._parse_time(value.get("updated_at")) or (
+                datetime.min.replace(tzinfo=UTC)
+            )
+
+        value = max(
+            values,
+            key=(
+                updated_at if key == EXIT_INTENT_KEY else lambda item: (
+                    ExitExecutionSingleFlightService._safe_float(item.get("realized_quantity"), 0.0),
+                    updated_at(item),
+                )
+            ),
+        )
+        merged[key] = dict(value)
     return merged

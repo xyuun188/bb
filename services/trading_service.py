@@ -5917,6 +5917,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             # cold or expired derivatives cache can keep every candidate at
             # zero depth indefinitely.
             "allow_derivatives_background_refresh": True,
+            "require_funding": bool(run_position_analysis and not run_market_analysis),
         }
 
     def _runtime_state(self, scope: str | None = None) -> _AnalysisRuntimeState:
@@ -14652,6 +14653,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                             wait_for_sentiment=False,
                             block_on_remote_indicators=False,
                             block_on_remote_derivatives=False,
+                            require_funding=True,
                         ),
                         timeout=feature_timeout,
                     )

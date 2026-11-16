@@ -257,6 +257,35 @@ def test_position_contract_refresh_preserves_exit_lease_without_stale_policy_fie
     assert merged[PROFIT_LOCK_LEDGER_KEY] is not previous[PROFIT_LOCK_LEDGER_KEY]
 
 
+@pytest.mark.parametrize("reverse_fragments", [False, True])
+def test_refresh_preserves_latest_intent_and_largest_confirmed_profit_ledger(
+    reverse_fragments: bool,
+) -> None:
+    contracts = [
+        {
+            EXIT_INTENT_KEY: {"token": "older", "updated_at": "2026-11-16T07:30:00Z"},
+            PROFIT_LOCK_LEDGER_KEY: {
+                "realized_quantity": 4.0,
+                "updated_at": "2026-11-16T07:30:00Z",
+                "intent_fill_quantities": {"older": 4.0},
+            },
+        },
+        {
+            EXIT_INTENT_KEY: {"token": "latest", "updated_at": "2026-11-16T07:51:05Z"},
+            PROFIT_LOCK_LEDGER_KEY: {
+                "realized_quantity": 3.0,
+                "updated_at": "2026-11-16T07:51:05Z",
+            },
+        },
+    ]
+    if reverse_fragments:
+        contracts.reverse()
+    merged = preserve_exit_execution_intent(contracts, {"management_eligible": True})
+    assert merged[EXIT_INTENT_KEY]["token"] == "latest"
+    assert merged[PROFIT_LOCK_LEDGER_KEY]["realized_quantity"] == pytest.approx(4.0)
+    assert merged[PROFIT_LOCK_LEDGER_KEY]["intent_fill_quantities"] == {"older": 4.0}
+
+
 @pytest.mark.asyncio
 async def test_confirmed_profit_lock_fill_updates_separate_idempotent_ledger() -> None:
     position = _position()

@@ -15,6 +15,7 @@ from services.current_position_management import (
     current_position_management_contract_complete,
     protection_coverage_evidence,
 )
+from services.exit_execution_singleflight import EXIT_INTENT_KEY, PROFIT_LOCK_LEDGER_KEY
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
@@ -540,9 +541,11 @@ def test_okx_close_fill_order_payload_does_not_invent_contract_size_authority() 
     assert payload["okx_raw_fills"]["contract_size_source"] == "missing"
 
 
+@pytest.mark.parametrize("concurrent_exit", [False, True])
 @pytest.mark.asyncio
 async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_position(
     monkeypatch: pytest.MonkeyPatch,
+    concurrent_exit: bool,
 ) -> None:
     first = SimpleNamespace(
         id=1,
@@ -652,6 +655,27 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
 
         async def execute(self, _statement):
             self.calls += 1
+            if "FOR UPDATE" in str(_statement):
+                return Result([
+                    SimpleNamespace(id=1, current_management_contract={}),
+                    SimpleNamespace(
+                        id=2,
+                        current_management_contract=(
+                            {
+                                EXIT_INTENT_KEY: {
+                                    "state": "exchange_progress_confirmed",
+                                    "token": "new-confirmed-exit",
+                                    "updated_at": "2026-11-16T07:51:05+00:00",
+                                },
+                                PROFIT_LOCK_LEDGER_KEY: {
+                                    "realized_quantity": 0.5,
+                                    "updated_at": "2026-11-16T07:51:05+00:00",
+                                },
+                            }
+                            if concurrent_exit else {}
+                        ),
+                    ),
+                ])
             return Result(orders if self.calls == 1 else decision_rows)
 
     monkeypatch.setattr(
@@ -711,6 +735,9 @@ async def test_management_refresh_builds_one_contract_for_fragmented_okx_net_pos
     assert contract["contracts"] == pytest.approx(3.0)
     assert contract["normal_paper_lifecycle"]["selection_reason"] == "paper_training_entry"
     assert contract["normal_paper_lifecycle"]["entry_decision_id"] == 11
+    if concurrent_exit:
+        assert contract[EXIT_INTENT_KEY]["token"] == "new-confirmed-exit"
+        assert contract[PROFIT_LOCK_LEDGER_KEY]["realized_quantity"] == pytest.approx(0.5)
     assert current_position_management_contract_complete(
         SimpleNamespace(
             symbol="BTC/USDT",
@@ -808,6 +835,10 @@ async def test_management_refresh_adds_only_matching_lifecycle_funding_bills(
 
         async def execute(self, _statement):
             self.execute_count += 1
+            if "FOR UPDATE" in str(_statement):
+                return Result([
+                    SimpleNamespace(id=position.id, current_management_contract={}),
+                ])
             return Result(
                 [order]
                 if self.execute_count == 1
@@ -865,7 +896,7 @@ async def test_management_refresh_adds_only_matching_lifecycle_funding_bills(
 
     contract = position.current_management_contract
     assert refreshed == 1
-    assert session.execute_count == 3
+    assert session.execute_count == 4
     assert contract["original_entry_contract_status"] == "complete_at_entry"
     assert contract["funding_fee_usdt"] == pytest.approx(12.5)
     assert contract["funding_bill_count"] == 1
