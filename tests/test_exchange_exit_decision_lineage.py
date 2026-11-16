@@ -9,6 +9,7 @@ from services.exchange_exit_decision_lineage import (
     _can_aggregate_close_positions,
     apply_exit_decision_lineage,
     choose_exit_decision_lineage,
+    decision_exit_exchange_order_ids,
     recover_exit_decision_lineage_from_order_fact,
 )
 
@@ -92,6 +93,97 @@ def test_multiple_production_decisions_for_one_order_fail_closed() -> None:
             [first, second],
             close_order_id="same-order",
         )
+
+
+@pytest.mark.parametrize("status", ["open", "partial", "filled"])
+@pytest.mark.parametrize("tracking_flag", ["existing_exit_order", "exit_replace_attempted"])
+def test_tracking_existing_close_cannot_claim_its_execution(
+    status: str, tracking_flag: str,
+) -> None:
+    observer = _decision(
+        826226,
+        {
+            "execution_result": {
+                "exchange_order_id": "okx-protection-close",
+                "status": status,
+                "quantity": 0.0,
+                "exchange_confirmed": False,
+                "raw_response": {
+                    "exit_tracking": True,
+                    tracking_flag: True,
+                    "id": "okx-protection-close",
+                    "info": {"ordId": "okx-protection-close"},
+                },
+            },
+        },
+    )
+    observer.was_executed = False
+
+    assert decision_exit_exchange_order_ids(observer) == set()
+    resolution = choose_exit_decision_lineage(
+        [observer],
+        close_order_id="okx-protection-close",
+        linked_decision=observer,
+        linked_order=SimpleNamespace(decision_id=observer.id),
+    )
+    assert resolution.authoritative is None
+
+
+def test_repeated_tracking_preserves_actual_submitter_and_external_protection_owner() -> None:
+    observations = [
+        _decision(
+            decision_id,
+            {
+                "execution_result": {
+                    "exchange_order_id": "okx-close",
+                    "raw_response": {"exit_tracking": True, "existing_exit_order": True},
+                },
+            },
+        )
+        for decision_id in [826188, 826226]
+    ]
+    for owner in [
+        _decision(1, {"execution_result": {"exchange_order_id": "okx-close"}}),
+        _decision(2, {"close_fill": {"order_id": "okx-close"}}, system_sync=True),
+    ]:
+        resolution = choose_exit_decision_lineage(
+            [*observations, owner], close_order_id="okx-close",
+        )
+        assert resolution.authoritative is owner
+        assert resolution.matched_decision_ids == (owner.id,)
+        assert resolution.superseded == ()
+
+
+def test_own_native_close_tracking_still_claims_submitted_order() -> None:
+    submitter = _decision(
+        1,
+        {
+            "execution_result": {
+                "exchange_order_id": "okx-own-close",
+                "raw_response": {"exit_tracking": True, "native_full_close": True},
+            },
+        },
+    )
+    assert decision_exit_exchange_order_ids(submitter) == {"okx-own-close"}
+
+
+def test_explicit_reconciliation_fact_survives_old_tracking_metadata() -> None:
+    reconciled = _decision(
+        1,
+        {
+            "close_fill": {"order_id": "okx-reconciled-close"},
+            "execution_result": {
+                "exchange_order_id": "old-observed-order",
+                "raw_response": {"exit_tracking": True, "existing_exit_order": True},
+            },
+        },
+        system_sync=True,
+    )
+    assert decision_exit_exchange_order_ids(reconciled) == {"okx-reconciled-close"}
+    resolution = choose_exit_decision_lineage(
+        [reconciled], close_order_id="okx-reconciled-close", linked_decision=reconciled,
+    )
+    assert resolution.authoritative is reconciled
 
 
 def test_distinct_close_fragments_can_aggregate_against_authoritative_quantity() -> None:

@@ -13,7 +13,7 @@ from models.decision import AIDecision
 from models.trade import Order, Position
 
 RECONCILE_ORIGIN_SYSTEM_EXECUTION = "system_execution"
-EXIT_LINEAGE_VERSION = "2026-07-15.okx-exit-decision-lineage.v1"
+EXIT_LINEAGE_VERSION = "2026-11-16.okx-exit-decision-lineage.v2"
 EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
 SUPERSEDED_POSITION_STATUS = "superseded_position_residual"
 SUPERSEDED_POSITION_REASONS = {
@@ -134,6 +134,15 @@ def _nested_order_ids(value: Any) -> set[str]:
     }
 
 
+def _observes_existing_exit_order(decision: Any) -> bool:
+    raw = _safe_dict(getattr(decision, "raw_llm_response", None))
+    execution_raw = _safe_dict(_safe_dict(raw.get("execution_result")).get("raw_response"))
+    return execution_raw.get("exit_tracking") is True and (
+        execution_raw.get("existing_exit_order") is True
+        or execution_raw.get("exit_replace_attempted") is True
+    )
+
+
 def decision_exit_exchange_order_ids(decision: Any) -> set[str]:
     """Read only execution/close paths; entry lineage cannot claim an exit fill."""
 
@@ -141,11 +150,18 @@ def decision_exit_exchange_order_ids(decision: Any) -> set[str]:
     execution = _safe_dict(raw.get("execution_result"))
     execution_raw = _safe_dict(execution.get("raw_response"))
     execution_info = _safe_dict(execution_raw.get("info"))
-    return set().union(
-        _nested_order_ids(execution),
+    close_ids = set().union(
         _nested_order_ids(raw.get("native_close_fill")),
         _nested_order_ids(raw.get("close_fill")),
         _nested_order_ids(execution.get("native_close_fill")),
+    )
+    # Inspecting another order (including a triggered OCO) does not submit it.
+    # Keep explicit reconciled close facts, but never promote an observer's
+    # copied order detail into ownership of the exchange execution.
+    if _observes_existing_exit_order(decision):
+        return close_ids
+    return close_ids.union(
+        _nested_order_ids(execution),
         _nested_order_ids(execution_raw),
         _nested_order_ids(execution_info),
     )
@@ -167,7 +183,10 @@ def choose_exit_decision_lineage(
         if order_id and order_id in decision_exit_exchange_order_ids(decision)
     ]
     by_id = {int(decision.id): decision for decision in exact}
-    if linked_decision is not None:
+    if linked_decision is not None and (
+        not _observes_existing_exit_order(linked_decision)
+        or order_id in decision_exit_exchange_order_ids(linked_decision)
+    ):
         by_id.setdefault(int(linked_decision.id), linked_decision)
     candidates = list(by_id.values())
     production = [
@@ -181,7 +200,11 @@ def choose_exit_decision_lineage(
             + ",".join(str(decision.id) for decision in production)
         )
     authoritative = production[0] if production else None
-    if authoritative is None and linked_decision is not None:
+    if (
+        authoritative is None
+        and linked_decision is not None
+        and int(linked_decision.id) in by_id
+    ):
         authoritative = linked_decision
     if authoritative is None:
         system_rows = [
