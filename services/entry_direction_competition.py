@@ -318,6 +318,7 @@ def _enforce_aggregate_contract_consistency(
         for side in ("long", "short")
         for item in evidence[side]
         if item.get("decision_eligible") is True
+        or item.get("direction_comparison_eligible") is True
     ]
     fields = [
         "objective_version",
@@ -337,6 +338,7 @@ def _enforce_aggregate_contract_consistency(
     ]
     for item in eligible:
         item["decision_eligible"] = False
+        item["direction_comparison_eligible"] = False
         item["aggregate_eligible"] = False
         item["observation_only"] = True
         item["eligibility_reason"] = blockers[0]
@@ -431,6 +433,11 @@ class EntryDirectionCompetitionPolicy:
                     or item.get("loss_probability") is not None
                 ):
                     continue
+                # Missing ordinary-loss risk blocks this side's entry, but a
+                # validated return distribution still provides its baseline.
+                item["direction_comparison_eligible"] = bool(
+                    item.get("decision_eligible") is True
+                )
                 item.update(
                     decision_eligible=False,
                     paper_eligible=False,
@@ -478,6 +485,7 @@ class EntryDirectionCompetitionPolicy:
                 # needs a fair long-vs-short comparison.
                 item["direction_comparison_eligible"] = bool(
                     item.get("decision_eligible") is True
+                    or item.get("direction_comparison_eligible") is True
                 )
                 item["decision_eligible"] = False
                 item["paper_eligible"] = False

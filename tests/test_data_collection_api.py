@@ -1086,9 +1086,7 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
             return True
 
         async def train(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-            captured["args"] = args
-            captured["kwargs"] = kwargs
-            return {"trained": True}
+            raise AssertionError("manual refresh must use the canonical isolated worker")
 
     monkeypatch.setattr(
         data_collection_module._dash,
@@ -1096,22 +1094,29 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
         lambda: FakeLocalAIToolsClient(),
     )
 
-    async def fake_shadow(_limit: int | None = None) -> list[dict[str, Any]]:
-        return [
-            {
-                "symbol": "BTC/USDT",
-                "decision_action": "hold",
-                "decision_confidence": 0.01,
-                "horizon_minutes": 30,
-                "features": {"current_price": 100.0, "spread_pct": 0.01},
-                "long_return_pct": 0.1,
-                "short_return_pct": -0.2,
-            }
-        ]
+    async def forbidden_shadow(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        raise AssertionError("Dashboard process must not read the training history")
+
+    worker_result = {
+        "trained": True,
+        "artifact_persisted": True,
+        "live_ml_ready": False,
+        "training_mode": "walk_forward",
+        "quality_report": {"source": "canonical_worker"},
+    }
+
+    async def worker() -> dict[str, Any]:
+        captured["worker_called"] = True
+        return worker_result
+
+    monkeypatch.setattr(
+        "services.model_training_coordinator.run_local_ai_tools_training_worker",
+        worker,
+    )
 
     monkeypatch.setattr(
         "scripts.train_local_ai_tools_models._load_shadow_samples",
-        fake_shadow,
+        forbidden_shadow,
     )
     monkeypatch.setattr(
         "scripts.train_local_ai_tools_models._load_trade_samples",
@@ -1136,23 +1141,8 @@ async def test_training_governance_refresh_trains_local_tools_without_trading_se
 
     result = await data_collection_module._train_local_ai_tools_from_dashboard()
 
-    assert result["trained"] is True
-    assert captured["kwargs"]["source"] == "dashboard_training_governance_refresh"
-    assert captured["kwargs"]["persist_artifact"] is True
-    assert captured["kwargs"]["confirm_phase3_rebuild"] is True
-    assert captured["kwargs"]["governance_report"]["cleanup_mode"] == "quarantine_not_delete"
-    assert captured["kwargs"]["promotion_recommendation"]["policy"] == (
-        "2026-07-24.model-owned-return-promotion.v3"
-    )
-    assert result["return_objective_report"]["objective_name"] == (
-        "maximize_expected_realized_net_return_after_cost"
-    )
-    assert result["persist_artifact_requested"] is True
-    assert result["confirm_phase3_rebuild"] is True
-    assert result["promotion_recommendation"]["policy"] == (
-        "2026-07-24.model-owned-return-promotion.v3"
-    )
-    assert result["promotion_recommendation"]["live_ml_ready"] is False
+    assert captured == {"worker_called": True}
+    assert result == worker_result
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ import pytest
 
 from services.entry_direction_competition import (
     EntryDirectionCompetitionPolicy,
+    _enforce_aggregate_contract_consistency,
     _paper_quant_quality_permissions,
 )
 from services.entry_direction_support import assess_paper_model_trade_support
@@ -729,6 +730,104 @@ def test_authorized_long_can_compare_against_unauthorized_short_observation() ->
     assert support["quant_evidence_families"] == ["local_ml"]
     assert context["short"]["evidence"][0]["decision_eligible"] is False
     assert context["short"]["evidence"][0]["direction_comparison_eligible"] is True
+
+
+@pytest.mark.parametrize("selected_side", ["long", "short"])
+@pytest.mark.parametrize("source", ["local_ml", "server_profit"])
+@pytest.mark.parametrize("blueprint_blocks_opposite", [False, True])
+def test_missing_opposite_loss_probability_keeps_only_return_comparison(
+    selected_side, source, blueprint_blocks_opposite,
+) -> None:
+    opposite = "short" if selected_side == "long" else "long"
+    payload = _paper_payload(
+        1.2 if selected_side == "long" else -0.3,
+        1.2 if selected_side == "short" else -0.3,
+    )
+    payload.pop(f"{opposite}_loss_probability")
+    if source == "local_ml":
+        payload["predictions"] = [{
+            "return_distribution_contract": deepcopy(payload["return_distribution_contract"]),
+        }]
+    signal = payload if source == "local_ml" else None
+    if blueprint_blocks_opposite:
+        signal = signal or {}
+        signal["strategy_blueprint"] = {
+            "version": "blueprint-v1",
+            "model_version": "model-v1",
+            "paper_execution_eligible": True,
+            "live_execution_permission": False,
+            "eligible_sides": [selected_side],
+        }
+    context = _context(
+        ml=signal,
+        tools={"profit_prediction": payload} if source == "server_profit" else None,
+        strategy={"execution_mode": "paper"},
+    )
+    row = next(item for item in context[opposite]["evidence"] if item["source"] == source)
+    assert row["loss_probability"] is None
+    assert row["direction_comparison_eligible"] is True
+    assert row["decision_eligible"] is False
+    assert row["paper_eligible"] is False
+    assert row["production_eligible"] is False
+    if blueprint_blocks_opposite and source == "local_ml":
+        assert row["model_strategy_side_authorization"]["eligible"] is False
+    assert context[opposite]["score"] is None
+    assert context["preferred_side"] == selected_side
+    support = assess_paper_model_trade_support(context, [], selected_side, execution_cost_pct=0.1)
+    assert support["eligible"] is True
+    assert assess_paper_model_trade_support(
+        context, [], opposite, execution_cost_pct=0.1,
+    )["eligible"] is False
+
+
+@pytest.mark.parametrize("selected_side", ["long", "short"])
+def test_better_opposite_baseline_still_blocks_weaker_selected_direction(selected_side) -> None:
+    opposite = "short" if selected_side == "long" else "long"
+    payload = _paper_payload(
+        1.2 if selected_side == "long" else 1.8,
+        1.2 if selected_side == "short" else 1.8,
+    )
+    payload.pop(f"{opposite}_loss_probability")
+    context = _context(
+        tools={"profit_prediction": payload}, strategy={"execution_mode": "paper"},
+    )
+    support = assess_paper_model_trade_support(context, [], selected_side, execution_cost_pct=0.1)
+    assert support["eligible"] is False
+    assert "direction_support_quant_family_conflict" in support["blocking_reasons"]
+
+
+def test_contract_mismatch_revokes_comparison_only_baseline() -> None:
+    evidence = {
+        "long": [{"decision_eligible": True, "cost_model_version": "current"}],
+        "short": [{"direction_comparison_eligible": True, "cost_model_version": "old"}],
+    }
+    assert _enforce_aggregate_contract_consistency(evidence, include_horizon=False) == [
+        "direction_competition_cost_model_version_mismatch",
+    ]
+    for rows in evidence.values():
+        assert rows[0]["decision_eligible"] is False
+        assert rows[0]["direction_comparison_eligible"] is False
+
+
+@pytest.mark.parametrize("invalid_contract", ["missing", "wrong_side", "wrong_version"])
+def test_missing_opposite_probability_cannot_rescue_invalid_return_contract(invalid_contract) -> None:
+    payload = _paper_payload(1.2, -0.3)
+    payload.pop("short_loss_probability")
+    if invalid_contract == "missing":
+        payload["return_distribution_contract"].pop("short")
+    elif invalid_contract == "wrong_side":
+        payload["return_distribution_contract"]["short"]["side"] = "long"
+    else:
+        payload["return_distribution_contract"]["short"]["objective_version"] = "invalid"
+    context = _context(
+        tools={"profit_prediction": payload}, strategy={"execution_mode": "paper"},
+    )
+    row = next(item for item in context["short"]["evidence"] if item["source"] == "server_profit")
+    assert row.get("direction_comparison_eligible") is not True
+    assert row["decision_eligible"] is False
+    assert assess_paper_model_trade_support(
+        context, [], "long", execution_cost_pct=0.1,
+    )["eligible"] is False
 
 
 @pytest.mark.parametrize("training_side", ["long", "short"])

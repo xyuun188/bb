@@ -46,10 +46,7 @@ from services.okx_training_gate import okx_training_refresh_gate
 from services.secure_runtime_config import set_runtime_secret, strip_secret_env_updates
 from services.trading_params import DEFAULT_TRADING_PARAMS
 from services.training_data_quality import assess_text_sentiment_sample
-from services.training_epoch import (
-    CURRENT_TRAINING_EPOCH_POLICY,
-    load_training_epoch_start,
-)
+from services.training_epoch import load_training_epoch_start
 from services.vector_memory import get_vector_memory_service
 from web_dashboard.api import dashboard as _dash
 from web_dashboard.api.security import require_dashboard_write_access
@@ -1247,76 +1244,11 @@ async def _train_local_ai_tools_from_dashboard_process() -> dict[str, Any]:
     if not getattr(local_ai_tools, "enabled", lambda: False)():
         return {"trained": False, "reason": "disabled"}
     try:
-        from scripts.train_local_ai_tools_models import (
-            _completed_shadow_sample_count,
-            _completed_trade_sample_count,
-            _load_sequence_samples,
-            _load_shadow_samples,
-            _load_text_sentiment_samples,
-            _load_trade_samples,
+        from services.model_training_coordinator import (
+            run_local_ai_tools_training_worker,
         )
-        from services.model_promotion_policy import (
-            build_phase3_promotion_recommendation,
-            build_return_objective_report,
-            load_latest_paper_observation_report,
-        )
-        from services.training_data_quality import annotate_training_payload
 
-        shadow_samples = await _load_shadow_samples()
-        trade_samples = await _load_trade_samples()
-        sequence_samples = await _load_sequence_samples()
-        text_sentiment_samples = await _load_text_sentiment_samples()
-        payload = annotate_training_payload(
-            shadow_samples=shadow_samples,
-            trade_samples=trade_samples,
-            sequence_samples=sequence_samples,
-            text_sentiment_samples=text_sentiment_samples,
-        )
-        trainer = getattr(local_ai_tools, "train", None)
-        if not callable(trainer):
-            return {"trained": False, "reason": "train_method_missing"}
-        completed_shadow_count = await _completed_shadow_sample_count()
-        completed_trade_count = await _completed_trade_sample_count()
-        paper_observation_report = load_latest_paper_observation_report()
-        return_objective_report = build_return_objective_report(
-            trade_samples=payload["trade_samples"],
-            shadow_samples=payload["shadow_samples"],
-        )
-        promotion_recommendation = build_phase3_promotion_recommendation(
-            training_mode="shadow",
-            quality_report=payload["quality_report"],
-            governance_report=payload["governance_report"],
-            paper_observation_report=paper_observation_report,
-            completed_shadow_sample_count=completed_shadow_count,
-            completed_trade_sample_count=completed_trade_count,
-            return_objective_report=return_objective_report,
-        )
-        result = await trainer(
-            payload["shadow_samples"],
-            payload["trade_samples"],
-            payload["sequence_samples"],
-            payload["text_sentiment_samples"],
-            source="dashboard_training_governance_refresh",
-            completed_shadow_sample_count=completed_shadow_count,
-            completed_trade_sample_count=completed_trade_count,
-            trade_sample_cursor_policy=CURRENT_TRAINING_EPOCH_POLICY,
-            quality_report=payload["quality_report"],
-            governance_report=payload["governance_report"],
-            training_mode="shadow",
-            paper_observation_report=paper_observation_report,
-            promotion_recommendation=promotion_recommendation,
-            persist_artifact=True,
-            confirm_phase3_rebuild=True,
-        )
-        result.setdefault("quality_report", payload["quality_report"])
-        result.setdefault("governance_report", payload["governance_report"])
-        result.setdefault("return_objective_report", return_objective_report)
-        result.setdefault("promotion_recommendation", promotion_recommendation)
-        result.setdefault("paper_observation_report", paper_observation_report)
-        result.setdefault("trade_sample_cursor_policy", CURRENT_TRAINING_EPOCH_POLICY)
-        result.setdefault("persist_artifact_requested", True)
-        result.setdefault("confirm_phase3_rebuild", True)
-        return result
+        return await run_local_ai_tools_training_worker()
     except Exception as exc:
         return {
             "trained": False,

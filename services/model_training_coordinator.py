@@ -117,6 +117,98 @@ def training_process_env(base_env: Mapping[str, str] | None = None) -> dict[str,
     return env
 
 
+async def run_local_ai_tools_training_worker(
+    active_processes: set[asyncio.subprocess.Process] | None = None,
+) -> dict[str, Any]:
+    """Use the canonical bounded trainer for scheduled and Dashboard refreshes."""
+
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / "train_local_ai_tools_models.py"),
+        "--training-mode", "walk_forward",
+        "--persist-artifact", "--confirm-phase3-rebuild",
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *low_priority_training_command(command),
+        cwd=str(PROJECT_ROOT),
+        env=training_process_env(),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    tracked = active_processes if active_processes is not None else set()
+    tracked.add(process)
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=AUTO_TRAIN_LEASE_STALE_SECONDS,
+        )
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        return {
+            "trained": False,
+            "reason": "timeout",
+            "error": "isolated local AI tools training exceeded its scheduler lease",
+        }
+    finally:
+        tracked.discard(process)
+    try:
+        stdout_text = stdout.decode("utf-8")
+        result_frame = next(
+            (
+                line.removeprefix(LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX)
+                for line in reversed(stdout_text.splitlines())
+                if line.startswith(LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX)
+            ),
+            None,
+        )
+        if result_frame is None:
+            raise ValueError("local AI tools training result frame missing")
+        payload = json.loads(result_frame)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return {
+            "trained": False,
+            "reason": "invalid_training_response",
+            "error": (
+                safe_error_text(exc, limit=180)
+                if process.returncode == 0
+                else safe_error_tail(
+                    stderr.decode("utf-8", errors="replace"), limit=500,
+                    fallback=(
+                        "isolated local AI tools training exited with code "
+                        f"{process.returncode} without stderr"
+                    ),
+                )
+            ),
+        }
+    if not isinstance(payload, dict):
+        return {
+            "trained": False,
+            "reason": "invalid_training_response",
+            "error": "isolated local AI tools training result was not an object",
+        }
+
+    # Preserve the worker's structured failure so retry classification survives
+    # a nonzero exit (for example MemoryError or a database disconnect).
+    result = dict(payload)
+    if process.returncode != 0 and not str(result.get("error") or "").strip():
+        result["error"] = safe_error_tail(
+            stderr.decode("utf-8", errors="replace"), limit=500,
+            fallback=(
+                "isolated local AI tools training exited with code "
+                f"{process.returncode}"
+            ),
+        )
+    result.setdefault("trained", False)
+    if process.returncode != 0:
+        result.setdefault("reason", "error")
+    return result
+
+
 class ModelTrainingCoordinatorMixin:
     """Own model-training lifecycle for the trading orchestrator."""
 
@@ -1158,105 +1250,14 @@ class ModelTrainingCoordinatorMixin:
         return result
 
     async def _run_local_ai_tools_training_subprocess(self) -> dict[str, Any]:
-        command = [
-            sys.executable,
-            str(PROJECT_ROOT / "scripts" / "train_local_ai_tools_models.py"),
-            "--training-mode",
-            "walk_forward",
-            "--persist-artifact",
-            "--confirm-phase3-rebuild",
-        ]
-        process = await asyncio.create_subprocess_exec(
-            *low_priority_training_command(command),
-            cwd=str(PROJECT_ROOT),
-            env=training_process_env(),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        active_processes = self._training_process_set()
-        active_processes.add(process)
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=AUTO_TRAIN_LEASE_STALE_SECONDS,
-            )
-        except asyncio.CancelledError:
-            if process.returncode is None:
-                process.kill()
-                await process.wait()
-            raise
-        except TimeoutError:
-            process.kill()
-            await process.wait()
+        result = await run_local_ai_tools_training_worker(self._training_process_set())
+        if result.get("reason") == "timeout":
             self._record_training_subprocess_timeout(
                 scheduler_id="local_ai_tools_auto_train",
                 model_ids=LOCAL_AI_TOOL_MODEL_IDS,
-                error="isolated local AI tools training exceeded its scheduler lease",
+                error=str(result["error"]),
                 run_id=getattr(self, "_local_tools_active_training_run_id", None),
             )
-            return {
-                "trained": False,
-                "reason": "timeout",
-                "error": "isolated local AI tools training exceeded its scheduler lease",
-            }
-        finally:
-            active_processes.discard(process)
-        try:
-            stdout_text = stdout.decode("utf-8")
-            result_frame = next(
-                (
-                    line.removeprefix(LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX)
-                    for line in reversed(stdout_text.splitlines())
-                    if line.startswith(LOCAL_AI_TOOLS_TRAIN_RESULT_PREFIX)
-                ),
-                None,
-            )
-            if result_frame is None:
-                raise ValueError("local AI tools training result frame missing")
-            payload = json.loads(result_frame)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            return {
-                "trained": False,
-                "reason": "invalid_training_response",
-                "error": (
-                    safe_error_text(exc, limit=180)
-                    if process.returncode == 0
-                    else safe_error_tail(
-                        stderr.decode("utf-8", errors="replace"),
-                        limit=500,
-                        fallback=(
-                            "isolated local AI tools training exited with code "
-                            f"{process.returncode} without stderr"
-                        ),
-                    )
-                ),
-            }
-        if not isinstance(payload, dict):
-            return {
-                "trained": False,
-                "reason": "invalid_training_response",
-                "error": (
-                    "isolated local AI tools training result was not an object"
-                ),
-            }
-
-        # The worker deliberately emits a structured failure frame before
-        # exiting non-zero.  Parse that frame first so MemoryError, database
-        # disconnects, and timeouts retain their retry classification instead
-        # of being collapsed into the opaque "no structured result" error.
-        result = dict(payload)
-        if process.returncode != 0 and not str(result.get("error") or "").strip():
-            result["error"] = safe_error_tail(
-                stderr.decode("utf-8", errors="replace"),
-                limit=500,
-                fallback=(
-                    "isolated local AI tools training exited with code "
-                    f"{process.returncode}"
-                ),
-            )
-        result.setdefault("trained", False)
-        if process.returncode != 0:
-            result.setdefault("reason", "error")
         return result
 
     async def _run_local_ai_tools_training_cursor_subprocess(self) -> dict[str, Any]:

@@ -83,16 +83,6 @@ def _current_funding_fields() -> dict[str, Any]:
     }
 
 
-def test_local_ai_tools_training_subprocess_requests_governed_walk_forward() -> None:
-    source = inspect.getsource(
-        trading_service.TradingService._run_local_ai_tools_training_subprocess
-    )
-
-    assert '"--training-mode"' in source
-    assert '"walk_forward"' in source
-    assert '"--model-stage"' not in source
-
-
 @pytest.mark.parametrize(
     ("total_count", "concurrency", "expected"),
     [
@@ -3942,6 +3932,7 @@ async def test_local_ai_tools_training_uses_framed_result_after_stdout_logs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = TradingService.__new__(TradingService)
+    captured: dict[str, Any] = {}
 
     class FakeProcess:
         returncode = 0
@@ -3954,7 +3945,9 @@ async def test_local_ai_tools_training_uses_framed_result_after_stdout_logs(
                 b"",
             )
 
-    async def fake_create_subprocess_exec(*_args: str, **_kwargs: Any) -> FakeProcess:
+    async def fake_create_subprocess_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
         return FakeProcess()
 
     monkeypatch.setattr(
@@ -3966,6 +3959,13 @@ async def test_local_ai_tools_training_uses_framed_result_after_stdout_logs(
     result = await service._run_local_ai_tools_training_subprocess()
 
     assert result == {"trained": True, "model_count": 6}
+    command = captured["args"]
+    assert command[command.index("--training-mode") + 1] == "walk_forward"
+    assert "--persist-artifact" in command
+    assert "--confirm-phase3-rebuild" in command
+    assert "--model-stage" not in command
+    assert captured["kwargs"]["env"]["BB_TRAINING_MAX_WORKERS"] == "1"
+    assert not service._training_process_set()
 
 
 @pytest.mark.asyncio
@@ -4028,6 +4028,53 @@ async def test_local_ai_tools_training_requires_framed_machine_result(
     assert result["trained"] is False
     assert result["reason"] == "invalid_training_response"
     assert result["error"] == "local AI tools training result frame missing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_shared_local_tools_worker_reaps_child_on_timeout_or_cancellation(
+    monkeypatch: pytest.MonkeyPatch, cancelled: bool,
+) -> None:
+    from services import model_training_coordinator as coordinator
+
+    started = asyncio.Event()
+    tracked: set[Any] = set()
+
+    class FakeProcess:
+        returncode = None
+        killed = False
+        waited = False
+
+        async def communicate(self):
+            started.set()
+            await asyncio.Event().wait()
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            self.waited = True
+            self.returncode = -9
+
+    process = FakeProcess()
+
+    async def create(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(coordinator.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(coordinator, "AUTO_TRAIN_LEASE_STALE_SECONDS", 0.01)
+    task = asyncio.create_task(coordinator.run_local_ai_tools_training_worker(tracked))
+    await started.wait()
+    if cancelled:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        result = await task
+        assert result["trained"] is False
+        assert result["reason"] == "timeout"
+    assert process.killed and process.waited
+    assert not tracked
 
 
 @pytest.mark.asyncio

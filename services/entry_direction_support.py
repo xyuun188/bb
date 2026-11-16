@@ -14,7 +14,7 @@ from services.normal_paper_trade import (
     normal_paper_entry_return_ready,
 )
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-11-17.scoped-paper-model-direction.v19"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-11-17.scoped-paper-model-direction.v20"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 PAPER_TRAINING_ENTRY_SCOPE = "paper_training_entry"
 MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY = (
