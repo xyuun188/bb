@@ -12,6 +12,7 @@ from typing import Any
 from ai_brain.base_model import DecisionOutput
 
 NORMAL_PAPER_TRADE_VERSION = "2026-11-14.normal-paper-strategy-trade.v23"
+NORMAL_PAPER_SIDE_SELECTION_POLICY = "2026-11-17.quality-first-side-selection.v1"
 NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-11-14.normal-paper-dynamic-risk.v12"
 HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS = frozenset(
     {
@@ -519,10 +520,11 @@ def select_normal_paper_trade_side(
             }
         )
         quality_permissions = _dict(support.get("quant_quality_permissions"))
+        quality_permission_ready = _quality_permissions_ready(quality_permissions)
         observation_only = support.get("paper_quality_observation_only") is True
         quality_permission_denied = bool(
             quality_permissions
-            and not _quality_permissions_ready(quality_permissions)
+            and not quality_permission_ready
         )
         training_candidate = bool(
             current_edge
@@ -554,7 +556,7 @@ def select_normal_paper_trade_side(
             and support.get("strong_expert_opposition") is not True
             and not training_candidate
             and not observation_only
-            and _quality_permissions_ready(quality_permissions)
+            and quality_permission_ready
         )
         training_edge = training_candidate and not validated_edge
         if validated_edge or training_edge:
@@ -589,6 +591,7 @@ def select_normal_paper_trade_side(
                     "loss_probability": loss_probability,
                     "quant_evidence_families": families,
                     "selection_reason": selection_reason,
+                    "quality_permission_ready": quality_permission_ready,
                 }
             )
         elif current_edge and not ordinary_return_ready:
@@ -599,6 +602,9 @@ def select_normal_paper_trade_side(
     candidates.sort(
         key=lambda item: (
             item["selection_reason"] == "strategy_edge_selected",
+            # Compare equally scoped candidates by verified quality before
+            # allowing an uncalibrated model's larger prediction to dominate.
+            item["quality_permission_ready"],
             float(item["expected_net_return_pct"])
             if item["expected_net_return_pct"] is not None
             else float("-inf"),
@@ -619,7 +625,9 @@ def select_normal_paper_trade_side(
         first_objective = first["objective_net_return_pct"]
         second_objective = second["objective_net_return_pct"]
         if (
-            first_expected is not None
+            first["selection_reason"] == second["selection_reason"]
+            and first["quality_permission_ready"] == second["quality_permission_ready"]
+            and first_expected is not None
             and second_expected is not None
             and first_objective is not None
             and second_objective is not None
@@ -668,11 +676,16 @@ def select_normal_paper_trade_side(
 
     return {
         "version": NORMAL_PAPER_TRADE_VERSION,
+        "selection_policy": NORMAL_PAPER_SIDE_SELECTION_POLICY,
         "selected": bool(selected),
         "selected_side": selected["side"] if selected else "neutral",
         "selection_reason": selected["selection_reason"] if selected else "no_direction",
         "selected_support": dict(selected["support"]) if selected else {},
         "eligible_side_count": len(candidates),
+        "quality_permission_ready_by_side": {
+            side: _quality_permissions_ready(support.get("quant_quality_permissions"))
+            for side, support in by_side.items()
+        },
         "by_side": by_side,
         "blocking_reasons": blocking_reasons,
         "blocking_reasons_by_side": {

@@ -868,6 +868,96 @@ def test_validated_strategy_candidate_precedes_quality_observation_candidate() -
     assert selection["selection_reason"] == "strategy_edge_selected"
 
 
+@pytest.mark.parametrize("preferred_side", ["long", "short"])
+@pytest.mark.parametrize("unverified_expected", [0.35, 1.5])
+def test_training_selection_prefers_verified_quality_in_either_direction(
+    preferred_side: str, unverified_expected: float,
+) -> None:
+    other_side = "short" if preferred_side == "long" else "long"
+    verified = _support(preferred_side, expected_net=0.35, objective_net=-1.7)
+    verified["paper_training_only"] = True
+    unverified = _support(
+        other_side, expected_net=unverified_expected, objective_net=-1.7,
+    )
+    unverified["quant_quality_permissions"]["local_ml"][
+        "paper_execution_permission"
+    ] = False
+
+    selection = select_normal_paper_trade_side(
+        {preferred_side: verified, other_side: unverified},
+    )
+
+    assert selection["selected_side"] == preferred_side
+    assert selection["selection_reason"] == "paper_training_entry"
+    contract = build_normal_paper_trade_contract(
+        symbol="LIT/USDT", side=preferred_side,
+        selection_reason=selection["selection_reason"],
+        direction_support=selection["selected_support"],
+    )
+    assert contract["authorized"] is True
+    assert contract["paper_training_only"] is True
+    assert contract["production_permission"] is False
+
+
+@pytest.mark.parametrize("quality_ready", [True, False])
+@pytest.mark.parametrize("preferred_side", ["long", "short"])
+def test_training_same_quality_tier_preserves_return_ranking(
+    quality_ready: bool, preferred_side: str,
+) -> None:
+    other_side = "short" if preferred_side == "long" else "long"
+    supports = {
+        preferred_side: _support(preferred_side, expected_net=0.5, objective_net=-1.0),
+        other_side: _support(other_side, expected_net=0.2, objective_net=-1.0),
+    }
+    for support in supports.values():
+        support["quant_quality_permissions"]["local_ml"][
+            "paper_execution_permission"
+        ] = quality_ready
+
+    assert select_normal_paper_trade_side(supports)["selected_side"] == preferred_side
+
+
+@pytest.mark.parametrize("preferred_side", ["long", "short"])
+def test_quality_permission_flag_alone_cannot_gain_training_priority(
+    preferred_side: str,
+) -> None:
+    other_side = "short" if preferred_side == "long" else "long"
+    unverified = _support(other_side, expected_net=0.2, objective_net=-1.0)
+    unverified["quant_quality_permissions"]["local_ml"][
+        "paper_execution_evidence"
+    ] = {"sample_count": 0}
+    other = _support(preferred_side, expected_net=0.5, objective_net=-1.0)
+    other["quant_quality_permissions"]["local_ml"][
+        "paper_execution_permission"
+    ] = False
+
+    assert select_normal_paper_trade_side(
+        {preferred_side: other, other_side: unverified},
+    )["selected_side"] == preferred_side
+
+
+def test_equal_training_returns_and_quality_remain_neutral() -> None:
+    selection = select_normal_paper_trade_side({
+        side: _support(side, expected_net=0.35, objective_net=-1.7)
+        for side in ("long", "short")
+    })
+
+    assert selection["selected"] is False
+    assert selection["selected_side"] == "neutral"
+
+
+def test_equal_returns_do_not_erase_ordinary_entry_priority() -> None:
+    restricted = _support("short", expected_net=0.35, objective_net=0.1)
+    restricted["paper_training_only"] = True
+    selection = select_normal_paper_trade_side({
+        "long": _support("long", expected_net=0.35, objective_net=0.1),
+        "short": restricted,
+    })
+
+    assert selection["selected_side"] == "long"
+    assert selection["selection_reason"] == "strategy_edge_selected"
+
+
 def test_quality_observation_rejects_excessive_loss_probability() -> None:
     support = _quality_observation_support("long", loss_probability=0.61)
     selection = select_normal_paper_trade_side({"long": support})
