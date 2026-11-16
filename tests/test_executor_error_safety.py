@@ -4102,6 +4102,59 @@ async def test_okx_entry_preserves_normal_submission_without_confirmed_exit_bloc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", [Action.LONG, Action.SHORT])
+async def test_okx_entry_protection_and_size_use_execution_book_with_public_basis(action) -> None:
+    class Exchange(_EntryExitLiquidityCcxt):
+        async def publicGetMarketTicker(self, params):
+            return await _native_ticker(params, last=1.2, bid=1.199, ask=1.201)
+
+        async def executionGetMarketTicker(self, _params):
+            pytest.fail("entry quotes must reuse the execution book, not the demo ticker route")
+
+    exchange = Exchange()
+    executor = _executor(exchange)
+    decision = _entry_decision()
+    decision.action = action
+    decision.feature_snapshot = {"current_price": 1.2}
+
+    result = await executor.place_order(decision, override_balance=100.0)
+
+    assert result.status == OrderStatus.FILLED
+    assert len(exchange.create_calls) == 1
+    protection = exchange.create_calls[0][5]["attachAlgoOrds"][0]
+    if action == Action.LONG:
+        expected_stop, expected_take = 0.999 * (1 - 0.013), 1.001 * (1 + 0.027)
+        expected_price = 1.001
+    else:
+        expected_stop, expected_take = 1.001 * (1 + 0.013), 0.999 * (1 - 0.027)
+        expected_price = 0.999
+    assert float(protection["slTriggerPx"]) == pytest.approx(expected_stop)
+    assert float(protection["tpTriggerPx"]) == pytest.approx(expected_take)
+    rules = result.raw_response["okx_order_rules"]
+    assert rules["price"] == expected_price
+    assert rules["fill_risk_price"] == 1.1
+    refresh = rules["pre_submit_price_refresh"]
+    assert refresh["source"] == "okx_execution_order_book_immediately_before_submit"
+    assert refresh["analysis_ticker_price"] == 1.2
+    assert refresh["refreshed_price"] == expected_price
+    assert decision.feature_snapshot["current_price"] == 1.2
+    assert (await executor._fetch_native_ticker(decision.symbol))["last"] == 1.2
+
+
+@pytest.mark.asyncio
+async def test_okx_sdk_entry_does_not_use_public_quote_when_execution_book_is_stale(monkeypatch) -> None:
+    exchange = _EntryExitLiquidityCcxt(stale=True)
+    monkeypatch.setattr(okx_module, "OkxPerpetualSdkExchange", _EntryExitLiquidityCcxt)
+
+    result = await _executor(exchange).place_order(_entry_decision(), override_balance=100.0)
+
+    assert result.status == OrderStatus.REJECTED
+    assert result.raw_response["execution_blocker"] == "okx_pre_submit_execution_quote_unavailable"
+    assert "fresh execution order book" in result.raw_response["raw_error"]
+    assert exchange.create_calls == []
+
+
+@pytest.mark.asyncio
 async def test_okx_entry_rejects_before_submit_when_native_price_limit_is_invalid() -> None:
     exchange = _InvalidEntryPriceLimitCcxt()
     executor = _executor(exchange)

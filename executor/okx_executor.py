@@ -1598,6 +1598,24 @@ class OKXExecutor(AbstractExecutor):
                             decision.symbol, "sell" if side == "buy" else "buy"
                         ),
                     )
+                    analysis_submit_price = self._safe_float(submit_ticker.get("last"), 0.0)
+                    submit_quote_source = "okx_native_ticker_immediately_before_submit"
+                    execution_bid = self._safe_float(entry_exit_liquidity.get("best_bid"))
+                    execution_ask = self._safe_float(entry_exit_liquidity.get("best_ask"))
+                    if 0 < execution_bid <= execution_ask:
+                        # Protection and size must share the venue that will fill
+                        # this entry; a public/demo basis can distort both exits.
+                        submit_ticker = {
+                            **submit_ticker,
+                            "last": execution_ask if side == "buy" else execution_bid,
+                            "bid": execution_bid,
+                            "ask": execution_ask,
+                            "timestamp": entry_exit_liquidity["quote_timestamp_ms"],
+                        }
+                        submit_price_limit = entry_exit_liquidity["price_limits"]
+                        submit_quote_source = "okx_execution_order_book_immediately_before_submit"
+                    elif isinstance(ccxt, OkxPerpetualSdkExchange):
+                        raise ExchangeAPIError("OKX fresh execution order book or price limits unavailable")
                 except Exception as exc:
                     error_text = safe_error_text(exc)
                     logger.warning(
@@ -1850,8 +1868,9 @@ class OKXExecutor(AbstractExecutor):
                 )
                 okx_order_rules["entry_exit_liquidity"] = entry_exit_liquidity
                 okx_order_rules["pre_submit_price_refresh"] = {
-                    "source": "okx_native_ticker_immediately_before_submit",
+                    "source": submit_quote_source,
                     "previous_price": round(previous_price, 12),
+                    "analysis_ticker_price": analysis_submit_price,
                     "refreshed_price": round(price, 12),
                     "source_timestamp_ms": int(submit_ticker.get("timestamp") or 0),
                     "price_limit_timestamp_ms": int(
@@ -5198,11 +5217,15 @@ class OKXExecutor(AbstractExecutor):
                 return {}
             if (limits.get("price_limit_info") or {}).get("enabled") in (False, "false"):
                 return {}
-            prices = [
-                self._safe_float(level[0]) for level in book.get("asks" if side == "buy" else "bids") or []
-                if isinstance(level, (list, tuple)) and len(level) >= 2
-                and self._safe_float(level[0]) > 0 and self._safe_float(level[1]) > 0
-            ]
+            def side_prices(key: str) -> list[float]:
+                return [
+                    self._safe_float(level[0]) for level in book.get(key) or []
+                    if isinstance(level, (list, tuple)) and len(level) >= 2
+                    and self._safe_float(level[0]) > 0 and self._safe_float(level[1]) > 0
+                ]
+
+            bids, asks = side_prices("bids"), side_prices("asks")
+            prices = asks if side == "buy" else bids
             if not prices:
                 return {}
             quote = min(prices) if side == "buy" else max(prices)
@@ -5219,7 +5242,10 @@ class OKXExecutor(AbstractExecutor):
                 "reason": "no_quote_inside_execution_price_limit" if blocked else "quote_inside_execution_price_limit",
                 "side": side,
                 "opposing_quote": quote,
+                "best_bid": max(bids) if bids else 0.0,
+                "best_ask": min(asks) if asks else 0.0,
                 "allowed_price_bound": bound,
+                "price_limits": limits,
                 "quote_timestamp_ms": book.get("timestamp"),
                 "price_limit_timestamp_ms": limits.get("price_limit_timestamp_ms"),
                 "source": "okx_execution_market",
