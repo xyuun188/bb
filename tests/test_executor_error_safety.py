@@ -1049,6 +1049,38 @@ class _EntryMaxMarketSizeCcxt:
         raise AssertionError("order confirmation must use OKX native privateGetTradeOrder")
 
 
+class _EntryExitLiquidityCcxt(_EntryMaxMarketSizeCcxt):
+    def __init__(self, *, blocked_side: str | None = None, stale: bool = False) -> None:
+        super().__init__()
+        self.blocked_side = blocked_side
+        self.stale = stale
+
+    async def executionFetchOrderBook(self, _symbol: str) -> dict[str, Any]:
+        return {
+            "bids": [[0.999, 100.0]],
+            "asks": [[1.001, 100.0]],
+            "timestamp": int(datetime.now(UTC).timestamp() * 1000) - (60000 if self.stale else 0),
+        }
+
+    async def executionGetPublicPriceLimit(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": [{
+            "instId": params["instId"],
+            "enabled": True,
+            "buyLmt": "0.99" if self.blocked_side == "buy" else "1.1",
+            "sellLmt": "1.01" if self.blocked_side == "sell" else "0.9",
+            "ts": str(int(datetime.now(UTC).timestamp() * 1000)),
+        }]}
+
+    async def publicGetPublicPriceLimit(self, params: dict[str, Any]) -> dict[str, Any]:
+        return {"data": [{
+            "instId": params["instId"],
+            "enabled": True,
+            "buyLmt": "1.1",
+            "sellLmt": "0.9",
+            "ts": str(int(datetime.now(UTC).timestamp() * 1000)),
+        }]}
+
+
 class _MovingEntryTickerCcxt(_EntryMaxMarketSizeCcxt):
     def __init__(self) -> None:
         super().__init__()
@@ -4024,6 +4056,49 @@ async def test_okx_entry_rechecks_fresh_available_margin_before_submit() -> None
     assert result.raw_response["available_margin_usdt"] == 9.0
     assert result.raw_response["required_margin_usdt"] > 9.0
     assert exchange.create_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("action", "exit_side"), [(Action.LONG, "sell"), (Action.SHORT, "buy")])
+async def test_okx_entry_blocks_an_already_price_limited_exit(action, exit_side) -> None:
+    exchange = _EntryExitLiquidityCcxt(blocked_side=exit_side)
+    decision = _entry_decision()
+    decision.action = action
+
+    result = await _executor(exchange).place_order(decision, override_balance=100.0)
+
+    assert result.status == OrderStatus.REJECTED
+    assert result.raw_response["execution_blocker"] == "okx_entry_exit_price_limit_liquidity"
+    assert result.raw_response["system_pre_submit_rejection"] is True
+    assert result.raw_response["okx_rejection"] is False
+    report = result.raw_response["entry_exit_liquidity"]
+    assert report["side"] == exit_side
+    assert report["source"] == "okx_execution_market"
+    assert report["blocked"] is True
+    assert exchange.create_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("action", "exit_side"), [(Action.LONG, "sell"), (Action.SHORT, "buy")])
+@pytest.mark.parametrize("stale", [False, True])
+async def test_okx_entry_preserves_normal_submission_without_confirmed_exit_block(
+    action, exit_side, stale,
+) -> None:
+    exchange = _EntryExitLiquidityCcxt(blocked_side=exit_side if stale else None, stale=stale)
+    decision = _entry_decision()
+    decision.action = action
+
+    result = await _executor(exchange).place_order(decision, override_balance=100.0)
+
+    assert result.status == OrderStatus.FILLED
+    assert len(exchange.create_calls) == 1
+    assert exchange.create_calls[0][2] == ("buy" if action == Action.LONG else "sell")
+    report = result.raw_response["okx_order_rules"]["entry_exit_liquidity"]
+    if stale:
+        assert report == {}
+    else:
+        assert report["blocked"] is False
+        assert report["side"] == exit_side
 
 
 @pytest.mark.asyncio

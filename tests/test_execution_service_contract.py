@@ -1302,6 +1302,12 @@ def test_legacy_paper_training_entry_is_blocked_but_history_remains_trainable() 
         decision_feature_by_order_id={
             entry_result.exchange_order_id: entry_features
         },
+        decision_execution_by_order_id={
+            entry_result.exchange_order_id: {
+                "stop_loss_pct": decision.stop_loss_pct,
+                "take_profit_pct": decision.take_profit_pct,
+            }
+        },
     )
     outcome = build_authoritative_trade_outcome(sample)
     payload = annotate_training_payload(

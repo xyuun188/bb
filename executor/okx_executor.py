@@ -1591,9 +1591,12 @@ class OKXExecutor(AbstractExecutor):
                         )
                 previous_price = price
                 try:
-                    submit_ticker, submit_price_limit = await asyncio.gather(
+                    submit_ticker, submit_price_limit, entry_exit_liquidity = await asyncio.gather(
                         self._fetch_native_ticker(decision.symbol),
                         self._fetch_native_price_limit(decision.symbol),
+                        self._pending_exit_liquidity(
+                            decision.symbol, "sell" if side == "buy" else "buy"
+                        ),
                     )
                 except Exception as exc:
                     error_text = safe_error_text(exc)
@@ -1625,6 +1628,29 @@ class OKXExecutor(AbstractExecutor):
                     )
                 price = self._safe_float(submit_ticker.get("last"), 0.0)
                 ticker = {**submit_ticker, **submit_price_limit}
+                okx_order_rules["entry_exit_liquidity"] = entry_exit_liquidity
+                if entry_exit_liquidity.get("blocked") is True:
+                    return ExecutionResult(
+                        order_id="entry_exit_liquidity_blocked",
+                        symbol=decision.symbol,
+                        side=side,
+                        order_type="market",
+                        quantity=0.0,
+                        price=price,
+                        status=OrderStatus.REJECTED,
+                        raw_response={
+                            "error": (
+                                "OKX 执行盘口的反向平仓报价已超出交易所限价，"
+                                "本次开仓已在提交前拦截，避免进入无法及时退出的仓位。"
+                            ),
+                            "execution_blocker": "okx_entry_exit_price_limit_liquidity",
+                            "system_pre_submit_rejection": True,
+                            "okx_rejection": False,
+                            "okx_symbol": okx_symbol,
+                            "entry_exit_liquidity": entry_exit_liquidity,
+                            "okx_order_rules": okx_order_rules,
+                        },
+                    )
                 sizing = (
                     decision.raw_response.get("profit_risk_sizing")
                     if isinstance(decision.raw_response, dict)
@@ -1822,6 +1848,7 @@ class OKXExecutor(AbstractExecutor):
                     fill_risk_price=fill_risk_price,
                     authorized_fill_ceiling_usdt=self._sizing_fill_ceiling(decision),
                 )
+                okx_order_rules["entry_exit_liquidity"] = entry_exit_liquidity
                 okx_order_rules["pre_submit_price_refresh"] = {
                     "source": "okx_native_ticker_immediately_before_submit",
                     "previous_price": round(previous_price, 12),
@@ -5157,7 +5184,7 @@ class OKXExecutor(AbstractExecutor):
         }
 
     async def _pending_exit_liquidity(self, symbol: str, side: str) -> dict[str, Any]:
-        """Explain an unfilled market close using only its execution venue."""
+        """Check market-close liquidity using only fresh execution-venue facts."""
         try:
             ccxt = await self._get_ccxt()
             fetch_book = getattr(ccxt, "executionFetchOrderBook", None)
