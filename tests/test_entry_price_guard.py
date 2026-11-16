@@ -6,7 +6,7 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_opportunity_score import EntryOpportunityScorePolicy
-from services.entry_price_guard import EntryPriceGuardPolicy
+from services.entry_price_guard import EntryPriceGuardPolicy, paper_entry_execution_price_limit
 from services.normal_paper_trade import NORMAL_PAPER_TRADE_VERSION
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.trading_policies import EntryPolicy
@@ -504,3 +504,114 @@ async def test_final_paper_budget_cannot_use_missing_or_rebased_price(field: str
     decision.raw_response["pre_execution_price_check"][field] = None
 
     assert policy.final_price_budget_reason(decision, "paper") is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "price,checked,submit,expected,tick",
+    [
+        (0.04274, 0.042725, 0.04264, 0.10041862, 0.00001),  # CRO 828451
+        (0.09615, 0.096, 0.0958, 0.26865573, 0.00001),  # IMX 828485
+    ],
+)
+async def test_final_execution_quote_cannot_bypass_a_previously_positive_budget(
+    price: float, checked: float, submit: float, expected: float, tick: float,
+) -> None:
+    decision = _paper_decision(action=Action.SHORT, price=price, expected=expected)
+    assert await _paper_policy(
+        latest=checked, final_expected=expected,
+    ).prepare_dynamic_risk_contract(decision, "paper", []) is None
+
+    guard = paper_entry_execution_price_limit(
+        decision, "paper", latest_price=submit, tick_size=tick,
+    )
+
+    assert guard["eligible"] is False
+    assert guard["remaining_expected_net_return_pct"] < 0.0
+    assert decision.raw_response["pre_execution_price_check"]["latest_price"] == checked
+
+
+@pytest.mark.asyncio
+async def test_sushi_market_fallback_cannot_fill_below_the_signal_budget() -> None:
+    decision = _paper_decision(action=Action.SHORT, price=0.153, expected=0.21584328)
+    assert await _paper_policy(
+        latest=0.1528, final_expected=0.21584328,
+    ).prepare_dynamic_risk_contract(decision, "paper", []) is None
+
+    guard = paper_entry_execution_price_limit(
+        decision, "paper", latest_price=0.1527, tick_size=0.0001,
+    )
+
+    assert guard["eligible"] is True
+    assert guard["limit_price"] == pytest.approx(0.1527)
+    assert guard["limit_price"] > 0.15240104956268222  # Actual unbounded fill, 828488.
+    assert guard["remaining_expected_net_return_pct"] > 0.0
+    assert decision.raw_response["normal_paper_trade"]["objective_net_return_pct"] < 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "price,quote,fill,expected,tick",
+    [
+        (0.05844, 0.0589612, 0.0589346552653749, 0.84443495, 0.0000001),
+        (7.244, 7.242, 7.238231092436975, 1.10975784, 0.001),
+        (44.56, 44.5249, 44.52009735099339, 0.16097076, 0.0001),
+    ],
+)
+async def test_execution_cap_preserves_doge_avax_ltc_profitable_entry_prices(
+    price: float, quote: float, fill: float, expected: float, tick: float,
+) -> None:
+    decision = _paper_decision(action=Action.SHORT, price=price, expected=expected)
+    assert await _paper_policy(
+        latest=quote, final_expected=expected,
+    ).prepare_dynamic_risk_contract(decision, "paper", []) is None
+
+    guard = paper_entry_execution_price_limit(
+        decision, "paper", latest_price=quote, tick_size=tick,
+    )
+
+    assert guard["eligible"] is True
+    assert fill >= guard["limit_price"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", [Action.LONG, Action.SHORT])
+async def test_execution_limit_leaves_positive_budget_at_an_exact_tick_boundary(
+    action: Action,
+) -> None:
+    decision = _paper_decision(action=action, price=100.0, expected=1.0)
+    assert await _paper_policy(
+        latest=100.0, final_expected=1.0,
+    ).prepare_dynamic_risk_contract(decision, "paper", []) is None
+
+    guard = paper_entry_execution_price_limit(
+        decision, "paper", latest_price=100.0, tick_size=0.1,
+    )
+
+    assert guard["eligible"] is True
+    assert guard["limit_price"] == pytest.approx(100.9 if action == Action.LONG else 99.1)
+    assert guard["worst_remaining_expected_net_return_pct"] > 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tick", [0.0, float("nan")])
+async def test_execution_limit_requires_a_real_tick_size(tick: float) -> None:
+    decision = _paper_decision(action=Action.SHORT, price=100.0, expected=1.0)
+    assert await _paper_policy(
+        latest=100.0, final_expected=1.0,
+    ).prepare_dynamic_risk_contract(decision, "paper", []) is None
+
+    assert paper_entry_execution_price_limit(
+        decision, "paper", latest_price=100.0, tick_size=tick,
+    )["eligible"] is False
+
+
+def test_execution_limit_does_not_add_a_new_live_or_exit_gate() -> None:
+    decision = _paper_decision(action=Action.SHORT, price=100.0, expected=1.0)
+    assert paper_entry_execution_price_limit(
+        decision, "live", latest_price=1.0, tick_size=0.1,
+    ) is None
+    decision.action = Action.CLOSE_SHORT
+    assert paper_entry_execution_price_limit(
+        decision, "paper", latest_price=1.0, tick_size=0.1,
+    ) is None

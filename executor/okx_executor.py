@@ -44,6 +44,7 @@ from services.entry_post_only import (
     plan_entry_post_only,
     post_only_execution_fact,
 )
+from services.entry_price_guard import paper_entry_execution_price_limit
 from services.entry_profit_risk_sizing import (
     reconcile_profit_risk_sizing,
     select_okx_leverage_tier,
@@ -2088,6 +2089,26 @@ class OKXExecutor(AbstractExecutor):
                             "okx_order_rules": okx_order_rules,
                         },
                     )
+                execution_price_guard = paper_entry_execution_price_limit(
+                    decision, self.executor_mode,
+                    latest_price=price,
+                    tick_size=self._market_info_float(market, "tickSz", "price_tick"),
+                )
+                if execution_price_guard is not None:
+                    if execution_price_guard.get("eligible") is not True:
+                        return ExecutionResult(
+                            order_id="entry_return_budget_consumed", symbol=decision.symbol,
+                            side=side, order_type="limit", quantity=0.0, price=price,
+                            status=OrderStatus.REJECTED,
+                            raw_response={
+                                "execution_blocker": "entry_execution_return_budget",
+                                "system_pre_submit_rejection": True,
+                                "okx_rejection": False,
+                                "entry_execution_price_check": execution_price_guard,
+                                "error": "最终执行报价已超出信号收益预算，或价格证据不完整，未提交订单。",
+                            },
+                        )
+                    params["entry_execution_price_check"] = execution_price_guard
                 params["attachAlgoOrds"] = [
                     {
                         "tpTriggerPx": protection["take_profit_price"],
@@ -2280,6 +2301,15 @@ class OKXExecutor(AbstractExecutor):
                         market=market,
                         ticker=ticker,
                     )
+                    if params.get("entry_execution_price_check"):
+                        post_only_fact.update({
+                            "entry_execution_style": (
+                                "post_only_with_ioc_fallback"
+                                if post_only_fact.get("post_only_attempted") else "ioc"
+                            ),
+                            "fallback_order_type": "ioc",
+                            "entry_execution_price_check": params["entry_execution_price_check"],
+                        })
                 else:
                     order = await self._create_order_with_client_recovery(
                         ccxt,
@@ -2812,7 +2842,10 @@ class OKXExecutor(AbstractExecutor):
                 order_id=final_order_id,
                 symbol=result_symbol,
                 side=side,
-                order_type="market",
+                order_type=(
+                    "limit" if decision.is_entry and params.get("entry_execution_price_check")
+                    else "market"
+                ),
                 quantity=(
                     filled_base_quantity
                     if filled_base_quantity > 0
@@ -4541,6 +4574,25 @@ class OKXExecutor(AbstractExecutor):
     ) -> dict[str, Any]:
         """Submit once logically and recover an ambiguous OKX response by ``clOrdId``."""
 
+        params = dict(params)
+        entry_guard = params.pop("entry_execution_price_check", None)
+        if entry_guard is not None:
+            limit = self._safe_float(entry_guard.get("limit_price"))
+            if (
+                entry_guard.get("eligible") is not True
+                or entry_guard.get("side") != str(side).lower()
+                or limit <= 0.0
+            ):
+                raise OrderPlacementError("Entry execution return limit is invalid")
+            if order_type == "post_only":
+                if price is None or (price > limit if side == "buy" else price < limit):
+                    raise OrderPlacementError("Passive entry exceeds its approved return limit")
+            elif order_type == "market":
+                # Every fallback and recovery retry retains the original cap.
+                # IOC cancels unfilled size instead of chasing a consumed edge.
+                order_type, price = "ioc", limit
+            else:
+                raise OrderPlacementError("Unsupported bounded entry order type")
         try:
             return await self._with_retry(
                 ccxt.create_order,
@@ -4755,6 +4807,13 @@ class OKXExecutor(AbstractExecutor):
                 min(planned_price, execution_price_limit["buy_price_limit"])
                 if str(side).lower() in {"buy", "long"}
                 else max(planned_price, execution_price_limit["sell_price_limit"])
+            )
+        entry_guard = params.get("entry_execution_price_check") or {}
+        return_limit = self._safe_float(entry_guard.get("limit_price"))
+        if return_limit > 0.0:
+            planned_price = (
+                min(planned_price, return_limit) if side == "buy"
+                else max(planned_price, return_limit)
             )
         passive_price = self._passive_limit_price(
             ccxt,

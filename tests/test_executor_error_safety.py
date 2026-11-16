@@ -3797,6 +3797,51 @@ async def test_okx_entry_reprices_attached_protection_immediately_before_submit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("expected,allowed", [(1.0, False), (30.0, True)])
+async def test_final_paper_entry_rechecks_signal_after_executor_quote_refresh(
+    expected: float, allowed: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(okx_module.settings, "okx_entry_post_only_enabled", False)
+
+    class Exchange(_MovingEntryTickerCcxt):
+        def market(self, symbol):
+            result = super().market(symbol)
+            result["info"]["tickSz"] = "0.001"
+            return result
+
+    exchange = Exchange()
+    decision = _entry_decision()
+    decision.raw_response.update({
+        "normal_paper_trade": {"authorized": True},
+        "pre_execution_analysis_basis": {
+            "version": "2026-08-19.entry-analysis-basis.v1",
+            "validated": True, "symbol": decision.symbol,
+            "action": "long", "snapshot_price": 1.0,
+        },
+        "pre_execution_price_check": {
+            "snapshot_price": 1.0, "latest_price": 1.0, "return_budget_verified": True,
+        },
+    })
+    decision.raw_response["profit_risk_sizing"]["expected_net_return_pct"] = expected
+
+    result = await _executor(exchange).place_order(decision, override_balance=100.0)
+
+    assert decision.raw_response["entry_execution_price_check"]["latest_price"] == 1.2
+    if allowed:
+        assert result.status == OrderStatus.FILLED
+        assert result.order_type == "limit"
+        assert exchange.create_calls[0][1] == "ioc"
+        assert exchange.create_calls[0][4] == pytest.approx(1.299)
+        assert "entry_execution_price_check" not in exchange.create_calls[0][5]
+        assert exchange.create_calls[0][5]["attachAlgoOrds"]
+        assert result.raw_response["protection_submission"]["state"] == "confirmed"
+    else:
+        assert result.status == OrderStatus.REJECTED
+        assert result.raw_response["execution_blocker"] == "entry_execution_return_budget"
+        assert exchange.create_calls == []
+
+
+@pytest.mark.asyncio
 async def test_entry_cancellation_runs_exchange_cleanup_before_propagating(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

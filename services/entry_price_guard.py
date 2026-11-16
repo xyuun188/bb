@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from math import isfinite
 from typing import Any
 
@@ -96,6 +97,85 @@ def paper_entry_price_budget_reason(
             "等待基于最新行情重新分析。"
         )
     return None
+
+
+def paper_entry_execution_price_limit(
+    decision: DecisionOutput,
+    model_mode: str,
+    *,
+    latest_price: float,
+    tick_size: float,
+) -> dict[str, Any] | None:
+    """Carry the approved paper signal budget through the actual venue fill."""
+    raw = _safe_dict(decision.raw_response)
+    if (
+        str(model_mode or "").lower() != "paper"
+        or not decision.is_entry
+        or not _safe_dict(raw.get("normal_paper_trade"))
+    ):
+        return None
+    basis = _safe_dict(raw.get("pre_execution_analysis_basis"))
+    check = _safe_dict(raw.get("pre_execution_price_check"))
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    price = _safe_float(basis.get("snapshot_price"))
+    latest = _safe_float(latest_price)
+    tick = _safe_float(tick_size)
+    expected = _safe_float(sizing.get("expected_net_return_pct"))
+    result: dict[str, Any] = {
+        "version": "2026-11-17.paper-execution-return-budget.v1",
+        "eligible": False,
+        "reason": "paper_execution_return_budget_evidence_incomplete",
+        "side": "buy" if decision.action == Action.LONG else "sell",
+        "snapshot_price": price,
+        "latest_price": latest,
+        "expected_net_return_pct": expected,
+        "tick_size": tick,
+        "fallback_order_type": "ioc",
+    }
+    if (
+        sizing.get("production_eligible") is True
+        and basis.get("version") == "2026-08-19.entry-analysis-basis.v1"
+        and basis.get("validated") is True
+        and basis.get("symbol") == decision.symbol
+        and basis.get("action") == decision.action.value
+        and _safe_float(check.get("snapshot_price")) == price
+        and check.get("return_budget_verified") is True
+        and min(price, latest, tick, expected) > 0.0
+    ):
+        # Strictly round inside the zero-return boundary, including when it
+        # falls exactly on a tick. The same cap also binds delayed fallbacks.
+        original = Decimal(str(price))
+        step = Decimal(str(tick))
+        budget = Decimal(str(expected)) / Decimal(100)
+        long = decision.action == Action.LONG
+        boundary = original * (1 + budget if long else 1 - budget)
+        units = (boundary / step).to_integral_value(
+            rounding=ROUND_CEILING if long else ROUND_FLOOR,
+        )
+        limit = float((units - 1 if long else units + 1) * step)
+        adverse = EntryPriceGuardPolicy._adverse_move(
+            decision.action, (latest - price) / price,
+        )
+        worst_adverse = EntryPriceGuardPolicy._adverse_move(
+            decision.action, (limit - price) / price,
+        )
+        remaining = expected - adverse * 100.0
+        eligible = limit > 0.0 and (latest <= limit if long else latest >= limit)
+        result.update({
+            "eligible": eligible,
+            "reason": (
+                "paper_execution_return_budget_ready" if eligible
+                else "paper_execution_quote_consumed_return_budget"
+            ),
+            "limit_price": limit,
+            "remaining_expected_net_return_pct": round(remaining, 8),
+            "worst_remaining_expected_net_return_pct": round(
+                expected - worst_adverse * 100.0, 8,
+            ),
+        })
+    raw["entry_execution_price_check"] = result
+    decision.raw_response = raw
+    return result
 
 
 @dataclass(slots=True)

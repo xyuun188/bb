@@ -188,6 +188,86 @@ async def test_post_only_full_fill_never_touches_the_market() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["disabled", "rejected", "timeout"])
+@pytest.mark.parametrize("side,limit", [("buy", 101.5), ("sell", 98.5)])
+async def test_paper_return_limit_survives_every_market_fallback(
+    path: str, side: str, limit: float, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = _executor()
+    ccxt = _FakeCCXT()
+    if path == "disabled":
+        monkeypatch.setattr(settings, "okx_entry_post_only_enabled", False)
+    if path == "rejected":
+        ccxt.reject_post_only = True
+    guard = {"eligible": True, "side": side, "limit_price": limit}
+    params = {
+        "tdMode": "cross", "clOrdId": "BBNP123456",
+        "attachAlgoOrds": [{"tpTriggerPx": "90", "slTriggerPx": "110"}],
+        "entry_execution_price_check": guard,
+    }
+
+    await executor._place_entry_with_post_only(
+        ccxt, okx_symbol=SYMBOL, side=side, quantity=10.0, params=params,
+        market={"info": {"tickSz": "0.1"}}, ticker={"bid": 99.0, "ask": 101.0},
+    )
+
+    fallback = ccxt.create_order_calls[-1]
+    assert fallback["type"] == "ioc"
+    assert fallback["price"] == limit
+    assert fallback["params"]["clOrdId"] == "BBNP123456"
+    assert fallback["params"]["attachAlgoOrds"] == params["attachAlgoOrds"]
+    assert "entry_execution_price_check" not in fallback["params"]
+    assert params["entry_execution_price_check"] == guard
+
+
+@pytest.mark.asyncio
+async def test_cancelled_ioc_remainder_keeps_only_the_real_maker_fill() -> None:
+    class Exchange(_FakeCCXT):
+        async def create_order(self, *args, **kwargs):
+            order = await super().create_order(*args, **kwargs)
+            if order["type"] == "ioc":
+                self.orders[order["id"]].update(filled=0.0, cancelled=True)
+                order.update(filled=0.0, status="canceled", average=None)
+            return order
+
+    ccxt = Exchange()
+    ccxt.detail_sequence = [6.0]
+    order, _fact = await _executor()._place_entry_with_post_only(
+        ccxt, okx_symbol=SYMBOL, side="buy", quantity=10.0,
+        params={"entry_execution_price_check": {
+            "eligible": True, "side": "buy", "limit_price": 101.5,
+        }},
+        market={"info": {"tickSz": "0.1"}}, ticker={"bid": 99.0, "ask": 101.0},
+    )
+
+    assert [call["type"] for call in ccxt.create_order_calls] == ["post_only", "ioc"]
+    assert ccxt.create_order_calls[-1]["amount"] == 4.0
+    assert order["filled"] == 6.0
+    assert order["post_only_maker_fill_contracts"] == 6.0
+    assert order["post_only_taker_fill_contracts"] == 0.0
+    assert order["status"] != "filled"
+
+
+@pytest.mark.asyncio
+async def test_paper_return_limit_bounds_a_passive_price_too() -> None:
+    executor = _executor()
+    ccxt = _FakeCCXT()
+    ccxt.detail_sequence = [10.0]
+
+    await executor._place_entry_with_post_only(
+        ccxt, okx_symbol=SYMBOL, side="sell", quantity=10.0,
+        params={"entry_execution_price_check": {
+            "eligible": True, "side": "sell", "limit_price": 102.0,
+        }},
+        market={"info": {"tickSz": "0.1"}}, ticker={"bid": 99.0, "ask": 101.0},
+    )
+
+    assert len(ccxt.create_order_calls) == 1
+    assert ccxt.create_order_calls[0]["type"] == "post_only"
+    assert ccxt.create_order_calls[0]["price"] == 102.0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("rejection_code", ("51016", "51006"))
 async def test_post_only_rejection_falls_back_to_market(rejection_code: str) -> None:
     executor = _executor()
