@@ -35,6 +35,69 @@ def _feature_snapshot(value: Any) -> dict[str, Any]:
     return {}
 
 
+def paper_entry_price_budget_reason(
+    decision: DecisionOutput,
+    model_mode: str,
+) -> str | None:
+    """Reject consumed paper signals only after final execution-cost sizing.
+
+    The mean return is the paper entry authority. A negative downside quantile
+    remains valid training evidence and must not become a new entry threshold.
+    This check never creates the separate normal-paper trading permission.
+    """
+
+    if str(model_mode or "").lower() != "paper" or not decision.is_entry:
+        return None
+    raw = _safe_dict(decision.raw_response)
+    if not _safe_dict(raw.get("normal_paper_trade")):
+        return None
+    sizing = _safe_dict(raw.get("profit_risk_sizing"))
+    if sizing.get("production_eligible") is not True:
+        return None  # Preserve the more specific sizing denial downstream.
+    basis = _safe_dict(raw.get("pre_execution_analysis_basis"))
+    check = _safe_dict(raw.get("pre_execution_price_check"))
+    price = _safe_float(basis.get("snapshot_price"))
+    latest = _safe_float(check.get("latest_price"))
+    if not (
+        basis.get("version") == "2026-08-19.entry-analysis-basis.v1"
+        and basis.get("validated") is True
+        and basis.get("symbol") == decision.symbol
+        and basis.get("action") == decision.action.value
+        and price > 0.0
+        and latest > 0.0
+        and _safe_float(check.get("snapshot_price")) == price
+    ):
+        return "模拟盘提交前原始分析价或最新价格证据不完整，未提交订单。"
+    expected = _safe_float(sizing.get("expected_net_return_pct"))
+    adverse = EntryPriceGuardPolicy._adverse_move(
+        decision.action, (latest - price) / price,
+    )
+    remaining = expected - adverse * 100.0
+    check.update({
+        "return_budget_fraction": round(expected / 100.0, 8),
+        "allowed_adverse_move_fraction": round(expected / 100.0, 8),
+        "remaining_expected_net_return_pct": round(remaining, 8),
+        "return_budget_basis": "final_sizing_expected_net_return_pct",
+        "return_budget_verified": remaining > 0.0,
+        "profitability_gate_applied": True,
+        "safety_scope": "market_integrity_and_signal_validity",
+    })
+    provenance = dict(_safe_dict(check.get("policy_provenance")))
+    provenance.update({
+        "source": "normal_paper_final_expected_return",
+        "strategy_version": "2026-11-16.paper-price-return-budget.v1",
+    })
+    check["policy_provenance"] = provenance
+    raw["pre_execution_price_check"] = check
+    decision.raw_response = raw
+    if remaining <= 0.0:
+        return (
+            "下单前价格变化已耗尽本次信号的预期净收益，未提交旧信号订单；"
+            "等待基于最新行情重新分析。"
+        )
+    return None
+
+
 @dataclass(slots=True)
 class EntryPriceGuardPolicy:
     """Require current adverse drift to fit inside authoritative return budget."""

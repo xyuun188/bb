@@ -5,8 +5,11 @@ from typing import Any
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.entry_opportunity_score import EntryOpportunityScorePolicy
 from services.entry_price_guard import EntryPriceGuardPolicy
+from services.normal_paper_trade import NORMAL_PAPER_TRADE_VERSION
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
+from services.trading_policies import EntryPolicy
 
 
 def _decision(*, return_lcb: float = 0.6, expected_net: float = 0.8) -> DecisionOutput:
@@ -162,7 +165,7 @@ async def test_missing_authoritative_return_budget_fails_closed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_paper_uses_market_integrity_without_profit_drift_budget() -> None:
+async def test_paper_market_refresh_defers_signal_budget_until_final_sizing() -> None:
     decision = _decision(return_lcb=0.0, expected_net=-1.0)
 
     assert await _policy(latest=150.0).guard_reason(decision, "paper") is None
@@ -363,3 +366,141 @@ async def test_pre_order_execution_fact_instrument_mismatch_fails_closed() -> No
 
     reason = await policy.guard_reason(_decision(), "paper")
     assert "instrument mismatch" in reason
+
+
+def _paper_decision(
+    *, action: Action, price: float, expected: float,
+) -> DecisionOutput:
+    decision = _decision(expected_net=expected, return_lcb=-2.0)
+    decision.action = action
+    decision.feature_snapshot = {"current_price": price, "close": price}
+    decision.raw_response["opportunity_score"] = {"score": 1.0}
+    decision.raw_response["normal_paper_trade"] = {
+        "version": NORMAL_PAPER_TRADE_VERSION,
+        "symbol": decision.symbol,
+        "side": action.value,
+        "authorized": True,
+        "selection_reason": "paper_training_entry",
+        "expected_net_return_pct": expected,
+        "objective_net_return_pct": -2.0,
+        "production_permission": False,
+    }
+    return decision
+
+
+def _paper_policy(
+    *, latest: float, final_expected: float, with_score: bool = False,
+) -> EntryPolicy:
+    class FinalSizing:
+        async def apply(self, decision, _mode, *, open_positions):
+            decision.raw_response["profit_risk_sizing"] = {
+                "production_eligible": True,
+                "expected_net_return_pct": final_expected,
+                "return_lcb_pct": -2.0,
+                "final_notional_usdt": 100.0,
+            }
+
+    return EntryPolicy(
+        entry_price_guard=_policy(latest=latest),
+        entry_profit_risk_sizing=FinalSizing(),
+        entry_opportunity_score=(
+            EntryOpportunityScorePolicy(lambda _decision, _strategy: 1.0)
+            if with_score else None
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "price", "latest", "expected"),
+    [
+        (Action.SHORT, 0.01467, 0.0145495, 0.39785122),  # IRYS, decision 816282
+        (Action.SHORT, 1.301, 1.2885, 0.81351882),  # ATOM, decision 818618
+        (Action.SHORT, 0.01607, 0.01605, 0.08390255),  # 2Z, decision 823310
+        (Action.SHORT, 0.7216, 0.717, 0.20926527),  # DOT, decision 827036
+        (Action.LONG, 100.0, 100.5, 0.2),
+        (Action.LONG, 100.0, 101.0, 1.0),  # No positive edge remains at equality.
+    ],
+)
+@pytest.mark.parametrize("with_score", [False, True])
+async def test_paper_final_sizing_rejects_price_consumed_return(
+    action: Action, price: float, latest: float, expected: float, with_score: bool,
+) -> None:
+    decision = _paper_decision(action=action, price=price, expected=expected)
+
+    reason = await _paper_policy(
+        latest=latest, final_expected=expected, with_score=with_score,
+    ).prepare_dynamic_risk_contract(decision, "paper", [])
+
+    assert reason is not None
+    assert "预期净收益" in reason
+    check = decision.raw_response["pre_execution_price_check"]
+    assert check["remaining_expected_net_return_pct"] <= 0.0
+    assert check["return_budget_basis"] == "final_sizing_expected_net_return_pct"
+    assert check["production_permission"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action,latest", [(Action.LONG, 100.1), (Action.SHORT, 99.9),
+                                          (Action.LONG, 99.0), (Action.SHORT, 101.0)])
+async def test_paper_positive_mean_with_negative_downside_keeps_entry(
+    action: Action, latest: float,
+) -> None:
+    decision = _paper_decision(action=action, price=100.0, expected=0.2)
+
+    reason = await _paper_policy(
+        latest=latest, final_expected=0.2, with_score=True,
+    ).prepare_dynamic_risk_contract(decision, "paper", [])
+
+    assert reason is None
+    assert decision.raw_response["pre_execution_price_check"][
+        "remaining_expected_net_return_pct"
+    ] > 0.0
+    assert decision.raw_response["normal_paper_trade"]["objective_net_return_pct"] == -2.0
+    assert decision.raw_response["profit_risk_sizing"]["final_notional_usdt"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_paper_price_budget_uses_final_costs_without_rebasing_original_price() -> None:
+    decision = _paper_decision(action=Action.LONG, price=100.0, expected=0.8)
+    policy = _paper_policy(latest=100.3, final_expected=0.5, with_score=True)
+    assert await policy.prepare_dynamic_risk_contract(decision, "paper", []) is None
+    # A later cost refresh consumes more of the original signal, not a signal
+    # reset to the previously refreshed price of 100.3.
+    policy.entry_profit_risk_sizing = _paper_policy(
+        latest=100.3, final_expected=0.2,
+    ).entry_profit_risk_sizing
+
+    reason = await policy.prepare_dynamic_risk_contract(decision, "paper", [])
+
+    assert reason is not None
+    check = decision.raw_response["pre_execution_price_check"]
+    assert check["snapshot_price"] == 100.0
+    assert check["latest_price"] == 100.3
+    assert check["return_budget_fraction"] == pytest.approx(0.002)
+    assert check["remaining_expected_net_return_pct"] == pytest.approx(-0.1)
+
+
+@pytest.mark.asyncio
+async def test_paper_price_budget_can_use_improved_final_execution_cost() -> None:
+    decision = _paper_decision(action=Action.LONG, price=100.0, expected=0.1)
+
+    reason = await _paper_policy(
+        latest=100.3, final_expected=0.5, with_score=True,
+    ).prepare_dynamic_risk_contract(decision, "paper", [])
+
+    assert reason is None
+    assert decision.raw_response["pre_execution_price_check"][
+        "remaining_expected_net_return_pct"
+    ] == pytest.approx(0.2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["latest_price", "snapshot_price"])
+async def test_final_paper_budget_cannot_use_missing_or_rebased_price(field: str) -> None:
+    decision = _paper_decision(action=Action.LONG, price=100.0, expected=0.5)
+    policy = _paper_policy(latest=100.1, final_expected=0.5, with_score=True)
+    assert await policy.prepare_dynamic_risk_contract(decision, "paper", []) is None
+    decision.raw_response["pre_execution_price_check"][field] = None
+
+    assert policy.final_price_budget_reason(decision, "paper") is not None

@@ -18,6 +18,7 @@ from services.dynamic_exit_policy import (
     apply_dynamic_exit,
     evaluate_dynamic_exit_execution_contract,
 )
+from services.entry_price_guard import paper_entry_price_budget_reason
 from services.entry_profit_risk_sizing import (
     uplift_profit_risk_sizing_to_exchange_minimum,
 )
@@ -191,6 +192,15 @@ class EntryPolicy:
             return None
         return await self.entry_price_guard.guard_reason(decision, model_mode)
 
+    def final_price_budget_reason(
+        self,
+        decision: DecisionOutput,
+        model_mode: str,
+    ) -> str | None:
+        if self.entry_price_guard is None:
+            return None
+        return paper_entry_price_budget_reason(decision, model_mode)
+
     async def apply_profit_risk_sizing(
         self,
         decision: DecisionOutput,
@@ -252,7 +262,7 @@ class EntryPolicy:
                 model_mode,
                 open_positions=open_positions or [],
             )
-            return None
+            return self.final_price_budget_reason(decision, model_mode)
 
         raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
         sizing = raw.get("profit_risk_sizing") if isinstance(raw, dict) else {}
@@ -275,7 +285,7 @@ class EntryPolicy:
                 0.0,
             )
         if impact_basis_notional <= 0:
-            return None
+            return self.final_price_budget_reason(decision, model_mode)
 
         # One complete exchange contract is indivisible.  The execution-cost
         # estimator may use a slightly lower bid/ask VWAP than the mark-price
@@ -399,7 +409,7 @@ class EntryPolicy:
         # boundary is reserved for the actual order shape or a confirmed fill
         # and would incorrectly restore an obsolete queued notional.
         self._record_execution_cost_sizing_pass(decision, impact_basis_notional)
-        return None
+        return self.final_price_budget_reason(decision, model_mode)
 
     async def high_risk_review_gate(
         self,
