@@ -12,6 +12,7 @@ from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.dynamic_exit_policy import assess_dynamic_exit
+from services.position_profit_peaks import position_scaled_profit_peak
 
 NormalizeSymbol = Callable[[Any], str]
 PositionPeakKeyProvider = Callable[[str, str, str], Any]
@@ -74,9 +75,12 @@ class PositionReviewPriorityPolicy:
             side,
         )
         peak_state = _safe_dict(self.position_peaks_provider().get(peak_key, {}))
-        peak_unrealized_pnl = _safe_float(
-            peak_state.get("peak_unrealized_pnl"),
-            _safe_float(position.get("peak_unrealized_pnl"), 0.0),
+        peak_unrealized_pnl = (
+            position_scaled_profit_peak(
+                peak_state, abs(_safe_float(position.get("quantity"), 0.0)),
+            )
+            if peak_state
+            else _safe_float(position.get("peak_unrealized_pnl"), 0.0)
         )
         assessment_positions[0]["peak_unrealized_pnl"] = peak_unrealized_pnl
         returns = [

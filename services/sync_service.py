@@ -951,6 +951,7 @@ def normalized_open_position_context(
             "side": snapshot.get("side", "long"),
             "entry_price": entry_price,
             "current_price": current_price,
+            "protection_trigger_price": float_parser(snapshot.get("last_price"), 0.0),
             "quantity": quantity,
             "base_quantity": quantity,
             "contracts": contracts,
@@ -3197,6 +3198,17 @@ class OkxSyncService:
                         ),
                         None,
                     ) or fallback_protection.get("stop_loss_price")
+                    submitted_stop = parse_float(
+                        fallback_protection.get("stop_loss_price"), 0.0,
+                    )
+                    if submitted_stop > 0 and parse_float(stop_loss_price, 0.0) > 0:
+                        # An older repair may already have widened the exchange
+                        # stop. The local hard-risk scan retains the entry limit.
+                        stop_loss_price = (
+                            min(float(stop_loss_price), submitted_stop)
+                            if side == "short"
+                            else max(float(stop_loss_price), submitted_stop)
+                        )
                     take_profit_price = protection.get("take_profit_price") or (
                         fallback_protection.get("take_profit_price")
                         if reanchored_protection

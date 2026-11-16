@@ -25,6 +25,15 @@ def _default_float_parser(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def position_scaled_profit_peak(state: dict[str, Any], quantity: float) -> float:
+    """Compare the historical peak and current PnL at the same base quantity."""
+    peak = _default_float_parser(state.get("peak_unrealized_pnl", state.get("peak_pnl")))
+    previous_quantity = abs(_default_float_parser(state.get("quantity")))
+    if previous_quantity > 0.0 and quantity > 0.0:
+        return peak * quantity / previous_quantity
+    return peak
+
+
 class PositionProfitPeakTracker:
     """Persist and update floating-profit peak state for open positions."""
 
@@ -97,7 +106,7 @@ class PositionProfitPeakTracker:
             "hold_minutes": hold_minutes,
         }
         state["peak_unrealized_pnl"] = max(
-            self.float_parser(state.get("peak_unrealized_pnl"), unrealized_pnl),
+            position_scaled_profit_peak(state, quantity_value),
             unrealized_pnl,
         )
         state["peak_pnl_ratio"] = max(

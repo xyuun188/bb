@@ -14352,18 +14352,21 @@ class TradingService(ModelTrainingCoordinatorMixin):
 
             stop_loss = self._safe_float(position.get("stop_loss"), 0.0)
             take_profit = self._safe_float(position.get("take_profit"), 0.0)
+            trigger_price = self._safe_float(
+                position.get("protection_trigger_price"), 0.0,
+            ) or current_price
             stop_crossed = bool(
                 stop_loss
                 and (
-                    (side == "long" and current_price <= stop_loss)
-                    or (side == "short" and current_price >= stop_loss)
+                    (side == "long" and trigger_price <= stop_loss)
+                    or (side == "short" and trigger_price >= stop_loss)
                 )
             )
             target_crossed = bool(
                 take_profit
                 and (
-                    (side == "long" and current_price >= take_profit)
-                    or (side == "short" and current_price <= take_profit)
+                    (side == "long" and trigger_price >= take_profit)
+                    or (side == "short" and trigger_price <= take_profit)
                 )
             )
             returns = [

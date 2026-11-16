@@ -1605,6 +1605,83 @@ def _executor(exchange: Any) -> OKXExecutor:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fraction", [0.5, 1.0])
+@pytest.mark.parametrize("filled", [0.0, 2.0, 5.0])
+async def test_profit_lock_uses_ioc_and_never_falls_back_to_market(
+    monkeypatch: pytest.MonkeyPatch, fraction: float, filled: float,
+) -> None:
+    class Exchange(_ExitMaxMarketSizeCcxt):
+        def __init__(self):
+            super().__init__(position_contracts=10.0)
+            self.native_calls = []
+
+        def market(self, symbol):
+            result = super().market(symbol)
+            result["info"]["tickSz"] = "0.001"
+            return result
+
+        async def privatePostTradeOrder(self, params):
+            self.native_calls.append(dict(params))
+            assert params["ordType"] == "ioc"
+            assert params["reduceOnly"] == "true"
+            assert float(params["px"]) > 2.31
+            self.position_contracts -= filled
+            return {"code": "0", "data": [{"sCode": "0", "ordId": "profit-ioc"}]}
+
+        async def privateGetTradeOrder(self, params):
+            return {"code": "0", "data": [{
+                "instId": "USAR-USDT-SWAP", "ordId": params["ordId"],
+                "side": "sell", "state": "canceled", "ordType": "ioc",
+                "sz": str(10.0 * fraction), "accFillSz": str(filled),
+                "avgPx": "2.32" if filled else "", "fee": "-0.001",
+            }]}
+
+    async def no_sleep(_seconds):
+        return None
+
+    exchange = Exchange()
+    executor = _executor(exchange)
+
+    async def fee():
+        return {"taker_fee_rate": 0.0005}
+
+    executor.fetch_account_fee_snapshot = fee
+    monkeypatch.setattr(okx_module.asyncio, "sleep", no_sleep)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.position_size_pct = fraction
+    decision.raw_response = {"dynamic_exit_policy": {
+        "lifecycle_net_pnl_usdt": 0.5, "profit_lock_pressure": 0.5,
+        "entry_fee_usdt": 0.01,
+    }}
+    result = await executor.place_order(decision)
+    assert len(exchange.native_calls) == 1
+    assert exchange.close_position_calls == []
+    assert exchange.create_calls == []
+    assert result.quantity == filled
+    assert result.status == (OrderStatus.CANCELLED if not filled else (
+        OrderStatus.FILLED if filled == 10 * fraction else OrderStatus.PARTIAL
+    ))
+    assert decision.raw_response["profit_lock_execution"]["market_fallback_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_profit_lock_missing_native_limit_support_cannot_use_full_market_close() -> None:
+    exchange = _ExitMaxMarketSizeCcxt(position_contracts=10.0)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.position_size_pct = 1.0
+    decision.raw_response = {"dynamic_exit_policy": {
+        "lifecycle_net_pnl_usdt": 1.0, "profit_lock_pressure": 1.0,
+        "entry_fee_usdt": 0.01,
+    }}
+    result = await _executor(exchange).place_order(decision)
+    assert result.status == OrderStatus.REJECTED
+    assert exchange.close_position_calls == []
+    assert exchange.create_calls == []
+
+
+@pytest.mark.asyncio
 async def test_okx_initialize_enables_and_loads_time_difference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -6,6 +6,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from services.position_profit_peaks import position_scaled_profit_peak
+
 NormalizeSymbol = Callable[[Any], str]
 AggregatePositionGroup = Callable[[list[dict[str, Any]], str, str, str], dict[str, Any]]
 PositionPeakKeyProvider = Callable[[str, str, str], Any]
@@ -58,9 +60,8 @@ class PositionProfitPeakContextPolicy:
                 model, normalized or str(pos.get("symbol") or symbol), side
             )
             state = peaks.get(key) or {}
-            peak = _safe_float(
-                state.get("peak_unrealized_pnl", state.get("peak_pnl")),
-                0.0,
+            peak = position_scaled_profit_peak(
+                state, abs(_safe_float(pos.get("quantity"), 0.0)),
             )
             current = _safe_float(pos.get("unrealized_pnl"), 0.0)
             peak = max(peak, current)

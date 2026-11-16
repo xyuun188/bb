@@ -257,3 +257,24 @@ async def test_stale_submitted_protection_without_original_fill_price_is_blocked
     )
 
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_crossed_short_stop_is_not_reanchored_to_losing_current_price() -> None:
+    contract = build_legacy_normal_paper_v4_trade_contract(symbol="ZIL/USDT", side="short")
+    decision = _decision(id=408, raw_llm_response={
+        "normal_paper_trade": contract,
+        "execution_result": {"price": 0.001175, "raw_response": {
+            "average": 0.001175, "request_params": {"attachAlgoOrds": [
+                {"slTriggerPx": "0.001226", "tpTriggerPx": "0.001131"},
+            ]},
+        }},
+    })
+    result = await PositionProtectionFallbackPolicy().protection_from_decision(
+        _FakeSession(decision), symbol="ZIL/USDT", side="short",
+        entry_price=0.001175, reference_price=0.001265,
+        order=SimpleNamespace(decision_id=408),
+    )
+    assert result["stop_loss_price"] == 0.001226
+    assert result["take_profit_price"] == 0.001131
+    assert result.get("reanchored_from_stale_submission") is not True

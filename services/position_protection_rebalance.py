@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from math import isfinite
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
 from core.symbols import normalize_trading_symbol
 from services.protection_order_integrity import audit_protection_order_integrity
 
-POSITION_PROTECTION_REBALANCE_VERSION = "2026-07-28.current-position-exact-coverage.v3"
+POSITION_PROTECTION_REBALANCE_VERSION = "2026-11-16.preserve-protection-boundaries.v4"
 PROTECTION_VERIFY_ATTEMPTS = 4
 PROTECTION_TRANSITION_VERIFY_ATTEMPTS = 12
 PROTECTION_VERIFY_DELAY_SECONDS = 0.5
-PROTECTION_MIN_STOP_DISTANCE_RATIO = 0.003
-PROTECTION_MIN_TAKE_DISTANCE_RATIO = 0.002
 
 
 class PositionProtectionRebalanceError(RuntimeError):
@@ -179,7 +178,7 @@ def _protection_prices_valid(
         take = float(take_profit_price)
     except (TypeError, ValueError):
         return False
-    if reference <= 0 or stop <= 0 or take <= 0:
+    if not all(isfinite(v) and v > 0 for v in (reference, stop, take)):
         return False
     if str(side or "").lower() == "short":
         return take < reference < stop
@@ -194,16 +193,10 @@ def _reanchor_protection_actions(
     side: str,
     reference_price: float,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Move stale trigger prices around the live price before creating an OCO.
-
-    OKX rejects a short SL below the current last price (and the symmetric long
-    case).  The old OCO's distance is retained where possible, while minimum
-    gaps keep both triggers strictly on the correct side of the market.
-    """
+    """Preserve trigger prices; a crossed boundary requires exit review."""
 
     if reference_price <= 0:
         return actions, False
-    changed = False
     normalized_side = str(side or "").lower()
     updated: list[dict[str, Any]] = []
     for action in actions:
@@ -220,32 +213,18 @@ def _reanchor_protection_actions(
             updated.append(item)
             continue
 
-        spread = abs(stop - take) if stop > 0 and take > 0 else 0.0
-        stop_gap = max(
-            spread * 0.6,
-            reference_price * PROTECTION_MIN_STOP_DISTANCE_RATIO,
+        raise PositionProtectionRebalanceError(
+            "Protection boundary crossed or invalid; refusing to move the stop or target",
+            {
+                "status": "protection_boundary_crossed",
+                "verified": False,
+                "reference_price": reference_price,
+                "stop_loss_price": stop,
+                "take_profit_price": take,
+                "requires_exit_review": True,
+            },
         )
-        take_gap = max(
-            spread * 0.4,
-            reference_price * PROTECTION_MIN_TAKE_DISTANCE_RATIO,
-        )
-        if normalized_side == "short":
-            new_stop = reference_price + stop_gap
-            new_take = max(reference_price - take_gap, reference_price * 0.001)
-        elif normalized_side == "long":
-            new_stop = max(reference_price - stop_gap, reference_price * 0.001)
-            new_take = reference_price + take_gap
-        else:
-            updated.append(item)
-            continue
-        item["stop_loss_price"] = new_stop
-        item["take_profit_price"] = new_take
-        item["price_reanchored"] = True
-        item["price_reanchor_reference"] = reference_price
-        item["price_reanchor_reason"] = "stale_trigger_direction_against_current_last"
-        changed = True
-        updated.append(item)
-    return updated, changed
+    return updated, False
 
 
 async def _wait_for_protection_verification(

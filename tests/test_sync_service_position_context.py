@@ -132,6 +132,7 @@ def test_normalized_open_position_context_uses_contract_value_and_stable_open_ti
                 "ctVal": "0.1",
                 "avgPx": "3.532",
                 "markPx": "3.528",
+                "last": "3.7",
                 "upl": "0.0398",
                 "cTime": str(int(opened_at.timestamp() * 1000)),
                 "uTime": str(int(updated_at.timestamp() * 1000)),
@@ -143,6 +144,8 @@ def test_normalized_open_position_context_uses_contract_value_and_stable_open_ti
 
     assert context["symbol"] == "AUCTION/USDT"
     assert context["quantity"] == pytest.approx(9.95)
+    assert context["current_price"] == 3.528
+    assert context["protection_trigger_price"] == 3.7
     assert context["contracts"] == pytest.approx(99.5)
     assert context["contract_size"] == pytest.approx(0.1)
     assert context["notional"] == pytest.approx(35.1434)

@@ -179,7 +179,23 @@ def _decision() -> DecisionOutput:
     )
 
 
-def test_stale_short_protection_prices_are_reanchored_around_live_price() -> None:
+@pytest.mark.parametrize(("side", "reference"), [
+    ("short", 0.2), ("short", 0.13), ("long", 0.1), ("long", 0.2),
+])
+def test_crossed_protection_prices_cannot_be_moved(side, reference) -> None:
+    actions = [
+        {"action": "amend_size", "position_side": side,
+         "stop_loss_price": 0.16 if side == "short" else 0.14,
+         "take_profit_price": 0.14 if side == "short" else 0.16},
+    ]
+    original = [dict(item) for item in actions]
+    with pytest.raises(PositionProtectionRebalanceError) as exc:
+        _reanchor_protection_actions(actions, side=side, reference_price=reference)
+    assert actions == original
+    assert exc.value.report["requires_exit_review"] is True
+
+
+def test_uncrossed_protection_preserves_exact_prices() -> None:
     actions, changed = _reanchor_protection_actions(
         [
             {
@@ -190,58 +206,52 @@ def test_stale_short_protection_prices_are_reanchored_around_live_price() -> Non
             }
         ],
         side="short",
-        reference_price=0.2,
+        reference_price=0.15,
     )
 
-    assert changed is True
+    assert changed is False
     assert _protection_prices_valid(
         "short",
-        0.2,
+        0.15,
         actions[0]["stop_loss_price"],
         actions[0]["take_profit_price"],
     )
-    assert actions[0]["price_reanchored"] is True
+    assert actions[0]["stop_loss_price"] == 0.16
+    assert actions[0]["take_profit_price"] == 0.14
 
 
 @pytest.mark.asyncio
-async def test_stale_short_protection_is_rebuilt_before_okx_amend() -> None:
+async def test_crossed_short_stop_is_not_rebuilt_with_a_wider_stop() -> None:
     executor = _Executor(
         position_contracts="5",
         protection_contracts=("13",),
         reference_price=0.2,
     )
 
-    result = await rebalance_position_protection_after_exit(executor, _decision())
+    with pytest.raises(PositionProtectionRebalanceError):
+        await rebalance_position_protection_after_exit(executor, _decision())
 
-    assert result["verified"] is True
-    assert result["fallback_reason"] == "stale_trigger_prices_reanchored"
     assert executor.amend_calls == []
-    assert executor.cancel_calls == [{"inst_id": "IRYS-USDT-SWAP", "algo_id": "algo-1"}]
-    assert len(executor.create_calls) == 1
-    created = executor.create_calls[0]
-    assert created["take_profit_price"] < 0.2 < created["stop_loss_price"]
+    assert executor.cancel_calls == []
+    assert executor.create_calls == []
 
 
 @pytest.mark.asyncio
-async def test_missing_protection_uses_reanchored_plan_without_replacing_absent_orders() -> None:
+async def test_missing_protection_cannot_expand_crossed_stop() -> None:
     executor = _Executor(
         position_contracts="5", protection_contracts=(), reference_price=0.2,
     )
-    result = await position_protection_rebalance.rebalance_current_position_protection(
-        executor, symbol="IRYS/USDT", side="short", observation_window="test",
-        missing_protection_plan={
-            "stop_loss_price": 0.16, "take_profit_price": 0.14,
-            "source": "persisted_local_dynamic_protection", "okx_position_side": "net",
-        },
-    )
-    assert result["verified"] is True
-    assert result["positions_unchanged"] is True
+    with pytest.raises(PositionProtectionRebalanceError):
+        await position_protection_rebalance.rebalance_current_position_protection(
+            executor, symbol="IRYS/USDT", side="short", observation_window="test",
+            missing_protection_plan={
+                "stop_loss_price": 0.16, "take_profit_price": 0.14,
+                "source": "persisted_local_dynamic_protection", "okx_position_side": "net",
+            },
+        )
     assert executor.amend_calls == []
     assert executor.cancel_calls == []
-    assert len(executor.create_calls) == 1
-    created = executor.create_calls[0]
-    assert created["contracts"] == 5
-    assert created["take_profit_price"] < 0.2 < created["stop_loss_price"]
+    assert executor.create_calls == []
 
 
 @pytest.mark.asyncio

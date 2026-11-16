@@ -59,6 +59,7 @@ from services.okx_entry_environment_compatibility import (
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.okx_native_facts import OkxNativeFactsClient
 from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
+from services.profit_lock_execution import profit_lock_execution_required, profit_lock_limit
 
 logger = structlog.get_logger(__name__)
 
@@ -2034,12 +2035,60 @@ class OKXExecutor(AbstractExecutor):
                 if position_side:
                     params["positionSide"] = position_side
                 params["reduceOnly"] = True
+                raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+                guarded_profit_lock = profit_lock_execution_required(raw)
+                if guarded_profit_lock:
+                    policy = raw["dynamic_exit_policy"]
+                    try:
+                        fee = await self.fetch_account_fee_snapshot()
+                        fee_rate = self._safe_float(fee.get("taker_fee_rate"), -1.0)
+                        entry_price = self._safe_float(
+                            matching[0].get("entryPrice")
+                            or (matching[0].get("info") or {}).get("avgPx"),
+                            0.0,
+                        )
+                        guard = profit_lock_limit(
+                            side=side,
+                            entry_price=entry_price,
+                            quantity=pre_exit_contracts * contract_size,
+                            entry_fee_usdt=self._safe_float(
+                                policy.get("entry_fee_usdt", policy.get("fee_buffer_usdt")),
+                                -1.0,
+                            ),
+                            exit_fee_rate=fee_rate,
+                            tick_size=self._market_info_float(market, "tickSz", "price_tick"),
+                            adverse_funding_usdt=(
+                                max(-self._safe_float(policy.get("settled_funding_fee")), 0.0)
+                                if policy.get("funding_fee_included") is True else 0.0
+                            ),
+                        )
+                    except Exception as exc:
+                        guard = {
+                            "eligible": False,
+                            "reason": "profit_lock_execution_economics_unavailable",
+                            "error": safe_error_text(exc, limit=180),
+                        }
+                    raw["profit_lock_execution"] = guard
+                    decision.raw_response = raw
+                    if guard.get("eligible") is not True:
+                        return ExecutionResult(
+                            order_id="profit_lock_deferred", symbol=decision.symbol,
+                            side=side, order_type="limit", quantity=0.0, price=price,
+                            status=OrderStatus.REJECTED,
+                            raw_response={
+                                "execution_blocker": "profit_lock_execution_economics",
+                                "system_pre_submit_rejection": True,
+                                "profit_lock_execution": guard,
+                                "error": "盈利减仓的成交成本无法确认，保留仓位并继续复评。",
+                            },
+                        )
+                    params["profit_lock_execution"] = guard
                 # A full close must use OKX's native close-position endpoint.
                 # Sending a reduce-only order for the entire net position first
                 # is rejected by the demo account with 51001 even though the
                 # instrument itself is valid.  Partial exits still use the
                 # reduce-only market-order path below.
-                if requested_exit_fraction >= 0.999:
+                if requested_exit_fraction >= 0.999 and not guarded_profit_lock:
                     full_close_result = await self._place_okx_native_full_close(
                         ccxt=ccxt,
                         decision=decision,
@@ -2104,6 +2153,18 @@ class OKXExecutor(AbstractExecutor):
                     )
                     if native_reduce_result is not None:
                         return native_reduce_result
+                if guarded_profit_lock:
+                    return ExecutionResult(
+                        order_id="profit_lock_deferred", symbol=decision.symbol,
+                        side=side, order_type="limit", quantity=0.0, price=price,
+                        status=OrderStatus.REJECTED,
+                        raw_response={
+                            "execution_blocker": "profit_lock_ioc_unavailable",
+                            "system_pre_submit_rejection": True,
+                            "profit_lock_execution": params["profit_lock_execution"],
+                            "error": "限价盈利减仓暂不可用，保留仓位并继续复评。",
+                        },
+                    )
                 split_exit_result = await self._place_split_exit_market_orders(
                     ccxt=ccxt,
                     decision=decision,
@@ -3688,6 +3749,10 @@ class OKXExecutor(AbstractExecutor):
             "sz": self._format_okx_number(contracts),
             "reduceOnly": "true",
         }
+        profit_guard = params.get("profit_lock_execution")
+        if isinstance(profit_guard, dict) and profit_guard.get("eligible") is True:
+            request_params["ordType"] = "ioc"
+            request_params["px"] = self._format_okx_number(profit_guard["limit_price"])
         if position_side and position_side != "net":
             request_params["posSide"] = target_side
 
@@ -3921,6 +3986,7 @@ class OKXExecutor(AbstractExecutor):
             "exit_tracking": True,
             "okx_native_reduce_market_order": True,
             "exit_order_replace_note": exit_order_replace_note,
+            "profit_lock_execution": profit_guard,
             "request_params": request_params,
             "fallback_market_order_params": params,
             "okx_symbol": okx_symbol,
@@ -3959,6 +4025,22 @@ class OKXExecutor(AbstractExecutor):
                 raw_response={**raw_response, "do_not_persist_order": True},
             )
         if order_scoped_fill <= tolerance:
+            if (
+                isinstance(profit_guard, dict)
+                and native_order_detail is not None
+                and order_status in {OrderStatus.CANCELLED, OrderStatus.REJECTED}
+                and not position_delta_unattributed
+            ):
+                return ExecutionResult(
+                    order_id=order_id, symbol=decision.symbol, side=side,
+                    order_type="limit", quantity=0.0, price=price,
+                    status=order_status, exchange_order_id=order_id,
+                    timestamp=datetime.now(UTC),
+                    raw_response={
+                        **raw_response,
+                        "message": "盈利限价未成交，剩余委托已撤销，保留仓位继续复评。",
+                    },
+                )
             if not order_id:
                 return ExecutionResult(
                     order_id="native_reduce_unconfirmed",

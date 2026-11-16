@@ -139,6 +139,15 @@ def test_dynamic_exit_execution_contract_allows_explicit_planned_stop() -> None:
     assert contract["explicit_hard_evidence"]["planned_stop_crossed"] is True
 
 
+def test_execution_last_crossed_stop_cannot_be_hidden_by_profitable_mark() -> None:
+    position = _position(current_price=101.0, unrealized_pnl=10.0,
+                         protection_trigger_price=97.0)
+    result = apply_dynamic_exit(_decision(), [position])
+    assert result.planned_stop_crossed is True
+    assert result.hard_risk is True
+    assert result.close_fraction == 1.0
+
+
 def test_dynamic_exit_execution_contract_rejects_unexplained_hard_risk() -> None:
     contract = evaluate_dynamic_exit_execution_contract(
         SimpleNamespace(
@@ -870,7 +879,7 @@ def test_adverse_return_alignment_is_scaled_by_consumed_stop_budget() -> None:
     assert result.close_fraction > result.stop_risk_usage
     assert result.close_fraction < 1.0
     assert result.policy_provenance["strategy_version"] == (
-        "2026-11-12.independent-loss-exit-evidence.v20"
+        "2026-11-16.execution-price-protection.v21"
     )
 
 

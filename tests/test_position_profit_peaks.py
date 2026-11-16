@@ -3,6 +3,28 @@ from datetime import UTC, datetime, timedelta
 from services.position_profit_peaks import PositionProfitPeakTracker
 
 
+def test_partial_close_does_not_create_artificial_profit_retrace(tmp_path):
+    tracker = _tracker(tmp_path)
+    kwargs = dict(model_name="ensemble_trader", symbol="IMX/USDT", side="short",
+                  entry_price=100.0, current_price=98.0)
+    tracker.update(**kwargs, quantity=10.0, unrealized_pnl=20.0, hold_minutes=20.0)
+    state = tracker.update(**kwargs, quantity=6.0, unrealized_pnl=12.0, hold_minutes=30.0)
+    assert state["peak_unrealized_pnl"] == 12.0
+    state = tracker.update(**{**kwargs, "current_price": 99.0}, quantity=6.0,
+                           unrealized_pnl=6.0, hold_minutes=40.0)
+    assert state["peak_unrealized_pnl"] == 12.0
+
+
+def test_peak_quantity_basis_survives_restart(tmp_path):
+    tracker = _tracker(tmp_path)
+    kwargs = dict(model_name="ensemble_trader", symbol="IMX/USDT", side="short",
+                  entry_price=100.0, current_price=98.0)
+    tracker.update(**kwargs, quantity=10.0, unrealized_pnl=20.0, hold_minutes=20.0)
+    state = _tracker(tmp_path).update(**kwargs, quantity=5.0,
+                                    unrealized_pnl=10.0, hold_minutes=30.0)
+    assert state["peak_unrealized_pnl"] == 10.0
+
+
 def _tracker(tmp_path):
     return PositionProfitPeakTracker(
         path=tmp_path / "position_profit_peaks.json",

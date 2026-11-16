@@ -154,6 +154,7 @@ class DynamicExitAssessment:
     funding_cost_projection_reason: str
     lifecycle_net_pnl_usdt: float
     fee_buffer_usdt: float
+    entry_fee_usdt: float
     estimated_exit_cost_usdt: float
     execution_cost_complete: bool
     current_management_contract_complete: bool
@@ -407,10 +408,13 @@ def assess_dynamic_exit(
         stop_price = max(_safe_float(position.get("stop_loss"), 0.0), 0.0)
         if stop_distance <= 0 and stop_price > 0 and entry > 0:
             stop_distance = abs(entry - stop_price) / entry
-        if stop_price > 0 and current > 0:
+        trigger_price = max(
+            _safe_float(position.get("protection_trigger_price"), 0.0), 0.0,
+        ) or current
+        if stop_price > 0 and trigger_price > 0:
             planned_stop_crossed = planned_stop_crossed or (
-                (_position_side(position) == "long" and current <= stop_price)
-                or (_position_side(position) == "short" and current >= stop_price)
+                (_position_side(position) == "long" and trigger_price <= stop_price)
+                or (_position_side(position) == "short" and trigger_price >= stop_price)
             )
         planned_risk += position_notional * stop_distance
         peak_profit = max(
@@ -904,7 +908,7 @@ def assess_dynamic_exit(
         "observation_window": "current_position_review",
         "sample_count": len(matches),
         "generated_at": datetime.now(UTC).isoformat(),
-        "strategy_version": "2026-11-12.independent-loss-exit-evidence.v20",
+        "strategy_version": "2026-11-16.execution-price-protection.v21",
         "fallback_reason": ",".join(reasons),
         "early_exit_observation_minutes": EARLY_EXIT_OBSERVATION_MINUTES,
         "minimum_automated_exit_fraction": MIN_AUTOMATED_EXIT_FRACTION,
@@ -977,6 +981,7 @@ def assess_dynamic_exit(
         funding_cost_projection_reason=funding_projection.reason,
         lifecycle_net_pnl_usdt=round(lifecycle_net_pnl, 8),
         fee_buffer_usdt=round(fee_buffer, 8),
+        entry_fee_usdt=round(entry_fees, 8),
         estimated_exit_cost_usdt=round(estimated_exit_cost, 8),
         execution_cost_complete=execution_cost_complete,
         current_management_contract_complete=current_management_contract_complete,

@@ -62,26 +62,29 @@ class PositionProtectionFallbackPolicy:
                     raw,
                     submitted=submitted,
                     side=side,
-                    reference_price=current_reference,
+                    reference_price=entry_price,
                 )
-                if not reanchored:
+                if reanchored and reanchored != submitted:
+                    return {
+                        **reanchored,
+                        "source": "exact_order_reanchored_dynamic_protection",
+                        "decision_id": getattr(decision, "id", None),
+                        "reanchored_from_stale_submission": True,
+                        "original_stop_loss_price": submitted["stop_loss_price"],
+                        "original_take_profit_price": submitted["take_profit_price"],
+                        "reference_price": entry_price,
+                        "policy_provenance": {
+                            "source": "persisted_execution_result_request_params",
+                            "observation_window": "missing_protection_entry_price_reanchor",
+                            "sample_count": 1,
+                            "generated_at": getattr(decision, "executed_at", None),
+                            "strategy_version": normal_trade.get("version"),
+                        },
+                    }
+                if not self._prices_bracket_reference(
+                    submitted, side=side, reference_price=entry_price,
+                ):
                     return {}
-                return {
-                    **reanchored,
-                    "source": "exact_order_reanchored_dynamic_protection",
-                    "decision_id": getattr(decision, "id", None),
-                    "reanchored_from_stale_submission": True,
-                    "original_stop_loss_price": submitted["stop_loss_price"],
-                    "original_take_profit_price": submitted["take_profit_price"],
-                    "reference_price": current_reference,
-                    "policy_provenance": {
-                        "source": "persisted_execution_result_request_params",
-                        "observation_window": "missing_protection_current_price_reanchor",
-                        "sample_count": 1,
-                        "generated_at": getattr(decision, "executed_at", None),
-                        "strategy_version": normal_trade.get("version"),
-                    },
-                }
             return {
                 **submitted,
                 "source": "exact_order_submitted_dynamic_protection",
@@ -278,6 +281,12 @@ class PositionProtectionFallbackPolicy:
                 kind="take_profit",
             ),
         }
+        # Restoring protection cannot grant a larger loss than the submitted stop.
+        reanchored["stop_loss_price"] = (
+            min(stop_loss, reanchored["stop_loss_price"])
+            if side == "short"
+            else max(stop_loss, reanchored["stop_loss_price"])
+        )
         return (
             reanchored
             if self._prices_bracket_reference(
