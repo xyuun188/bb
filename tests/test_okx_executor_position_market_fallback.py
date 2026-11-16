@@ -295,8 +295,10 @@ async def test_place_order_uses_native_reduce_order_for_position_only_market() -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("hard_risk", [False, True])
+@pytest.mark.parametrize("continuation", [0.0, 0.01])
 async def test_profitable_exit_with_adverse_funding_uses_ioc_unless_hard_risk(
     hard_risk: bool,
+    continuation: float,
 ) -> None:
     executor = OKXExecutor("paper")
     exchange = _MissingLabMarketExchange()
@@ -316,6 +318,7 @@ async def test_profitable_exit_with_adverse_funding_uses_ioc_unless_hard_risk(
             "eligible": True, "gross_unrealized_pnl_usdt": 0.8293,
             "lifecycle_net_pnl_usdt": 0.75, "profit_lock_pressure": 0.3,
             "stop_risk_usage": 0.01, "settled_funding_fee": -0.01,
+            "continuation_deterioration": continuation,
             "funding_fee_included": True, "entry_fee_usdt": 0.003,
             "hard_risk": hard_risk, "planned_stop_crossed": hard_risk,
         }},

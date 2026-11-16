@@ -22,7 +22,10 @@ def profit_lock_execution_required(raw: dict[str, Any]) -> bool:
     try:
         gross_pnl = float(policy.get("gross_unrealized_pnl_usdt", float("nan")))
         price_loss_risk = bool(
-            float(policy.get("stop_risk_usage") or 0.0) > 0.0
+            max(
+                float(policy.get("stop_risk_usage") or 0.0),
+                float(policy.get("continuation_deterioration") or 0.0),
+            ) > 0.0
             and (not isfinite(gross_pnl) or gross_pnl < 0.0)
         )
         return bool(
@@ -36,10 +39,7 @@ def profit_lock_execution_required(raw: dict[str, Any]) -> bool:
             and not price_loss_risk
             and not any(
                 float(policy.get(key) or 0.0) > 0.0
-                for key in (
-                    "continuation_deterioration",
-                    "opposite_pressure", "model_exit_pressure",
-                )
+                for key in ("opposite_pressure", "model_exit_pressure")
             )
         )
     except (TypeError, ValueError):

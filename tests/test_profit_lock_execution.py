@@ -50,13 +50,14 @@ def test_profit_limit_is_only_required_for_discretionary_profitable_exit():
     assert profit_lock_execution_required({}) is False
 
 
-def test_small_settled_funding_cost_cannot_bypass_profitable_exit_price_limit():
+@pytest.mark.parametrize("continuation", [0.0, 0.01, 0.01834915])
+def test_small_settled_funding_cost_cannot_bypass_profitable_exit_price_limit(continuation):
     raw = _raw()
     raw["dynamic_exit_policy"].update({
         "gross_unrealized_pnl_usdt": 2.37262575,
         "settled_funding_fee": -0.11263427,
         "stop_risk_usage": 0.01834915,
-        "continuation_deterioration": 0.0,
+        "continuation_deterioration": continuation,
         "lifecycle_net_pnl_usdt": 1.98076796,
     })
 
