@@ -199,10 +199,15 @@ async def test_paper_return_limit_survives_every_market_fallback(
         monkeypatch.setattr(settings, "okx_entry_post_only_enabled", False)
     if path == "rejected":
         ccxt.reject_post_only = True
-    guard = {"eligible": True, "side": side, "limit_price": limit}
+    stop, target = (90.0, 110.0) if side == "buy" else (110.0, 90.0)
+    guard = {
+        "eligible": True, "side": side, "limit_price": limit,
+        "protection_compatible": True,
+        "stop_loss_price": stop, "take_profit_price": target,
+    }
     params = {
         "tdMode": "cross", "clOrdId": "BBNP123456",
-        "attachAlgoOrds": [{"tpTriggerPx": "90", "slTriggerPx": "110"}],
+        "attachAlgoOrds": [{"tpTriggerPx": str(target), "slTriggerPx": str(stop)}],
         "entry_execution_price_check": guard,
     }
 
@@ -218,6 +223,51 @@ async def test_paper_return_limit_survives_every_market_fallback(
     assert fallback["params"]["attachAlgoOrds"] == params["attachAlgoOrds"]
     assert "entry_execution_price_check" not in fallback["params"]
     assert params["entry_execution_price_check"] == guard
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["buy", "sell"])
+async def test_bounded_passive_entry_rejects_price_outside_approved_protection(side: str) -> None:
+    ccxt = _FakeCCXT()
+    stop, target = (99.0, 103.0) if side == "buy" else (101.0, 97.0)
+    guard = {
+        "eligible": True, "side": side,
+        "limit_price": 102.0 if side == "buy" else 98.0,
+        "protection_compatible": True,
+        "stop_loss_price": stop, "take_profit_price": target,
+    }
+
+    with pytest.raises(OrderPlacementError, match="conflicts with attached protection"):
+        await _executor()._create_order_with_client_recovery(
+            ccxt, SYMBOL, side, 10.0,
+            {"entry_execution_price_check": guard},
+            order_type="post_only", price=stop,
+        )
+
+    assert ccxt.create_order_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["buy", "sell"])
+async def test_passive_protection_conflict_uses_compatible_ioc_fallback(side: str) -> None:
+    ccxt = _FakeCCXT()
+    stop, target = (99.0, 103.0) if side == "buy" else (101.0, 97.0)
+    guard = {
+        "eligible": True, "side": side,
+        "limit_price": 102.0 if side == "buy" else 98.0,
+        "protection_compatible": True,
+        "stop_loss_price": stop, "take_profit_price": target,
+    }
+
+    _order, fact = await _executor()._place_entry_with_post_only(
+        ccxt, okx_symbol=SYMBOL, side=side, quantity=10.0,
+        params={"entry_execution_price_check": guard},
+        market={"info": {"tickSz": "0.1"}}, ticker={"bid": 99.0, "ask": 101.0},
+    )
+
+    assert [call["type"] for call in ccxt.create_order_calls] == ["ioc"]
+    assert ccxt.create_order_calls[0]["price"] == guard["limit_price"]
+    assert fact["post_only_plan_reason"] == "post_only_price_outside_protection"
 
 
 @pytest.mark.asyncio

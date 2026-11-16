@@ -914,6 +914,7 @@ def _select_top_return_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 ENTRY_COHORT_VERSION = "2026-11-13.positive-objective-entry-cohort.v1"
 PREDICTION_SCORE_POLICY_VERSION = "2026-11-13.leaf-total-risk-objective.v1"
+SHADOW_FORECAST_COMPARISON_VERSION = "2026-11-17.shadow-no-entry-forecast-comparison.v1"
 
 
 def positive_objective_entry_rows(
@@ -2379,6 +2380,11 @@ def _paired_artifact_return_evaluation(
         x = [row["x"] for row in rows]
         for role, bundle in bundles.items():
             scored_by_side = {}
+            forecast_evidence = {
+                "version": SHADOW_FORECAST_COMPARISON_VERSION,
+                "sample_count": len(rows),
+                "sides": {},
+            }
             for side in ("long", "short"):
                 moments = _regression_prediction_moments(bundle[f"{side}_return_model"], x)
                 market = moments["expected"]
@@ -2423,6 +2429,35 @@ def _paired_artifact_return_evaluation(
                     for index, row in enumerate(rows)
                 ]
                 scored_by_side[side] = scored_rows
+                ordinary_report = bundle["metadata"].get("ordinary_loss_holdout_report") or {}
+                ordinary_model = (bundle.get("ordinary_loss_models") or {}).get(side)
+                ordinary_aligned = bool(
+                    ordinary_report.get("version") == ORDINARY_LOSS_PREDICTION_VERSION
+                    and ordinary_report.get("event") == ORDINARY_LOSS_EVENT
+                    and ordinary_report.get("source_authority") == ORDINARY_LOSS_SOURCE
+                    and ordinary_report.get("profit_supervision_version") == PROFIT_SUPERVISION_VERSION
+                    and ordinary_report.get("horizon_minutes") == PRIMARY_PREDICTION_HORIZON_MINUTES
+                    and ordinary_report.get("chronological") is True
+                    and ordinary_report.get("decision_group_disjoint") is True
+                )
+                ordinary_probability = (
+                    predict_proba_positive_values(ordinary_model, x)
+                    if ordinary_aligned and ordinary_model is not None
+                    else np.full(len(rows), float("nan"))
+                )
+                net_labels = np.asarray([row[f"{side}_net_return"] for row in rows], dtype=float)
+                gross_labels = net_labels + np.asarray(
+                    [row[f"{side}_total_cost_pct"] for row in rows], dtype=float,
+                )
+                forecast_evidence["sides"][side] = {
+                    "gross_return_mse": float(np.mean((market - gross_labels) ** 2)),
+                    "net_return_mse": float(np.mean((market - cost - net_labels) ** 2)),
+                    "ordinary_loss_brier": (
+                        float(np.mean((ordinary_probability - (net_labels <= 0.0)) ** 2))
+                        if np.isfinite(ordinary_probability).all() else None
+                    ),
+                }
+            report[f"{role}_forecast_evaluation"] = forecast_evidence
             selected_by_side = positive_objective_entry_rows(scored_by_side)
             sides = {}
             for side, selected in selected_by_side.items():
@@ -2469,6 +2504,54 @@ def _replaceable_current_artifact(
         return current, None
     except IncompatibleArtifactContractError as exc:
         return None, str(exc)
+
+
+def _shadow_no_entry_forecast_comparison(evaluation: dict[str, Any]) -> dict[str, Any]:
+    """Update observation forecasts without manufacturing entry return evidence."""
+
+    report: dict[str, Any] = {
+        "version": SHADOW_FORECAST_COMPARISON_VERSION,
+        "accepted": False,
+        "scope": "shadow_forecasts_only",
+        "paper_execution_permission": False,
+        "production_permission": False,
+        "blocking_reasons": [],
+    }
+    if (
+        evaluation.get("ready") is not True
+        or evaluation.get("chronological_label_disjoint") is not True
+        or int(evaluation.get("sample_count") or 0) < 16
+    ):
+        return {**report, "blocking_reasons": ["common_unfitted_forecast_evidence_unavailable"]}
+    forecasts = {}
+    for role in ("candidate", "champion"):
+        entry = _comparison_entry_evidence(evaluation, role)
+        if entry.get("count") != 0 or entry.get("profit_factor_status") != "no_observations":
+            return {**report, "blocking_reasons": ["shadow_forecast_requires_both_empty_entry_cohorts"]}
+        forecast = evaluation.get(f"{role}_forecast_evaluation") or {}
+        if (
+            forecast.get("version") != SHADOW_FORECAST_COMPARISON_VERSION
+            or forecast.get("sample_count") != evaluation["sample_count"]
+        ):
+            return {**report, "blocking_reasons": ["common_unfitted_forecast_evidence_unavailable"]}
+        forecasts[role] = forecast.get("sides") or {}
+    blockers = []
+    for side in ("long", "short"):
+        for metric in ("gross_return_mse", "net_return_mse", "ordinary_loss_brier"):
+            values = [
+                (forecasts[role].get(side) or {}).get(metric)
+                for role in ("candidate", "champion")
+            ]
+            if any(
+                not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not math.isfinite(value) or value < 0.0
+                or (metric == "ordinary_loss_brier" and value > 1.0)
+                for value in values
+            ):
+                blockers.append(f"{side}_{metric}_unavailable")
+            elif values[0] >= values[1]:
+                blockers.append(f"candidate_{side}_{metric}_not_improved")
+    return {**report, "accepted": not blockers, "blocking_reasons": blockers}
 
 
 def _compare_candidate_to_current(
@@ -2561,6 +2644,16 @@ def _compare_candidate_to_current(
     champion = _entry_comparison_metrics(entry_evidence["champion"])
     report["candidate_metrics"] = candidate
     report["champion_metrics"] = champion
+    if candidate_stage == current_stage == "shadow":
+        forecast_comparison = _shadow_no_entry_forecast_comparison(evaluation)
+        report["shadow_forecast_comparison"] = forecast_comparison
+        if forecast_comparison.get("accepted") is True:
+            return {
+                **report,
+                "accepted": True,
+                "reason": "shadow_forecast_quality_improved_without_entry_permission",
+                "champion_version": current.get("version"),
+            }
     if any(candidate.get(key) is None or champion.get(key) is None for key in candidate):
         missing_reasons = []
         for role, metrics in (("candidate", candidate), ("champion", champion)):

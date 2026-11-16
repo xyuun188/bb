@@ -105,6 +105,8 @@ def paper_entry_execution_price_limit(
     *,
     latest_price: float,
     tick_size: float,
+    protection: dict[str, Any] | None = None,
+    price_limit: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Carry the approved paper signal budget through the actual venue fill."""
     raw = _safe_dict(decision.raw_response)
@@ -122,7 +124,7 @@ def paper_entry_execution_price_limit(
     tick = _safe_float(tick_size)
     expected = _safe_float(sizing.get("expected_net_return_pct"))
     result: dict[str, Any] = {
-        "version": "2026-11-17.paper-execution-return-budget.v1",
+        "version": "2026-11-17.paper-execution-return-budget.v2",
         "eligible": False,
         "reason": "paper_execution_return_budget_evidence_incomplete",
         "side": "buy" if decision.action == Action.LONG else "sell",
@@ -153,6 +155,51 @@ def paper_entry_execution_price_limit(
             rounding=ROUND_CEILING if long else ROUND_FLOOR,
         )
         limit = float((units - 1 if long else units + 1) * step)
+        result["return_budget_limit_price"] = limit
+        venue_ready = True
+        if price_limit is not None:
+            buy_limit = _safe_float(price_limit.get("buy_price_limit"))
+            sell_limit = _safe_float(price_limit.get("sell_price_limit"))
+            venue_ready = bool(0.0 < sell_limit <= buy_limit)
+            if venue_ready:
+                venue_units = (
+                    Decimal(str(buy_limit if long else sell_limit)) / step
+                ).to_integral_value(rounding=ROUND_FLOOR if long else ROUND_CEILING)
+                venue_limit = float(venue_units * step)
+                limit = min(limit, venue_limit) if long else max(limit, venue_limit)
+                venue_ready = sell_limit <= limit <= buy_limit
+                result["venue_limit_price"] = venue_limit
+            result["venue_price_limit_compatible"] = venue_ready
+        protection_ready = True
+        if protection is not None:
+            stop = _safe_float(protection.get("stop_loss_price"))
+            target = _safe_float(protection.get("take_profit_price"))
+            protection_ready = bool(
+                min(stop, target) > 0.0
+                and (stop < latest < target if long else target < latest < stop)
+            )
+            if protection_ready:
+                # OKX compares attached triggers to the parent order price,
+                # including an IOC's worst fill price, not just the quote.
+                target_units = (Decimal(str(target)) / step).to_integral_value(
+                    rounding=ROUND_CEILING if long else ROUND_FLOOR,
+                )
+                protection_limit = float(
+                    (target_units - 1 if long else target_units + 1) * step
+                )
+                limit = min(limit, protection_limit) if long else max(limit, protection_limit)
+                protection_ready = bool(
+                    stop < limit < target if long else target < limit < stop
+                )
+                result["protection_limit_price"] = protection_limit
+            result.update({
+                "stop_loss_price": stop,
+                "take_profit_price": target,
+                "protection_compatible": protection_ready,
+            })
+        if price_limit is not None and venue_ready:
+            venue_ready = sell_limit <= limit <= buy_limit
+            result["venue_price_limit_compatible"] = venue_ready
         adverse = EntryPriceGuardPolicy._adverse_move(
             decision.action, (latest - price) / price,
         )
@@ -160,11 +207,16 @@ def paper_entry_execution_price_limit(
             decision.action, (limit - price) / price,
         )
         remaining = expected - adverse * 100.0
-        eligible = limit > 0.0 and (latest <= limit if long else latest >= limit)
+        eligible = (
+            venue_ready and protection_ready and limit > 0.0
+            and (latest <= limit if long else latest >= limit)
+        )
         result.update({
             "eligible": eligible,
             "reason": (
-                "paper_execution_return_budget_ready" if eligible
+                "paper_execution_venue_price_limit_incompatible" if not venue_ready
+                else "paper_execution_protection_incompatible" if not protection_ready
+                else "paper_execution_return_budget_ready" if eligible
                 else "paper_execution_quote_consumed_return_budget"
             ),
             "limit_price": limit,

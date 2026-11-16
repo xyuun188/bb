@@ -4769,6 +4769,153 @@ def test_local_ai_comparison_allows_empty_direction_but_not_empty_portfolio(monk
         assert report["candidate_metrics"]["profit_factor"] == pytest.approx(7.5)
 
 
+def _shadow_no_entry_comparison_fixture(module: ModuleType) -> dict:
+    evaluation = {"ready": True, "chronological_label_disjoint": True, "sample_count": 20}
+    for role, errors in (("candidate", (0.5, 0.6, 0.1)), ("champion", (1.0, 1.1, 0.2))):
+        evaluation[f"{role}_entry_evaluation"] = module._entry_return_evaluation(
+            {"long": [], "short": []},
+        )
+        evaluation[f"{role}_forecast_evaluation"] = {
+            "version": module.SHADOW_FORECAST_COMPARISON_VERSION,
+            "sample_count": 20,
+            "sides": {
+                side: dict(zip(
+                    ("gross_return_mse", "net_return_mse", "ordinary_loss_brier"), errors,
+                    strict=True,
+                ))
+                for side in ("long", "short")
+            },
+        }
+    return evaluation
+
+
+@pytest.mark.parametrize("stage,accepted", [("shadow", True), ("canary", False), ("active", False)])
+def test_both_no_entry_models_can_only_refresh_shadow_forecasts(
+    monkeypatch, stage: str, accepted: bool,
+) -> None:
+    module = ModuleType("local_ai_tools_no_entry_shadow_refresh_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    evaluation = _shadow_no_entry_comparison_fixture(module)
+    monkeypatch.setattr(module, "_replaceable_current_artifact", lambda: ({
+        "version": "champion", "activation_manifest": {"activation_stage": stage},
+    }, None))
+    monkeypatch.setattr(module, "_paired_artifact_return_evaluation", lambda *_args: evaluation)
+
+    report = module._compare_candidate_to_current(
+        {}, candidate_stage=stage, candidate_bundle={}, holdout_rows=[],
+    )
+
+    assert report["accepted"] is accepted
+    assert report["candidate_metrics"]["profit_factor"] is None
+    if accepted:
+        assert report["reason"] == "shadow_forecast_quality_improved_without_entry_permission"
+        scope = report["shadow_forecast_comparison"]
+        assert scope["scope"] == "shadow_forecasts_only"
+        assert scope["paper_execution_permission"] is False
+        assert scope["production_permission"] is False
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["overlap", "small", "missing_forecast", "wrong_version", "different_rows", "nonempty", "bad_count"],
+)
+def test_shadow_forecast_refresh_requires_complete_common_no_entry_evidence(defect: str) -> None:
+    module = ModuleType("local_ai_tools_no_entry_evidence_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    evaluation = _shadow_no_entry_comparison_fixture(module)
+    if defect == "overlap":
+        evaluation["chronological_label_disjoint"] = False
+    elif defect == "small":
+        evaluation["sample_count"] = 15
+    elif defect == "missing_forecast":
+        evaluation.pop("champion_forecast_evaluation")
+    elif defect == "wrong_version":
+        evaluation["candidate_forecast_evaluation"]["version"] = "old"
+    elif defect == "different_rows":
+        evaluation["candidate_forecast_evaluation"]["sample_count"] = 19
+    elif defect == "nonempty":
+        evaluation["champion_entry_evaluation"]["portfolio"]["count"] = 1
+    else:
+        evaluation["candidate_entry_evaluation"]["portfolio"]["count"] = None
+
+    assert module._shadow_no_entry_forecast_comparison(evaluation)["accepted"] is False
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("metric", ["gross_return_mse", "net_return_mse", "ordinary_loss_brier"])
+@pytest.mark.parametrize("defect", ["tie", "worse", "missing", "nan", "negative"])
+def test_shadow_forecast_refresh_requires_each_direction_and_error_to_improve(
+    side: str, metric: str, defect: str,
+) -> None:
+    module = ModuleType("local_ai_tools_no_entry_metrics_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    evaluation = _shadow_no_entry_comparison_fixture(module)
+    champion = evaluation["champion_forecast_evaluation"]["sides"][side][metric]
+    value = {
+        "tie": champion, "worse": champion + 0.1,
+        "missing": None, "nan": float("nan"), "negative": -0.1,
+    }[defect]
+    evaluation["candidate_forecast_evaluation"]["sides"][side][metric] = value
+
+    assert module._shadow_no_entry_forecast_comparison(evaluation)["accepted"] is False
+
+
+def test_common_holdout_scores_all_forecasts_without_inventing_entry_returns(tmp_path: Path) -> None:
+    from sklearn.dummy import DummyClassifier, DummyRegressor
+
+    module = ModuleType("local_ai_tools_no_entry_forecast_math_test")
+    exec(compile(SERVICE_CODE, "local_ai_tools_api.py", "exec"), module.__dict__)
+    _configure_local_ai_registry(module, tmp_path)
+    x = [[0.0]] * 20
+    market = DummyRegressor().fit(x, [-1.0, 1.0] * 10)
+    cost = DummyRegressor().fit(x, [0.1] * 20)
+    tail = module.Pipeline([("model", DummyClassifier())]).fit(x, [0] * 20)
+    ordinary = module.Pipeline([("model", DummyClassifier())]).fit(x, [0, 1] * 10)
+    bundle = {
+        "metadata": {
+            "training_data_sha256": "a" * 64,
+            "primary_prediction_horizon_minutes": 240,
+            "comparison_fit_label_end": "2026-07-14T00:00:00+00:00",
+            "tail_loss_scale_pct": {"long": 0.0, "short": 0.0},
+            "ordinary_loss_holdout_report": {
+                "version": module.ORDINARY_LOSS_PREDICTION_VERSION,
+                "event": module.ORDINARY_LOSS_EVENT,
+                "source_authority": module.ORDINARY_LOSS_SOURCE,
+                "profit_supervision_version": module.PROFIT_SUPERVISION_VERSION,
+                "horizon_minutes": 240, "chronological": True, "decision_group_disjoint": True,
+            },
+        },
+        "ordinary_loss_models": {"long": ordinary, "short": ordinary},
+    }
+    for side in ("long", "short"):
+        bundle.update({f"{side}_return_model": market, f"{side}_cost_model": cost,
+                       f"{side}_loss_model": tail})
+    path = module.VERSIONS_ROOT / "champion" / "model.joblib"
+    module.dump_trusted_joblib_bundle(bundle, path)
+    start = datetime(2026, 7, 15, tzinfo=UTC)
+    rows = [{
+        "id": index, "decision_group": str(index), "symbol": "BTC/USDT",
+        "horizon": 240, "x": [0.0],
+        "decision_timestamp": (start + timedelta(hours=5 * index)).isoformat(),
+        "label_timestamp": (start + timedelta(hours=5 * index + 4)).isoformat(),
+        "long_total_cost_pct": 0.1, "short_total_cost_pct": 0.1,
+        "long_net_return": (-1.0 if index % 2 else 1.0) - 0.1,
+        "short_net_return": (1.0 if index % 2 else -1.0) - 0.1,
+    } for index in range(20)]
+
+    report = module._paired_artifact_return_evaluation(bundle, {"model_path": path}, rows)
+
+    assert report["ready"] is True
+    for role in ("candidate", "champion"):
+        assert report[f"{role}_entry_evaluation"]["portfolio"]["count"] == 0
+        for side in ("long", "short"):
+            error = report[f"{role}_forecast_evaluation"]["sides"][side]
+            assert error["gross_return_mse"] == pytest.approx(1.0)
+            assert error["net_return_mse"] == pytest.approx(1.0)
+            assert error["ordinary_loss_brier"] == pytest.approx(0.25)
+    assert module._shadow_no_entry_forecast_comparison(report)["accepted"] is False
+
+
 def test_entry_comparison_pools_chronological_outcomes_without_averaging_sides() -> None:
     from services.ml_signal_service import _entry_return_evaluation
     from services.model_champion_policy import _comparison_entry_evidence, _entry_metrics

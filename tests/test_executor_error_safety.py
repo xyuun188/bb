@@ -3831,7 +3831,10 @@ async def test_final_paper_entry_rechecks_signal_after_executor_quote_refresh(
         assert result.status == OrderStatus.FILLED
         assert result.order_type == "limit"
         assert exchange.create_calls[0][1] == "ioc"
-        assert exchange.create_calls[0][4] == pytest.approx(1.299)
+        assert exchange.create_calls[0][4] == pytest.approx(1.233)
+        assert exchange.create_calls[0][4] < float(
+            exchange.create_calls[0][5]["attachAlgoOrds"][0]["tpTriggerPx"]
+        )
         assert "entry_execution_price_check" not in exchange.create_calls[0][5]
         assert exchange.create_calls[0][5]["attachAlgoOrds"]
         assert result.raw_response["protection_submission"]["state"] == "confirmed"

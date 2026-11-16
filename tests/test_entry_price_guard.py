@@ -594,6 +594,161 @@ async def test_execution_limit_leaves_positive_budget_at_an_exact_tick_boundary(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action,price,quote,expected,tick,stop,target,limit",
+    [
+        (Action.SHORT, 0.9557, 0.9574, 1.18797556, 0.0001, 0.9696, 0.9452, 0.9453),
+        (Action.LONG, 100.0, 100.0, 2.0, 0.1, 99.0, 101.0, 100.9),
+        (Action.SHORT, 100.0, 100.0, 2.0, 0.1, 101.0, 99.0, 99.1),
+        (Action.LONG, 100.0, 100.0, 2.0, 0.1, 99.0, 101.05, 101.0),
+        (Action.SHORT, 100.0, 100.0, 2.0, 0.1, 101.0, 98.95, 99.0),
+    ],
+)
+async def test_bounded_entry_stays_inside_attached_protection(
+    action: Action, price: float, quote: float, expected: float, tick: float,
+    stop: float, target: float, limit: float,
+) -> None:
+    decision = _paper_decision(action=action, price=price, expected=expected)
+    assert await _paper_policy(
+        latest=quote, final_expected=expected,
+    ).prepare_dynamic_risk_contract(decision, "paper", []) is None
+    protection = {"stop_loss_price": str(stop), "take_profit_price": str(target)}
+
+    guard = paper_entry_execution_price_limit(
+        decision, "paper", latest_price=quote, tick_size=tick, protection=protection,
+    )
+
+    assert guard["eligible"] is True
+    assert guard["protection_compatible"] is True
+    assert guard["limit_price"] == pytest.approx(limit)
+    assert guard["worst_remaining_expected_net_return_pct"] > 0.0
+    if action == Action.LONG:
+        assert stop < guard["limit_price"] < target
+        assert guard["limit_price"] <= guard["return_budget_limit_price"]
+    else:
+        assert target < guard["limit_price"] < stop
+        assert guard["limit_price"] >= guard["return_budget_limit_price"]
+    assert protection == {"stop_loss_price": str(stop), "take_profit_price": str(target)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", [Action.LONG, Action.SHORT])
+async def test_protection_cannot_loosen_a_tighter_entry_return_limit(action: Action) -> None:
+    decision = _paper_decision(action=action, price=100.0, expected=0.5)
+    assert await _paper_policy(
+        latest=100.0, final_expected=0.5,
+    ).prepare_dynamic_risk_contract(decision, "paper", []) is None
+    protection = {
+        "stop_loss_price": 99.0 if action == Action.LONG else 101.0,
+        "take_profit_price": 102.0 if action == Action.LONG else 98.0,
+    }
+
+    guard = paper_entry_execution_price_limit(
+        decision, "paper", latest_price=100.0, tick_size=0.1, protection=protection,
+    )
+
+    assert guard["eligible"] is True
+    assert guard["limit_price"] == pytest.approx(100.4 if action == Action.LONG else 99.6)
+    assert guard["limit_price"] == guard["return_budget_limit_price"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action,price,quote,expected,tick,stop,target,buy_limit,sell_limit,limit",
+    [
+        (Action.SHORT, 0.9557, 0.9574, 1.18797556, 0.0001, 0.9696, 0.9452, 0.9668, 0.9475, 0.9475),
+        (Action.LONG, 100.0, 100.0, 3.0, 0.1, 98.0, 104.0, 101.05, 99.0, 101.0),
+        (Action.SHORT, 100.0, 100.0, 3.0, 0.1, 102.0, 96.0, 101.0, 98.95, 99.0),
+    ],
+)
+async def test_bounded_entry_intersects_return_protection_and_venue_limits(
+    action: Action, price: float, quote: float, expected: float, tick: float,
+    stop: float, target: float, buy_limit: float, sell_limit: float, limit: float,
+) -> None:
+    decision = _paper_decision(action=action, price=price, expected=expected)
+    assert await _paper_policy(
+        latest=quote, final_expected=expected,
+    ).prepare_dynamic_risk_contract(decision, "paper", []) is None
+
+    guard = paper_entry_execution_price_limit(
+        decision, "paper", latest_price=quote, tick_size=tick,
+        protection={"stop_loss_price": stop, "take_profit_price": target},
+        price_limit={"buy_price_limit": buy_limit, "sell_price_limit": sell_limit},
+    )
+
+    assert guard["eligible"] is True
+    assert guard["limit_price"] == pytest.approx(limit)
+    assert guard["venue_price_limit_compatible"] is True
+    assert guard["protection_compatible"] is True
+    assert sell_limit <= limit <= buy_limit
+    assert guard["worst_remaining_expected_net_return_pct"] > 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("price_limit", [{}, {"buy_price_limit": 99.0, "sell_price_limit": 101.0}])
+async def test_bounded_entry_requires_valid_venue_bounds_when_supplied(
+    price_limit: dict[str, Any],
+) -> None:
+    decision = _paper_decision(action=Action.LONG, price=100.0, expected=1.0)
+    assert await _paper_policy(
+        latest=100.0, final_expected=1.0,
+    ).prepare_dynamic_risk_contract(decision, "paper", []) is None
+
+    guard = paper_entry_execution_price_limit(
+        decision, "paper", latest_price=100.0, tick_size=0.1, price_limit=price_limit,
+    )
+
+    assert guard["eligible"] is False
+    assert guard["reason"] == "paper_execution_venue_price_limit_incompatible"
+
+
+@pytest.mark.asyncio
+async def test_no_entry_when_venue_and_protection_have_no_common_price() -> None:
+    decision = _paper_decision(action=Action.LONG, price=94.0, expected=20.0)
+    assert await _paper_policy(
+        latest=94.0, final_expected=20.0,
+    ).prepare_dynamic_risk_contract(decision, "paper", []) is None
+
+    guard = paper_entry_execution_price_limit(
+        decision, "paper", latest_price=94.0, tick_size=0.1,
+        protection={"stop_loss_price": 90.0, "take_profit_price": 95.0},
+        price_limit={"buy_price_limit": 110.0, "sell_price_limit": 99.0},
+    )
+
+    assert guard["eligible"] is False
+    assert guard["reason"] == "paper_execution_venue_price_limit_incompatible"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action,stop,target",
+    [
+        (Action.LONG, 100.0, 102.0),
+        (Action.LONG, 99.0, 100.0),
+        (Action.SHORT, 100.0, 98.0),
+        (Action.SHORT, 101.0, 100.0),
+        (Action.LONG, None, 102.0),
+        (Action.SHORT, 101.0, float("nan")),
+    ],
+)
+async def test_execution_limit_rejects_incompatible_protection(
+    action: Action, stop: float | None, target: float,
+) -> None:
+    decision = _paper_decision(action=action, price=100.0, expected=1.0)
+    assert await _paper_policy(
+        latest=100.0, final_expected=1.0,
+    ).prepare_dynamic_risk_contract(decision, "paper", []) is None
+
+    guard = paper_entry_execution_price_limit(
+        decision, "paper", latest_price=100.0, tick_size=0.1,
+        protection={"stop_loss_price": stop, "take_profit_price": target},
+    )
+
+    assert guard["eligible"] is False
+    assert guard["reason"] == "paper_execution_protection_incompatible"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tick", [0.0, float("nan")])
 async def test_execution_limit_requires_a_real_tick_size(tick: float) -> None:
     decision = _paper_decision(action=Action.SHORT, price=100.0, expected=1.0)

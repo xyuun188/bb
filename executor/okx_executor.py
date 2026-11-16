@@ -2093,6 +2093,8 @@ class OKXExecutor(AbstractExecutor):
                     decision, self.executor_mode,
                     latest_price=price,
                     tick_size=self._market_info_float(market, "tickSz", "price_tick"),
+                    protection=protection,
+                    price_limit=submit_price_limit,
                 )
                 if execution_price_guard is not None:
                     if execution_price_guard.get("eligible") is not True:
@@ -2105,7 +2107,7 @@ class OKXExecutor(AbstractExecutor):
                                 "system_pre_submit_rejection": True,
                                 "okx_rejection": False,
                                 "entry_execution_price_check": execution_price_guard,
-                                "error": "最终执行报价已超出信号收益预算，或价格证据不完整，未提交订单。",
+                                "error": "最终执行报价不满足收益预算或止盈止损价格关系，或价格证据不完整，未提交订单。",
                             },
                         )
                     params["entry_execution_price_check"] = execution_price_guard
@@ -4593,6 +4595,15 @@ class OKXExecutor(AbstractExecutor):
                 order_type, price = "ioc", limit
             else:
                 raise OrderPlacementError("Unsupported bounded entry order type")
+            if entry_guard.get("protection_compatible") is not None:
+                stop = self._safe_float(entry_guard.get("stop_loss_price"))
+                target = self._safe_float(entry_guard.get("take_profit_price"))
+                if (
+                    entry_guard.get("protection_compatible") is not True
+                    or price is None
+                    or not (stop < price < target if side == "buy" else target < price < stop)
+                ):
+                    raise OrderPlacementError("Entry order price conflicts with attached protection")
         try:
             return await self._with_retry(
                 ccxt.create_order,
@@ -4832,7 +4843,14 @@ class OKXExecutor(AbstractExecutor):
                 or (str(side).lower() in {"sell", "short"} and passive_price <= best_bid)
             )
         )
-        if passive_price <= 0 or crossing:
+        protection_conflict = False
+        if entry_guard.get("protection_compatible") is True:
+            stop = self._safe_float(entry_guard.get("stop_loss_price"))
+            target = self._safe_float(entry_guard.get("take_profit_price"))
+            protection_conflict = not (
+                stop < passive_price < target if side == "buy" else target < passive_price < stop
+            )
+        if passive_price <= 0 or crossing or protection_conflict:
             order = await self._create_order_with_client_recovery(
                 ccxt,
                 okx_symbol,
@@ -4841,7 +4859,13 @@ class OKXExecutor(AbstractExecutor):
                 params,
             )
             return order, post_only_execution_fact(
-                plan={**plan, "eligible": False, "reason": "post_only_price_would_cross"},
+                plan={
+                    **plan, "eligible": False,
+                    "reason": (
+                        "post_only_price_outside_protection" if protection_conflict
+                        else "post_only_price_would_cross"
+                    ),
+                },
                 outcome="not_attempted",
             )
         plan = {**plan, "price": passive_price, "execution_price_limit": execution_price_limit}
