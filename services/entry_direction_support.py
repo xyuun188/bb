@@ -14,7 +14,7 @@ from services.normal_paper_trade import (
     normal_paper_entry_return_ready,
 )
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-11-14.qualified-paper-model-direction.v18"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-11-17.scoped-paper-model-direction.v19"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 PAPER_TRAINING_ENTRY_SCOPE = "paper_training_entry"
 MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY = (
@@ -143,6 +143,9 @@ def _quant_family_summaries(
                 "objective_net_return_pct": objective_expected - execution_cost_pct,
                 "loss_probability": loss_probability,
                 "horizon_minutes": horizon,
+                "paper_training_only": any(
+                    item.get("paper_training_only") is True for item in rows
+                ),
             }
         )
     return summaries
@@ -162,24 +165,41 @@ def summarize_paper_quantitative_evidence(
     evidence_rows = _dict(competition.get(side)).get("evidence")
     if not isinstance(evidence_rows, list):
         evidence_rows = []
+    parsed_cost = _float(execution_cost_pct)
+    execution_cost_complete = bool(parsed_cost is not None and parsed_cost > 0.0)
+    applied_cost = float(parsed_cost or 0.0)
     if support_scope == PAPER_MODEL_TRADE_SCOPE:
+        opposite_side = "short" if side == "long" else "long"
+        opposite_rows = _dict(competition.get(opposite_side)).get("evidence")
+        opposite_rows = opposite_rows if isinstance(opposite_rows, list) else []
         qualified_rows = [
             row
             for row in evidence_rows
             if isinstance(row, dict)
             and row.get("decision_eligible") is True
+            and row.get("paper_training_only") is not True
             and _dict(row.get("paper_return_quality_governance")).get(
                 "paper_execution_permission"
             ) is True
+            and normal_paper_entry_return_ready(
+                (_float(row.get("raw_expected_return_pct")) or 0.0) - applied_cost,
+                (_float(row.get("objective_expected_return_pct")) or 0.0) - applied_cost,
+            )
+            and any(
+                _dict(opposite).get("source") == row.get("source")
+                and _float(_dict(opposite).get("horizon_minutes")) == _float(row.get("horizon_minutes"))
+                and (_float(_dict(opposite).get("raw_expected_return_pct")) is not None)
+                and (_float(_dict(opposite).get("objective_expected_return_pct")) is not None)
+                and float(row["raw_expected_return_pct"]) > float(opposite["raw_expected_return_pct"])
+                and float(row["objective_expected_return_pct"]) > float(opposite["objective_expected_return_pct"])
+                for opposite in opposite_rows
+            )
         ]
-        # Ordinary paper entries use their qualified model evidence. Mixing
-        # observation-only tools back in would downgrade them to training risk.
+        # Prefer a current, directional ordinary edge. Historical permission
+        # alone must not hide a positive training side behind a losing tool.
         if qualified_rows:
             evidence_rows = qualified_rows
 
-    parsed_cost = _float(execution_cost_pct)
-    execution_cost_complete = bool(parsed_cost is not None and parsed_cost > 0.0)
-    applied_cost = float(parsed_cost or 0.0)
     family_summaries = _quant_family_summaries(evidence_rows, applied_cost)
     by_horizon: dict[float, list[dict[str, Any]]] = {}
     for item in family_summaries:
@@ -551,6 +571,9 @@ def assess_directional_entry_support(
         for source in quantitative_sources
     )
     quant_families = sorted(str(item["family"]) for item in effective_families)
+    direction_training_only = any(
+        item.get("paper_training_only") is True for item in effective_families
+    )
     # When no family survives directional screening, retain the complete
     # aggregate values for diagnostics and blocking reasons.  They are never
     # used to authorize an entry because ``quant_families`` remains empty.
@@ -694,13 +717,17 @@ def assess_directional_entry_support(
         "current_edge_validated": current_edge_validated,
         "paper_quality_observation_only": quality_observation_only,
         "paper_quality_observation_reasons": quality_observation_reasons,
-        "paper_training_only": training_scope,
+        "paper_training_only": training_scope or direction_training_only,
         "paper_training_reasons": (
             [
-                "historical_quality_gate_is_observation_only",
+                *(
+                    ["model_direction_authorized_for_paper_training_only"]
+                    if direction_training_only
+                    else ["historical_quality_gate_is_observation_only"]
+                ),
                 "current_directional_evidence_is_training_eligible",
             ]
-            if training_scope
+            if training_scope or direction_training_only
             else []
         ),
         "aligned_expert_count": len(aligned),

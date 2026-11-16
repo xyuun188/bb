@@ -538,6 +538,7 @@ def select_normal_paper_trade_side(
                 observation_only
                 or quality_permission_denied
                 or not ordinary_return_ready
+                or support.get("paper_training_only") is True
             )
         )
         validated_edge = bool(
@@ -566,6 +567,7 @@ def select_normal_paper_trade_side(
                     {
                         "paper_training_only": True,
                         "paper_training_reasons": [
+                            *(support.get("paper_training_reasons") or []),
                             *(
                                 ["historical_quality_gate_is_observation_only"]
                                 if observation_only or quality_permission_denied else []
@@ -774,6 +776,7 @@ def build_normal_paper_trade_contract(
             and (
                 not current_edge_validated
                 or not _quality_permissions_ready(source_quality_permissions)
+                or support.get("paper_training_only") is True
             )
         )
         or (

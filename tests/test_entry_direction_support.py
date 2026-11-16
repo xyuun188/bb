@@ -107,6 +107,82 @@ def test_negative_objective_with_unproven_history_only_selects_bounded_training(
     assert selection["production_permission"] is False
 
 
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("raw,loss_probability,selected", [
+    (0.6, 0.3, True), (0.05, 0.3, False), (0.6, 0.7, False),
+])
+def test_training_direction_never_inherits_ordinary_quality_permission(
+    side, raw, loss_probability, selected,
+) -> None:
+    opposite = "short" if side == "long" else "long"
+    row = _row("local_ml", raw=raw, objective=raw - 0.1)
+    row["paper_training_only"] = True
+    row["loss_probability"] = loss_probability
+    row["paper_return_quality_governance"] = {
+        "paper_execution_permission": True,
+        "paper_execution_evidence": {
+            "sample_count": 30, "average_return": 0.3, "return_lcb": 0.2,
+            "profit_factor": 2.0, "profit_factor_above_break_even": True,
+        },
+        "break_even_contract": {
+            "average_return_above_zero": True,
+            "return_lcb_above_zero": True,
+            "profit_factor_above_one": True,
+        },
+    }
+    support = assess_paper_model_trade_support(
+        {
+            side: {"evidence": [row]},
+            opposite: {"evidence": [_row("local_ml", raw=-raw, objective=-raw - 0.1)]},
+        },
+        [], side, execution_cost_pct=0.1,
+    )
+    selection = select_normal_paper_trade_side({side: support})
+    assert selection["selected"] is selected
+    if selected:
+        from services.normal_paper_trade import build_normal_paper_trade_contract
+
+        assert support["paper_training_only"] is True
+        assert selection["selection_reason"] == "paper_training_entry"
+        contract = build_normal_paper_trade_contract(
+            symbol="BTC/USDT", side=side,
+            selection_reason=selection["selection_reason"],
+            direction_support=selection["selected_support"],
+        )
+        assert contract["authorized"] is True
+        assert contract["paper_training_only"] is True
+        assert contract["production_permission"] is False
+        assert build_normal_paper_trade_contract(
+            symbol="BTC/USDT", side=side, selection_reason="strategy_edge_selected",
+            direction_support=selection["selected_support"],
+        ) == {}
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_negative_qualified_tool_cannot_hide_positive_training_direction(side) -> None:
+    opposite = "short" if side == "long" else "long"
+    training = _row("local_ml", raw=0.6, objective=-0.2)
+    training["paper_training_only"] = True
+    training["paper_return_quality_governance"] = {"paper_execution_permission": True}
+    tool = _row("server_profit", raw=-0.6, objective=-0.8)
+    tool["paper_return_quality_governance"] = {"paper_execution_permission": True}
+    support = assess_paper_model_trade_support(
+        {
+            side: {"evidence": [training, tool]},
+            opposite: {"evidence": [
+                _row("local_ml", raw=-0.6, objective=-0.8),
+                _row("server_profit", raw=0.6, objective=-0.2),
+            ]},
+        },
+        [], side, execution_cost_pct=0.1,
+    )
+    selection = select_normal_paper_trade_side({side: support})
+    assert support["eligible"] is True
+    assert support["quant_evidence_families"] == ["local_ml"]
+    assert selection["selected_side"] == side
+    assert selection["selection_reason"] == "paper_training_entry"
+
+
 def test_governed_candidate_still_requires_positive_objective_evidence() -> None:
     support = assess_directional_entry_support(
         {"long": {"evidence": [_row("local_ml")] }},

@@ -5,6 +5,7 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_opportunity_scoring import EntryOpportunityScoringPolicy
+from services.model_strategy_blueprint import build_model_strategy_blueprint
 from services.normal_paper_trade import build_normal_paper_trade_contract
 from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
@@ -285,6 +286,51 @@ def test_missing_final_return_distribution_revokes_paper_contract_with_specific_
     assert raw["entry_permission"]["blocking_reasons"][-1] == (
         "normal_paper_trade_not_authorized"
     )
+
+
+@pytest.mark.parametrize("training_contract", [True, False])
+def test_training_direction_survives_scoring_only_under_training_execution_contract(training_contract) -> None:
+    decision = _decision()
+    decision.raw_response["local_ai_tools"] = {}
+    signal = decision.raw_response["ml_signal"]
+    signal["model_version"] = "current-model"
+    signal["strategy_blueprint"] = build_model_strategy_blueprint(
+        metadata={
+            "artifact_version": "current-model",
+            "trained_at": "2026-11-15T00:00:00+00:00", "test_count": 120,
+            "oos_return_evaluation": {
+                "long": {"return_lcb_pct": -0.2}, "short": {"return_lcb_pct": -0.1},
+            },
+        },
+        readiness={},
+        activation={
+            "activation_stage": "canary",
+            "champion_comparison": {
+                "accepted": True, "candidate_stage": "canary", "comparison_sides": ["short"],
+            },
+        },
+    )
+    decision.raw_response["normal_paper_trade"] = build_normal_paper_trade_contract(
+        symbol="BTC/USDT", side="long",
+        selection_reason="paper_training_entry" if training_contract else "strategy_edge_selected",
+        direction_support={
+            "eligible": True, "selected_side": "long", "prediction_horizon_minutes": 30,
+            "expected_net_return_pct": 0.7, "raw_expected_return_pct": 0.8,
+            "objective_net_return_pct": 0.6, "loss_probability": 0.2,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
+            "current_edge_validated": True, "paper_training_only": training_contract,
+        },
+    )
+    assert decision.raw_response["normal_paper_trade"]["authorized"] is True
+
+    _scorer().score_candidate(decision, {"execution_mode": "paper"})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    component = opportunity["expected_net_breakdown"]["components"][0]
+    assert component["paper_training_only"] is True
+    assert component["decision_eligible"] is training_contract
+    assert decision.raw_response["normal_paper_trade"]["authorized"] is training_contract
 
 
 def test_live_models_use_equal_empirical_observations_and_live_cost() -> None:

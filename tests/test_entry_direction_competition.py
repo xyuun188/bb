@@ -9,6 +9,7 @@ from services.entry_direction_competition import (
 )
 from services.entry_direction_support import assess_paper_model_trade_support
 from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
+from services.model_strategy_blueprint import build_model_strategy_blueprint
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
     COST_MODEL_VERSION,
@@ -728,6 +729,47 @@ def test_authorized_long_can_compare_against_unauthorized_short_observation() ->
     assert support["quant_evidence_families"] == ["local_ml"]
     assert context["short"]["evidence"][0]["decision_eligible"] is False
     assert context["short"]["evidence"][0]["direction_comparison_eligible"] is True
+
+
+@pytest.mark.parametrize("training_side", ["long", "short"])
+def test_side_scoped_canary_keeps_opposite_complete_paper_training_direction(training_side) -> None:
+    compared_side = "short" if training_side == "long" else "long"
+    signal = _paper_payload(
+        0.8 if training_side == "long" else -0.8,
+        0.8 if training_side == "short" else -0.8,
+    )
+    signal["model_version"] = "current-model"
+    signal["strategy_blueprint"] = build_model_strategy_blueprint(
+        metadata={
+            "artifact_version": "current-model",
+            "trained_at": "2026-11-15T00:00:00+00:00",
+            "test_count": 120,
+            "oos_return_evaluation": {
+                "long": {"return_lcb_pct": -0.2},
+                "short": {"return_lcb_pct": -0.1},
+            },
+        },
+        readiness={},
+        activation={
+            "activation_stage": "canary",
+            "champion_comparison": {
+                "accepted": True, "candidate_stage": "canary", "comparison_sides": [compared_side],
+            },
+        },
+    )
+    context = _context(ml=signal, strategy={"execution_mode": "paper"})
+    evidence = context[training_side]["evidence"][0]
+    assert evidence["decision_eligible"] is True
+    assert evidence["paper_training_only"] is True
+    assert context["production_source_count"] == 0
+    support = assess_paper_model_trade_support(context, [], training_side, execution_cost_pct=0.1)
+    assert support["eligible"] is True
+    assert support["paper_training_only"] is True
+    assert support["quant_evidence_families"] == ["local_ml"]
+
+    signal["prediction_quality"]["anomalous"] = True
+    invalid = _context(ml=signal, strategy={"execution_mode": "paper"})
+    assert invalid[training_side]["evidence"][0]["decision_eligible"] is False
 
 
 def test_mismatched_horizons_cannot_enter_direction_aggregation() -> None:

@@ -142,6 +142,7 @@ class EntryOpportunityScoringPolicy:
             execution_scope=execution_scope,
             side=side,
             source="local_ml",
+            allow_paper_training=execution_scope == "paper",
         )
         influence = safe_dict(signal.get("influence_policy"))
         side_policy = safe_dict(influence.get(side))
@@ -201,6 +202,10 @@ class EntryOpportunityScoringPolicy:
                 or direction_authorization.get("eligible") is True
             )
         )
+        if direction_authorization.get("paper_training_only") is True:
+            paper_eligible = bool(
+                paper_eligible and paper_governance.get("eligible") is True
+            )
         cost_distribution = safe_dict(
             safe_dict(primary.get("counterfactual_execution_cost_distribution")).get(
                 side
@@ -259,6 +264,7 @@ class EntryOpportunityScoringPolicy:
             "execution_scope": execution_scope,
             "paper_strategy_authorization": paper_authorization,
             "model_strategy_side_authorization": direction_authorization,
+            "paper_training_only": direction_authorization.get("paper_training_only") is True,
             "return_distribution_contract": contract,
             "raw_market_return_pct": contract.get("raw_expected_return_pct"),
             "raw_return_pct": contract.get("raw_expected_return_pct"),
@@ -494,6 +500,19 @@ class EntryOpportunityScoringPolicy:
                 family = _quant_family_for_component(component.get("key"))
                 selected = family in selected_families
                 component["direction_support_selected"] = selected
+                if (
+                    selected
+                    and component.get("paper_training_only") is True
+                    and normal_trade.get("paper_training_only") is not True
+                ):
+                    component.update(
+                        decision_eligible=False,
+                        paper_eligible=False,
+                        aggregate_eligible=False,
+                        observation_only=True,
+                        eligibility_reason="paper_training_direction_requires_training_contract",
+                    )
+                    continue
                 if selected or component.get("decision_eligible") is not True:
                     continue
                 component["decision_eligible"] = False

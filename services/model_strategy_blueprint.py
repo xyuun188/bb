@@ -12,7 +12,7 @@ from services.ml_prediction_contract import (
     PREDICTION_SCORE_POLICY_VERSION,
 )
 
-MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-11-13.score-bound-entry-replay.v6"
+MODEL_STRATEGY_BLUEPRINT_VERSION = "2026-11-17.scoped-direction-training.v7"
 MODEL_STRATEGY_BLUEPRINT_OWNER_SOURCE = "local_ml"
 
 
@@ -286,12 +286,15 @@ def model_strategy_side_authorization(
     execution_scope: str,
     side: str,
     source: str = MODEL_STRATEGY_BLUEPRINT_OWNER_SOURCE,
+    allow_paper_training: bool = False,
 ) -> dict[str, Any]:
     """Resolve the trained model blueprint for the source that owns it.
 
     The local profit-quality blueprint governs only ``local_ml``. Independent
     server models retain their own artifact, return-distribution, and execution
     governance; one model artifact must never suppress another model family.
+    Callers opting into paper training must preserve its scope through selection
+    and sizing; this never expands the ordinary or live execution sides.
     """
 
     model_signal = _safe_dict(signal)
@@ -389,33 +392,49 @@ def model_strategy_side_authorization(
         if normalized_scope == "paper"
         else production_eligible_sides
     )
+    training_only = bool(
+        normalized_scope == "paper"
+        and normalized_side in paper_training_sides
+        and normalized_side not in production_eligible_sides
+        and normalized_side not in paper_bootstrap_sides
+    )
     if normalized_side not in authorized_sides:
-        return {
-            **result,
-            "eligible": False,
-            "reason": "direction_not_authorized_by_model_blueprint",
-        }
+        # A side-scoped canary comparison governs ordinary execution. It must
+        # not suppress the complete artifact's separately bounded paper-training
+        # route, or the model can never collect trades for the other direction.
+        if (
+            allow_paper_training
+            and normalized_scope == "paper"
+            and normalized_side in paper_training_sides
+            and blueprint.get("version") == MODEL_STRATEGY_BLUEPRINT_VERSION
+            and blueprint.get("artifact_stage") in {"candidate", "shadow", "canary", "active"}
+            and int(_safe_dict(blueprint.get("training_evidence")).get("holdout_sample_count") or 0) > 0
+        ):
+            training_only = True
+        else:
+            return {
+                **result,
+                "eligible": False,
+                "reason": "direction_not_authorized_by_model_blueprint",
+            }
     return {
         **result,
         "eligible": True,
+        "paper_training_only": training_only,
         "reason": (
-            "paper_bootstrap_direction_authorized"
+            "paper_training_direction_authorized"
+            if training_only
+            else "paper_bootstrap_direction_authorized"
             if normalized_scope == "paper"
             and normalized_side in paper_bootstrap_sides
-            else "paper_training_direction_authorized"
-            if normalized_scope == "paper"
-            and normalized_side in paper_training_sides
-            and normalized_side not in production_eligible_sides
             else "direction_authorized_by_model_blueprint"
         ),
         "authorization_basis": (
-            "paper_bootstrap_canary"
+            "paper_current_signal_training"
+            if training_only
+            else "paper_bootstrap_canary"
             if normalized_scope == "paper"
             and normalized_side in paper_bootstrap_sides
-            else "paper_current_signal_training"
-            if normalized_scope == "paper"
-            and normalized_side in paper_training_sides
-            and normalized_side not in production_eligible_sides
             else "production_quality"
         ),
     }

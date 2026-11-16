@@ -276,6 +276,56 @@ def test_canary_replacement_executes_only_the_compared_sides(
             side=side,
         )
         assert permission["eligible"] is (side in compared_sides)
+        training_permission = model_strategy_side_authorization(
+            {"model_version": "side-scoped-canary", "strategy_blueprint": blueprint},
+            execution_scope="paper",
+            side=side,
+            allow_paper_training=True,
+        )
+        assert training_permission["eligible"] is True
+        assert training_permission["paper_training_only"] is (side not in compared_sides)
+        assert model_strategy_side_authorization(
+            {"model_version": "side-scoped-canary", "strategy_blueprint": blueprint},
+            execution_scope="live",
+            side=side,
+            allow_paper_training=True,
+        )["eligible"] is False
+
+
+@pytest.mark.parametrize("invalid_field,value", [
+    ("authority_available", False),
+    ("paper_execution_eligible", False),
+    ("version", "legacy-blueprint"),
+    ("artifact_stage", "rejected"),
+    ("training_evidence", {"holdout_sample_count": 0}),
+    ("paper_training_sides", []),
+    ("model_version", "replaced-model"),
+])
+def test_training_direction_does_not_bypass_artifact_authority(invalid_field, value) -> None:
+    blueprint = build_model_strategy_blueprint(
+        metadata={
+            "artifact_version": "current-model",
+            "trained_at": "2026-11-15T00:00:00+00:00",
+            "test_count": 120,
+            "oos_return_evaluation": {
+                "long": {"return_lcb_pct": -0.2},
+                "short": {"avg_return_pct": 0.4, "return_lcb_pct": 0.2, "profit_factor": 1.5},
+            },
+        },
+        readiness={},
+        activation={
+            "activation_stage": "canary",
+            "champion_comparison": {
+                "accepted": True, "candidate_stage": "canary", "comparison_sides": ["short"],
+            },
+        },
+    )
+    blueprint[invalid_field] = value
+    permission = model_strategy_side_authorization(
+        {"model_version": "current-model", "strategy_blueprint": blueprint},
+        execution_scope="paper", side="long", allow_paper_training=True,
+    )
+    assert permission["eligible"] is False
 
 
 def test_activation_manifest_paper_canary_restores_runtime_blueprint_side() -> None:

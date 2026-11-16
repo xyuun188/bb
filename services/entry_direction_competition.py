@@ -453,6 +453,7 @@ class EntryDirectionCompetitionPolicy:
                     execution_scope=execution_scope,
                     side=side,
                     source=source,
+                    allow_paper_training=execution_scope == "paper",
                 )
                 for side in ("long", "short")
             }
@@ -469,6 +470,8 @@ class EntryDirectionCompetitionPolicy:
                 if authorization.get("enforced") is not True:
                     continue
                 if authorization.get("eligible") is True:
+                    if authorization.get("paper_training_only") is True:
+                        item["paper_training_only"] = True
                     continue
                 # Keep otherwise-valid evidence as a counterfactual baseline.
                 # It cannot authorize this side, but the selected side still
