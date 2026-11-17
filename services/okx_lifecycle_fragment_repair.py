@@ -22,7 +22,7 @@ from models.decision import AIDecision
 from models.trade import OkxPositionHistory, Order, Position
 
 REPAIR_SOURCE = "okx_authoritative_lifecycle_fragment_recovery"
-REPAIR_VERSION = "2026-11-16.okx-lifecycle-recovery.v5"
+REPAIR_VERSION = "2026-11-17.okx-lifecycle-recovery.v6"
 REPAIR_TRAINING_POLICY = "exclude_until_authoritative_settlement"
 REPAIR_REASON = "missing_local_position_for_authoritative_closed_lifecycle"
 ORDER_CONFIRMATION_STATES = {
@@ -505,9 +505,29 @@ async def _repair_missing_lifecycle_close_link(
         or position.closed_at is None
         or abs((_aware_utc(position.closed_at) - facts["closed_at"]).total_seconds())
         > TIME_TOLERANCE_SECONDS
-        or any(close_id in _split_ids(p.close_exchange_order_id) for p in positions)
     ):
         return None
+    # Fill backfill can already own the close order without knowing posId.
+    # Recover the exact same projection so settlement can retire its duplicate.
+    for projection in positions:
+        if close_id not in _split_ids(projection.close_exchange_order_id):
+            continue
+        if (
+            projection.is_open
+            or projection.execution_mode != facts["mode"]
+            or _text(projection.okx_inst_id).upper() != facts["inst_id"]
+            or _text(projection.okx_pos_id) not in {"", facts["pos_id"]}
+            or normalize_trading_symbol(projection.symbol) != facts["symbol"]
+            or _text(projection.side).lower() != facts["side"]
+            or _split_ids(projection.entry_exchange_order_id) != entry_ids
+            or _split_ids(projection.close_exchange_order_id) != close_ids
+            or not _close_enough(projection.quantity, position.quantity)
+            or not _close_enough(projection.entry_price, record.open_avg_px)
+            or not _close_enough(projection.current_price, record.close_avg_px)
+            or projection.closed_at is None
+            or abs((_aware_utc(projection.closed_at) - facts["closed_at"]).total_seconds()) > 0.001
+        ):
+            return None
     owner = (facts["inst_id"], facts["pos_id"], facts["side"], facts["opened_at"])
     if (
         any(entry_owners.get(order_id) != {owner} for order_id in entry_ids)

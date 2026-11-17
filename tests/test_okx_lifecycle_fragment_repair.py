@@ -25,6 +25,7 @@ from services.okx_position_history_store import (
 )
 from services.okx_position_settlement_sync import (
     OkxPositionSettlementSyncService,
+    _deduplicate_closed_lifecycle_rows,
     _group_candidates_by_lifecycle,
     _prepare_lifecycle_allocations,
 )
@@ -281,6 +282,8 @@ async def _seed_missing_full_lifecycle(session, *, failure: str | None = None):
 @pytest.mark.parametrize("failure", [
     None, "wrong_position", "wrong_quantity", "unconfirmed", "other_owner",
     "wrong_price", "wrong_time", "partial", "wrong_entry", "wrong_mode",
+    "matching_projection", "different_projection_pos_id", "different_projection_entry",
+    "different_projection_quantity", "different_projection_time",
 ])
 async def test_missing_close_link_uses_official_lifecycle_instead_of_estimated_price(
     tmp_path, monkeypatch: pytest.MonkeyPatch, failure: str | None, missing_history_link: bool,
@@ -332,19 +335,32 @@ async def test_missing_close_link_uses_official_lifecycle_instead_of_estimated_p
                 position.entry_exchange_order_id = "different-entry"
             elif failure == "wrong_mode":
                 close_order.execution_mode = "live"
+            if failure == "matching_projection" or str(failure).startswith("different_projection_"):
+                session.add(Position(
+                    model_name="ensemble_trader", execution_mode="paper", symbol="SLX/USDT",
+                    side="long", quantity=1050.0 if failure == "different_projection_quantity" else 1040.0,
+                    entry_price=0.07, current_price=0.072, leverage=2.0,
+                    is_open=False, created_at=opened_at,
+                    closed_at=closed_at + timedelta(seconds=1) if failure == "different_projection_time" else closed_at,
+                    okx_inst_id="SLX-USDT-SWAP",
+                    okx_pos_id="another-lifecycle" if failure == "different_projection_pos_id" else None,
+                    entry_exchange_order_id="different-entry" if failure == "different_projection_entry" else "entry-full-lifecycle",
+                    close_exchange_order_id="close-full-lifecycle",
+                ))
             await session.flush()
             result = await repair_missing_okx_lifecycle_fragments(
                 session, mode="paper", position_history_rows=[row],
                 now=closed_at + timedelta(minutes=1),
             )
             recovered = [s for s in result["samples"] if s["kind"] == "okx_lifecycle_close_link_recovered"]
-            assert bool(recovered) is (failure is None)
+            should_recover = failure in {None, "matching_projection"}
+            assert bool(recovered) is should_recover
             assert position.close_exchange_order_id == (
-                "close-full-lifecycle" if failure is None else None
+                "close-full-lifecycle" if should_recover else None
             )
             assert position.realized_pnl == -0.09254275
             assert position.current_price == 0.071
-            if failure is None:
+            if should_recover:
                 assert result["created_count"] == 0
                 assert history.close_order_ids == ["close-full-lifecycle"]
                 assert position.settlement_raw["close_link_recovery"]["history_record_id"] == history.id
@@ -353,6 +369,14 @@ async def test_missing_close_link_uses_official_lifecycle_instead_of_estimated_p
                     now=closed_at + timedelta(minutes=2),
                 )
                 assert repeat["repaired_order_link_count"] == 0
+                if failure == "matching_projection":
+                    projections = list((await session.execute(select(Position))).scalars().all())
+                    retained, duplicates = _deduplicate_closed_lifecycle_rows(
+                        projections, now=closed_at + timedelta(minutes=3),
+                    )
+                    assert [p.id for p in retained] == [position.id]
+                    assert len(duplicates) == 1
+                    assert duplicates[0].settlement_status == "superseded_position_residual"
     finally:
         await close_db()
 
