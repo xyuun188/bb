@@ -1220,18 +1220,33 @@ def _phase3_preflight_needs_live_refresh(
     *,
     report_age_seconds: float | None,
 ) -> tuple[bool, str | None]:
-    """Avoid replaying an OKX blocker from a snapshot superseded by a sync.
+    """Recheck cached blockers superseded by newer infrastructure evidence.
 
     The timer report is normally reused to keep the dashboard cheap.  A
-    persisted report that still contains an OKX difference must be compared
-    with the newest reconciliation artifact, otherwise a successful repair
-    can remain visible as an unresolved incident for up to 45 minutes.
+    Compare failed OKX and model probes with newer reconciliation/readiness
+    artifacts, otherwise a repaired incident can remain visible for up to
+    45 minutes. Newer evidence triggers a live check, never an assumed pass.
     """
     blocker_codes = {
         str(item.get("code") or "")
         for item in _safe_list(report.get("blockers"))
         if isinstance(item, dict)
     }
+    if blocker_codes.intersection(
+        {
+            "phase3_model_server_runtime_not_ready",
+            "phase3_model_server_go_live_blocked",
+        }
+    ):
+        readiness = _load_phase3_model_server_readiness_latest_report()
+        readiness_at = _report_checked_at(readiness)
+        persisted_at = _report_checked_at(report)
+        if readiness_at is not None and (
+            persisted_at is None or readiness_at > persisted_at
+        ):
+            return True, "model_readiness_newer_than_preflight"
+        if report_age_seconds is None or report_age_seconds > 5 * 60:
+            return True, "model_blocker_snapshot_older_than_live_probe_window"
     if not blocker_codes.intersection(
         {
             "okx_authoritative_sync_not_clean",

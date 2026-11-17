@@ -1638,6 +1638,74 @@ async def test_phase3_paper_resume_preflight_refreshes_persisted_okx_blocker_aft
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("live_blocked", [False, True])
+async def test_phase3_preflight_rechecks_model_blocker_after_new_readiness(
+    monkeypatch: pytest.MonkeyPatch, live_blocked: bool,
+) -> None:
+    checked_at = datetime.now(UTC) - timedelta(minutes=2)
+    blocker = {"code": "phase3_model_server_runtime_not_ready"}
+    persisted = {
+        "checked_at": checked_at.isoformat(),
+        "status": "blocked",
+        "can_resume_paper": False,
+        "blockers": [blocker],
+    }
+    calls = []
+
+    class PreflightService:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def report(self) -> dict[str, Any]:
+            calls.append(True)
+            return {
+                "status": "blocked" if live_blocked else "ready",
+                "can_resume_paper": not live_blocked,
+                "blockers": [blocker] if live_blocked else [],
+            }
+
+    monkeypatch.setattr(
+        system_audit, "_read_latest_phase3_report", lambda _path: persisted,
+    )
+    monkeypatch.setattr(
+        system_audit, "_load_phase3_model_server_readiness_latest_report",
+        lambda: {
+            "checked_at": (checked_at + timedelta(seconds=30)).isoformat(),
+            "status": "ready",
+            "runtime_ready": True,
+        },
+    )
+    monkeypatch.setattr(system_audit, "Phase3PaperResumePreflightService", PreflightService)
+
+    card = await system_audit._phase3_paper_resume_preflight_audit()
+
+    assert calls == [True]
+    assert card["status"] == ("critical" if live_blocked else "ok")
+    assert card["details"]["report_refresh_reason"] == "model_readiness_newer_than_preflight"
+    assert card["details"]["effective_blockers"] == ([blocker] if live_blocked else [])
+
+
+@pytest.mark.parametrize(
+    "age_seconds, expected",
+    [(60, (False, None)), (301, (True, "model_blocker_snapshot_older_than_live_probe_window"))],
+)
+def test_phase3_preflight_model_blocker_cache_has_short_retry_window(
+    monkeypatch: pytest.MonkeyPatch, age_seconds: int, expected: tuple,
+) -> None:
+    monkeypatch.setattr(
+        system_audit, "_load_phase3_model_server_readiness_latest_report", lambda: {},
+    )
+    result = system_audit._phase3_preflight_needs_live_refresh(
+        {
+            "checked_at": (datetime.now(UTC) - timedelta(seconds=age_seconds)).isoformat(),
+            "blockers": [{"code": "phase3_model_server_go_live_blocked"}],
+        },
+        report_age_seconds=age_seconds,
+    )
+    assert result == expected
+
+
+@pytest.mark.asyncio
 async def test_phase3_paper_resume_preflight_audit_is_consumed_after_paper_starts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
