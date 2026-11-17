@@ -3898,6 +3898,46 @@ def test_trade_history_marks_no_position_exit_as_reconciled_terminal_state() -> 
     assert _execution_status_label("rejected", reason) == "已同步，无需重复平仓"
 
 
+def test_trade_history_distinguishes_pre_submit_guards_from_exchange_failures() -> None:
+    raw = {
+        "execution_blocker": "entry_execution_return_budget",
+        "system_pre_submit_rejection": True,
+        "okx_rejection": False,
+    }
+
+    assert _execution_failure_kind("最终执行报价未满足收益预算", raw) == (
+        "pre_submit_return_guard"
+    )
+    assert _execution_status_label("rejected", "最终执行报价未满足收益预算", raw) == (
+        "未提交：收益/价格保护"
+    )
+    assert _readable_execution_reason(
+        execution_reason="",
+        reasoning="",
+        exchange_order_id="entry_return_budget_consumed",
+        status="rejected",
+        raw_response=raw,
+    ).startswith("未提交：最终执行报价")
+
+
+def test_trade_history_distinguishes_profit_gate_and_cooldown_blocks() -> None:
+    profit_raw = {"execution_blocker": "profit_gate_blocked", "okx_rejection": False}
+    cooldown_raw = {"execution_blocker": "same_symbol_reentry_cooldown_active", "okx_rejection": False}
+
+    assert _execution_failure_kind("normal_paper_trade_expected_net_not_positive", profit_raw) == (
+        "profit_gate_blocked"
+    )
+    assert _execution_status_label("rejected", "normal_paper_trade_expected_net_not_positive", profit_raw) == (
+        "未提交：收益门禁"
+    )
+    assert _execution_failure_kind("same_symbol_reentry_cooldown_active", cooldown_raw) == (
+        "business_cooldown"
+    )
+    assert _execution_status_label("rejected", "same_symbol_reentry_cooldown_active", cooldown_raw) == (
+        "未执行：同币种冷却"
+    )
+
+
 @pytest.mark.asyncio
 async def test_no_position_trade_list_and_detail_agree(tmp_path, monkeypatch) -> None:
     from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage

@@ -325,24 +325,76 @@ def _translate_execution_text(message: str | None) -> str:
     return sanitize_text(text)
 
 
-def _execution_failure_kind(message: str | None) -> str | None:
+def _execution_failure_kind(
+    message: str | None,
+    raw_response: dict[str, Any] | None = None,
+) -> str | None:
+    """Classify terminal execution states without calling pre-submit guards failures.
+
+    A rejected local order can be created to keep an audit trail even when no
+    request was sent to OKX.  Those records must remain distinguishable from
+    an exchange rejection or a transport failure.
+    """
+
     if is_okx_temporary_service_error(message):
         return "transient_exchange_error"
     if ExecutionResultClassifier.is_no_exchange_position_error(message):
         return "no_exchange_position"
+    raw = raw_response if isinstance(raw_response, dict) else {}
+    blocker = str(raw.get("execution_blocker") or "").strip().lower()
+    reason_text = str(message or "").strip().lower()
+    pre_submit = bool(
+        raw.get("system_pre_submit_rejection") is True
+        or raw.get("okx_rejection") is False and blocker
+    )
+    if pre_submit or blocker:
+        if (
+            "entry_execution_return_budget" in blocker
+            or "return_budget" in reason_text
+            or "报价不满足收益预算" in str(message or "")
+        ):
+            return "pre_submit_return_guard"
+        if (
+            "cooldown" in blocker
+            or "cooldown" in reason_text
+            or "冷却" in str(message or "")
+        ):
+            return "business_cooldown"
+        if (
+            "profit_gate" in blocker
+            or "normal_paper_trade" in reason_text
+            or "expected_net" in reason_text
+            or "return_lcb" in reason_text
+            or "收益门禁" in str(message or "")
+        ):
+            return "profit_gate_blocked"
+        return "pre_submit_blocked"
     return None
 
 
-def _execution_status_label(status: str | None, reason: str | None) -> str:
+def _execution_status_label(
+    status: str | None,
+    reason: str | None,
+    raw_response: dict[str, Any] | None = None,
+) -> str:
     """Return a stable, human-readable terminal state for execution history."""
 
     normalized_status = str(status or "").lower()
     if normalized_status == "filled":
         return "执行成功"
-    if _execution_failure_kind(reason) == "no_exchange_position":
+    kind = _execution_failure_kind(reason, raw_response)
+    if kind == "no_exchange_position":
         return "\u5df2\u540c\u6b65\uff0c\u65e0\u9700\u91cd\u590d\u5e73\u4ed3"
-    if _execution_failure_kind(reason) == "transient_exchange_error":
+    if kind == "transient_exchange_error":
         return "交易所临时不可用"
+    if kind == "pre_submit_return_guard":
+        return "未提交：收益/价格保护"
+    if kind == "profit_gate_blocked":
+        return "未提交：收益门禁"
+    if kind == "business_cooldown":
+        return "未执行：同币种冷却"
+    if kind == "pre_submit_blocked":
+        return "未提交：交易前保护"
     return "执行失败"
 
 
@@ -383,8 +435,24 @@ def _readable_execution_reason(
     reasoning: str | None,
     exchange_order_id: str | None,
     status: str | None,
+    raw_response: dict[str, Any] | None = None,
 ) -> str:
     """Choose a human-readable reason without treating order ids as reasons."""
+
+    raw = raw_response if isinstance(raw_response, dict) else {}
+    blocker = str(raw.get("execution_blocker") or "").strip().lower()
+    if raw.get("system_pre_submit_rejection") is True or blocker:
+        if "entry_execution_return_budget" in blocker:
+            return "未提交：最终执行报价未满足扣费后收益预算或止盈止损价格关系，系统在提交前保护性拦截。"
+        if "cooldown" in blocker:
+            return "未执行：该币种仍处于重复开仓冷却期，系统没有向 OKX 提交新订单。"
+        if "profit_gate" in blocker or any(
+            token in str(execution_reason or "").lower()
+            for token in ("normal_paper_trade", "expected_net", "return_lcb")
+        ):
+            return "未提交：当前费后收益或盈利证据未达到开仓门槛，系统保留信号但没有向 OKX 下单。"
+        if raw.get("okx_rejection") is False:
+            return "未提交：交易前保护条件未满足，系统在请求到达 OKX 前拦截了本次订单。"
 
     for candidate in (execution_reason, reasoning):
         text = sanitize_text(candidate)
@@ -1035,6 +1103,7 @@ async def get_trades(
                 reasoning=meta.get("reasoning"),
                 exchange_order_id=order.exchange_order_id,
                 status=order.status,
+                raw_response=raw,
             )
 
         p = matching_closed_position(order)
@@ -1152,8 +1221,9 @@ async def get_trades(
             1.0,
         )
         reason = sanitize_text(display_reason(order))
-        failure_kind = _execution_failure_kind(reason)
-        execution_status_label = _execution_status_label(order.status, reason)
+        raw_response = raw_for_order(order)
+        failure_kind = _execution_failure_kind(reason, raw_response)
+        execution_status_label = _execution_status_label(order.status, reason, raw_response)
         return {
             "id": order.id,
             "decision_id": order.decision_id,
@@ -1289,6 +1359,7 @@ async def get_trade_detail(trade_id: int):
         reasoning=sanitize_text(getattr(decision, "reasoning", None)),
         exchange_order_id=order.exchange_order_id,
         status=order.status,
+        raw_response=raw_response,
     )
     execution_source = _execution_source_from_decision(decision, order)
     matched_closed_positions = _matching_closed_positions_for_order(order, closed_positions)
@@ -1322,8 +1393,8 @@ async def get_trade_detail(trade_id: int):
         order_filled_at=order.filled_at,
         fallback_reason=fallback_reason,
     )
-    failure_kind = _execution_failure_kind(fallback_reason)
-    execution_status_label = _execution_status_label(order.status, fallback_reason)
+    failure_kind = _execution_failure_kind(fallback_reason, raw_response)
+    execution_status_label = _execution_status_label(order.status, fallback_reason, raw_response)
 
     return sanitize_payload(
         {

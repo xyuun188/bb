@@ -8718,11 +8718,21 @@ function executionStatusPresentation(record, explicitSuccess = null) {
     const kind = String(record?.execution_failure_kind || record?.final_result?.status || '').toLowerCase();
     const isTransientExchange = kind === 'transient_exchange_error';
     const isNoExchangePosition = kind === 'no_exchange_position';
-    const label = record?.execution_status_label || (success ? '执行成功' : (isTransientExchange ? '交易所临时不可用' : '执行失败'));
+    const isPreSubmit = ['pre_submit_return_guard', 'profit_gate_blocked', 'business_cooldown', 'pre_submit_blocked'].includes(kind);
+    const fallbackLabel = kind === 'pre_submit_return_guard'
+        ? '未提交：收益/价格保护'
+        : kind === 'profit_gate_blocked'
+            ? '未提交：收益门禁'
+            : kind === 'business_cooldown'
+                ? '未执行：同币种冷却'
+                : kind === 'pre_submit_blocked'
+                    ? '未提交：交易前保护'
+                    : success ? '执行成功' : (isTransientExchange ? '交易所临时不可用' : '执行失败');
+    const label = record?.execution_status_label || fallbackLabel;
     const color = success || isNoExchangePosition
         ? 'var(--green)'
-        : (isTransientExchange ? 'var(--orange)' : 'var(--red)');
-    return { label, color, kind, success, isTransientExchange, isNoExchangePosition };
+        : (isTransientExchange || isPreSubmit ? 'var(--orange)' : 'var(--red)');
+    return { label, color, kind, success, isTransientExchange, isNoExchangePosition, isPreSubmit };
 }
 function fmtPrice(p) {
     if (p === null || p === undefined || p === '') return '-';
@@ -11088,10 +11098,12 @@ function renderExecutionDetailModal(trade, detailData = null) {
     const finalTitle = finalResult?.success
         ? '执行成功'
         : detailStatusInfo.isNoExchangePosition ? '无需重复平仓'
+        : detailStatusInfo.isPreSubmit ? '未提交（系统保护）'
         : (detailStatusInfo.isTransientExchange ? '交易所临时不可用' : '执行未完成/失败');
     const reasonLabel = success
         ? '执行原因'
         : detailStatusInfo.isNoExchangePosition ? '同步说明'
+        : detailStatusInfo.isPreSubmit ? '未提交原因'
         : (detailStatusInfo.isTransientExchange ? '临时故障原因' : '失败原因');
     const finalHtml = finalResult ? `
         <div class="reason-block">
