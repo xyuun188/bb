@@ -30,7 +30,7 @@ from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
     is_normal_paper_trade_decision,
-    normal_paper_current_return_ready,
+    normal_paper_entry_return_ready,
     normal_paper_trade_contract_reasons,
     reconcile_normal_paper_trade_contract,
 )
@@ -97,6 +97,7 @@ def solve_size_aware_positive_expected_net(
     return_lcb_pct: float,
     execution_cost: dict[str, Any],
     execution_slippage_floor_pct: float = 0.0,
+    paper_training_only: bool = False,
 ) -> dict[str, Any]:
     """Maximize expected net profit within the risk budget and native book.
 
@@ -194,11 +195,13 @@ def solve_size_aware_positive_expected_net(
         # Some paper snapshots only contain the pre-sizing spread/fee facts,
         # without enough native order-book levels for a second size-specific
         # VWAP pass.  Preserve that existing audited cost contract when its
-        # expected return is positive and downside is finite; never use this
-        # fallback to authorize a negative opportunity.
+        # return satisfies the same entry scope as the native-book path.
+        # Training still needs finite downside and positive fee-after mean.
         if (
             execution_cost.get("production_eligible") is True
-            and normal_paper_current_return_ready(original_expected, original_lcb)
+            and normal_paper_entry_return_ready(
+                original_expected, original_lcb, paper_training_only=paper_training_only,
+            )
         ):
             result.update(
                 {
@@ -248,7 +251,13 @@ def solve_size_aware_positive_expected_net(
     if not evaluated:
         result["reason"] = "round_trip_size_cost_incomplete"
         return result
-    profitable = [candidate for candidate in evaluated if candidate["expected"] > 0.0]
+    profitable = [
+        candidate for candidate in evaluated
+        if normal_paper_entry_return_ready(
+            candidate["expected"], candidate["lcb"],
+            paper_training_only=paper_training_only,
+        )
+    ]
     selected = (
         max(
             profitable,
@@ -277,6 +286,9 @@ def solve_size_aware_positive_expected_net(
     )
     if selected["expected"] <= 0.0:
         result["reason"] = "no_positive_expected_net_at_exchange_minimum"
+        return result
+    if not profitable:
+        result["reason"] = "no_positive_return_lcb_at_executable_size"
         return result
     result.update(
         {
@@ -2190,6 +2202,7 @@ class EntryProfitRiskSizingPolicy:
             # slippage floor. Reuse it while repricing size so its delta is
             # applied once, not once in scoring and again in sizing.
             execution_slippage_floor_pct=execution_slippage_floor_pct,
+            paper_training_only=training_mode,
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (
@@ -2445,6 +2458,8 @@ class EntryProfitRiskSizingPolicy:
             reasons.append("normal_paper_training_raw_return_not_positive")
         if not isfinite(return_lcb):
             reasons.append("normal_paper_downside_return_missing_after_size_cost")
+        elif return_lcb <= 0.0 and not training_mode:
+            reasons.append("normal_paper_return_lcb_not_positive_after_size_cost")
         if existing_leverage_exceeds_dynamic_limit:
             reasons.append("normal_paper_existing_leverage_exceeds_dynamic_limit")
         if final_notional <= 0:

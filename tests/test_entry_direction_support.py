@@ -9,7 +9,11 @@ from services.entry_direction_support import (
     directional_entry_support_reasons,
     summarize_paper_quantitative_evidence,
 )
-from services.normal_paper_trade import select_normal_paper_trade_side
+from services.normal_paper_trade import (
+    build_normal_paper_trade_contract,
+    normal_paper_entry_contract_reasons,
+    select_normal_paper_trade_side,
+)
 
 
 def _row(source: str, *, raw: float = 0.4, objective: float = 0.2) -> dict:
@@ -34,6 +38,141 @@ def _opinion(name: str, action: str, *, source_group: str) -> dict:
         "trace_only_fallback": False,
         "entry_support_eligible": True,
     }
+
+
+def _loss_strategy(side: str, symbol: str = "BTC/USDT") -> dict:
+    return {
+        "strategy_context_performance": {
+            "available": True, "status": "fresh", "age_seconds": 1.0,
+            "source": "background_performance_snapshot", "failed_labels": [],
+        },
+        "symbol_side_performance": {
+            f"{symbol}|{side}": {
+                "count": 4, "profit": 1.0, "loss": 3.0, "pnl": -2.0,
+                "profile_scope": "symbol_side",
+                "policy_provenance": {
+                    "source": "trusted_closed_position_fee_after_pnl_distribution",
+                    "sample_count": 4,
+                },
+            },
+        },
+    }
+
+
+def _training_support(
+    side: str, strategy: dict, *, verified: bool = False,
+    raw: float = 0.6, symbol: str = "BTC/USDT",
+) -> dict:
+    from tests.normal_paper_test_fixtures import paper_quality_permissions
+
+    opposite = "short" if side == "long" else "long"
+    row = _row("local_ml", raw=raw, objective=0.4)
+    row["paper_return_quality_governance"] = (
+        paper_quality_permissions()["local_ml"]
+        if verified else {"paper_execution_permission": False}
+    )
+    return assess_paper_model_trade_support(
+        {side: {"evidence": [row]}, opposite: {"evidence": [_row("local_ml", raw=-0.6, objective=-0.8)]}},
+        [], side, execution_cost_pct=0.1, strategy_mode=strategy,
+        symbol=symbol,
+    )
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_recent_trusted_side_loss_blocks_training_without_forcing_opposite(side: str) -> None:
+    strategy = _loss_strategy(side)
+    support = _training_support(side, strategy)
+    assert support["recent_side_loss_guard"]["blocked"] is True
+    selection = select_normal_paper_trade_side({side: support})
+    assert selection["selected_side"] == "neutral"
+    assert "direction_support_recent_side_loss" in selection["blocking_reasons"]
+    opposite = "short" if side == "long" else "long"
+    other = _training_support(opposite, strategy, raw=0.05)
+    assert select_normal_paper_trade_side({side: support, opposite: other})["selected"] is False
+    other = _training_support(opposite, strategy)
+    assert select_normal_paper_trade_side({side: support, opposite: other})["selected_side"] == opposite
+
+
+@pytest.mark.parametrize("mutation", [
+    "unavailable", "expired", "partial_failure", "wrong_source", "few_samples",
+    "incomplete", "inconsistent", "recovered", "untrusted_profile", "all_sides_profile",
+    "other_symbol", "missing_symbol", "global_loss_only", "sample_count_mismatch",
+])
+def test_side_loss_guard_ignores_unusable_or_recovered_settlement_evidence(mutation: str) -> None:
+    strategy = _loss_strategy("short")
+    snapshot = strategy["strategy_context_performance"]
+    bucket = strategy["symbol_side_performance"]["BTC/USDT|short"]
+    symbol = "BTC/USDT"
+    if mutation == "unavailable":
+        snapshot["available"] = False
+    elif mutation == "expired":
+        snapshot["status"] = "expired_background_refresh"
+    elif mutation == "partial_failure":
+        snapshot["failed_labels"] = ["symbol_side_perf"]
+    elif mutation == "wrong_source":
+        snapshot["source"] = "untrusted"
+    elif mutation == "few_samples":
+        bucket["count"] = 3
+    elif mutation == "incomplete":
+        bucket.pop("profit")
+    elif mutation == "inconsistent":
+        bucket["pnl"] = -20.0
+    elif mutation == "recovered":
+        bucket.update({"profit": 4.0, "loss": 3.0, "pnl": 1.0})
+    elif mutation == "untrusted_profile":
+        bucket["policy_provenance"]["source"] = "untrusted"
+    elif mutation == "all_sides_profile":
+        bucket["profile_scope"] = "symbol"
+    elif mutation == "other_symbol":
+        symbol = "ETH/USDT"
+    elif mutation == "missing_symbol":
+        symbol = ""
+    elif mutation == "global_loss_only":
+        strategy["side_performance_multiday"] = {"short": bucket}
+        strategy["symbol_side_performance"] = {}
+    elif mutation == "sample_count_mismatch":
+        bucket["policy_provenance"]["sample_count"] = 50
+    support = _training_support("short", strategy, symbol=symbol)
+    assert support["recent_side_loss_guard"]["blocked"] is False
+    assert select_normal_paper_trade_side({"short": support})["selected"] is True
+
+
+@pytest.mark.parametrize("symbol", ["BTC/USDT", "BTC/USDT:USDT", "BTC-USDT-SWAP"])
+def test_symbol_side_loss_guard_matches_canonical_instrument(symbol: str) -> None:
+    support = _training_support("short", _loss_strategy("short"), symbol=symbol)
+    assert support["recent_side_loss_guard"]["symbol"] == "BTC/USDT"
+    assert support["recent_side_loss_guard"]["blocked"] is True
+
+
+def test_losses_in_both_global_sides_do_not_stop_other_instruments() -> None:
+    strategy = _loss_strategy("short")
+    strategy["side_performance_multiday"] = {
+        side: {"count": 500, "profit": 10.0, "loss": 100.0, "pnl": -90.0}
+        for side in ("long", "short")
+    }
+    for side in ("long", "short"):
+        support = _training_support(side, strategy, symbol="ETH/USDT")
+        assert select_normal_paper_trade_side({side: support})["selected"] is True
+
+
+def test_recent_side_loss_cannot_veto_independently_validated_current_entry() -> None:
+    support = _training_support("short", _loss_strategy("short"), verified=True)
+    selection = select_normal_paper_trade_side({"short": support})
+    assert selection["selection_reason"] == "strategy_edge_selected"
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT", side="short", selection_reason=selection["selection_reason"],
+        direction_support=selection["selected_support"],
+    )
+    assert normal_paper_entry_contract_reasons(contract) == []
+
+
+def test_direct_training_contract_cannot_bypass_recent_side_loss_guard() -> None:
+    support = _training_support("short", _loss_strategy("short"))
+    support["paper_training_only"] = True
+    assert build_normal_paper_trade_contract(
+        symbol="BTC/USDT", side="short", selection_reason="paper_training_entry",
+        direction_support=support,
+    ) == {}
 
 
 @pytest.mark.parametrize("qualified_source", ["local_ml", "server_profit"])

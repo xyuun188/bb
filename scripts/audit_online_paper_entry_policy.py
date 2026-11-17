@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
+from services.entry_direction_support import _recent_side_loss_guard  # noqa: E402
 from services.normal_paper_trade import (  # noqa: E402
     build_normal_paper_trade_contract,
     normal_paper_entry_contract_reasons,
@@ -49,6 +50,7 @@ async def main():
                 AIDecision.id, AIDecision.created_at, AIDecision.symbol,
                 AIDecision.was_executed,
                 AIDecision.raw_llm_response['paper_trade_selection'].label('selection'),
+                AIDecision.raw_llm_response['strategy_mode'].label('strategy_mode'),
             ).where(AIDecision.id.in_(ids)).order_by(AIDecision.id.desc()))).all()
         payload = json.dumps([dict(row._mapping) for row in rows], default=str).encode()
         print('BB_POLICY_DATA=' + base64.b64encode(zlib.compress(payload)).decode())
@@ -71,11 +73,23 @@ def replay_policy(rows: list[dict[str, Any]]) -> dict[str, Any]:
         by_side = deepcopy(selection["by_side"])
         # This reason was added by the old selector, after direction support.
         # Re-run selection from that stage without erasing any upstream guard.
-        for support in by_side.values():
+        for side, support in by_side.items():
             support["blocking_reasons"] = [
                 reason for reason in support.get("blocking_reasons") or []
                 if reason != "direction_support_risk_adjusted_return_not_positive"
             ]
+            if isinstance(row.get("strategy_mode"), dict):
+                guard = _recent_side_loss_guard(row["strategy_mode"], side, row["symbol"])
+                support["recent_side_loss_guard"] = guard
+                counts["side_loss_guard_snapshots_available"] += guard["enabled"]
+                counts["side_loss_guard_snapshots_losing"] += guard["blocked"]
+            else:
+                guard = support.get("recent_side_loss_guard")
+                if isinstance(guard, dict) and guard:
+                    counts["side_loss_guard_snapshots_available"] += guard.get("enabled") is True
+                    counts["side_loss_guard_snapshots_losing"] += guard.get("blocked") is True
+                else:
+                    counts["side_loss_guard_context_missing"] += 1
         replay = select_normal_paper_trade_side(by_side)
         counts["replayed"] += 1
         counts["originally_selected"] += selection.get("selected") is True

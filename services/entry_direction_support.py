@@ -5,21 +5,23 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
-from math import isfinite
+from math import isclose, isfinite
 from typing import Any
 
+from core.symbols import normalize_trading_symbol
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY,
     normal_paper_current_return_ready,
     normal_paper_entry_return_ready,
 )
 
-INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-11-17.scoped-paper-model-direction.v20"
+INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-11-17.scoped-paper-model-direction.v21"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
 PAPER_TRAINING_ENTRY_SCOPE = "paper_training_entry"
 MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY = (
     NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
 )
+RECENT_SIDE_LOSS_MIN_SAMPLES = 4
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -67,6 +69,69 @@ def _expert_group(item: dict[str, Any]) -> str:
 def _weight(value: Any) -> float:
     parsed = _float(value)
     return parsed if parsed is not None and parsed > 0.0 else 1.0
+
+
+def _recent_side_loss_guard(
+    strategy_mode: dict[str, Any] | None,
+    side: str,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    """Restrict unvalidated training only for the losing instrument and side."""
+
+    strategy = _dict(strategy_mode)
+    freshness = _dict(strategy.get("strategy_context_performance"))
+    normalized_symbol = normalize_trading_symbol(symbol)
+    profile = _dict(_dict(strategy.get("symbol_side_performance")).get(
+        f"{normalized_symbol}|{side}",
+    )) if normalized_symbol and side in {"long", "short"} else {}
+    provenance = _dict(profile.get("policy_provenance"))
+    sample_count = max(int(_float(profile.get("count")) or 0.0), 0)
+    pnl = _float(profile.get("pnl"))
+    profit = _float(profile.get("profit"))
+    loss = _float(profile.get("loss"))
+    evidence_complete = bool(
+        pnl is not None
+        and profit is not None and profit >= 0.0
+        and loss is not None and loss >= 0.0
+        and isclose(profit - loss, pnl, abs_tol=1e-5)
+    )
+    profit_factor = profit / loss if evidence_complete and loss > 0.0 else None
+    snapshot_available = bool(
+        freshness.get("available") is True
+        and freshness.get("status") in {"fresh", "stale"}
+        and freshness.get("source") == "background_performance_snapshot"
+        and "symbol_side_perf" not in (freshness.get("failed_labels") or [])
+        and profile.get("profile_scope") == "symbol_side"
+        and provenance.get("source") == "trusted_closed_position_fee_after_pnl_distribution"
+        and provenance.get("sample_count") == sample_count
+    )
+    sufficient = sample_count >= RECENT_SIDE_LOSS_MIN_SAMPLES
+    negative_pnl = pnl is not None and pnl < 0.0
+    risk_is_not_positive = profit_factor is not None and profit_factor <= 1.0
+    blocked = bool(
+        snapshot_available and sufficient and negative_pnl and risk_is_not_positive
+    )
+    return {
+        "enabled": snapshot_available,
+        "evidence_complete": evidence_complete,
+        "blocked": blocked,
+        "sample_count": sample_count,
+        "fee_after_pnl_usdt": pnl,
+        "profit_factor": profit_factor,
+        "minimum_samples": RECENT_SIDE_LOSS_MIN_SAMPLES,
+        "symbol": normalized_symbol,
+        "side": side,
+        "profile_scope": "symbol_side",
+        "lookback_days": profile.get("lookback_days"),
+        "last_closed_at": profile.get("last_closed_at"),
+        "reason": (
+            "recent_trusted_symbol_side_loss"
+            if blocked
+            else "recent_side_loss_guard_not_triggered"
+        ),
+        "execution_scope": "paper_training_entry_only",
+        "policy": "recent_trusted_symbol_side_loss_blocks_unvalidated_training_entries",
+    }
 
 
 def _weighted_mean(
@@ -374,6 +439,7 @@ def _fingerprint_payload(value: dict[str, Any]) -> dict[str, Any]:
             "paper_quality_observation_reasons",
             "paper_training_only",
             "paper_training_reasons",
+            "recent_side_loss_guard",
         )
     }
 
@@ -385,6 +451,8 @@ def assess_directional_entry_support(
     *,
     support_scope: str = "governed_return_candidate",
     execution_cost_pct: float | None = None,
+    strategy_mode: dict[str, Any] | None = None,
+    symbol: str | None = None,
 ) -> dict[str, Any]:
     """Use quantitative return evidence for eligibility and experts for diagnostics.
 
@@ -399,6 +467,7 @@ def assess_directional_entry_support(
         PAPER_TRAINING_ENTRY_SCOPE,
     }
     training_scope = support_scope == PAPER_TRAINING_ENTRY_SCOPE
+    recent_side_loss_guard = _recent_side_loss_guard(strategy_mode, side, symbol)
     competition = _dict(direction_competition)
     quantitative = summarize_paper_quantitative_evidence(
         direction_competition,
@@ -739,6 +808,7 @@ def assess_directional_entry_support(
         "independent_support_groups": support_groups,
         "independent_support_group_count": len(support_groups),
         "strong_expert_opposition": strong_expert_opposition,
+        "recent_side_loss_guard": recent_side_loss_guard,
         "blocking_reasons": list(dict.fromkeys(blockers)),
         "production_permission": False,
         "policy_provenance": {
@@ -760,6 +830,8 @@ def assess_paper_model_trade_support(
     selected_side: str,
     *,
     execution_cost_pct: float | None,
+    strategy_mode: dict[str, Any] | None = None,
+    symbol: str | None = None,
 ) -> dict[str, Any]:
     return assess_directional_entry_support(
         direction_competition,
@@ -767,6 +839,8 @@ def assess_paper_model_trade_support(
         selected_side,
         support_scope=PAPER_MODEL_TRADE_SCOPE,
         execution_cost_pct=execution_cost_pct,
+        strategy_mode=strategy_mode,
+        symbol=symbol,
     )
 
 

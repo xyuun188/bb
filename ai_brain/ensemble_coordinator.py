@@ -956,6 +956,8 @@ class EnsembleCoordinator:
                     raw_opinions,
                     side,
                     execution_cost_pct=self._finite_or_none(cost.get("total_pct")),
+                    strategy_mode=self._safe_dict(context.get("strategy_mode")),
+                    symbol=features.symbol,
                 )
             paper_selection = select_normal_paper_trade_side(support_by_side)
             selected_side = str(paper_selection.get("selected_side") or "neutral")

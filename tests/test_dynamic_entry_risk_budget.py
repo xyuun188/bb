@@ -382,7 +382,7 @@ def test_size_aware_profit_solver_reduces_even_when_full_size_is_positive() -> N
         minimum_notional_usdt=100.0,
         contract_step_notional_usdt=100.0,
         expected_net_return_pct=gross_expected - original_cost["total_pct"],
-        return_lcb_pct=-0.5,
+        return_lcb_pct=0.1,
         execution_cost=original_cost,
     )
 
@@ -445,6 +445,7 @@ def test_size_aware_profit_solver_preserves_finite_negative_downside() -> None:
         expected_net_return_pct=0.5,
         return_lcb_pct=-0.2,
         execution_cost=original_cost,
+        paper_training_only=True,
     )
 
     assert solved["production_eligible"] is True
@@ -454,6 +455,39 @@ def test_size_aware_profit_solver_preserves_finite_negative_downside() -> None:
     assert solved["return_lcb_pct"] <= 0.0
     assert solved["execution_cost"]["order_size_complete"] is True
     assert solved["reduced"] is False
+
+
+@pytest.mark.parametrize("with_book", [True, False])
+def test_validated_size_solver_rejects_negative_downside_including_cost_fallback(with_book) -> None:
+    snapshot = _size_aware_book_snapshot(400.0)
+    cost = execution_cost_estimate(snapshot).to_dict()
+    if not with_book:
+        snapshot.pop("orderbook_bids")
+        snapshot.pop("orderbook_asks")
+    solved = solve_size_aware_positive_expected_net(
+        feature_snapshot=snapshot, side="long",
+        maximum_notional_usdt=400.0, minimum_notional_usdt=100.0,
+        contract_step_notional_usdt=100.0,
+        expected_net_return_pct=0.5, return_lcb_pct=-0.2,
+        execution_cost=cost,
+    )
+    assert solved["production_eligible"] is False
+    assert solved["return_lcb_pct"] < 0.0
+
+
+def test_validated_size_solver_selects_positive_bound_size_instead_of_rejecting_all() -> None:
+    snapshot = _size_aware_book_snapshot(5_000.0)
+    cost = execution_cost_estimate(snapshot).to_dict()
+    solved = solve_size_aware_positive_expected_net(
+        feature_snapshot=snapshot, side="long",
+        maximum_notional_usdt=5_000.0, minimum_notional_usdt=100.0,
+        contract_step_notional_usdt=100.0,
+        expected_net_return_pct=0.46 - cost["total_pct"],
+        return_lcb_pct=0.20 - cost["total_pct"], execution_cost=cost,
+    )
+    assert solved["production_eligible"] is True
+    assert solved["selected_notional_usdt"] == pytest.approx(500.0)
+    assert solved["return_lcb_pct"] > 0.0
 
 
 def test_size_solver_cannot_remove_measured_execution_slippage_by_shrinking() -> None:
@@ -490,7 +524,7 @@ def test_size_solver_uses_both_book_boundaries_when_full_close_depth_is_missing(
         minimum_notional_usdt=100.0,
         contract_step_notional_usdt=100.0,
         expected_net_return_pct=1.0,
-        return_lcb_pct=-0.5,
+        return_lcb_pct=0.1,
         execution_cost=cost,
     )
     assert solved["production_eligible"] is True
@@ -1230,7 +1264,7 @@ async def test_normal_paper_negative_downside_is_stressed_but_blocks_entry() -> 
             "selected_side": "long",
             "prediction_horizon_minutes": 30.0,
             "expected_net_return_pct": 0.82,
-            "objective_net_return_pct": -3.0,
+            "objective_net_return_pct": 0.3,
             "loss_probability": 0.4,
             "quant_evidence_families": ["local_ml"],
             "quant_quality_permissions": paper_quality_permissions(),

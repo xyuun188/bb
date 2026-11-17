@@ -356,10 +356,7 @@ def test_negative_return_lcb_remains_sizing_evidence_but_cannot_submit_entry() -
         direction_support=_support("short", expected_net=0.2, objective_net=-0.22),
     )
 
-    assert normal_paper_trade_contract_reasons(contract) == []
-    assert "normal_paper_trade_return_lcb_not_positive" in (
-        normal_paper_entry_contract_reasons(contract)
-    )
+    assert contract == {}
 
 
 def test_reconcile_cannot_restore_entry_after_historical_quality_permission_is_denied() -> None:
@@ -774,16 +771,14 @@ def test_unauthorized_shadow_observation_cannot_be_reused_as_entry_permission() 
     assert "normal_paper_trade_not_authorized" in normal_paper_trade_contract_reasons(contract)
 
 
-def test_negative_downside_does_not_veto_positive_mean_normal_paper_entry() -> None:
+def test_negative_lcb_cannot_authorize_positive_mean_normal_paper_entry() -> None:
     contract = build_normal_paper_trade_contract(
         symbol="BTC/USDT",
         side="long",
         selection_reason="strategy_edge_selected",
         direction_support=_support("long", expected_net=0.2, objective_net=-0.3),
     )
-    assert contract["authorized"] is True
-    assert contract["objective_net_return_pct"] == -0.3
-    assert normal_paper_trade_contract_reasons(contract) == []
+    assert contract == {}
 
 
 def test_current_positive_edge_does_not_inherit_historical_quality_observation_cap() -> None:
@@ -900,10 +895,10 @@ def test_training_selection_prefers_verified_quality_in_either_direction(
     preferred_side: str, unverified_expected: float,
 ) -> None:
     other_side = "short" if preferred_side == "long" else "long"
-    verified = _support(preferred_side, expected_net=0.35, objective_net=-1.7)
+    verified = _support(preferred_side, expected_net=0.35, objective_net=0.2)
     verified["paper_training_only"] = True
     unverified = _support(
-        other_side, expected_net=unverified_expected, objective_net=-1.7,
+        other_side, expected_net=unverified_expected, objective_net=0.1,
     )
     unverified["quant_quality_permissions"]["local_ml"][
         "paper_execution_permission"
@@ -1148,7 +1143,7 @@ def test_legacy_v4_contract_is_removed_before_new_entry_authorization() -> None:
 
 
 def test_v19_entry_can_settle_but_cannot_be_retried_as_a_new_order() -> None:
-    support = _support("short", expected_net=0.2, objective_net=-0.3)
+    support = _support("short", expected_net=0.2, objective_net=0.1)
     contract = build_normal_paper_trade_contract(
         symbol="BTC/USDT",
         side="short",

@@ -11,8 +11,8 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-11-14.normal-paper-strategy-trade.v23"
-NORMAL_PAPER_SIDE_SELECTION_POLICY = "2026-11-17.quality-first-side-selection.v1"
+NORMAL_PAPER_TRADE_VERSION = "2026-11-17.normal-paper-strategy-trade.v24"
+NORMAL_PAPER_SIDE_SELECTION_POLICY = "2026-11-17.quality-first-side-selection.v2"
 NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-11-14.normal-paper-dynamic-risk.v12"
 HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS = frozenset(
     {
@@ -29,6 +29,7 @@ NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
 HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS = frozenset(
     {
+        "2026-11-14.normal-paper-strategy-trade.v23",
         "2026-10-31.normal-paper-strategy-trade.v22",
         "2026-10-30.normal-paper-strategy-trade.v21",
         "2026-10-21.normal-paper-strategy-trade.v20",
@@ -94,11 +95,7 @@ def normal_paper_current_return_ready(expected_net: Any, downside_return: Any) -
 def normal_paper_entry_return_ready(
     expected_net: Any, downside_return: Any, *, paper_training_only: bool = False,
 ) -> bool:
-    """Keep ordinary entries strict; bounded paper training uses positive mean.
-
-    Training still needs a finite downside estimate for stress sizing. Its
-    separate contract enforces paper-only scope, loss probability and budgets.
-    """
+    """Require positive net mean and finite downside; validated entries need positive LCB."""
 
     expected = _float(expected_net, None)
     downside = _float(downside_return, None)
@@ -449,6 +446,7 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
             "quality_observation_reasons",
             "paper_training_only",
             "paper_training_reasons",
+            "recent_side_loss_guard",
         )
     }
     return payload
@@ -531,6 +529,7 @@ def select_normal_paper_trade_side(
             and _quality_permissions_well_formed(quality_permissions)
             and expected_net is not None
             and expected_net > 0.0
+            and objective_net is not None
             and raw_expected is not None
             and raw_expected > 0.0
             and 0.0 <= loss_probability <= NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
@@ -543,6 +542,12 @@ def select_normal_paper_trade_side(
                 or support.get("paper_training_only") is True
             )
         )
+        if (
+            training_candidate
+            and _dict(support.get("recent_side_loss_guard")).get("blocked") is True
+        ):
+            support["blocking_reasons"].append("direction_support_recent_side_loss")
+            training_candidate = False
         validated_edge = bool(
             current_edge
             and ordinary_return_ready
@@ -655,6 +660,7 @@ def select_normal_paper_trade_side(
         "direction_support_quality_observation_loss_probability_too_high",
         "direction_support_quant_family_conflict",
         "direction_support_strong_expert_opposition",
+        "direction_support_recent_side_loss",
     }
     evidence_reasons = {
         "direction_support_execution_cost_incomplete",
@@ -778,12 +784,25 @@ def build_normal_paper_trade_contract(
         normalized_side not in {"long", "short"}
         or selection_reason not in NORMAL_PAPER_TRADE_SELECTION_REASONS
         or support.get("eligible") is not True
+        or bool(support.get("blocking_reasons"))
         or support.get("selected_side") != normalized_side
         or horizon <= 0.0
         or expected_net is None
         or expected_net <= 0.0
         or (paper_training_only and (current_raw_expected is None or current_raw_expected <= 0.0))
         or objective_net is None
+        or (
+            selection_reason in NORMAL_PAPER_TRADE_NEW_ENTRY_SELECTION_REASONS
+            and not normal_paper_entry_return_ready(
+                expected_net,
+                objective_net,
+                paper_training_only=paper_training_only,
+            )
+        )
+        or (
+            paper_training_only
+            and _dict(support.get("recent_side_loss_guard")).get("blocked") is True
+        )
         or loss_probability is None
         or not 0.0 <= loss_probability <= NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
         or not _quality_permissions_well_formed(quality_permissions)
@@ -866,6 +885,7 @@ def build_normal_paper_trade_contract(
         "quality_observation_reasons": quality_observation_reasons,
         "paper_training_only": paper_training_only,
         "paper_training_reasons": paper_training_reasons,
+        "recent_side_loss_guard": deepcopy(_dict(support.get("recent_side_loss_guard"))),
         "generated_at": datetime.now(UTC).isoformat(),
     }
     contract["contract_fingerprint"] = _fingerprint(_contract_fingerprint_payload(contract))
@@ -1158,6 +1178,12 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_training_raw_return_not_positive")
     if objective_net is None:
         reasons.append("normal_paper_trade_objective_net_missing")
+    elif require_new_entry_permission and not normal_paper_entry_return_ready(
+        expected_net,
+        objective_net,
+        paper_training_only=training_mode,
+    ):
+        reasons.append("normal_paper_trade_return_lcb_not_positive")
     if contract.get("uses_shared_order_pipeline") is not True:
         reasons.append("normal_paper_trade_order_pipeline_split")
     if contract.get("uses_shared_position_ledger") is not True:
@@ -1185,6 +1211,12 @@ def _normal_strategy_trade_contract_reasons(
     training_reasons = [str(reason) for reason in contract.get("paper_training_reasons") or [] if str(reason).strip()]
     if training_mode and not training_reasons:
         reasons.append("normal_paper_trade_training_reason_missing")
+    if (
+        require_new_entry_permission
+        and training_mode
+        and _dict(contract.get("recent_side_loss_guard")).get("blocked") is True
+    ):
+        reasons.append("normal_paper_trade_recent_side_loss")
     loss_probability = _float(contract.get("loss_probability"), None)
     if (
         loss_probability is None

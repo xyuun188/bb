@@ -38,6 +38,7 @@ def test_replay_uses_new_training_policy_without_mutating_historical_evidence() 
     assert report["examples"][0]["selection_reason"] == "paper_training_entry"
     assert report["examples"][0]["production_permission"] is False
     assert report["submits_orders"] is False
+    assert report["counts"]["side_loss_guard_context_missing"] == 1
     assert row == original
 
 
@@ -50,3 +51,42 @@ def test_replay_preserves_upstream_blockers() -> None:
     assert report["counts"]["still_blocked"] == 1
     assert report["counts"].get("newly_selection_contract_ready", 0) == 0
     assert report["blocking_reasons"]["direction_support_execution_cost_incomplete"] == 1
+
+
+def test_replay_uses_settled_side_loss_guard_without_changing_source_evidence() -> None:
+    row = _row()
+    row["strategy_mode"] = {
+        "strategy_context_performance": {
+            "available": True, "status": "fresh",
+            "source": "background_performance_snapshot", "failed_labels": [],
+        },
+        "symbol_side_performance": {
+            "ALGO/USDT|short": {
+                "count": 8, "profit": 1.0, "loss": 5.0, "pnl": -4.0,
+                "profile_scope": "symbol_side",
+                "policy_provenance": {
+                    "source": "trusted_closed_position_fee_after_pnl_distribution",
+                    "sample_count": 8,
+                },
+            },
+        },
+    }
+    original = deepcopy(row)
+    report = replay_policy([row])
+    assert report["counts"]["still_blocked"] == 1
+    assert report["counts"]["side_loss_guard_snapshots_losing"] == 1
+    assert report["blocking_reasons"]["direction_support_recent_side_loss"] == 1
+    assert report["ready_sides"] == {}
+    assert row == original
+
+
+def test_replay_reports_guard_saved_with_support_when_full_context_was_not_persisted() -> None:
+    row = _row()
+    row["selection"]["by_side"]["short"]["recent_side_loss_guard"] = {
+        "enabled": True, "blocked": True, "symbol": "ALGO/USDT", "side": "short",
+    }
+    report = replay_policy([row])
+    assert report["counts"]["side_loss_guard_snapshots_available"] == 1
+    assert report["counts"]["side_loss_guard_snapshots_losing"] == 1
+    assert report["counts"].get("side_loss_guard_context_missing", 0) == 0
+    assert report["counts"]["still_blocked"] == 1
