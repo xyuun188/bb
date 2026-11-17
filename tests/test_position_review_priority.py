@@ -105,6 +105,38 @@ def test_priority_is_continuous_dynamic_exit_fraction() -> None:
     assert scan["force_exit_candidate"] is False
 
 
+def test_priority_keeps_native_mark_and_upl_paired_when_public_quote_differs() -> None:
+    row = {
+        "model_name": "ensemble_trader",
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "entry_price": 100.0,
+        "current_price": 99.0,
+        "protection_trigger_price": 99.0,
+        "quantity": 10.0,
+        "unrealized_pnl": -10.0,
+        "entry_fee_usdt": 0.05,
+        "stop_loss_pct": 0.02,
+        "stop_loss": 98.0,
+        "created_at": datetime.now(UTC) - timedelta(minutes=20),
+        "current_management_contract": _management_contract(),
+    }
+    policy = _policy()
+    baseline = policy._assessment(
+        row, FeatureVector(symbol="BTC/USDT", current_price=99.0),
+    )
+    divergent = policy._assessment(
+        row,
+        FeatureVector(symbol="BTC/USDT", current_price=1.0),
+        position_fragments=[row],
+    )
+
+    assert baseline["stop_risk_usage"] == pytest.approx(10.0 / 19.8)
+    for key in ("stop_risk_usage", "close_fraction", "hard_risk", "gross_unrealized_pnl_usdt"):
+        assert divergent[key] == baseline[key]
+    assert row["current_price"] == 99.0
+
+
 def test_profitable_priority_requires_cost_complete_dynamic_exit() -> None:
     scans = _policy(
         {

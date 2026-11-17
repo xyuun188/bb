@@ -14344,9 +14344,13 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 getattr(feature, "current_price", 0.0) if feature is not None else 0.0,
                 0.0,
             )
-            # Hard protection must evaluate the freshest round price first;
-            # the persisted position snapshot may be several seconds old.
-            current_price = feature_price or position_price
+            # Native mark and UPL are one valuation; public market features
+            # may belong to a different execution environment.
+            current_price = (
+                position_price
+                if "protection_trigger_price" in position and position_price > 0.0
+                else feature_price or position_price
+            )
             entry_price = self._safe_float(position.get("entry_price"), 0.0)
             if current_price <= 0.0 or entry_price <= 0.0:
                 continue
@@ -14469,7 +14473,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 model_name=model_name,
                 symbol=symbol,
                 side=side,
-                position=position,
+                position=position_snapshot,
                 decision=close_decision,
                 trigger=trigger,
                 reason=reason,

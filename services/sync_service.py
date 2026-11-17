@@ -80,7 +80,7 @@ POSITION_PRICE_REFRESH_DB_LOAD_TIMEOUT_SECONDS = 1.5
 POSITION_PRICE_REFRESH_WRITE_LOCK_WAIT_SECONDS = 0.1
 POSITION_PRICE_REFRESH_EXCHANGE_TIMEOUT_SECONDS = 4.0
 AUTHORITATIVE_POSITION_CONTEXT_REUSE_SECONDS = 30.0
-AUTHORITATIVE_POSITION_PRICE_REUSE_SECONDS = 300.0
+AUTHORITATIVE_POSITION_PRICE_REUSE_SECONDS = AUTHORITATIVE_POSITION_CONTEXT_REUSE_SECONDS
 LOCAL_POSITION_PERSISTENCE_GRACE_SECONDS = 60.0
 CURRENT_ENTRY_ORDER_MATCH_WINDOW_SECONDS = 10 * 60.0
 CURRENT_ENTRY_ORDER_PRICE_TOLERANCE_RATIO = 0.005
@@ -2017,7 +2017,7 @@ class OkxSyncService:
                     snapshot = exchange_snapshots.get(key)
                     fv = feature_vectors.get(pos.symbol)
                     fv_price = getattr(fv, "current_price", None) if fv is not None else None
-                    if snapshot and not snapshot.get("_cached"):
+                    if snapshot:
                         current_price = (
                             parse_float(snapshot.get("mark_price"), 0.0)
                             or parse_float(snapshot.get("last_price"), 0.0)
@@ -2026,21 +2026,12 @@ class OkxSyncService:
                             or pos.entry_price
                         )
                     else:
-                        current_price = (
-                            fv_price
-                            or (
-                                parse_float(snapshot.get("mark_price"), 0.0)
-                                if snapshot
-                                else 0.0
-                            )
-                            or pos.current_price
-                            or pos.entry_price
-                        )
+                        current_price = fv_price or pos.current_price or pos.entry_price
                     if not current_price or current_price <= 0:
                         continue
 
                     snapshot_upl = parse_float(snapshot.get("upl"), 0.0) if snapshot else 0.0
-                    if snapshot and snapshot.get("upl") is not None and not snapshot.get("_cached"):
+                    if snapshot and snapshot.get("upl") is not None:
                         unrealized_pnl = snapshot_upl
                     elif pos.side == "short":
                         unrealized_pnl = (pos.entry_price - current_price) * pos.quantity

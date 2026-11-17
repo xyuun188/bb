@@ -6240,6 +6240,74 @@ async def test_hard_protection_prefers_fresh_feature_price_over_stale_position_s
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("native_snapshot", [False, True])
+async def test_fast_protection_keeps_valuation_and_execution_snapshot_consistent(
+    monkeypatch: pytest.MonkeyPatch,
+    native_snapshot: bool,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    assessed_positions: list[dict] = []
+    submitted_positions: list[dict] = []
+    peak_inputs: list[dict] = []
+    position = {
+        "model_name": "ensemble_trader",
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "entry_price": 100.0,
+        "current_price": 110.0,
+        "stop_loss": 90.0,
+        "take_profit": 120.0,
+        "quantity": 1.0,
+        "unrealized_pnl": 10.0,
+        "created_at": datetime.now(UTC) - timedelta(minutes=30),
+    }
+    if native_snapshot:
+        position["protection_trigger_price"] = 89.0
+
+    class FakeProfitPeaks:
+        def update(self, **kwargs):
+            peak_inputs.append(kwargs)
+            return {"peak_unrealized_pnl": 12.0}
+
+    class FakeProcessor:
+        async def execute(self, **kwargs):
+            submitted_positions.append(kwargs["position"])
+            return SimpleNamespace(skipped=False, auto_close={"symbol": "BTC/USDT"})
+
+    def fake_apply(_decision, positions):
+        assessed_positions.extend(positions)
+        return SimpleNamespace(
+            eligible=True,
+            close_fraction=1.0,
+            hard_risk=True,
+            planned_stop_crossed=True,
+            funding_loss_budget_crossed=False,
+            projected_funding_budget_crossed=False,
+            reason="dynamic_exit_policy_passed",
+            policy_provenance={},
+        )
+
+    monkeypatch.setattr("services.trading_service.apply_dynamic_exit", fake_apply)
+    service.position_time = SimpleNamespace(position_age_minutes=lambda _value: 30.0)
+    service.position_profit_peaks = FakeProfitPeaks()
+    service.fast_risk_exit_execution_processor = FakeProcessor()
+    feature = SimpleNamespace(current_price=89.0, returns_1=0.0, returns_5=0.0, returns_20=0.0)
+
+    result = await service._enforce_sl_tp({"BTC/USDT": feature}, open_positions=[position])
+
+    assert result == [{"symbol": "BTC/USDT"}]
+    assert len(submitted_positions) == 1
+    assert submitted_positions[0] is assessed_positions[0]
+    expected_price = 110.0 if native_snapshot else 89.0
+    assert submitted_positions[0]["current_price"] == expected_price
+    assert peak_inputs[0]["current_price"] == expected_price
+    assert submitted_positions[0]["unrealized_pnl"] == 10.0
+    assert submitted_positions[0]["peak_unrealized_pnl"] == 12.0
+    assert position["current_price"] == 110.0
+    assert "peak_unrealized_pnl" not in position
+
+
+@pytest.mark.asyncio
 async def test_fast_dynamic_position_scan_requires_hard_risk(monkeypatch) -> None:
     service = TradingService.__new__(TradingService)
     calls: list[tuple[str, str, float]] = []
@@ -13696,11 +13764,14 @@ async def test_refresh_position_prices_defers_database_write_when_pool_is_busy(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot_age_seconds", [None, 0.0, 31.0])
 async def test_refresh_position_prices_prefers_okx_position_mark_and_upl(
     monkeypatch: pytest.MonkeyPatch,
+    snapshot_age_seconds: float | None,
 ):
     updated_prices: list[tuple[int, float, float]] = []
     peak_calls: list[dict[str, Any]] = []
+    fetch_count = 0
 
     class FakeTradeRepository:
         def __init__(self, _session):
@@ -13732,6 +13803,8 @@ async def test_refresh_position_prices_prefers_okx_position_mark_and_upl(
 
     class FakePaperOkx:
         async def get_positions_strict(self):
+            nonlocal fetch_count
+            fetch_count += 1
             return [
                 {
                     "symbol": "LAB-USDT-SWAP",
@@ -13758,19 +13831,29 @@ async def test_refresh_position_prices_prefers_okx_position_mark_and_upl(
     monkeypatch.setattr(sync_module, "TradeRepository", FakeTradeRepository)
     monkeypatch.setattr(sync_module, "get_session_ctx", fake_session_ctx)
 
+    executor = FakePaperOkx()
     service = OkxSyncService(
-        paper_okx_provider=lambda: FakePaperOkx(),
+        paper_okx_provider=lambda: executor,
         symbol_normalizer=normalize_trading_symbol,
         position_profit_peak_recorder=lambda **kwargs: peak_calls.append(kwargs),
         position_age_minutes_provider=lambda created_at: 12.5 if created_at else None,
         position_profit_peak_pruner=lambda _open_context: None,
     )
+    if snapshot_age_seconds is not None:
+        service._remember_authoritative_position_snapshot(
+            "paper", executor, await executor.get_positions_strict(),
+        )
+        key = ("paper", id(executor))
+        cached_at, rows = service._authoritative_position_snapshots[key]
+        service._authoritative_position_snapshots[key] = (cached_at - snapshot_age_seconds, rows)
+        fetch_count = 0
 
     await service.refresh_position_prices({"LAB/USDT": SimpleNamespace(current_price=17.32)})
 
     assert updated_prices == [(17, pytest.approx(18.192), pytest.approx(1.1938))]
     assert peak_calls[0]["current_price"] == pytest.approx(18.192)
     assert peak_calls[0]["unrealized_pnl"] == pytest.approx(1.1938)
+    assert fetch_count == (0 if snapshot_age_seconds == 0.0 else 1)
 
 
 @pytest.mark.asyncio

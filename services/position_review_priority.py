@@ -54,7 +54,7 @@ class PositionReviewPriorityPolicy:
             getattr(feature_vector, "current_price", 0.0) if feature_vector is not None else 0.0,
             0.0,
         )
-        if feature_price > 0.0:
+        if feature_price > 0.0 and "protection_trigger_price" not in snapshot:
             snapshot["current_price"] = feature_price
         # The display aggregate omits fee, management, and confirmed-exit facts.
         assessment_positions = [
@@ -67,7 +67,7 @@ class PositionReviewPriorityPolicy:
         for item in assessment_positions:
             if not item.get("symbol"):
                 item["symbol"] = snapshot.get("symbol")
-            if feature_price > 0.0:
+            if feature_price > 0.0 and "protection_trigger_price" not in item:
                 item["current_price"] = feature_price
         peak_key = self.position_peak_key(
             str(position.get("model_name") or ""),
