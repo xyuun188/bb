@@ -1005,6 +1005,52 @@ def test_historical_training_settlement_uses_persisted_budget_caps(version) -> N
     )
 
 
+def _v23_shared_risk_training_raw() -> dict[str, object]:
+    raw = _normal_paper_historical_observation_raw()
+    raw["normal_paper_trade"].update({
+        "version": "2026-11-14.normal-paper-strategy-trade.v23",
+        "selection_reason": "paper_training_entry",
+        "paper_training_only": True,
+    })
+    raw["profit_risk_sizing"].update({
+        "production_eligible": True,
+        "final_notional_usdt": 100.0,
+        "planned_stressed_loss_usdt": 2.0,
+        "portfolio_risk_limit_applied": False,
+    })
+    return raw
+
+
+def test_v23_training_fill_retains_normal_budget_after_protocol_migration() -> None:
+    raw = _v23_shared_risk_training_raw()
+    report = summarize_trade_execution_contract(
+        [_decision(402, "long", raw)], orders=[_filled_order(402, quantity=1.0)],
+    )
+    assert report["summary"]["entry_contract_ready_count"] == 1
+    assert report["violation_reason_counts"] == {}
+    _, reasons = trade_execution_contract_module.validate_normal_paper_entry_contract(raw)
+    assert "normal_paper_historical_contract_not_authorized_for_new_entry" in reasons
+
+
+@pytest.mark.parametrize("mutation, reason", [
+    ("exceeded_budget", "normal_paper_single_trade_risk_cap_exceeded"),
+    ("changed_cap", "normal_paper_training_shared_risk_policy_invalid"),
+    ("unexpected_portfolio_limit", "normal_paper_unexpected_portfolio_risk_limit"),
+])
+def test_v23_training_settlement_still_checks_its_own_risk_policy(mutation, reason) -> None:
+    raw = _v23_shared_risk_training_raw()
+    if mutation == "exceeded_budget":
+        raw["profit_risk_sizing"]["risk_budget_usdt"] = 6.0
+    elif mutation == "changed_cap":
+        raw["normal_paper_trade"]["single_trade_risk_fraction_cap"] = 0.01
+    else:
+        raw["profit_risk_sizing"]["portfolio_risk_limit_applied"] = True
+    report = summarize_trade_execution_contract(
+        [_decision(403, "long", raw)], orders=[_filled_order(403, quantity=1.0)],
+    )
+    assert reason in report["violation_reason_counts"]
+
+
 def test_obsolete_policy_payload_is_rejected_even_when_nested() -> None:
     raw = _entry_raw()
     raw["diagnostics"] = {"profit_first_trade_plan": {"decision_lane": "old"}}

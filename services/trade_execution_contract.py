@@ -17,6 +17,7 @@ from services.normal_paper_trade import (
     HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS,
     HISTORICAL_PAPER_TRAINING_PORTFOLIO_RISK_FRACTION,
     HISTORICAL_PAPER_TRAINING_SINGLE_TRADE_RISK_FRACTION,
+    HISTORICAL_SHARED_RISK_PAPER_TRAINING_VERSIONS,
     NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD,
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
@@ -1578,6 +1579,13 @@ def validate_normal_paper_entry_contract(
         str(normal_trade.get("selection_reason") or "").strip()
         == "paper_training_entry"
     )
+    # v23 already used the normal risk budget. A version migration must not
+    # reinterpret its settled fills under the older micro-training policy.
+    historical_shared_risk_training = bool(
+        historical_normal_trade
+        and training_entry
+        and source_normal_trade.get("version") in HISTORICAL_SHARED_RISK_PAPER_TRAINING_VERSIONS
+    )
     if historical_normal_trade:
         raw = dict(raw)
         raw["normal_paper_trade"] = normal_trade
@@ -1746,7 +1754,14 @@ def validate_normal_paper_entry_contract(
         or risk_budget > equity * settlement_single_cap + 1e-8
     ):
         reasons.append("normal_paper_single_trade_risk_cap_exceeded")
-    if historical_normal_trade and training_entry:
+    if historical_shared_risk_training and not isclose(
+        settlement_single_cap,
+        NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        reasons.append("normal_paper_training_shared_risk_policy_invalid")
+    if historical_normal_trade and training_entry and not historical_shared_risk_training:
         portfolio_cap = settlement_portfolio_cap
         training_single_cap = settlement_single_cap
         portfolio_budget = _safe_float(
@@ -1790,7 +1805,10 @@ def validate_normal_paper_entry_contract(
             > portfolio_budget - current_portfolio_risk + 1e-8
         ):
             reasons.append("normal_paper_training_portfolio_risk_cap_exceeded")
-    elif not historical_normal_trade and sizing.get("portfolio_risk_limit_applied") is not False:
+    elif (
+        (not historical_normal_trade or historical_shared_risk_training)
+        and sizing.get("portfolio_risk_limit_applied") is not False
+    ):
         reasons.append("normal_paper_unexpected_portfolio_risk_limit")
     if stress <= 0.0 or not persisted_product_isclose(
         planned_loss,
