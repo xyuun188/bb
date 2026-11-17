@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pandas as pd
 import pytest
@@ -8791,6 +8792,75 @@ async def test_market_entry_pipeline_handoff_keeps_symbol_claim_without_blocking
         "stage_updated_at": service._market_entry_pipeline_stage_updated_at.isoformat(),
     }
     assert len(published) == 1
+
+
+@pytest.mark.asyncio
+async def test_market_entry_queue_timeout_never_executes_and_next_candidate_can_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(trading_service, "MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS", 0.01)
+    service = TradingService.__new__(TradingService)
+    service._analysis_symbol_lock = asyncio.Lock()
+    service._active_analysis_symbols = {"ZIL/USDT", "ETH/USDT"}
+    service._market_entry_pipeline_tasks = {}
+    gate = asyncio.Semaphore(1)
+    await gate.acquire()
+    service._market_entry_pipeline_semaphore = gate
+    service._recent_decisions = []
+    service._recent_executions = []
+    service._mark_decision_pending_execution = AsyncMock()
+    service._mark_decision_reason = AsyncMock()
+    service._mark_decision_raw_response = AsyncMock()
+    service._run_market_entry_pipeline = AsyncMock()
+    service._publish_dashboard_update = AsyncMock()
+    service.decision_final_state_ensurer = SimpleNamespace(ensure=AsyncMock())
+
+    def append_result(**kwargs: Any) -> None:
+        kwargs["results"]["decisions"].append({
+            "symbol": kwargs["symbol"],
+            "execution_status": kwargs["execution_status"],
+            "reason": kwargs["reason"],
+        })
+
+    service.market_decision_result_recorder = SimpleNamespace(append_result=append_result)
+    common = {
+        "model_name": "ensemble_trader",
+        "model_mode": "paper",
+        "feature_vector": None,
+        "open_positions": [],
+        "staged_entry_counts": {},
+        "strategy_mode_context": {},
+        "market_regime_context": {},
+        "new_pair_pause_reason": None,
+    }
+    assert service._schedule_market_entry_pipeline(
+        symbol="ZIL/USDT", decision=_decision(Action.LONG), decision_db_id=123,
+        **common,
+    )
+    task = service._market_entry_pipeline_tasks["ZIL/USDT"]
+    await asyncio.wait_for(task, timeout=1)
+
+    service._run_market_entry_pipeline.assert_not_awaited()
+    service._mark_decision_raw_response.assert_awaited_once()
+    assert "本次不提交订单" in service._mark_decision_reason.await_args.args[1]
+    assert service._recent_decisions[-1]["execution_status"] == "skipped"
+    assert service._market_entry_pipeline_tasks == {}
+    assert "ZIL/USDT" not in service._active_analysis_symbols
+    assert gate.locked(), "Timed-out candidate must not release another task's permit."
+
+    gate.release()
+    assert service._schedule_market_entry_pipeline(
+        symbol="ETH/USDT", decision=_decision(Action.LONG), decision_db_id=124,
+        **common,
+    )
+    await asyncio.wait_for(service._market_entry_pipeline_tasks["ETH/USDT"], timeout=1)
+
+    service._run_market_entry_pipeline.assert_awaited_once()
+    assert service._run_market_entry_pipeline.await_args.kwargs["decision_db_id"] == 124
+    service.decision_final_state_ensurer.ensure.assert_awaited_once()
+    assert service._market_entry_pipeline_tasks == {}
+    assert "ETH/USDT" not in service._active_analysis_symbols
+    assert not gate.locked()
 
 
 def test_unsubmitted_entry_contract_is_terminal_rejected() -> None:

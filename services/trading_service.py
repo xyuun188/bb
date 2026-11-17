@@ -10889,6 +10889,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     execution_status="skipped",
                     reason=reason,
                 )
+                return
             self._set_market_entry_pipeline_stage(f"risk_and_execution:{symbol}")
             await self._run_market_entry_pipeline(
                 symbol=symbol,
