@@ -1,6 +1,9 @@
 import pytest
 
-from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
+from services.okx_execution_slippage import (
+    OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
+    PAPER_ROUND_TRIP_SLIPPAGE_VERSION,
+)
 from services.profit_supervision import (
     AUTHORITATIVE_REALIZED_RETURN_TASK,
     COUNTERFACTUAL_EXECUTION_COST_TASK,
@@ -237,6 +240,51 @@ def test_authoritative_return_rejects_old_net_return_label_without_contract() ->
     assert task["eligible"] is False
     assert task[PROFIT_TRAINING_TARGET] is None
     assert task["return_target"] == PROFIT_TRAINING_TARGET
+
+
+@pytest.mark.parametrize("mode,complete,signed_pct,expected", [
+    ("paper", True, 0.23, 0.23),
+    ("paper", True, -0.23, 0.0),
+    ("paper", True, 10.13, 10.13),
+    ("paper", False, 0.23, 163.9),
+    ("live", True, 0.23, 163.9),
+])
+def test_round_trip_calibration_cancels_basis_only_for_complete_paper_fills(
+    mode: str, complete: bool, signed_pct: float, expected: float,
+) -> None:
+    sample = _trade_sample()
+    sample.update({
+        "execution_mode": mode,
+        "notional": 3.045,
+        "slippage": 163.9,
+        "outcome_complete": True,
+        "paper_round_trip_cost": {
+            "version": PAPER_ROUND_TRIP_SLIPPAGE_VERSION,
+            "source": OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
+            "execution_mode": mode,
+            "complete": complete,
+            "basis": "net_signed_fill_mark_round_trip",
+            "signed_slippage_usdt": 3.045 * signed_pct / 100.0,
+            "notional": 3.045,
+        },
+        "training_label_contract": {
+            "complete": True, "execution_mode": mode,
+            "slippage_source": OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
+            "slippage_pct": 163.9,
+            PROFIT_TRAINING_TARGET: -0.33,
+        },
+    })
+    supervision = build_profit_supervision_contract(sample, kind="trade")
+    costs = supervision["tasks"][COUNTERFACTUAL_EXECUTION_COST_TASK]
+    assert costs["slippage_pct"] == pytest.approx(expected)
+    assert costs["adverse_fill_slippage_pct"] == 163.9
+    realized = supervision["tasks"][AUTHORITATIVE_REALIZED_RETURN_TASK]
+    assert realized[PROFIT_TRAINING_TARGET] == 0.6
+    calibration = authoritative_execution_cost_calibration([sample], execution_mode=mode)
+    profile = select_trade_calibration(calibration, symbol="BTC/USDT", side="long")
+    assert profile["slippage_pct"]["expected"] == pytest.approx(expected)
+    assert profile["adverse_fill_slippage_pct"]["expected"] == 163.9
+    assert profile[PROFIT_TRAINING_TARGET]["expected"] == -0.33
 
 
 def test_confirmed_round_trip_slippage_can_supervise_actual_execution_cost() -> None:

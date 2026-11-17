@@ -139,5 +139,8 @@ def apply_lifecycle_order_allocation(
     execution_slippage_usdt = fact.get("execution_slippage_usdt")
     if execution_slippage_usdt is not None:
         adjusted["execution_slippage_usdt"] = float(execution_slippage_usdt) * ratio
+    signed_slippage = fact.get("signed_execution_slippage_usdt")
+    if signed_slippage is not None:
+        adjusted["signed_execution_slippage_usdt"] = float(signed_slippage) * ratio
     adjusted["lifecycle_order_allocation"] = dict(allocation)
     return adjusted

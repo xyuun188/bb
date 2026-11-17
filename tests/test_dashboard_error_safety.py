@@ -23,6 +23,58 @@ from services.okx_position_history_store import upsert_okx_position_history_row
 from web_dashboard.api import dashboard, symbols
 
 
+@pytest.mark.parametrize("selected", [True, False])
+def test_paper_selection_display_preserves_side_blockers_without_mixing_them(
+    selected: bool,
+) -> None:
+    blocker = "direction_support_expected_net_not_positive"
+    selection = {
+        "selected": selected,
+        "selected_side": "short" if selected else "neutral",
+        "blocking_reasons": [blocker],
+        "by_side": {
+            "short": {"eligible": True, "blocking_reasons": []},
+            "long": {"eligible": False, "blocking_reasons": [blocker]},
+        },
+        "blocking_reasons_by_side": {"short": [], "long": [blocker]},
+    }
+
+    displayed = dashboard._display_paper_trade_selection({
+        "paper_trade_selection": selection,
+    })
+
+    assert displayed["blocking_reasons"] == ([] if selected else [blocker])
+    assert displayed["by_side"]["long"]["blocking_reasons"] == [blocker]
+    assert displayed["blocking_reasons_by_side"]["long"] == [blocker]
+    assert selection["blocking_reasons"] == [blocker]
+    attribution = dashboard._build_decision_attribution(
+        SimpleNamespace(action="short", was_executed=False),
+        {
+            "paper_trade_selection": selection,
+            "entry_permission": {"granted": False, "blocking_reasons": ["real_blocker"]},
+        },
+        [],
+    )
+    assert attribution["paper_trade_selection"]["blocking_reasons"] == (
+        [] if selected else [blocker]
+    )
+    assert attribution["entry_permission"]["blocking_reasons"] == ["real_blocker"]
+
+
+def test_paper_selection_display_keeps_blockers_when_side_evidence_is_missing() -> None:
+    selection = {
+        "selected": True,
+        "selected_side": "short",
+        "blocking_reasons": ["unresolved_legacy_blocker"],
+    }
+
+    displayed = dashboard._display_paper_trade_selection({
+        "paper_trade_selection": selection,
+    })
+
+    assert displayed["blocking_reasons"] == ["unresolved_legacy_blocker"]
+
+
 def test_open_position_display_prefers_native_exchange_leverage() -> None:
     positions = dashboard._group_open_dashboard_positions(
         [

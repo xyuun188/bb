@@ -1916,6 +1916,42 @@ def test_protection_execution_is_not_required_for_round_trip_slippage() -> None:
     assert sample["profit_training_contract"]["eligible"] is True
 
 
+def test_paper_cost_keeps_both_legs_of_a_persistent_mark_basis() -> None:
+    lineage = _complete_lineage()
+    for order_id in ("entry-1", "close-1"):
+        order = lineage["orders_by_exchange_id"][order_id]
+        order.okx_raw_fills["execution_slippage"] = _slippage_fact(
+            order_id=order_id,
+            trade_id="trade-entry" if order_id == "entry-1" else "trade-close",
+            side=order.side,
+            average_price=order.price,
+            mark_price=110_000.0,
+        )
+    sample = build_okx_history_training_sample(_history(), **lineage)
+
+    assert sample["realized_pnl"] == 8.5
+    assert sample["slippage"] == pytest.approx(9.5)
+    cost = sample["paper_round_trip_cost"]
+    assert cost["complete"] is True
+    assert cost["signed_slippage_usdt"] == pytest.approx(-10.0)
+    assert cost["slippage_pct"] == 0.0
+    assert cost["adverse_fill_slippage_usdt"] == pytest.approx(190.0)
+    assert cost["notional"] == sample["notional"]
+
+
+def test_legacy_fill_without_mark_notional_keeps_conservative_cost_fallback() -> None:
+    lineage = _complete_lineage()
+    lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills[
+        "execution_slippage"
+    ].pop("fill_mark_notional_usdt")
+
+    sample = build_okx_history_training_sample(_history(), **lineage)
+
+    assert sample["paper_round_trip_cost"]["complete"] is False
+    assert sample["paper_round_trip_cost"]["slippage_pct"] is None
+    assert sample["slippage"] == pytest.approx(0.1)
+
+
 def test_missing_fill_mark_fact_cannot_create_slippage_label() -> None:
     lineage = _complete_lineage()
     lineage["orders_by_exchange_id"]["close-1"].okx_raw_fills.pop("execution_slippage")

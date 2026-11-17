@@ -478,6 +478,32 @@ def test_learning_snapshot_preserves_training_risk_audit_fields() -> None:
     assert compact["profit_risk_sizing"] == raw["profit_risk_sizing"]
 
 
+@pytest.mark.parametrize("selected_side", ["long", "short"])
+def test_selected_direction_does_not_inherit_opposite_side_blockers(
+    selected_side: str,
+) -> None:
+    opposite_side = "short" if selected_side == "long" else "long"
+    selection = select_normal_paper_trade_side({
+        selected_side: _support(selected_side, expected_net=0.4),
+        opposite_side: _support(opposite_side, expected_net=-0.2),
+    })
+
+    assert selection["selected"] is True
+    assert selection["selected_side"] == selected_side
+    assert selection["diagnostic_status"] == "selected"
+    assert selection["blocking_reasons"] == []
+    assert "direction_support_expected_net_not_positive" in (
+        selection["blocking_reasons_by_side"][opposite_side]
+    )
+    assert selection["by_side"][opposite_side]["expected_net_return_pct"] == -0.2
+    assert build_normal_paper_trade_contract(
+        symbol="BTC/USDT",
+        side=selected_side,
+        selection_reason=selection["selection_reason"],
+        direction_support=selection["selected_support"],
+    )["authorized"] is True
+
+
 def test_negative_net_direction_cannot_authorize_a_paper_order() -> None:
     selection = select_normal_paper_trade_side(
         {"short": _support("short", expected_net=-0.05)}

@@ -19,6 +19,8 @@ from services.okx_execution_slippage import (
     OKX_FILL_MARK_SLIPPAGE_SOURCE,
     OKX_FILL_MARK_SLIPPAGE_VERSION,
     OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
+    PAPER_ROUND_TRIP_SLIPPAGE_VERSION,
+    signed_fill_mark_slippage_usdt,
 )
 from services.okx_lifecycle_order_allocations import (
     apply_lifecycle_order_allocation,
@@ -323,6 +325,10 @@ def _authoritative_fill_fact(order: Any, *, order_id: str) -> dict[str, Any]:
         "execution_slippage_usdt": (
             execution_slippage_usdt if execution_slippage_complete else None
         ),
+        "signed_execution_slippage_usdt": (
+            signed_fill_mark_slippage_usdt(execution_slippage)
+            if execution_slippage_complete else None
+        ),
         "execution_slippage_source": (
             OKX_FILL_MARK_SLIPPAGE_SOURCE if execution_slippage_complete else ""
         ),
@@ -484,6 +490,12 @@ def _authoritative_fill_group(
         "fill_pnl": (sum(float(fact["fill_pnl"]) for fact in facts) if fill_pnl_complete else None),
         "fee_source": "+".join(sources),
         "execution_slippage_complete": execution_slippage_complete,
+        "signed_execution_slippage_usdt": (
+            sum(float(fact["signed_execution_slippage_usdt"]) for fact in facts)
+            if execution_slippage_complete
+            and all(fact.get("signed_execution_slippage_usdt") is not None for fact in facts)
+            else None
+        ),
         "execution_slippage_usdt": (
             sum(float(fact["execution_slippage_usdt"]) for fact in facts)
             if execution_slippage_complete
@@ -1342,6 +1354,40 @@ def build_okx_history_training_sample(
     canonical_slippage_source = (
         OKX_ROUND_TRIP_SLIPPAGE_SOURCE if canonical_slippage is not None else ""
     )
+    entry_signed_slippage = _safe_float(
+        entry_fill_group.get("signed_execution_slippage_usdt"), None,
+    )
+    close_signed_slippage = _safe_float(
+        close_fill_group.get("signed_execution_slippage_usdt"), None,
+    )
+    signed_round_trip_slippage = (
+        (entry_signed_slippage + close_signed_slippage) * (
+            slippage_notional_scale
+            if historical_contract_reconciliation.get("applied") is True else 1.0
+        )
+        if entry_signed_slippage is not None and close_signed_slippage is not None
+        else None
+    )
+    round_trip_cost_complete = bool(
+        execution_slippage_usdt is not None
+        and signed_round_trip_slippage is not None
+        and canonical_notional is not None
+        and canonical_notional > 0.0
+    )
+    paper_round_trip_cost = {
+        "version": PAPER_ROUND_TRIP_SLIPPAGE_VERSION,
+        "source": OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
+        "execution_mode": _value(history, "mode"),
+        "complete": round_trip_cost_complete,
+        "basis": "net_signed_fill_mark_round_trip",
+        "signed_slippage_usdt": signed_round_trip_slippage,
+        "adverse_fill_slippage_usdt": execution_slippage_usdt,
+        "notional": canonical_notional,
+        "slippage_pct": (
+            max(signed_round_trip_slippage, 0.0) / canonical_notional * 100.0
+            if round_trip_cost_complete else None
+        ),
+    }
     if canonical_slippage is None:
         gaps.append("missing_authoritative_slippage")
     gaps = list(dict.fromkeys(gaps))
@@ -1546,6 +1592,7 @@ def build_okx_history_training_sample(
         "stop_loss_fill_confirmed": stop_loss_fill_confirmed,
         "slippage": canonical_slippage,
         "slippage_source": canonical_slippage_source,
+        "paper_round_trip_cost": paper_round_trip_cost,
         "entry_execution_slippage_usdt": entry_execution_slippage_usdt,
         "close_execution_slippage_usdt": close_execution_slippage_usdt,
         "execution_slippage_usdt": execution_slippage_usdt,

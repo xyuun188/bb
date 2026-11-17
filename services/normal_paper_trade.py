@@ -636,10 +636,13 @@ def select_normal_paper_trade_side(
         ):
             selected = None
 
+    # Rejected alternatives do not block the selected direction. Keep their
+    # reasons in the per-side diagnostics below.
+    diagnostic_supports = [selected["support"]] if selected else by_side.values()
     blocking_reasons = list(
         dict.fromkeys(
             str(reason)
-            for support in by_side.values()
+            for support in diagnostic_supports
             for reason in support.get("blocking_reasons") or []
             if str(reason).strip()
         )

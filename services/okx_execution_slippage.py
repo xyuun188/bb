@@ -8,6 +8,29 @@ from typing import Any
 OKX_FILL_MARK_SLIPPAGE_VERSION = "2026-07-24.okx-fill-mark-slippage.v2"
 OKX_FILL_MARK_SLIPPAGE_SOURCE = "okx_fills_history_fill_mark_vwap"
 OKX_ROUND_TRIP_SLIPPAGE_SOURCE = "okx_fills_history_fill_mark_round_trip"
+PAPER_ROUND_TRIP_SLIPPAGE_VERSION = "2026-11-17.paper-net-fill-mark-round-trip.v1"
+
+
+def signed_fill_mark_slippage_usdt(fact: dict[str, Any]) -> float | None:
+    """Preserve favorable fill offsets when composing a complete round trip."""
+
+    if (
+        fact.get("complete") is not True
+        or fact.get("version") != OKX_FILL_MARK_SLIPPAGE_VERSION
+        or fact.get("source") != OKX_FILL_MARK_SLIPPAGE_SOURCE
+        or fact.get("side") not in {"buy", "sell"}
+    ):
+        return None
+    actual = _finite_float(fact.get("actual_notional_usdt"))
+    mark = _finite_float(fact.get("fill_mark_notional_usdt"))
+    mark_price = _finite_float(fact.get("fill_mark_vwap"))
+    contracts = _finite_float(fact.get("contracts"))
+    size = _finite_float(fact.get("contract_size"))
+    if any(value is None or value <= 0.0 for value in (actual, mark, mark_price, contracts, size)):
+        return None
+    if not isclose(mark, mark_price * contracts * size, rel_tol=1e-9, abs_tol=1e-8):
+        return None
+    return actual - mark if fact["side"] == "buy" else mark - actual
 
 
 def build_okx_fill_mark_slippage(

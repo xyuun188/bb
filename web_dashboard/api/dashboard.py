@@ -1551,7 +1551,7 @@ def _display_paper_trade_selection(raw: dict[str, Any]) -> dict[str, Any]:
             )
             if key in support
         }
-    return {
+    result = {
         key: selection.get(key)
         for key in (
             "version",
@@ -1568,6 +1568,14 @@ def _display_paper_trade_selection(raw: dict[str, Any]) -> dict[str, Any]:
         )
         if key in selection
     } | {"by_side": by_side}
+    if selection.get("selected") is True:
+        # Older rows combined blockers from both sides despite selecting one.
+        support = _safe_dict(selection.get("selected_support")) or _safe_dict(
+            by_side.get(str(selection.get("selected_side") or ""))
+        )
+        if "blocking_reasons" in support:
+            result["blocking_reasons"] = list(support.get("blocking_reasons") or [])
+    return result
 
 
 def _display_prediction_economics(raw: dict[str, Any]) -> dict[str, Any]:
@@ -1991,7 +1999,7 @@ def _build_decision_attribution(
     decision_maker = _safe_dict(raw.get("decision_maker"))
     close_evidence = _safe_dict(raw.get("close_evidence"))
     high_risk_review = _safe_dict(raw.get("high_risk_review"))
-    paper_selection = _safe_dict(raw.get("paper_trade_selection"))
+    paper_selection = _display_paper_trade_selection(raw)
     entry_permission = _safe_dict(raw.get("entry_permission"))
     ml = _extract_primary_ml(raw)
     local = _extract_local_tools(raw)

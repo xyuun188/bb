@@ -22,7 +22,10 @@ from core.training_contracts import (
     SHADOW_FEE_AFTER_LABEL_VERSION,
 )
 from services.execution_cost_model import funding_cost_estimate, shadow_execution_cost_estimate
-from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
+from services.okx_execution_slippage import (
+    OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
+    PAPER_ROUND_TRIP_SLIPPAGE_VERSION,
+)
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 PROFIT_SUPERVISION_VERSION = "2026-11-11.observed-shadow-exit-cost.v6"
@@ -205,12 +208,40 @@ def shadow_fee_after_return_labels(sample: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _calibration_slippage(sample: dict[str, Any], fallback: float | None) -> tuple[float | None, str]:
+    cost = _safe_dict(sample.get("paper_round_trip_cost"))
+    signed = _safe_float(cost.get("signed_slippage_usdt"))
+    notional = _safe_float(cost.get("notional"))
+    expected_notional = _safe_float(
+        sample.get("notional")
+        or _safe_dict(sample.get("training_label_contract")).get("notional")
+    )
+    if (
+        sample.get("execution_mode") == "paper"
+        and cost.get("execution_mode") == "paper"
+        and cost.get("version") == PAPER_ROUND_TRIP_SLIPPAGE_VERSION
+        and cost.get("source") == OKX_ROUND_TRIP_SLIPPAGE_SOURCE
+        and cost.get("basis") == "net_signed_fill_mark_round_trip"
+        and cost.get("complete") is True
+        and fallback is not None and fallback >= 0.0
+        and signed is not None
+        and notional is not None and notional > 0.0
+        and expected_notional is not None
+        and math.isclose(notional, expected_notional, rel_tol=1e-9, abs_tol=1e-8)
+    ):
+        # A persistent demo mark/last basis must not become a one-way cost.
+        # Retain adverse-only fills separately for execution-risk diagnostics.
+        return max(signed, 0.0) / notional * 100.0, cost["basis"]
+    return fallback, "adverse_fill_mark_round_trip"
+
+
 def _trade_cost_labels(
     labels: dict[str, Any],
     sample: dict[str, Any],
 ) -> dict[str, Any]:
     fee = _safe_float(labels.get("fee_return_pct"))
-    slippage = _safe_float(sample.get("slippage"))
+    adverse_slippage = _safe_float(sample.get("slippage"))
+    slippage, slippage_basis = _calibration_slippage(sample, adverse_slippage)
     slippage_source = _safe_text(sample.get("slippage_source"))
     funding = _safe_float(labels.get("funding_return_pct"))
     eligible = bool(
@@ -226,6 +257,8 @@ def _trade_cost_labels(
         "source_authority": "okx_fills_fees_funding",
         "fee_pct": fee,
         "slippage_pct": slippage,
+        "slippage_basis": slippage_basis,
+        "adverse_fill_slippage_pct": adverse_slippage,
         "slippage_source": slippage_source,
         "funding_return_pct": funding,
         "total_cost_pct": total_cost,
@@ -753,8 +786,15 @@ def authoritative_execution_cost_calibration(
         ):
             continue
         seen.add(lifecycle)
-        buckets[f"{symbol}|{side}"].append(label)
-        buckets[f"*|{side}"].append(label)
+        calibrated_slippage, basis = _calibration_slippage(outcome, slippage)
+        cost_label = {
+            **label,
+            "slippage_pct": calibrated_slippage,
+            "slippage_basis": basis,
+            "adverse_fill_slippage_pct": slippage,
+        }
+        buckets[f"{symbol}|{side}"].append(cost_label)
+        buckets[f"*|{side}"].append(cost_label)
     profiles = {
         key: {
             "source_authority": "okx_position_history",
@@ -767,6 +807,10 @@ def authoritative_execution_cost_calibration(
             "slippage_pct": weighted_distribution(
                 [(label["slippage_pct"], 1.0) for label in labels]
             ),
+            "adverse_fill_slippage_pct": weighted_distribution(
+                [(label["adverse_fill_slippage_pct"], 1.0) for label in labels]
+            ),
+            "slippage_basis_counts": dict(Counter(label["slippage_basis"] for label in labels)),
         }
         for key, labels in buckets.items()
     }

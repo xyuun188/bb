@@ -3,6 +3,7 @@ import pytest
 from services.okx_execution_slippage import (
     OKX_FILL_MARK_SLIPPAGE_SOURCE,
     build_okx_fill_mark_slippage,
+    signed_fill_mark_slippage_usdt,
 )
 
 
@@ -42,6 +43,7 @@ def test_fill_mark_slippage_measures_adverse_buy_execution_from_all_rows() -> No
     assert fact["actual_notional_usdt"] == pytest.approx(3.02)
     assert fact["adverse_slippage_usdt"] == pytest.approx(0.02)
     assert fact["adverse_slippage_pct"] == pytest.approx(0.02 / 3.02 * 100.0)
+    assert signed_fill_mark_slippage_usdt(fact) == pytest.approx(0.02)
 
 
 def test_fill_mark_slippage_does_not_turn_sell_price_improvement_into_cost() -> None:
@@ -68,6 +70,28 @@ def test_fill_mark_slippage_does_not_turn_sell_price_improvement_into_cost() -> 
     assert fact["complete"] is True
     assert fact["adverse_slippage_usdt"] == 0.0
     assert fact["adverse_slippage_pct"] == 0.0
+    assert signed_fill_mark_slippage_usdt(fact) == pytest.approx(-0.2)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("complete", False),
+    ("fill_mark_notional_usdt", None),
+    ("fill_mark_notional_usdt", 5.0),
+    ("fill_mark_vwap", float("nan")),
+])
+def test_signed_slippage_requires_verified_mark_notional(field, value) -> None:
+    fact = build_okx_fill_mark_slippage(
+        order_id="entry", inst_id="XPL-USDT-SWAP", side="sell",
+        contracts=7.0, average_price=0.0435, contract_size=10.0,
+        rows=[{
+            "ordId": "entry", "instId": "XPL-USDT-SWAP", "side": "sell",
+            "tradeId": "one", "fillSz": "7", "fillPx": "0.0435",
+            "fillMarkPx": "0.1148",
+        }],
+    )
+    assert signed_fill_mark_slippage_usdt(fact) == pytest.approx(4.991)
+    fact[field] = value
+    assert signed_fill_mark_slippage_usdt(fact) is None
 
 
 def test_fill_mark_slippage_fails_closed_when_any_fill_mark_is_missing() -> None:
