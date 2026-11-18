@@ -37,6 +37,7 @@ from services.normal_paper_trade import (
     normal_paper_entry_contract_reasons,
     reconcile_normal_paper_trade_contract,
 )
+from services.okx_native_facts import OKX_STOP_LOSS_SLIPPAGE_SOURCE
 from services.paper_prediction_horizon import select_paper_horizon_cohort
 from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
@@ -716,10 +717,22 @@ class EntryOpportunityScoringPolicy:
                 "_slippage_upper_hinge",
             ),
         )
-        if execution_scope == "paper":
-            current_calibration = safe_dict(
-                safe_dict(strategy).get("execution_trade_calibration")
+        current_calibration = safe_dict(
+            safe_dict(strategy).get("execution_trade_calibration")
+        )
+        stop_profile = safe_dict(
+            safe_dict(current_calibration.get("stop_loss_slippage_profiles")).get(
+                f"{self.normalize_symbol(decision.symbol)}|{side}"
             )
+        )
+        current_stop_slippage_calibration = (
+            stop_profile
+            if current_calibration.get("execution_mode") == execution_scope
+            and stop_profile.get("execution_mode") == execution_scope
+            and stop_profile.get("stop_loss_slippage_source") == OKX_STOP_LOSS_SLIPPAGE_SOURCE
+            else {}
+        )
+        if execution_scope == "paper":
             current_profile = select_trade_calibration(
                 current_calibration, symbol=decision.symbol, side=side
             )
@@ -1003,6 +1016,7 @@ class EntryOpportunityScoringPolicy:
             ),
             "score_policy": "standardized_objective_expected_return",
             "execution_scope": execution_scope,
+            "stop_loss_slippage_calibration": current_stop_slippage_calibration,
             "return_distribution_mode": distribution_mode,
             "return_distribution_contract": combination,
             "profit_supervision_version": PROFIT_SUPERVISION_VERSION,

@@ -4,6 +4,7 @@ from services.okx_execution_slippage import (
     OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
     PAPER_ROUND_TRIP_SLIPPAGE_VERSION,
 )
+from services.okx_native_facts import OKX_STOP_LOSS_SLIPPAGE_SOURCE
 from services.profit_supervision import (
     AUTHORITATIVE_REALIZED_RETURN_TASK,
     COUNTERFACTUAL_EXECUTION_COST_TASK,
@@ -190,6 +191,59 @@ def test_trade_calibration_selects_symbol_side_then_global_side() -> None:
     assert exact[PROFIT_TRAINING_TARGET]["count"] == 1
     assert "net_return_after_cost_pct" not in exact
     assert exact["slippage_pct"]["count"] == 1
+
+
+def test_stop_slippage_requires_a_complete_okx_stop_fill_lifecycle() -> None:
+    verified = _trade_sample()
+    verified.update(
+        {
+            "execution_mode": "paper",
+            "inst_id": "BTC-USDT-SWAP",
+            "outcome_complete": True,
+            "verified_stop_loss_fills": [
+                {"order_id": "stop-order", "slippage_pct": 0.12, "credential_scope": "current"},
+            ],
+            "training_label_contract": {
+                "execution_mode": "paper",
+                "complete": True,
+                PROFIT_TRAINING_TARGET: -1.0,
+                "slippage_pct": 0.15,
+                "slippage_source": OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
+            },
+        }
+    )
+    calibration = authoritative_execution_cost_calibration(
+        [verified, dict(verified)], execution_mode="paper", credential_scope="current"
+    )
+    exact = calibration["stop_loss_slippage_profiles"]["BTC/USDT|long"]
+    assert exact["stop_loss_slippage_pct"]["count"] == 1
+    assert exact["stop_loss_slippage_pct"]["expected"] == pytest.approx(0.12)
+    assert exact["stop_loss_slippage_source"] == OKX_STOP_LOSS_SLIPPAGE_SOURCE
+    assert exact["stop_loss_slippage_credential_scope"] == "current"
+    assert set(calibration["stop_loss_slippage_profiles"]) == {"BTC/USDT|long"}
+    stop_only = authoritative_execution_cost_calibration(
+        [{**verified, "outcome_complete": False, "training_label_contract": {}}],
+        execution_mode="paper",
+        credential_scope="current",
+    )
+    assert stop_only["profiles"] == {}
+    assert stop_only["stop_loss_slippage_profiles"]["BTC/USDT|long"] == exact
+
+    for field, invalid_value in (
+        ("verified_stop_loss_fills", []),
+        ("verified_stop_loss_fills", [{"slippage_pct": 0.12, "credential_scope": "current"}]),
+        ("verified_stop_loss_fills", [
+            {"order_id": "stop-order", "slippage_pct": 0.12, "credential_scope": "old"},
+        ]),
+        ("inst_id", "ETH-USDT-SWAP"),
+        ("execution_mode", "live"),
+    ):
+        calibration = authoritative_execution_cost_calibration(
+            [{**verified, field: invalid_value}],
+            execution_mode="paper",
+            credential_scope="current",
+        )
+        assert calibration["stop_loss_slippage_profiles"] == {}
 
 
 def test_execution_calibration_learns_costs_of_excluded_losing_trades_only_in_own_mode() -> None:

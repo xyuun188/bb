@@ -1743,7 +1743,21 @@ async def test_native_facts_client_fetch_position_protection_orders_uses_okx_alg
 
 
 @pytest.mark.asyncio
-async def test_native_algo_history_and_fill_build_authoritative_stop_lifecycle() -> None:
+@pytest.mark.parametrize(("mismatch", "expected_scope"), [
+    ("", "signed-account"),
+    ("generated_order_list", "signed-account"),
+    ("other_account", None),
+    ("incomplete", None),
+    ("other_direction", None),
+    ("missing_algo_order_id", None),
+    ("other_instrument", None),
+    ("take_profit", None),
+])
+async def test_native_algo_history_and_fill_build_authoritative_stop_lifecycle(
+    mismatch: str, expected_scope: str | None,
+) -> None:
+    from dataclasses import replace
+
     ccxt = _NativeAlgoHistoryCcxt()
     client = OkxNativeFactsClient(_FakeExecutor(ccxt))
 
@@ -1781,22 +1795,51 @@ async def test_native_algo_history_and_fill_build_authoritative_stop_lifecycle()
             },
         ]
     )
+    algo_row = {**algo_rows[0], "_bb_okx_credential_scope": "signed-account"}
+    if mismatch == "missing_algo_order_id":
+        algo_row.pop("ordId")
+    elif mismatch == "generated_order_list":
+        algo_row["ordId"] = "other-chunk"
+        algo_row["ordIdList"] = ["other-chunk", "close-stop-1"]
+    elif mismatch == "other_instrument":
+        algo_row["instId"] = "BTC-USDT-SWAP"
+    elif mismatch == "take_profit":
+        algo_row["actualSide"] = "tp"
+    fill = replace(
+        fills[0],
+        rows=tuple(
+            {
+                **row,
+                "_bb_okx_credential_scope": (
+                    "other-account" if mismatch == "other_account" and i == 1
+                    else "signed-account"
+                ),
+                "posSide": "long" if mismatch == "other_direction" and i == 1 else "net",
+            }
+            for i, row in enumerate(fills[0].rows)
+        ),
+        pagination_complete=mismatch != "incomplete",
+    )
 
     lifecycle = build_okx_protection_execution_lifecycle(
-        fills[0],
+        fill,
         order_row={
             "ordId": "close-stop-1",
             "algoId": "algo-stop-1",
             "side": "buy",
             "reduceOnly": "true",
         },
-        algo_row=algo_rows[0],
+        algo_row=algo_row,
     )
 
     assert ccxt.detail_params == [{"algoId": "algo-stop-1"}]
     assert lifecycle is not None
     assert lifecycle["lifecycle_complete"] is True
     assert lifecycle["reduce_only"] is True
+    assert lifecycle["stop_loss_slippage_credential_scope"] == expected_scope
+    if mismatch == "take_profit":
+        assert lifecycle["stop_loss_slippage_pct"] is None
+        return
     assert lifecycle["actual_side"] == "sl"
     assert lifecycle["position_side"] == "short"
     assert lifecycle["configured_trigger_price"] == pytest.approx(0.01655)

@@ -7,6 +7,7 @@ from ai_brain.base_model import Action, DecisionOutput
 from services.entry_opportunity_scoring import EntryOpportunityScoringPolicy
 from services.model_strategy_blueprint import build_model_strategy_blueprint
 from services.normal_paper_trade import build_normal_paper_trade_contract
+from services.okx_native_facts import OKX_STOP_LOSS_SLIPPAGE_SOURCE
 from services.profit_supervision import (
     PRODUCTION_RETURN_COMBINATION_VERSION,
     PROFIT_SUPERVISION_VERSION,
@@ -759,25 +760,52 @@ def test_paper_scoring_uses_fresh_execution_costs_without_artifact_promotion() -
         "net_return_after_all_cost_pct": {"count": 2, "expected": -1.0, "lower_hinge": -2.0},
         "slippage_pct": {"count": 2, "expected": 0.3, "upper_hinge": 0.5},
     }
+    stop_profile = {
+        "source_authority": "okx_position_history",
+        "execution_mode": "paper",
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "profile_source": "symbol_side",
+        "stop_loss_slippage_credential_scope": "current",
+        "stop_loss_slippage_source": OKX_STOP_LOSS_SLIPPAGE_SOURCE,
+        "stop_loss_slippage_pct": {
+            "count": 1,
+            "expected": 0.04,
+            "upper_hinge": 0.06,
+            "maximum": 0.08,
+        },
+    }
     context = {
         "execution_mode": "paper",
         "execution_trade_calibration": {
             "execution_mode": "paper",
             "profiles": {"BTC/USDT|long": profile},
+            "stop_loss_slippage_profiles": {"BTC/USDT|long": stop_profile},
         },
     }
     _scorer().score_candidate(decision, context)
     opportunity = decision.raw_response["opportunity_score"]
     assert opportunity["paper_eligible"] is True
+    assert opportunity["stop_loss_slippage_calibration"] == stop_profile
     assert opportunity["expected_net_return_pct"] == pytest.approx(
         initial_net - max(0.3 - initial_slippage, 0.0)
     )
     assert opportunity["expected_net_breakdown"]["authoritative_trade_calibration_count"] == 1
     context["execution_trade_calibration"]["profiles"] = {"*|long": {**profile, "symbol": "*"}}
     _scorer().score_candidate(decision, context)
+    assert decision.raw_response["opportunity_score"]["stop_loss_slippage_calibration"] == stop_profile
     assert decision.raw_response["opportunity_score"]["expected_net_return_pct"] == pytest.approx(initial_net)
+    context["execution_trade_calibration"]["stop_loss_slippage_profiles"] = {
+        "*|long": {**stop_profile, "symbol": "*"},
+    }
+    _scorer().score_candidate(decision, context)
+    assert decision.raw_response["opportunity_score"]["stop_loss_slippage_calibration"] == {}
+    context["execution_trade_calibration"]["stop_loss_slippage_profiles"] = {
+        "BTC/USDT|long": stop_profile,
+    }
     context["execution_trade_calibration"]["execution_mode"] = "live"
     _scorer().score_candidate(decision, context)
+    assert decision.raw_response["opportunity_score"]["stop_loss_slippage_calibration"] == {}
     assert decision.raw_response["opportunity_score"]["expected_net_return_pct"] == pytest.approx(initial_net)
 
 

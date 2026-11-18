@@ -4193,6 +4193,35 @@ def test_short_stop_widening_reduces_quantity_without_expanding_risk_budget() ->
     assert decision.raw_response["profit_risk_sizing"]["risk_budget_usdt"] == 20.0
 
 
+@pytest.mark.parametrize(("side", "entry", "stop"), [
+    ("buy", 102.0, 98.0),
+    ("sell", 98.0, 102.0),
+])
+def test_entry_protection_prices_include_stop_gap_in_final_notional(side, entry, stop) -> None:
+    executor = OKXExecutor(mode="paper")
+    decision = _entry_decision()
+    decision.raw_response["profit_risk_sizing"].update(
+        risk_budget_usdt=20.0,
+        stressed_loss_fraction=0.03,
+        stress_components={"actual_stop_slippage_tail_fraction": 0.01},
+        estimated_fill_drift_reserve_fraction=0.0025,
+    )
+    result = executor._entry_protection_risk(
+        decision=decision,
+        side=side,
+        reference_price=100.0,
+        price_limit={"buy_price_limit": 102.0, "sell_price_limit": 98.0},
+        stop_loss_price=stop,
+        planned_notional_usdt=1000.0,
+    )
+    expected_loss_per_unit = abs(entry - stop) + 0.01 * stop
+    assert result["stop_loss_price"] == stop
+    assert result["stressed_loss_fraction"] == pytest.approx(expected_loss_per_unit / entry)
+    assert result["maximum_notional_usdt"] / entry * expected_loss_per_unit * 1.0025 == (
+        pytest.approx(20.0)
+    )
+
+
 @pytest.mark.parametrize(
     ("side", "stop", "worst_entry"),
     [("buy", 0.138, 1.4), ("sell", 0.142, 0.0143)],

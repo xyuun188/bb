@@ -91,6 +91,23 @@ async def test_exact_order_dynamic_plan_recovers_stop_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stop_recovery_uses_trigger_distance_instead_of_gap_stress() -> None:
+    decision = _decision()
+    decision.raw_llm_response["profit_risk_sizing"]["stress_components"] = {
+        "planned_stop_fraction": 0.02,
+        "stop_gap_stressed_loss_fraction": 0.05,
+    }
+    result = await PositionProtectionFallbackPolicy().protection_from_decision(
+        _FakeSession(decision),
+        symbol="BTC/USDT",
+        side="long",
+        entry_price=100.0,
+        order=SimpleNamespace(decision_id=decision.id),
+    )
+    assert result["stop_loss_price"] == 98.0
+
+
+@pytest.mark.asyncio
 async def test_missing_order_link_never_reuses_latest_symbol_decision() -> None:
     session = _FakeSession(_decision(id=202))
     result = await PositionProtectionFallbackPolicy().protection_from_decision(

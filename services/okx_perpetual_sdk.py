@@ -9,6 +9,7 @@ executor and sync services already use, but the transport is the official
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -54,6 +55,14 @@ def okx_sdk_flag_for_mode(mode: str) -> str:
     """Return python-okx flag: ``1`` for demo/simulated, ``0`` for live."""
 
     return "1" if settings.is_okx_demo(mode) else "0"
+
+
+def okx_credential_scope(mode: str, api_key: str | None = None) -> str:
+    """Scope new trade evidence to the signing key, without persisting the key."""
+    key = settings.get_okx_credentials(mode).get("api_key", "") if api_key is None else api_key
+    if mode not in {"paper", "live"} or not key or key == "-1":
+        return ""
+    return hashlib.sha256(f"bb-okx-trade-evidence:{mode}:{key}".encode()).hexdigest()
 
 
 def okx_proxy_url() -> str | None:
@@ -725,6 +734,7 @@ class OkxPerpetualSdkExchange:
         method_name: str,
         *,
         check_data_code: bool = False,
+        attach_trade_credential_scope: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         def _sync(api: Any) -> dict[str, Any]:
@@ -735,7 +745,14 @@ class OkxPerpetualSdkExchange:
                 fallback=f"OKX SDK {method_name} failed",
                 check_data_code=check_data_code,
             )
-            return dict(result)
+            result = dict(result)
+            if attach_trade_credential_scope and isinstance(result.get("data"), list):
+                scope = okx_credential_scope(self.mode, str(getattr(api, "API_KEY", "") or ""))
+                result["data"] = [
+                    {**row, "_bb_okx_credential_scope": scope} if isinstance(row, dict) else row
+                    for row in result["data"]
+                ]
+            return result
 
         # python-okx reuses a requests Session inside each API object. Concurrent
         # to_thread calls can corrupt that session's mutable cookie state. An
@@ -1215,6 +1232,7 @@ class OkxPerpetualSdkExchange:
         return await self._call_sdk(
             lambda: self.trade_api,
             "get_fills_history",
+            attach_trade_credential_scope=True,
             instType=OKX_SWAP_INST_TYPE,
             instId=str(params.get("instId") or ""),
             ordId=str(params.get("ordId") or ""),
@@ -1230,6 +1248,7 @@ class OkxPerpetualSdkExchange:
         return await self._call_sdk(
             lambda: self.trade_api,
             "get_fills",
+            attach_trade_credential_scope=True,
             instType=OKX_SWAP_INST_TYPE,
             instId=str(params.get("instId") or ""),
             ordId=str(params.get("ordId") or ""),
@@ -1331,6 +1350,7 @@ class OkxPerpetualSdkExchange:
         return await self._call_sdk(
             lambda: self.trade_api,
             "order_algos_history",
+            attach_trade_credential_scope=True,
             ordType=str(params.get("ordType") or ""),
             state=str(params.get("state") or ""),
             algoId=str(params.get("algoId") or ""),
@@ -1352,6 +1372,7 @@ class OkxPerpetualSdkExchange:
         return await self._call_sdk(
             lambda: self.trade_api,
             "get_algo_order_details",
+            attach_trade_credential_scope=True,
             algoId=algo_id,
             algoClOrdId=algo_client_id,
         )

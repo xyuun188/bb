@@ -26,6 +26,7 @@ from services.okx_execution_slippage import (
     OKX_ROUND_TRIP_SLIPPAGE_SOURCE,
     PAPER_ROUND_TRIP_SLIPPAGE_VERSION,
 )
+from services.okx_native_facts import OKX_STOP_LOSS_SLIPPAGE_SOURCE
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 
 PROFIT_SUPERVISION_VERSION = "2026-11-11.observed-shadow-exit-cost.v6"
@@ -749,7 +750,10 @@ def select_trade_calibration(
 
 
 def authoritative_execution_cost_calibration(
-    outcomes: list[dict[str, Any]], *, execution_mode: str
+    outcomes: list[dict[str, Any]],
+    *,
+    execution_mode: str,
+    credential_scope: str = "",
 ) -> dict[str, Any]:
     """Reprice execution from settled lifecycles, including costly losing fills.
 
@@ -760,7 +764,9 @@ def authoritative_execution_cost_calibration(
     if execution_mode not in {"paper", "live"}:
         raise ValueError("execution_mode_must_be_paper_or_live")
     buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    stop_buckets: dict[str, list[tuple[float, float]]] = defaultdict(list)
     seen: set[str] = set()
+    seen_stops: set[tuple[str, str]] = set()
     for outcome in outcomes:
         label = _safe_dict(outcome.get("training_label_contract"))
         lifecycle = _safe_text(outcome.get("lifecycle_key"))
@@ -768,6 +774,31 @@ def authoritative_execution_cost_calibration(
         net = _safe_float(label.get(PROFIT_TRAINING_TARGET))
         side = _safe_text(outcome.get("side")).lower()
         symbol = normalize_trading_symbol(outcome.get("symbol"))
+        # A stop fill can be verified even when the trade has no training label.
+        if (
+            credential_scope
+            and outcome.get("execution_mode") == execution_mode
+            and outcome.get("source") in AUTHORITATIVE_TRADE_OUTCOME_SOURCES
+            and side in {"long", "short"}
+            and symbol
+            and _safe_text(outcome.get("inst_id")).upper() == f"{symbol.replace('/', '-')}-SWAP"
+        ):
+            stops = outcome.get("verified_stop_loss_fills")
+            for row in stops if isinstance(stops, list) else ():
+                stop = _safe_dict(row)
+                order_id = _safe_text(stop.get("order_id"))
+                slippage_pct = _safe_float(stop.get("slippage_pct"))
+                stop_key = (symbol, order_id)
+                if (
+                    order_id
+                    and stop_key not in seen_stops
+                    and stop.get("credential_scope") == credential_scope
+                    and slippage_pct is not None
+                    and slippage_pct >= 0.0
+                ):
+                    seen_stops.add(stop_key)
+                    stop_buckets[f"{symbol}|{side}"].append((slippage_pct, 1.0))
+
         if (
             outcome.get("execution_mode") != execution_mode
             or label.get("execution_mode") != execution_mode
@@ -814,10 +845,24 @@ def authoritative_execution_cost_calibration(
         }
         for key, labels in buckets.items()
     }
+    stop_profiles = {
+        key: {
+            "source_authority": "okx_position_history",
+            "execution_mode": execution_mode,
+            "symbol": key.rsplit("|", 1)[0],
+            "side": key.rsplit("|", 1)[-1],
+            "profile_source": "symbol_side",
+            "stop_loss_slippage_pct": weighted_distribution(pairs),
+            "stop_loss_slippage_source": OKX_STOP_LOSS_SLIPPAGE_SOURCE,
+            "stop_loss_slippage_credential_scope": credential_scope,
+        }
+        for key, pairs in stop_buckets.items()
+    }
     result = {
         "version": PROFIT_SUPERVISION_VERSION,
         "execution_mode": execution_mode,
         "profiles": profiles,
+        "stop_loss_slippage_profiles": stop_profiles,
         "actual_realized_return_sample_count": len(seen),
     }
     result["data_fingerprint"] = _fingerprint(result)

@@ -106,9 +106,15 @@ class PositionProtectionFallbackPolicy:
             raw,
             allow_historical_settlement=True,
         )
+        stress_components = sizing.get("stress_components")
+        stress_components = stress_components if isinstance(stress_components, dict) else {}
+        stored_stop = (
+            stress_components.get("planned_stop_fraction")
+            if "stop_gap_stressed_loss_fraction" in stress_components
+            else sizing.get("stressed_loss_fraction")
+        )
         stop_loss_pct = self.float_parser(
-            getattr(decision, "stop_loss_pct", None)
-            or sizing.get("stressed_loss_fraction"),
+            getattr(decision, "stop_loss_pct", None) or stored_stop,
             0.0,
         )
         take_profit_pct = self.float_parser(

@@ -7,6 +7,7 @@ from risk_manager.engine import RiskEngine
 from services.entry_profit_risk_sizing import (
     EntryProfitRiskSizingPolicy,
     _fingerprint,
+    _same_mode_stop_slippage_distribution,
     build_portfolio_correlation_context,
     reconcile_profit_risk_sizing,
     select_okx_leverage_tier,
@@ -22,6 +23,7 @@ from services.normal_paper_trade import (
 from services.normal_paper_trade import (
     _fingerprint as normal_paper_fingerprint,
 )
+from services.okx_native_facts import OKX_STOP_LOSS_SLIPPAGE_SOURCE
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.return_objective import execution_cost_with_slippage_floor
 from tests.normal_paper_test_fixtures import paper_quality_permissions
@@ -238,6 +240,90 @@ def _use_bounded_training_entry(
 
 async def _balance(_mode: str, _decision: DecisionOutput | None) -> float:
     return 1000.0
+
+
+def test_stop_slippage_requires_exact_mode_symbol_side_and_okx_stop_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("services.entry_profit_risk_sizing.okx_credential_scope", lambda _: "current")
+    calibration = {
+        "source_authority": "okx_position_history",
+        "profile_source": "symbol_side",
+        "execution_mode": "paper",
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "stop_loss_slippage_source": OKX_STOP_LOSS_SLIPPAGE_SOURCE,
+        "stop_loss_slippage_credential_scope": "current",
+        "stop_loss_slippage_pct": {
+            "count": 2,
+            "expected": 0.03,
+            "upper_hinge": 0.05,
+            "maximum": 0.08,
+        },
+    }
+    opportunity = {"stop_loss_slippage_calibration": calibration}
+
+    assert _same_mode_stop_slippage_distribution(
+        opportunity, "paper", symbol="BTC-USDT-SWAP", side="long"
+    ) == calibration["stop_loss_slippage_pct"]
+    for key, value in (
+        ("execution_mode", "live"),
+        ("symbol", "ETH/USDT"),
+        ("side", "short"),
+        ("profile_source", "global_side"),
+        ("stop_loss_slippage_source", "unverified"),
+        ("stop_loss_slippage_credential_scope", "old"),
+        ("stop_loss_slippage_credential_scope", ""),
+    ):
+        mismatched = deepcopy(opportunity)
+        mismatched["stop_loss_slippage_calibration"][key] = value
+        assert _same_mode_stop_slippage_distribution(
+            mismatched, "paper", symbol="BTC/USDT", side="long"
+        ) == {}
+
+
+@pytest.mark.asyncio
+async def test_verified_stop_slippage_reduces_size_without_widening_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("services.entry_profit_risk_sizing.okx_credential_scope", lambda _: "current")
+    without_stop_slippage = _decision()
+    with_stop_slippage = deepcopy(without_stop_slippage)
+    with_stop_slippage.raw_response["opportunity_score"][
+        "stop_loss_slippage_calibration"
+    ] = {
+        "source_authority": "okx_position_history",
+        "execution_mode": "paper",
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "profile_source": "symbol_side",
+        "stop_loss_slippage_source": OKX_STOP_LOSS_SLIPPAGE_SOURCE,
+        "stop_loss_slippage_credential_scope": "current",
+        "stop_loss_slippage_pct": {
+            "count": 2,
+            "expected": 0.03,
+            "upper_hinge": 0.05,
+            "maximum": 0.08,
+        },
+    }
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+
+    await policy.apply(without_stop_slippage, "paper", [])
+    await policy.apply(with_stop_slippage, "paper", [])
+
+    baseline = without_stop_slippage.raw_response["profit_risk_sizing"]
+    sized = with_stop_slippage.raw_response["profit_risk_sizing"]
+    assert sized["production_eligible"] is True
+    assert sized["stress_components"]["actual_stop_slippage_tail_fraction"] == pytest.approx(
+        0.0008
+    )
+    assert sized["stressed_loss_fraction"] > baseline["stressed_loss_fraction"]
+    assert sized["stress_components"]["quote_band_stress_fraction"] == (
+        baseline["stress_components"]["quote_band_stress_fraction"]
+    )
+    assert sized["final_notional_usdt"] < baseline["final_notional_usdt"]
+    assert sized["planned_stressed_loss_usdt"] <= sized["risk_budget_usdt"]
+    assert with_stop_slippage.stop_loss_pct == pytest.approx(0.02)
 
 
 @pytest.mark.asyncio

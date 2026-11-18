@@ -51,6 +51,7 @@ from services.okx_native_facts import (
     OkxNativeFillGroup,
     build_okx_protection_execution_lifecycle,
     group_okx_native_fill_rows,
+    okx_algo_generated_order_ids,
     validated_okx_order_detail,
 )
 from services.okx_protection_position_recovery import (
@@ -4598,9 +4599,9 @@ def _protection_execution_by_order_id(
     algo_rows: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     algo_by_order_id = {
-        str(row.get("ordId") or "").strip(): row
+        order_id: row
         for row in algo_rows
-        if str(row.get("ordId") or "").strip()
+        for order_id in okx_algo_generated_order_ids(row)
     }
     algo_by_id = {
         str(row.get("algoId") or row.get("algoClOrdId") or "").strip(): row

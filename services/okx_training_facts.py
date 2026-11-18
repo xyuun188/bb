@@ -26,7 +26,10 @@ from services.okx_lifecycle_order_allocations import (
     apply_lifecycle_order_allocation,
     lifecycle_order_allocation,
 )
-from services.okx_native_facts import OKX_ACCOUNT_BILLS_TRADE_SOURCE
+from services.okx_native_facts import (
+    OKX_ACCOUNT_BILLS_TRADE_SOURCE,
+    OKX_STOP_LOSS_SLIPPAGE_SOURCE,
+)
 from services.okx_order_fact_sync import authoritative_order_fee_fact_source
 from services.paper_exploration import paper_exploration_contract_reasons
 from services.paper_training import paper_training_contract_reasons
@@ -1316,6 +1319,29 @@ def build_okx_history_training_sample(
     stop_loss_fill_confirmed = bool(
         protection_execution and _text(protection_execution.get("actual_side")).lower() == "sl"
     )
+    # The first protection fill can be a TP or an older, unscoped stop.
+    verified_stops = []
+    for order in close_orders:
+        execution = _protection_execution(order)
+        order_id = _text(execution.get("generated_order_id"))
+        slippage = _safe_float(execution.get("stop_loss_slippage_pct"), None)
+        if (
+            _text(execution.get("actual_side")).lower() == "sl"
+            and execution.get("stop_loss_slippage_source") == OKX_STOP_LOSS_SLIPPAGE_SOURCE
+            and execution.get("stop_loss_slippage_credential_scope")
+            and _text(execution.get("inst_id")).upper()
+            == _text(_value(history, "inst_id")).upper()
+            and _text(execution.get("position_side")).lower() == side
+            and order_id in close_order_ids
+            and order_id == _text(_value(order, "exchange_order_id"))
+            and slippage is not None
+            and slippage >= 0.0
+        ):
+            verified_stops.append({
+                "order_id": order_id,
+                "slippage_pct": slippage,
+                "credential_scope": execution["stop_loss_slippage_credential_scope"],
+            })
     entry_execution_slippage_usdt = _safe_float(
         entry_fill_group.get("execution_slippage_usdt"),
         None,
@@ -1590,6 +1616,7 @@ def build_okx_history_training_sample(
         "planned_take_profit_price": take_profit_price,
         "planned_protection_price_sources": planned_price_sources,
         "stop_loss_fill_confirmed": stop_loss_fill_confirmed,
+        "verified_stop_loss_fills": verified_stops,
         "slippage": canonical_slippage,
         "slippage_source": canonical_slippage_source,
         "paper_round_trip_cost": paper_round_trip_cost,

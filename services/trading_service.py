@@ -181,6 +181,7 @@ from services.okx_order_fact_sync import (
     OKX_ORDER_FACT_SYNC_RESULT_PREFIX,
     OkxOrderFactSyncService,
 )
+from services.okx_perpetual_sdk import okx_credential_scope
 from services.okx_position_settlement_sync import OkxPositionSettlementSyncService
 from services.okx_settlement_fact_sync import OkxSettlementFactSyncService
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
@@ -8452,7 +8453,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             compact=True,
         )
         calibration = authoritative_execution_cost_calibration(
-            outcomes, execution_mode=mode
+            outcomes, execution_mode=mode, credential_scope=okx_credential_scope(mode)
         )
         calibration["generated_at"] = datetime.now(UTC).isoformat()
         return calibration

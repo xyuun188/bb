@@ -25,6 +25,7 @@ DEFAULT_MAX_ORDER_HISTORY_CONTEXT_QUERIES = 30
 DEFAULT_MAX_ALGO_DETAIL_QUERIES = 100
 DEFAULT_PROTECTION_ALGO_ORDER_TYPES = ("conditional", "oco", "trigger", "move_order_stop")
 OKX_PROTECTION_EXECUTION_VERSION = "2026-07-15.okx-protection-execution.v1"
+OKX_STOP_LOSS_SLIPPAGE_SOURCE = "okx_configured_stop_trigger_to_fills_vwap"
 FUNDING_FEE_BILL_SUBTYPES = {"173", "174"}
 OKX_ACCOUNT_BILLS_TRADE_SOURCE = "okx_account_bills_archive_trade"
 
@@ -1323,7 +1324,7 @@ class OkxNativeFactsClient:
         def append_rows(values: Iterable[dict[str, Any]]) -> None:
             for row in values:
                 algo_id = str(row.get("algoId") or row.get("algoClOrdId") or "").strip()
-                order_id = str(row.get("ordId") or "").strip()
+                order_ids = okx_algo_generated_order_ids(row)
                 inst_id = str(row.get("instId") or "").strip().upper()
                 updated_ms = _safe_float(
                     row.get("uTime") or row.get("triggerTime") or row.get("cTime"), 0.0
@@ -1331,14 +1332,14 @@ class OkxNativeFactsClient:
                 if (
                     (target_algo_ids or target_order_ids)
                     and algo_id not in target_algo_ids
-                    and order_id not in target_order_ids
+                    and target_order_ids.isdisjoint(order_ids)
                 ):
                     continue
                 if target_inst_ids and inst_id not in target_inst_ids:
                     continue
                 if since_ms > 0 and updated_ms > 0 and updated_ms < since_ms:
                     continue
-                key = (algo_id, order_id)
+                key = (algo_id, ",".join(sorted(order_ids)))
                 if not algo_id or key in seen:
                     continue
                 seen.add(key)
@@ -1503,6 +1504,16 @@ def group_okx_native_fill_rows(
     return sorted(result, key=lambda item: item.timestamp_ms, reverse=True)
 
 
+def okx_algo_generated_order_ids(row: dict[str, Any]) -> set[str]:
+    order_ids = row.get("ordIdList")
+    order_ids = order_ids if isinstance(order_ids, list) else []
+    return {
+        str(value).strip()
+        for value in (row.get("ordId"), *order_ids)
+        if isinstance(value, str) and value.strip()
+    }
+
+
 def build_okx_protection_execution_lifecycle(
     fill: Any,
     *,
@@ -1516,8 +1527,14 @@ def build_okx_protection_execution_lifecycle(
     algo_id = str(
         algo_row.get("algoId") or order_row.get("algoId") or algo_row.get("algoClOrdId") or ""
     ).strip()
-    generated_order_id = str(algo_row.get("ordId") or order_row.get("ordId") or "").strip()
     fill_order_id = str(getattr(fill, "order_id", "") or "").strip()
+    reported_order_ids = okx_algo_generated_order_ids(algo_row)
+    if reported_order_ids and fill_order_id and fill_order_id not in reported_order_ids:
+        return None
+    generated_order_id = (
+        fill_order_id if fill_order_id in reported_order_ids
+        else str(algo_row.get("ordId") or order_row.get("ordId") or "").strip()
+    )
     actual_side = str(algo_row.get("actualSide") or "").strip().lower()
     if actual_side not in {"sl", "tp"}:
         return None
@@ -1601,6 +1618,32 @@ def build_okx_protection_execution_lifecycle(
         return None
 
     state = str(algo_row.get("state") or "").strip().lower()
+    inst_id = str(algo_row.get("instId") or order_row.get("instId") or "").strip().upper()
+    fill_inst_id = str(getattr(fill, "inst_id", "") or "").strip().upper()
+    credential_scope = str(algo_row.get("_bb_okx_credential_scope") or "")
+    scoped_fill_rows = bool(
+        credential_scope
+        and fill_rows
+        and getattr(fill, "pagination_complete", False) is True
+        and fill_order_id
+        and fill_order_id in reported_order_ids
+        and str(algo_row.get("instId") or "").strip().upper() == fill_inst_id
+        and str(algo_row.get("side") or "").strip().lower() == close_side
+        and inst_id.endswith("-USDT-SWAP")
+        and (
+            (position_side == "long" and close_side == "sell")
+            or (position_side == "short" and close_side == "buy")
+        )
+        and all(
+            row.get("_bb_okx_credential_scope") == credential_scope
+            and str(row.get("ordId") or "").strip() == fill_order_id
+            and str(row.get("instId") or "").strip().upper() == inst_id
+            and str(row.get("side") or "").strip().lower() == close_side
+            and str(row.get("posSide") or "").strip().lower() in {"net", position_side}
+            and str(row.get("tradeId") or "").strip()
+            for row in fill_rows
+        )
+    )
     lifecycle_complete = bool(
         algo_id
         and generated_order_id
@@ -1623,7 +1666,7 @@ def build_okx_protection_execution_lifecycle(
         "lifecycle_complete": lifecycle_complete,
         "algo_id": algo_id,
         "generated_order_id": generated_order_id,
-        "inst_id": str(algo_row.get("instId") or order_row.get("instId") or "").strip().upper(),
+        "inst_id": inst_id,
         "state": state,
         "actual_side": actual_side,
         "position_side": position_side,
@@ -1661,8 +1704,11 @@ def build_okx_protection_execution_lifecycle(
         "trigger_path_extrema_available": False,
         "trigger_orderbook_snapshot_available": False,
         "stop_loss_slippage_pct": stop_slippage,
+        "stop_loss_slippage_credential_scope": (
+            credential_scope if stop_slippage is not None and scoped_fill_rows else None
+        ),
         "stop_loss_slippage_source": (
-            "okx_configured_stop_trigger_to_fills_vwap"
+            OKX_STOP_LOSS_SLIPPAGE_SOURCE
             if stop_slippage is not None
             else "not_applicable_or_incomplete"
         ),

@@ -48,6 +48,7 @@ from services.entry_price_guard import paper_entry_execution_price_limit
 from services.entry_profit_risk_sizing import (
     reconcile_profit_risk_sizing,
     select_okx_leverage_tier,
+    stop_gap_stressed_loss_fraction,
     uplift_profit_risk_sizing_to_exchange_minimum,
 )
 from services.exchange_position_state import parse_exchange_position_snapshot
@@ -6156,7 +6157,16 @@ class OKXExecutor(AbstractExecutor):
             if stop > 0 and worst_entry > 0 and stop_direction_valid
             else 0.0
         )
-        stop_stress = stop_distance / worst_entry if worst_entry > 0 else 0.0
+        stop_distance_fraction = stop_distance / worst_entry if worst_entry > 0 else 0.0
+        components = sizing.get("stress_components") or {}
+        stop_slippage_tail = max(
+            self._safe_float(components.get("actual_stop_slippage_tail_fraction")), 0.0
+        )
+        stop_stress = stop_gap_stressed_loss_fraction(
+            stop_distance_fraction=stop_distance_fraction,
+            stop_slippage_fraction=stop_slippage_tail,
+            stop_trigger_to_entry_price_ratio=stop_ratio,
+        )
         stress = max(declared_stress, stop_stress)
         risk_budget = max(self._safe_float(sizing.get("risk_budget_usdt")), 0.0)
         reserve = max(
@@ -6174,6 +6184,9 @@ class OKXExecutor(AbstractExecutor):
             "worst_entry_price": worst_entry,
             "stop_price_same_scale": stop_is_same_scale,
             "stop_direction_valid": stop_direction_valid,
+            "stop_distance_fraction": stop_distance_fraction,
+            "stop_slippage_tail_fraction": stop_slippage_tail,
+            "stop_gap_stressed_loss_fraction": stop_stress,
             "stressed_loss_fraction": stress,
             "risk_budget_usdt": risk_budget,
             "maximum_notional_usdt": max(maximum, 0.0),

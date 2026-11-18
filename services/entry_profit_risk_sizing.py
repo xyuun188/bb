@@ -34,15 +34,19 @@ from services.normal_paper_trade import (
     normal_paper_trade_contract_reasons,
     reconcile_normal_paper_trade_contract,
 )
-from services.okx_native_facts import okx_minimum_order_notional_usdt
+from services.okx_native_facts import (
+    OKX_STOP_LOSS_SLIPPAGE_SOURCE,
+    okx_minimum_order_notional_usdt,
+)
+from services.okx_perpetual_sdk import okx_credential_scope
 from services.production_trade_gate import validate_production_trade_gate
 from services.return_objective import (
     execution_cost_with_slippage_floor,
     reprice_execution_opportunity,
 )
 
-RISK_SIZING_VERSION = "2026-07-15.independent-profit-risk-budget.v3"
-LIVE_RULES_CANARY_SIZING_VERSION = "2026-07-23.live-rules-canary-sizing.v2"
+RISK_SIZING_VERSION = "2026-11-19.independent-profit-risk-budget.v4"
+LIVE_RULES_CANARY_SIZING_VERSION = "2026-11-19.live-rules-canary-sizing.v3"
 LEVERAGE_TIER_SELECTION_VERSION = "2026-07-15.okx-target-notional-tier.v1"
 
 EntryProfitRiskSizingEvaluator = Callable[
@@ -514,6 +518,38 @@ def _actual_trade_calibration(opportunity: dict[str, Any]) -> dict[str, Any]:
     return (symbol_rows or rows)[0]
 
 
+def _same_mode_stop_slippage_distribution(
+    opportunity: dict[str, Any],
+    execution_mode: str,
+    *,
+    symbol: str,
+    side: str,
+) -> dict[str, Any]:
+    target_symbol = normalize_trading_symbol(symbol)
+    target_side = str(side or "").strip().lower()
+    target_mode = str(execution_mode or "").strip().lower()
+    credential_scope = okx_credential_scope(target_mode)
+    calibration = _safe_dict(opportunity.get("stop_loss_slippage_calibration"))
+    distribution = _safe_dict(calibration.get("stop_loss_slippage_pct"))
+    if (
+        calibration.get("source_authority") not in AUTHORITATIVE_TRADE_OUTCOME_SOURCES
+        or calibration.get("profile_source") != "symbol_side"
+        or normalize_trading_symbol(str(calibration.get("symbol") or ""))
+        != target_symbol
+        or str(calibration.get("side") or "").strip().lower() != target_side
+        or str(calibration.get("execution_mode") or "").strip().lower()
+        != target_mode
+        or calibration.get("stop_loss_slippage_source")
+        != OKX_STOP_LOSS_SLIPPAGE_SOURCE
+        or not credential_scope
+        or calibration.get("stop_loss_slippage_credential_scope") != credential_scope
+        or _safe_float(distribution.get("count"), 0.0) <= 0.0
+        or _safe_float(distribution.get("expected"), -1.0) < 0.0
+    ):
+        return {}
+    return distribution
+
+
 def _distribution_tail(value: Any) -> float:
     distribution = _safe_dict(value)
     return max(
@@ -522,6 +558,16 @@ def _distribution_tail(value: Any) -> float:
         _safe_float(distribution.get("maximum"), 0.0),
         0.0,
     )
+
+
+def stop_gap_stressed_loss_fraction(
+    *,
+    stop_distance_fraction: float,
+    stop_slippage_fraction: float,
+    stop_trigger_to_entry_price_ratio: float,
+) -> float:
+    # OKX stop slippage is measured against the trigger, not the entry price.
+    return stop_distance_fraction + stop_slippage_fraction * stop_trigger_to_entry_price_ratio
 
 
 def _rolling_realized_lcb_pct(calibration: dict[str, Any]) -> float | None:
@@ -1229,7 +1275,13 @@ class EntryProfitRiskSizingPolicy:
         path_adverse = _path_adverse_fraction(decision)
         volatility = _normalized_ratio(snapshot.get("volatility_20"))
         wick = max(_safe_float(snapshot.get("abnormal_wick_max_pct"), 0.0) / 100.0, 0.0)
-        stop_slippage_tail = _distribution_tail(calibration.get("stop_loss_slippage_pct")) / 100.0
+        stop_slippage_distribution = _same_mode_stop_slippage_distribution(
+            opportunity,
+            model_mode,
+            symbol=decision.symbol,
+            side=_side(decision),
+        )
+        stop_slippage_tail = _distribution_tail(stop_slippage_distribution) / 100.0
         general_slippage_tail = _distribution_tail(calibration.get("slippage_pct")) / 100.0
         market_impact = (
             max(
@@ -1241,17 +1293,27 @@ class EntryProfitRiskSizingPolicy:
             )
             / 100.0
         )
-        stressed_loss_fraction = max(
+        protection_stop_fraction = max(
             declared_stop,
             atr_ratio,
             path_adverse,
             volatility,
             wick,
             expected_loss_pct / 100.0,
-            stop_slippage_tail,
             general_slippage_tail,
             market_impact,
         )
+        stop_trigger_to_entry_price_ratio = (
+            max(1.0 - protection_stop_fraction, 0.0)
+            if _side(decision) == "long"
+            else 1.0 + protection_stop_fraction
+        )
+        stop_gap_stress_fraction = stop_gap_stressed_loss_fraction(
+            stop_distance_fraction=protection_stop_fraction,
+            stop_slippage_fraction=stop_slippage_tail,
+            stop_trigger_to_entry_price_ratio=stop_trigger_to_entry_price_ratio,
+        )
+        stressed_loss_fraction = max(protection_stop_fraction, stop_gap_stress_fraction)
         cost_pct = max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0)
         positive_return = max(expected_net, 0.0) if isfinite(expected_net) else 0.0
         positive_lcb = max(return_lcb, 0.0) if isfinite(return_lcb) else 0.0
@@ -1438,6 +1500,10 @@ class EntryProfitRiskSizingPolicy:
             "rolling_realized_return_lcb_pct": rolling_realized_lcb,
             "return_uncertainty_pct": uncertainty_pct,
             "expected_loss_pct": expected_loss_pct,
+            "protection_stop_fraction": protection_stop_fraction,
+            "stop_slippage_tail_fraction": stop_slippage_tail,
+            "stop_gap_stressed_loss_fraction": stop_gap_stress_fraction,
+            "stop_trigger_to_entry_price_ratio": stop_trigger_to_entry_price_ratio,
             "loss_probability": loss_probability,
             "tail_risk_score": tail_risk,
             "liquidity_capacity_usdt": side_depth,
@@ -1505,13 +1571,21 @@ class EntryProfitRiskSizingPolicy:
             "declared_take_profit_fraction": round(declared_take_profit, 8),
             "dynamic_take_profit_fraction": round(dynamic_take_profit, 8),
             "stress_components": {
-                "planned_stop_fraction": round(declared_stop, 8),
+                "planned_stop_fraction": round(protection_stop_fraction, 8),
                 "atr_fraction": round(atr_ratio, 8),
                 "path_adverse_fraction": round(path_adverse, 8),
                 "volatility_fraction": round(volatility, 8),
                 "abnormal_wick_fraction": round(wick, 8),
                 "expected_tail_loss_fraction": round(expected_loss_pct / 100.0, 8),
                 "actual_stop_slippage_tail_fraction": round(stop_slippage_tail, 8),
+                "stop_gap_stressed_loss_fraction": round(
+                    stop_gap_stress_fraction,
+                    8,
+                ),
+                "stop_trigger_to_entry_price_ratio": round(
+                    stop_trigger_to_entry_price_ratio,
+                    8,
+                ),
                 "actual_execution_slippage_tail_fraction": round(general_slippage_tail, 8),
                 "current_orderbook_impact_fraction": round(market_impact, 8),
             },
@@ -1545,7 +1619,9 @@ class EntryProfitRiskSizingPolicy:
         decision.raw_response = raw
         decision.position_size_pct = final_size if eligible else 0.0
         decision.suggested_leverage = leverage if eligible else 1.0
-        decision.stop_loss_pct = stressed_loss_fraction if eligible else decision.stop_loss_pct
+        decision.stop_loss_pct = (
+            protection_stop_fraction if eligible else decision.stop_loss_pct
+        )
         decision.take_profit_pct = dynamic_take_profit if eligible else decision.take_profit_pct
 
     async def _apply_live_rules_canary_sizing(
@@ -1595,11 +1671,17 @@ class EntryProfitRiskSizingPolicy:
 
         snapshot = _safe_dict(decision.feature_snapshot)
         calibration = _actual_trade_calibration(opportunity)
+        stop_slippage_distribution = _same_mode_stop_slippage_distribution(
+            opportunity,
+            model_mode,
+            symbol=decision.symbol,
+            side=_side(decision),
+        )
         atr_ratio = _atr_ratio(decision)
         path_adverse = _path_adverse_fraction(decision)
         volatility = _normalized_ratio(snapshot.get("volatility_20"))
         wick = max(_safe_float(snapshot.get("abnormal_wick_max_pct"), 0.0) / 100.0, 0.0)
-        stop_slippage_tail = _distribution_tail(calibration.get("stop_loss_slippage_pct")) / 100.0
+        stop_slippage_tail = _distribution_tail(stop_slippage_distribution) / 100.0
         general_slippage_tail = _distribution_tail(calibration.get("slippage_pct")) / 100.0
         cost_pct = max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0)
         market_impact = (
@@ -1612,16 +1694,26 @@ class EntryProfitRiskSizingPolicy:
             )
             / 100.0
         )
-        stressed_loss_fraction = max(
+        protection_stop_fraction = max(
             atr_ratio,
             path_adverse,
             volatility,
             wick,
-            stop_slippage_tail,
             general_slippage_tail,
             market_impact,
         )
-        take_profit_fraction = stressed_loss_fraction * 1.5 + cost_pct / 100.0
+        stop_trigger_to_entry_price_ratio = (
+            max(1.0 - protection_stop_fraction, 0.0)
+            if _side(decision) == "long"
+            else 1.0 + protection_stop_fraction
+        )
+        stop_gap_stress_fraction = stop_gap_stressed_loss_fraction(
+            stop_distance_fraction=protection_stop_fraction,
+            stop_slippage_fraction=stop_slippage_tail,
+            stop_trigger_to_entry_price_ratio=stop_trigger_to_entry_price_ratio,
+        )
+        stressed_loss_fraction = max(protection_stop_fraction, stop_gap_stress_fraction)
+        take_profit_fraction = protection_stop_fraction * 1.5 + cost_pct / 100.0
         side_depth = max(
             _safe_float(
                 snapshot.get(
@@ -1748,6 +1840,10 @@ class EntryProfitRiskSizingPolicy:
             "target_price": target_price,
             "exchange_minimum_order": exchange_minimum_order,
             "stressed_loss_fraction": stressed_loss_fraction,
+            "protection_stop_fraction": protection_stop_fraction,
+            "stop_slippage_tail_fraction": stop_slippage_tail,
+            "stop_gap_stressed_loss_fraction": stop_gap_stress_fraction,
+            "stop_trigger_to_entry_price_ratio": stop_trigger_to_entry_price_ratio,
             "execution_cost_pct": cost_pct,
             "current_portfolio_stressed_loss_usdt": portfolio[
                 "current_stressed_loss_usdt"
@@ -1808,12 +1904,21 @@ class EntryProfitRiskSizingPolicy:
             "declared_take_profit_fraction": 0.0,
             "dynamic_take_profit_fraction": round(take_profit_fraction, 8),
             "stress_components": {
+                "planned_stop_fraction": round(protection_stop_fraction, 8),
                 "atr_fraction": round(atr_ratio, 8),
                 "path_adverse_fraction": round(path_adverse, 8),
                 "volatility_fraction": round(volatility, 8),
                 "abnormal_wick_fraction": round(wick, 8),
                 "actual_stop_slippage_tail_fraction": round(
                     stop_slippage_tail,
+                    8,
+                ),
+                "stop_gap_stressed_loss_fraction": round(
+                    stop_gap_stress_fraction,
+                    8,
+                ),
+                "stop_trigger_to_entry_price_ratio": round(
+                    stop_trigger_to_entry_price_ratio,
                     8,
                 ),
                 "actual_execution_slippage_tail_fraction": round(
@@ -1858,7 +1963,7 @@ class EntryProfitRiskSizingPolicy:
         decision.position_size_pct = position_size if eligible else 0.0
         decision.suggested_leverage = final_leverage
         if eligible:
-            decision.stop_loss_pct = stressed_loss_fraction
+            decision.stop_loss_pct = protection_stop_fraction
             decision.take_profit_pct = take_profit_fraction
 
     async def _apply_normal_paper_sizing(
@@ -2021,6 +2126,18 @@ class EntryProfitRiskSizingPolicy:
             0.01,
         )
         protection_stop_fraction = stress_fraction
+        stop_slippage_distribution = _same_mode_stop_slippage_distribution(
+            opportunity,
+            model_mode,
+            symbol=decision.symbol,
+            side=side,
+        )
+        stop_slippage_tail = _distribution_tail(stop_slippage_distribution) / 100.0
+        stop_trigger_to_entry_price_ratio = (
+            max(1.0 - protection_stop_fraction, 0.0)
+            if side == "long"
+            else 1.0 + protection_stop_fraction
+        )
         # Preview the executor's stop geometry before authorizing an indivisible
         # contract. Keep the stop distance separate from price-band stress so
         # repeated sizing passes cannot compound that stress into wider stops.
@@ -2047,6 +2164,17 @@ class EntryProfitRiskSizingPolicy:
                 stress_fraction = max(
                     stress_fraction, abs(native_stop - worst_entry) / worst_entry,
                 )
+                stop_trigger_to_entry_price_ratio = max(
+                    native_stop / worst_entry,
+                    0.0,
+                )
+        quote_band_stress_fraction = stress_fraction
+        stop_gap_stress_fraction = stop_gap_stressed_loss_fraction(
+            stop_distance_fraction=quote_band_stress_fraction,
+            stop_slippage_fraction=stop_slippage_tail,
+            stop_trigger_to_entry_price_ratio=stop_trigger_to_entry_price_ratio,
+        )
+        stress_fraction = max(stress_fraction, stop_gap_stress_fraction)
         single_trade_risk_fraction = min(
             max(
                 _safe_float(normal_trade.get("single_trade_risk_fraction_cap"), 0.0),
@@ -2511,6 +2639,10 @@ class EntryProfitRiskSizingPolicy:
             "contract_step_fill_reserve_fraction": contract_step_fill_reserve_fraction,
             "final_notional_usdt": final_notional,
             "stressed_loss_fraction": stress_fraction,
+            "protection_stop_fraction": protection_stop_fraction,
+            "stop_slippage_tail_fraction": stop_slippage_tail,
+            "stop_gap_stressed_loss_fraction": stop_gap_stress_fraction,
+            "stop_trigger_to_entry_price_ratio": stop_trigger_to_entry_price_ratio,
             "negative_lcb_stress_fraction": negative_lcb_stress_fraction,
             "expected_net_return_pct": expected_net,
             "return_lcb_pct": return_lcb,
@@ -2620,6 +2752,19 @@ class EntryProfitRiskSizingPolicy:
             "expected_profit_usdt": round(final_notional * expected_net / 100.0, 8),
             "declared_stop_loss_fraction": round(declared_stop, 8),
             "stressed_loss_fraction": round(stress_fraction, 8),
+            "stress_components": {
+                "planned_stop_fraction": round(protection_stop_fraction, 8),
+                "quote_band_stress_fraction": round(quote_band_stress_fraction, 8),
+                "actual_stop_slippage_tail_fraction": round(stop_slippage_tail, 8),
+                "stop_gap_stressed_loss_fraction": round(
+                    stop_gap_stress_fraction,
+                    8,
+                ),
+                "stop_trigger_to_entry_price_ratio": round(
+                    stop_trigger_to_entry_price_ratio,
+                    8,
+                ),
+            },
             "negative_lcb_stress_fraction": round(
                 negative_lcb_stress_fraction,
                 8,

@@ -187,6 +187,26 @@ class _TradeApi:
         return {"code": "0", "data": []}
 
 
+@pytest.mark.asyncio
+async def test_stop_evidence_is_scoped_to_the_sdk_signing_key(monkeypatch) -> None:
+    exchange = OkxPerpetualSdkExchange("paper")
+    api = _TradeApi()
+    api.API_KEY = "test-signing-key"
+    exchange._trade_api = api
+    row = {"ordId": "order-1", "tradeId": "fill-1"}
+    monkeypatch.setattr(api, "get_fills_history", lambda **_: {"code": "0", "data": [row]})
+    expected_scope = okx_perpetual_sdk.okx_credential_scope("paper", "test-signing-key")
+
+    fills = await exchange.privateGetTradeFillsHistory({"ordId": "order-1"})
+    algos = await exchange.privateGetTradeOrderAlgoDetails({"algoId": "algo-1"})
+
+    assert expected_scope and expected_scope != api.API_KEY
+    assert fills["data"][0]["_bb_okx_credential_scope"] == expected_scope
+    assert algos["data"][0]["_bb_okx_credential_scope"] == expected_scope
+    assert "_bb_okx_credential_scope" not in row
+    assert expected_scope != okx_perpetual_sdk.okx_credential_scope("live", api.API_KEY)
+
+
 class _AccountApi:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []

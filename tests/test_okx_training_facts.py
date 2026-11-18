@@ -1834,7 +1834,16 @@ def test_position_fallback_payload_is_not_misreported_as_exact_entry_lineage() -
     assert "missing_exact_entry_order_decision_link" in sample["strategy_lineage_gaps"]
 
 
-def test_round_trip_slippage_uses_fill_mark_facts_not_protection_trigger() -> None:
+@pytest.mark.parametrize(("override", "expected"), [
+    ({}, True),
+    ({"lifecycle_complete": False}, False),
+    ({"actual_side": "tp"}, False),
+    ({"inst_id": "ETH-USDT-SWAP"}, False),
+    ({"position_side": "short"}, False),
+    ({"generated_order_id": "another-order"}, False),
+    ({"stop_loss_slippage_credential_scope": None}, False),
+])
+def test_verified_stop_fill_is_separate_from_round_trip_slippage(override, expected) -> None:
     lineage = _complete_lineage()
     _set_close_fill_price(lineage, 97_000.0)
     lineage["orders_by_exchange_id"]["entry-1"].okx_raw_fills["protection_submission"] = {
@@ -1848,6 +1857,8 @@ def test_round_trip_slippage_uses_fill_mark_facts_not_protection_trigger() -> No
         "lifecycle_complete": True,
         "algo_id": "algo-stop-1",
         "generated_order_id": "close-1",
+        "inst_id": "BTC-USDT-SWAP",
+        "position_side": "long",
         "actual_side": "sl",
         "configured_trigger_price": 97_500.0,
         "actual_trigger_market_price": None,
@@ -1866,6 +1877,8 @@ def test_round_trip_slippage_uses_fill_mark_facts_not_protection_trigger() -> No
         "trigger_orderbook_snapshot_available": False,
         "stop_loss_slippage_pct": (97_500.0 - 97_000.0) / 97_500.0 * 100.0,
         "stop_loss_slippage_source": "okx_configured_stop_trigger_to_fills_vwap",
+        "stop_loss_slippage_credential_scope": "current",
+        **override,
     }
     lineage["decision_raw_by_order_id"]["entry-1"] = {
         "profit_risk_sizing": {
@@ -1888,11 +1901,19 @@ def test_round_trip_slippage_uses_fill_mark_facts_not_protection_trigger() -> No
 
     sample = build_okx_history_training_sample(history, **lineage)
 
-    assert sample["stop_loss_fill_confirmed"] is True
     assert sample["slippage"] == pytest.approx((0.4 + 1.6) / 2_000.0 * 100.0)
     assert sample["slippage"] != pytest.approx((97_500.0 - 97_000.0) / 97_500.0 * 100.0)
     assert sample["slippage_source"] == OKX_ROUND_TRIP_SLIPPAGE_SOURCE
     assert sample["execution_slippage_usdt"] == pytest.approx(2.0)
+    if not expected:
+        assert sample["verified_stop_loss_fills"] == []
+        return
+    assert sample["stop_loss_fill_confirmed"] is True
+    assert sample["verified_stop_loss_fills"] == [{
+        "order_id": "close-1",
+        "slippage_pct": pytest.approx((97_500.0 - 97_000.0) / 97_500.0 * 100.0),
+        "credential_scope": "current",
+    }]
     assert sample["actual_trigger_market_price"] is None
     assert sample["protection_lifecycle_complete"] is True
     assert sample["trigger_to_first_fill_ms"] == pytest.approx(25.0)
