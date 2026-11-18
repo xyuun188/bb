@@ -26,10 +26,12 @@ from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order
 from services.decision_state import (
+    EXIT_EXECUTION_CLAIM,
     DecisionStage,
     DecisionStageStatus,
     append_decision_stage,
     decision_state_from_raw,
+    exit_execution_started,
     is_decision_terminal_state,
 )
 from services.text_integrity import looks_like_mojibake, sanitize_runtime_text
@@ -340,6 +342,42 @@ class DecisionPersistenceService:
         """Mark an entry as in-flight without letting final fallback overwrite it."""
 
         await self.mark_reason(decision_id, f"正在提交 OKX：{reason}")
+
+    async def claim_exit_execution(self, decision_id: int, decision: DecisionOutput) -> bool:
+        """Give one executor ownership before it can write policy evidence."""
+        try:
+            async with self._session_context_factory() as session:
+                row = (
+                    await session.execute(
+                        select(AIDecision)
+                        .where(AIDecision.id == int(decision_id))
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if row is None or row.was_executed or row.action != decision.action.value:
+                    return False
+                if exit_execution_started(row.raw_llm_response):
+                    return False
+                summary = decision_state_from_raw(row.raw_llm_response)["summary"]
+                if is_decision_terminal_state(summary["final_stage"], summary["final_status"]):
+                    return False
+                order_exists = (
+                    await session.execute(
+                        select(Order.id).where(Order.decision_id == row.id).limit(1)
+                    )
+                ).scalar()
+                if order_exists is not None:
+                    return False
+                row.raw_llm_response = {**(row.raw_llm_response or {}), EXIT_EXECUTION_CLAIM: True}
+        except Exception as exc:
+            logger.warning(
+                "failed to claim exit decision",
+                decision_id=decision_id,
+                error=safe_error_text(exc),
+            )
+            return False
+        decision.raw_response = {**(decision.raw_response or {}), EXIT_EXECUTION_CLAIM: True}
+        return True
 
     async def duplicate_order_reason(
         self,

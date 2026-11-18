@@ -7,7 +7,12 @@ import pytest
 
 import db.repositories.decision_repo as decision_repo_module
 from db.repositories.decision_repo import DecisionRepository
-from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
+from services.decision_state import (
+    EXIT_EXECUTION_CLAIM,
+    DecisionStage,
+    DecisionStageStatus,
+    append_decision_stage,
+)
 
 BAD_REASON = "AI 选择观望，未提交订单。?"
 GOOD_REASON = "AI 选择观望，未提交订单。"
@@ -59,7 +64,7 @@ class FakeSession:
     async def flush(self) -> None:
         self.flush_count += 1
 
-    async def get(self, _model: Any, _row_id: int) -> Any:
+    async def get(self, _model: Any, _row_id: int, **_kwargs: Any) -> Any:
         return self.row
 
     async def execute(self, _stmt: Any) -> Any:
@@ -75,6 +80,26 @@ class FakeRowsResult:
 
     def all(self) -> list[Any]:
         return self.rows
+
+
+@pytest.mark.asyncio
+async def test_stale_exit_payloads_cannot_replace_claimed_execution_state() -> None:
+    original = {EXIT_EXECUTION_CLAIM: True, "dynamic_exit_policy": {"eligible": True}}
+    row = SimpleNamespace(id=7, was_executed=False, execution_reason="", raw_llm_response=original)
+    session = FakeSession(row=row, rows=[row])
+    repo = DecisionRepository(session)
+    stale = {"dynamic_exit_policy": {"eligible": False}}
+
+    await repo.update_raw_response(7, stale)
+    assert await repo.finalize_unresolved_decisions([(7, "stale fallback", stale)]) == 0
+    assert row.raw_llm_response == original
+    assert row.execution_reason == ""
+    assert session.flush_count == 0
+
+    owner_update = {**original, "execution_result": {"exchange_confirmed": True}}
+    await repo.update_raw_response(7, owner_update)
+    assert row.raw_llm_response == owner_update
+    assert session.flush_count == 1
 
 
 @pytest.mark.asyncio

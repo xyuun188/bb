@@ -9,13 +9,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import structlog
-from sqlalchemy import func, or_, select
+from sqlalchemy import exists, or_, select
 
 from ai_brain.base_model import Action, DecisionOutput
 from core.safe_output import safe_error_text
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order
+from services.decision_state import exit_execution_started
 
 logger = structlog.get_logger(__name__)
 
@@ -63,6 +64,7 @@ async def load_pending_exit_decision_rows(cutoff: datetime) -> list[dict[str, An
                 AIDecision.was_executed.is_(False),
                 AIDecision.action.in_([Action.CLOSE_LONG.value, Action.CLOSE_SHORT.value]),
                 AIDecision.created_at >= cutoff.replace(tzinfo=None),
+                ~exists().where(Order.decision_id == AIDecision.id),
                 or_(
                     AIDecision.execution_reason.is_(None),
                     AIDecision.execution_reason == "",
@@ -72,17 +74,11 @@ async def load_pending_exit_decision_rows(cutoff: datetime) -> list[dict[str, An
                     ],
                 ),
             )
-            .order_by(AIDecision.created_at.asc())
-            .limit(10)
+            .order_by(AIDecision.created_at.asc(), AIDecision.id.asc())
         )
-        rows = list((await session.execute(stmt)).scalars().all())
-        for row in rows:
-            order_count = (
-                await session.execute(
-                    select(func.count(Order.id)).where(Order.decision_id == row.id)
-                )
-            ).scalar() or 0
-            if order_count > 0:
+        rows = await session.stream_scalars(stmt.execution_options(yield_per=10))
+        async for row in rows:
+            if exit_execution_started(row.raw_llm_response):
                 continue
             pending.append(
                 {
@@ -101,6 +97,9 @@ async def load_pending_exit_decision_rows(cutoff: datetime) -> list[dict[str, An
                     "created_at": row.created_at,
                 }
             )
+            if len(pending) == 10:
+                break
+        await rows.close()
     return pending
 
 
@@ -139,14 +138,14 @@ class PendingExitDecisionRecoveryProcessor:
         skipped = 0
         for item in pending:
             action = Action.from_string(str(item.get("action", "")))
-            if not action.is_exit():
+            if not action.is_exit() or exit_execution_started(item.get("raw_response")):
                 skipped += 1
                 continue
 
             decision = self._decision_from_row(item, action)
             decision_db_id = int(item["id"])
             round_decision_ids.add(decision_db_id)
-            await self.candidate_executor(
+            result = await self.candidate_executor(
                 decision.symbol,
                 decision.model_name,
                 decision,
@@ -155,7 +154,14 @@ class PendingExitDecisionRecoveryProcessor:
                 results,
                 open_positions=open_positions,
             )
-            executed += 1
+            result_raw = getattr(result, "raw_response", None)
+            if (
+                isinstance(result_raw, dict)
+                and result_raw.get("skip_kind") == "exit_decision_claim_unavailable"
+            ):
+                skipped += 1
+            else:
+                executed += 1
 
         return PendingExitRecoveryResult(
             loaded=len(pending),

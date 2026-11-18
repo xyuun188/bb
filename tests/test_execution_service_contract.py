@@ -61,6 +61,7 @@ def _test_execution_service(
     decision_stage_recorder=None,
     entry_instrument_unavailable_marker=None,
     exit_execution_singleflight=None,
+    exit_decision_claimer=None,
 ) -> ExecutionService:
     async def mark_reason(_decision_id: int, reason: str | None) -> None:
         if reasons is not None:
@@ -95,6 +96,7 @@ def _test_execution_service(
         position_review_alert_context_provider=lambda _decision: None,
         position_review_risk_result_logger=_noop_async,
         duplicate_decision_order_reason_provider=lambda *_args: _noop_async(),
+        exit_decision_claimer=exit_decision_claimer,
         okx_executor_provider=okx_executor_provider,
         allocated_order_balance_provider=lambda *_args: _noop_async(),
         rejected_execution_result_factory=ExecutionResultFactory().rejected,
@@ -147,6 +149,70 @@ def _entry_decision(symbol: str = "SPK/USDT") -> DecisionOutput:
         suggested_leverage=3.0,
         raw_response={},
     )
+
+
+@pytest.mark.asyncio
+async def test_recovered_exit_loses_claim_before_same_decision_evidence_can_change() -> None:
+    claimed_ids: set[int] = set()
+    policy_started = asyncio.Event()
+    allow_submit = asyncio.Event()
+    raw_updates: list[dict[str, Any] | None] = []
+    stages: list[tuple[str, str, str]] = []
+    submits: list[DecisionOutput] = []
+    approval = {"eligible": True, "close_fraction": 0.25}
+
+    async def claim(decision_id: int, _decision: DecisionOutput) -> bool:
+        if decision_id in claimed_ids:
+            return False
+        claimed_ids.add(decision_id)
+        return True
+
+    async def evaluate_exit(decision: DecisionOutput, *_args, **_kwargs) -> PolicyGateResult:
+        decision.raw_response = {"dynamic_exit_policy": approval}
+        policy_started.set()
+        await allow_submit.wait()
+        return PolicyGateResult.allow()
+
+    async def place_order(decision: DecisionOutput, **_kwargs) -> ExecutionResult:
+        submits.append(decision)
+        return ExecutionResult(
+            order_id="okx-123", exchange_order_id="okx-123", status=OrderStatus.FILLED,
+            symbol=decision.symbol, side="sell", order_type="ioc", quantity=1.0, price=10.0,
+            raw_response={},
+        )
+
+    async def executor_provider(_mode: str) -> SimpleNamespace:
+        return SimpleNamespace(place_order=place_order)
+
+    service = _test_execution_service(
+        okx_executor_provider=executor_provider, exit_policy_evaluator=evaluate_exit,
+        exit_decision_claimer=claim, raw_updates=raw_updates, stages=stages,
+    )
+    original, stale = _entry_decision(), _entry_decision()
+    original.action = stale.action = Action.CLOSE_LONG
+    results = {"warnings": [], "decisions": [], "executions": []}
+    assessment = SimpleNamespace(warnings=[])
+    task = asyncio.create_task(
+        service.execute_candidate_locked(original.symbol, original.model_name, original,
+                                         assessment, 11, results)
+    )
+    try:
+        await asyncio.wait_for(policy_started.wait(), timeout=1)
+        stages_before_retry = list(stages)
+        retry = await service.execute_candidate_locked(
+            stale.symbol, stale.model_name, stale, assessment, 11, results,
+        )
+        assert retry is not None
+        assert retry.raw_response["skip_kind"] == "exit_decision_claim_unavailable"
+        assert stages == stages_before_retry
+        assert not raw_updates
+    finally:
+        allow_submit.set()
+        result = await task
+
+    assert result is not None and result.status == OrderStatus.FILLED
+    assert submits == [original]
+    assert all(raw["dynamic_exit_policy"] == approval for raw in raw_updates if raw)
 
 
 def _profit_first_ready_position_review_decision() -> DecisionOutput:

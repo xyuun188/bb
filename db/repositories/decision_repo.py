@@ -9,6 +9,7 @@ from sqlalchemy import func, or_, select
 from db.repositories.base import BaseRepository
 from models.decision import AIDecision, compact_runtime_decision_payload
 from services.decision_state import (
+    EXIT_EXECUTION_CLAIM,
     DecisionStage,
     decision_state_from_raw,
     is_decision_terminal_state,
@@ -212,8 +213,10 @@ class DecisionRepository(BaseRepository):
     async def update_raw_response(
         self, decision_id: int, raw_response: dict | None
     ) -> AIDecision | None:
-        decision = await self.get(decision_id)
+        decision = await self.session.get(AIDecision, decision_id, with_for_update=True)
         if decision:
+            if _has_exit_claim(decision.raw_llm_response) and not _has_exit_claim(raw_response):
+                return None
             clean_response = sanitize_runtime_text(compact_runtime_decision_payload(raw_response))
             decision.raw_llm_response = clean_response
             _sync_execution_parameters(decision, clean_response)
@@ -253,14 +256,19 @@ class DecisionRepository(BaseRepository):
         ids = [int(decision_id) for decision_id, _reason, _raw in decision_updates if decision_id]
         if not ids:
             return 0
-        result = await self.session.execute(select(AIDecision).where(AIDecision.id.in_(ids)))
+        result = await self.session.execute(
+            select(AIDecision).where(AIDecision.id.in_(ids)).order_by(AIDecision.id).with_for_update()
+        )
         rows = {int(row.id): row for row in result.scalars().all()}
         updated = 0
         for decision_id, reason, raw_response in decision_updates:
             row = rows.get(int(decision_id))
             if row is None or bool(row.was_executed):
                 continue
-            current_machine = decision_state_from_raw(row.raw_llm_response)
+            current_raw = row.raw_llm_response
+            if _has_exit_claim(current_raw) and not _has_exit_claim(raw_response):
+                continue
+            current_machine = decision_state_from_raw(current_raw)
             current_summary = (
                 current_machine.get("summary") if isinstance(current_machine, dict) else {}
             )
@@ -361,6 +369,10 @@ def _sanitize_decision_payload(data: dict) -> dict:
                 value = compact_runtime_decision_payload(value)
             clean[key] = sanitize_runtime_text(value)
     return clean
+
+
+def _has_exit_claim(raw_response: Any) -> bool:
+    return isinstance(raw_response, dict) and raw_response.get(EXIT_EXECUTION_CLAIM) is True
 
 
 def _sync_execution_parameters(decision: AIDecision, raw_response: Any) -> None:

@@ -248,6 +248,7 @@ class ExecutionService:
         duplicate_decision_order_reason_provider: (
             Callable[[int, DecisionOutput], Awaitable[str | None]] | None
         ) = None,
+        exit_decision_claimer: Callable[[int, DecisionOutput], Awaitable[bool]] | None = None,
         okx_executor_provider: Callable[[str], Awaitable[Any]] | None = None,
         allocated_order_balance_provider: (
             Callable[[str, DecisionOutput], Awaitable[float | None]] | None
@@ -332,6 +333,7 @@ class ExecutionService:
         self.position_review_alert_context_provider = position_review_alert_context_provider
         self.position_review_risk_result_logger = position_review_risk_result_logger
         self.duplicate_decision_order_reason_provider = duplicate_decision_order_reason_provider
+        self.exit_decision_claimer = exit_decision_claimer
         self.okx_executor_provider = okx_executor_provider
         self.allocated_order_balance_provider = allocated_order_balance_provider
         self.rejected_execution_result_factory = rejected_execution_result_factory
@@ -723,6 +725,22 @@ class ExecutionService:
         open_positions: list[dict] | None = None,
         refresh_exit_positions: bool = True,
     ) -> ExecutionResult | None:
+        if (
+            decision.is_exit
+            and decision_db_id is not None
+            and self.exit_decision_claimer is not None
+            and not await self.exit_decision_claimer(decision_db_id, decision)
+        ):
+            reason = "该平仓裁决无法认领，已跳过重复执行。"
+            result = self._required_rejected_execution_result_factory()(decision, reason)
+            result.raw_response = {
+                **_safe_dict(result.raw_response),
+                "stage_status": DecisionStageStatus.SKIPPED,
+                "execution_skipped": True,
+                "execution_policy_terminal": True,
+                "skip_kind": "exit_decision_claim_unavailable",
+            }
+            return result
         log_risk_event = self._required_risk_event_logger()
         get_model_execution_mode = self._required_model_execution_mode_provider()
         record_decision_stage = self._required_decision_stage_recorder()
@@ -1184,7 +1202,9 @@ class ExecutionService:
                 "已进入执行前严重风险检查。",
                 {"mode": model_mode},
             )
-        if decision_db_id is not None:
+        if decision_db_id is not None and (
+            not decision.is_exit or self.exit_decision_claimer is None
+        ):
             duplicate_reason = await duplicate_decision_order_reason(decision_db_id, decision)
             if duplicate_reason:
                 return await block_before_submit(
@@ -1339,11 +1359,17 @@ class ExecutionService:
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
 
         if decision.is_entry or decision.is_exit:
+            risk_evidence = {"mode": model_mode}
+            if decision.is_exit:
+                raw = _safe_dict(decision.raw_response)
+                for key in ("dynamic_exit_policy", "dynamic_exit_execution_contract"):
+                    if isinstance(raw.get(key), dict):
+                        risk_evidence[key] = raw[key]
             await mark_stage(
                 DecisionStage.RISK_CHECK,
                 DecisionStageStatus.PASSED,
                 "执行前严重风险检查通过，进入交易所提交阶段。",
-                {"mode": model_mode},
+                risk_evidence,
             )
             await mark_stage(
                 DecisionStage.EXCHANGE_SUBMIT,

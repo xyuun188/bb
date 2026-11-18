@@ -642,6 +642,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             position_review_alert_context_provider=self.position_review_alert_context,
             position_review_risk_result_logger=self.log_position_review_risk_result,
             duplicate_decision_order_reason_provider=self.duplicate_decision_order_reason,
+            exit_decision_claimer=self.decision_persistence.claim_exit_execution,
             okx_executor_provider=self.get_okx_executor_for_mode,
             allocated_order_balance_provider=self.allocated_order_balance,
             rejected_execution_result_factory=self.rejected_execution_result,

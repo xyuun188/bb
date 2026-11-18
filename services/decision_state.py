@@ -33,6 +33,25 @@ class DecisionStageStatus:
     COMPLETED = "completed"
 
 
+EXIT_EXECUTION_CLAIM = "exit_execution_claimed"
+
+
+def exit_execution_started(raw_response: dict[str, Any] | None) -> bool:
+    """Detect a claimed exit or exchange evidence on a legacy decision."""
+    if not isinstance(raw_response, dict):
+        return False
+    if raw_response.get(EXIT_EXECUTION_CLAIM) or raw_response.get("execution_result"):
+        return True
+    machine = raw_response.get("decision_state_machine")
+    stages = machine.get("stages") if isinstance(machine, dict) else None
+    return isinstance(stages, list) and any(
+        isinstance(event, dict)
+        and event.get("stage")
+        in {DecisionStage.EXCHANGE_SUBMIT, DecisionStage.EXCHANGE_CONFIRM, DecisionStage.LOCAL_SYNC}
+        for event in stages
+    )
+
+
 STAGE_LABELS = {
     DecisionStage.AI_ANALYSIS: "AI分析",
     DecisionStage.STRATEGY_ARBITRATION: "策略仲裁",

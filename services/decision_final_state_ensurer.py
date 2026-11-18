@@ -14,6 +14,11 @@ from core.safe_output import safe_error_text
 from db.session import get_session_ctx
 from models.decision import AIDecision
 from models.trade import Order
+from services.decision_state import (
+    decision_state_from_raw,
+    exit_execution_started,
+    is_decision_terminal_state,
+)
 from services.stale_entry_candidate_expirer import (
     is_pending_execution_reason,
     pending_execution_failed_reason,
@@ -84,6 +89,12 @@ class DecisionFinalStateEnsurer:
             return
 
         reason = str(getattr(row, "execution_reason", "") or "")
+        if decision.is_exit and order_count == 0:
+            raw = getattr(row, "raw_llm_response", None)
+            if exit_execution_started(raw):
+                summary = decision_state_from_raw(raw)["summary"]
+                if not is_decision_terminal_state(summary["final_stage"], summary["final_status"]):
+                    return
         if order_count > 0:
             if (
                 not reason
