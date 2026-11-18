@@ -27,6 +27,10 @@ from core.feature_availability import feature_availability_reasons
 from db.session import get_read_session_ctx
 from models.decision import AIDecision
 from models.learning import ShadowBacktest
+from models.trade import Order
+from services.decision_state import (
+    DecisionStage, DecisionStageStatus, is_decision_terminal_state,
+)
 from services.entry_direction_competition import _paper_quant_quality_permissions
 from services.entry_funnel_diagnostics import classify_entry_funnel_reason
 from services.ml_signal_service import MLSignalService, MODEL_TRAINING_STATE_STORE
@@ -59,6 +63,7 @@ def _selection(value):
 def _entry_funnel_reason(row, fields):
     raw = {field: row.get(field) for field in fields}
     reason = row.get("execution_reason")
+    has_order = bool(row.get("has_order"))
     if not row["was_executed"] and row["action"] in {"long", "short"}:
         boundary = _dict(raw.get("market_analysis_only_contract"))
         if boundary.get("entry_permission") is False:
@@ -74,9 +79,30 @@ def _entry_funnel_reason(row, fields):
             and reentry.get("reason") == "same_symbol_reentry_cooldown_active"
         ):
             return "same_symbol_reentry_cooldown"
+        state = _dict(row.get("decision_state_summary"))
+        stage = state.get("final_stage")
+        status = state.get("final_status")
+        if not is_decision_terminal_state(stage, status):
+            if (
+                str(reason or "").startswith((
+                    "本轮还在分析或排队中",
+                    "正在提交 OKX：开仓裁决已移交执行队列",
+                ))
+                and not has_order
+                and stage not in {
+                    DecisionStage.EXCHANGE_SUBMIT, DecisionStage.EXCHANGE_CONFIRM,
+                    DecisionStage.LOCAL_SYNC,
+                }
+            ):
+                return "entry_queued"
+            if stage in {
+                DecisionStage.EXCHANGE_SUBMIT, DecisionStage.EXCHANGE_CONFIRM,
+                DecisionStage.LOCAL_SYNC,
+            } and status in {DecisionStageStatus.PENDING, DecisionStageStatus.UNKNOWN}:
+                return "entry_result_pending"
     return classify_entry_funnel_reason(
         raw=raw, action=row["action"], was_executed=row["was_executed"],
-        has_order=False, reason=reason,
+        has_order=has_order, reason=reason,
     )
 
 
@@ -188,6 +214,10 @@ async def main():
             AIDecision.id, AIDecision.symbol, AIDecision.action,
             AIDecision.created_at, AIDecision.was_executed, AIDecision.execution_reason,
             AIDecision.feature_snapshot.label("feature_snapshot"),
+            raw["decision_state_machine"]["summary"].label("decision_state_summary"),
+            select(Order.id).where(
+                Order.decision_id == AIDecision.id, Order.execution_mode == "paper",
+            ).exists().label("has_order"),
             *(raw[field].label(field) for field in fields),
         ).where(AIDecision.id.in_(recent_ids)).order_by(AIDecision.id.desc()),
         lambda rows: [dict(row._mapping) for row in rows],

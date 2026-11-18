@@ -51,3 +51,31 @@ def test_entry_recovery_distinguishes_pre_submit_states(state, reason, executed,
     }
 
     assert namespace["_entry_funnel_reason"](row, fields) == expected
+
+
+@pytest.mark.parametrize(
+    ("stage", "status", "has_order", "expected"),
+    [
+        ("strategy_arbitration", "completed", False, "entry_queued"),
+        ("risk_check", "pending", False, "entry_queued"),
+        ("exchange_submit", "pending", False, "entry_result_pending"),
+        ("exchange_confirm", "unknown", True, "entry_result_pending"),
+        ("risk_check", "blocked", False, "execution_blocked"),
+        ("exchange_confirm", "failed", True, "execution_blocked"),
+    ],
+)
+def test_entry_recovery_does_not_count_queued_or_pending_as_blocked(
+    stage, status, has_order, expected,
+) -> None:
+    namespace = {"__LIMIT__": 8, "__SINCE_MINUTES__": 30}
+    rendered = audit._render_remote_script(include_historical_requalification=False)
+    exec(rendered.rsplit("asyncio.run(main())", 1)[0], namespace)  # noqa: S102
+    row = {
+        "action": "short",
+        "was_executed": False,
+        "has_order": has_order,
+        "execution_reason": "正在提交 OKX：开仓裁决已移交执行队列",
+        "decision_state_summary": {"final_stage": stage, "final_status": status},
+    }
+
+    assert namespace["_entry_funnel_reason"](row, ()) == expected
