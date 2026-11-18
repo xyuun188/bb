@@ -56,6 +56,30 @@ def _selection(value):
     }
 
 
+def _entry_funnel_reason(row, fields):
+    raw = {field: row.get(field) for field in fields}
+    reason = row.get("execution_reason")
+    if not row["was_executed"] and row["action"] in {"long", "short"}:
+        boundary = _dict(raw.get("market_analysis_only_contract"))
+        if boundary.get("entry_permission") is False:
+            state = boundary.get("execution_candidate_state")
+            if state == "analysis_only_execution_unverified":
+                return "execution_capability_pending"
+            if state == "execution_unavailable":
+                return "execution_instrument_unavailable"
+            return "analysis_only"
+        reentry = _dict(raw.get("same_symbol_reentry_guard"))
+        if reason == "same_symbol_reentry_cooldown_active" or (
+            reentry.get("allowed") is False
+            and reentry.get("reason") == "same_symbol_reentry_cooldown_active"
+        ):
+            return "same_symbol_reentry_cooldown"
+    return classify_entry_funnel_reason(
+        raw=raw, action=row["action"], was_executed=row["was_executed"],
+        has_order=False, reason=reason,
+    )
+
+
 async def query(statement):
     async with get_read_session_ctx(statement_timeout_ms=20000) as session:
         return (await session.execute(statement)).all()
@@ -152,6 +176,7 @@ async def main():
         "entry_candidate_evidence", "analysis_quality_contract",
         "authoritative_return_candidate", "continuous_model_weights",
         "ml_signal", "local_ml_signal",
+        "market_analysis_only_contract", "same_symbol_reentry_guard",
     )
     recent_ids = select(AIDecision.id).where(
         AIDecision.is_paper.is_(True), AIDecision.analysis_type == "market",
@@ -188,11 +213,7 @@ async def main():
                 availability_reasons.update(reasons_for_snapshot)
             else:
                 availability_clean += 1
-            reason = classify_entry_funnel_reason(
-                raw={field: row.get(field) for field in fields},
-                action=row["action"], was_executed=row["was_executed"],
-                has_order=False, reason=row["execution_reason"],
-            )
+            reason = _entry_funnel_reason(row, fields)
             reasons[reason or "executed"] += 1
             weights = _dict(row.get("continuous_model_weights"))
             signal = _dict(row.get("local_ml_signal") or row.get("ml_signal"))
