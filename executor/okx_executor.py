@@ -2131,6 +2131,9 @@ class OKXExecutor(AbstractExecutor):
                     policy = raw["dynamic_exit_policy"]
                     try:
                         fee = await self.fetch_account_fee_snapshot()
+                        profit_price_limit = await self._fetch_native_price_limit(
+                            decision.symbol, execution_market=True,
+                        )
                         fee_rate = self._safe_float(fee.get("taker_fee_rate"), -1.0)
                         entry_price = self._safe_float(
                             matching[0].get("entryPrice")
@@ -2151,6 +2154,7 @@ class OKXExecutor(AbstractExecutor):
                                 max(-self._safe_float(policy.get("settled_funding_fee")), 0.0)
                                 if policy.get("funding_fee_included") is True else 0.0
                             ),
+                            price_limit=profit_price_limit,
                         )
                     except Exception as exc:
                         guard = {

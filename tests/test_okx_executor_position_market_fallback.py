@@ -93,6 +93,11 @@ class _MissingLabMarketExchange:
         self.native_pending_order_requests.append(dict(params))
         return {"data": []}
 
+    async def executionGetPublicPriceLimit(self, params):
+        return {"code": "0", "data": [{
+            "instId": params["instId"], "buyLmt": "18", "sellLmt": "17",
+        }]}
+
     async def privateGetTradeOrder(self, params):
         self.native_detail_requests.append(dict(params))
         order_id = str(params.get("ordId") or params.get("clOrdId") or "")

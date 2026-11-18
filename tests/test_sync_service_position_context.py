@@ -4,17 +4,21 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 import services.sync_service as sync_module
+from ai_brain.base_model import Action, DecisionOutput
 from core.symbols import normalize_trading_symbol
 from services.current_position_management import (
     CURRENT_POSITION_MANAGEMENT_KIND,
     CURRENT_POSITION_MANAGEMENT_VERSION,
+    build_current_position_management_contract,
     current_position_management_contract_complete,
     protection_coverage_evidence,
 )
+from services.dynamic_exit_policy import apply_dynamic_exit
 from services.exit_execution_singleflight import EXIT_INTENT_KEY, PROFIT_LOCK_LEDGER_KEY
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_LEVERAGE_POLICY,
@@ -24,6 +28,8 @@ from services.normal_paper_trade import (
     _fingerprint,
     build_normal_paper_trade_contract,
 )
+from services.position_profit_peaks import PositionProfitPeakTracker
+from services.position_time import PositionTimeParser
 from services.sync_service import (
     OkxSyncService,
     _confirmed_local_close_fill_for_position,
@@ -39,6 +45,81 @@ def _float(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remaining_quantity", [10.0, 5.0])
+async def test_exit_refresh_preserves_quantity_scaled_peak_across_policy_passes(
+    tmp_path, remaining_quantity,
+) -> None:
+    opened_at = datetime.now(UTC) - timedelta(minutes=30)
+    tracker_path = tmp_path / "peaks.json"
+    tracker = PositionProfitPeakTracker(path=tracker_path)
+    tracker.update(
+        model_name="ensemble_trader", symbol="BTC/USDT", side="long",
+        entry_price=100.0, current_price=102.0, unrealized_pnl=20.0,
+        hold_minutes=25.0, quantity=10.0,
+    )
+    # Exercise persisted peaks as well as the in-memory path.
+    tracker = PositionProfitPeakTracker(path=tracker_path)
+
+    class Exchange:
+        async def get_positions_strict(self):
+            return [{
+                "symbol": "BTC/USDT:USDT", "contractSize": 1.0,
+                "info": {
+                    "instId": "BTC-USDT-SWAP", "posSide": "net",
+                    "pos": str(remaining_quantity), "ctVal": "1",
+                    "avgPx": "100", "markPx": "101",
+                    "upl": str(remaining_quantity),
+                },
+            }]
+
+    service = OkxSyncService(
+        symbol_normalizer=normalize_trading_symbol, float_parser=_float,
+        active_okx_provider=lambda: Exchange(),
+        exchange_position_open_checker=lambda p: bool(p),
+        position_profit_peak_recorder=tracker.update,
+        position_age_minutes_provider=PositionTimeParser().position_age_minutes,
+    )
+    management = build_current_position_management_contract({
+        "symbol": "BTC/USDT", "side": "long", "quantity": remaining_quantity,
+        "contracts": remaining_quantity, "entry_price": 100.0, "current_price": 101.0,
+        "entry_fee_usdt": 0.5, "full_entry_fee_usdt": 0.5,
+        "full_entry_notional_usdt": 100.0 * remaining_quantity,
+        "entry_fee_evidence_complete": True, "entry_fee_source": "okx_fills_history",
+        "stop_loss_price": 98.0, "take_profit_price": 110.0,
+        "protection_evidence_complete": True,
+        "protection_orders": [{
+            "algo_id": "oco-1", "state": "live", "contracts": remaining_quantity,
+            "reduce_only": True, "stop_loss_price": 98.0, "take_profit_price": 110.0,
+        }],
+        "position_stressed_loss_usdt": 2.0 * remaining_quantity,
+        "portfolio_stressed_loss_usdt": 2.0 * remaining_quantity,
+        "portfolio_gross_notional_usdt": 101.0 * remaining_quantity,
+        "account_equity_usdt": 10_000.0, "open_position_count": 1,
+        "entry_order_ids": ["entry-1"], "entry_decision_ids": [],
+        "original_entry_contract_complete": False,
+        "original_entry_contract_gaps": ["historical_contract_missing"],
+    })
+    service.get_local_open_positions_context = AsyncMock(return_value=[{
+        "symbol": "BTC/USDT", "side": "long", "model_name": "ensemble_trader",
+        "quantity": remaining_quantity, "created_at": opened_at,
+        "entry_price": 100.0, "entry_fee": 0.5,
+        "stop_loss": 98.0, "take_profit": 110.0,
+        "current_management_contract": management,
+    }])
+    decision = DecisionOutput(
+        model_name="ensemble_trader", symbol="BTC/USDT", action=Action.CLOSE_LONG,
+        confidence=0.0, reasoning="profit retrace review", position_size_pct=0.0,
+    )
+    for _ in range(2):
+        positions = await service.get_open_positions_context()
+        assert positions[0]["peak_unrealized_pnl"] == pytest.approx(2 * remaining_quantity)
+        result = apply_dynamic_exit(decision, positions)
+        assert result.eligible is True, result.reason
+        assert result.profit_retrace_ratio == pytest.approx(0.5)
+        assert result.target_close_fraction >= 0.5
 
 
 def test_protection_evidence_accepts_safe_oco_overcoverage_after_partial_close() -> None:

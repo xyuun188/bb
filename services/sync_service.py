@@ -4681,11 +4681,32 @@ class OkxSyncService:
 
         normalized: list[dict[str, Any]] = []
         for position_payload in positions or []:
-            normalized.append(
-                normalized_open_position_context(
-                    position_payload,
-                    symbol_normalizer=normalize_symbol,
-                    float_parser=parse_float,
-                )
+            context = normalized_open_position_context(
+                position_payload,
+                symbol_normalizer=normalize_symbol,
+                float_parser=parse_float,
             )
+            if (
+                self.position_profit_peak_recorder is not None
+                and self.position_age_minutes_provider is not None
+            ):
+                hold_minutes = self.position_age_minutes_provider(context.get("created_at"))
+                if hold_minutes is not None:
+                    peak_state = self.position_profit_peak_recorder(
+                        model_name=context["model_name"],
+                        symbol=context["symbol"],
+                        side=context["side"],
+                        current_price=context["current_price"],
+                        entry_price=context["entry_price"],
+                        unrealized_pnl=parse_float(context.get("unrealized_pnl"), 0.0),
+                        hold_minutes=hold_minutes,
+                        quantity=context["quantity"],
+                    )
+                    if isinstance(peak_state, dict):
+                        # Review, hold observation, and the final exit refresh
+                        # must assess the same quantity-scaled historical peak.
+                        context["peak_unrealized_pnl"] = parse_float(
+                            peak_state.get("peak_unrealized_pnl"), 0.0,
+                        )
+            normalized.append(context)
         return normalized

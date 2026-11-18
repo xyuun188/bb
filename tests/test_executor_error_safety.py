@@ -1768,11 +1768,16 @@ async def test_profit_lock_uses_ioc_and_never_falls_back_to_market(
             result["info"]["tickSz"] = "0.001"
             return result
 
+        async def executionGetPublicPriceLimit(self, params):
+            return {"code": "0", "data": [{
+                "instId": params["instId"], "buyLmt": "3.06", "sellLmt": "2.32",
+            }]}
+
         async def privatePostTradeOrder(self, params):
             self.native_calls.append(dict(params))
             assert params["ordType"] == "ioc"
             assert params["reduceOnly"] == "true"
-            assert float(params["px"]) > 2.31
+            assert float(params["px"]) == pytest.approx(2.32)
             self.position_contracts -= filled
             return {"code": "0", "data": [{"sCode": "0", "ordId": "profit-ioc"}]}
 
@@ -1813,6 +1818,9 @@ async def test_profit_lock_uses_ioc_and_never_falls_back_to_market(
         OrderStatus.FILLED if filled == 10 * fraction else OrderStatus.PARTIAL
     ))
     assert decision.raw_response["profit_lock_execution"]["market_fallback_allowed"] is False
+    assert decision.raw_response["profit_lock_execution"]["execution_price_limit"][
+        "price_limit_source_endpoint"
+    ] == "executionGetPublicPriceLimit"
 
 
 @pytest.mark.asyncio

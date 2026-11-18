@@ -31,6 +31,43 @@ def test_sand_false_mark_profit_cannot_cross_the_limit():
     assert plan["limit_price"] < 0.0358 < 0.0359
 
 
+@pytest.mark.parametrize(("side", "entry", "tick", "bound", "expected"), [
+    ("buy", 0.0045657842696631, 0.00001, 0.004487, 0.00448),
+    ("buy", 0.1168, 0.0001, 0.1161, 0.1161),
+    ("sell", 100.0, 0.01, 102.003, 102.01),
+])
+def test_profitable_ioc_stays_inside_venue_band_without_weakening_fee_floor(
+    side, entry, tick, bound, expected,
+):
+    plan = profit_lock_limit(
+        side=side, entry_price=entry, quantity=10.0,
+        entry_fee_usdt=entry * 10 * 0.0005, exit_fee_rate=0.0005,
+        tick_size=tick,
+        price_limit={"buy_price_limit": bound, "sell_price_limit": bound},
+    )
+
+    assert plan["eligible"] is True
+    assert plan["limit_price"] == pytest.approx(expected)
+    if side == "buy":
+        assert plan["limit_price"] <= bound
+        assert plan["limit_price"] <= plan["fee_after_limit_price"]
+    else:
+        assert plan["limit_price"] >= bound
+        assert plan["limit_price"] >= plan["fee_after_limit_price"]
+    assert plan["market_fallback_allowed"] is False
+
+
+@pytest.mark.parametrize("bound", [None, 0, -1, "NaN", "invalid"])
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_invalid_execution_price_limit_cannot_authorize_profit_order(side, bound):
+    plan = profit_lock_limit(
+        side=side, entry_price=100.0, quantity=10.0,
+        entry_fee_usdt=0.5, exit_fee_rate=0.0005, tick_size=0.01,
+        price_limit={"buy_price_limit": bound, "sell_price_limit": bound},
+    )
+    assert plan["eligible"] is False
+
+
 @pytest.mark.parametrize("key", [
     "hard_risk", "planned_stop_crossed", "funding_loss_budget_crossed",
     "projected_funding_budget_crossed", "stop_risk_usage",

@@ -50,6 +50,7 @@ def profit_lock_limit(
     *, side: str, entry_price: float, quantity: float,
     entry_fee_usdt: float, exit_fee_rate: float, tick_size: float,
     adverse_funding_usdt: float = 0.0,
+    price_limit: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One tick beyond fee-after break-even; quantities are base units."""
     values = (
@@ -75,17 +76,30 @@ def profit_lock_limit(
         rounding = ROUND_FLOOR if side == "buy" else ROUND_CEILING
         units = (boundary / tick).to_integral_value(rounding=rounding)
         limit = (units - 1 if side == "buy" else units + 1) * tick
+        fee_after_limit = limit
+        if price_limit is not None:
+            bound_key = "buy_price_limit" if side == "buy" else "sell_price_limit"
+            bound = Decimal(str(price_limit.get(bound_key, "NaN")))
+            if not bound.is_finite() or bound <= 0:
+                return {"eligible": False, "reason": "profit_lock_price_limit_missing"}
+            # A more favorable price preserves the fee-after floor while
+            # keeping an IOC inside the execution venue's current price band.
+            bound_units = (bound / tick).to_integral_value(rounding=rounding)
+            venue_limit = bound_units * tick
+            limit = min(limit, venue_limit) if side == "buy" else max(limit, venue_limit)
     except (InvalidOperation, ZeroDivisionError):
         return {"eligible": False, "reason": "profit_lock_execution_economics_missing"}
     return {
         "eligible": limit > 0,
         "reason": "fee_after_profit_limit" if limit > 0 else "profit_limit_not_positive",
         "limit_price": float(limit),
+        "fee_after_limit_price": float(fee_after_limit),
+        "execution_price_limit": price_limit,
         "break_even_price": float(boundary),
         "entry_fee_usdt": entry_fee_usdt,
         "exit_fee_rate": exit_fee_rate,
         "adverse_funding_usdt": adverse_funding_usdt,
         "order_type": "ioc",
         "market_fallback_allowed": False,
-        "version": "2026-11-16.executable-profit-lock.v1",
+        "version": "2026-11-18.executable-profit-lock.v2",
     }
