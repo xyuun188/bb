@@ -8336,11 +8336,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if normalized_mode != "paper":
             return False
         selected_mode = normalized_mode
-        # Keep this round's selection based on the cache snapshot that existed
-        # when the round began. The capability refresh runs concurrently and
-        # may finish during the hand-off below, but its result must only affect
-        # the next round; otherwise a background task changes the current
-        # shortlist halfway through its diagnostics.
+        # Check current capability again before accepting a paper contract.
         unavailable_by_mode = dict(self._entry_unavailable_cache_for_mode(selected_mode))
         symbol = self._normalize_position_symbol(getattr(decision, "symbol", ""))
         funnel = self._safe_dict(raw.get("market_candidate_funnel"))
@@ -8981,6 +8977,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
             candidate_count=diagnostics.get("candidate_count"),
             selected_count=diagnostics.get("selected_count"),
             selected_symbols=diagnostics.get("selected_symbols"),
+            execution_verified_selected_symbols=[
+                symbol for symbol in result.selected
+                if self._normalize_position_symbol(symbol) in verified_symbols
+            ],
             recent_candidate_count=diagnostics.get("recent_candidate_count"),
             recent_unchanged_candidate_count=diagnostics.get("recent_unchanged_candidate_count"),
             coverage_due_candidate_count=diagnostics.get("coverage_due_candidate_count"),
@@ -10032,6 +10032,13 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "execution_availability": self._safe_dict(
                 rank_diagnostics.get("execution_availability")
             ),
+            "execution_verified_at_final_selection_symbols": [
+                item["symbol"]
+                for item in analysis_selection.get("selected") or []
+                if isinstance(item, dict)
+                and isinstance(item.get("symbol"), str)
+                and item.get("execution_verified") is True
+            ],
             "rank_top_symbols": rank_diagnostics.get("symbols", []),
             "ranked_symbol_sample": rank_diagnostics.get("ranked_symbol_sample", []),
             "filtered_symbol_sample": rank_diagnostics.get("filtered_symbol_sample", []),
@@ -10127,6 +10134,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
         selected_for_analysis = isinstance(selected_symbols, (list, tuple, set)) and any(
             self._normalize_position_symbol(item) == normalized for item in selected_symbols
         )
+        final_verified = any(
+            self._normalize_position_symbol(item) == normalized
+            for item in funnel.get("execution_verified_at_final_selection_symbols") or []
+        )
         availability = self._safe_dict(funnel.get("execution_availability"))
         for key in ("analysis_only_execution_unverified", "unavailable"):
             rows = availability.get(key)
@@ -10156,7 +10167,23 @@ class TradingService(ModelTrainingCoordinatorMixin):
         ]
         for item in matching:
             state = str(item.get("execution_candidate_state") or "").strip()
-            if state in {"analysis_only_execution_unverified", "execution_unavailable"}:
+            if state == "execution_unavailable":
+                return {
+                    "reason": item.get("reason")
+                    or item.get("non_selected_reason")
+                    or "ranker_analysis_only_fill",
+                    "state": state,
+                }
+        for item in matching:
+            state = str(item.get("execution_candidate_state") or "").strip()
+            if state == "analysis_only_execution_unverified":
+                if final_verified:
+                    # Preserve the observation boundary and require the full
+                    # paper contract before using the newer capability result.
+                    return {
+                        "reason": item.get("reason") or "ranker_analysis_only_fill",
+                        "state": "execution_verified",
+                    }
                 return {
                     "reason": item.get("reason")
                     or item.get("non_selected_reason")

@@ -8373,6 +8373,7 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
             "candidate_count": 4,
             "selected_count": 1,
             "selected_symbols": ["BTC/USDT"],
+            "selected": [{"symbol": "BTC/USDT", "execution_verified": True}],
         },
         "market_deferred_rotation": {
             "read_only": True,
@@ -8412,6 +8413,7 @@ def test_market_candidate_funnel_snapshot_is_read_only_and_exposes_rank_dedupe_c
 
     assert funnel["read_only"] is True
     assert funnel["is_entry_gate"] is False
+    assert funnel["execution_verified_at_final_selection_symbols"] == ["BTC/USDT"]
     assert funnel["analysis_scope"] == "market"
     assert funnel["scan_symbol_count"] == 3
     assert funnel["feature_fetch_budget"]["selected_market_feature_fetch_count"] == 48

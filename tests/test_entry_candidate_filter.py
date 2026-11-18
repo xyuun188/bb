@@ -177,11 +177,23 @@ def test_market_analysis_only_candidate_is_blocked_before_execution() -> None:
 
 
 @pytest.mark.parametrize(
-    ("model_mode", "expected_reason"),
-    [("paper", None), ("live", "blocked"), ("shadow", "blocked")],
+    ("model_mode", "final_verified", "capability_revoked", "has_permission", "expected_reason"),
+    [
+        ("paper", None, False, True, None),
+        ("live", None, False, True, "blocked"),
+        ("shadow", None, False, True, "blocked"),
+        ("paper", True, False, True, None),
+        ("paper", False, False, True, "blocked"),
+        ("paper", True, True, True, "blocked"),
+        ("paper", True, False, False, "blocked"),
+        ("live", True, False, True, "blocked"),
+    ],
 )
 def test_market_analysis_only_candidate_promotion_uses_execution_mode(
     model_mode: str,
+    final_verified: bool | None,
+    capability_revoked: bool,
+    has_permission: bool,
     expected_reason: str | None,
 ) -> None:
     service = object.__new__(TradingService)
@@ -229,7 +241,7 @@ def test_market_analysis_only_candidate_promotion_uses_execution_mode(
     }
     decision.raw_response = {
         "paper_trade_selection": {"selected": True},
-        "entry_permission": {"granted": True},
+        "entry_permission": {"granted": has_permission},
         "market_analysis_only_contract": {
             "selected_for_market_analysis": True,
             "entry_permission": False,
@@ -242,6 +254,21 @@ def test_market_analysis_only_candidate_promotion_uses_execution_mode(
             direction_support=support,
         ),
     }
+    if final_verified is not None:
+        service._attach_market_candidate_funnel(decision, {
+            "execution_availability": {
+                "analysis_only_execution_unverified": [
+                    {"symbol": "BTC/USDT", "reason": "okx_private_entry_instrument_probe_deferred"}
+                ],
+            },
+            "execution_verified_at_final_selection_symbols": (
+                ["BTC-USDT-SWAP"] if final_verified else ["ETH/USDT"]
+            ),
+        })
+    if capability_revoked:
+        service._remember_unavailable_entry_symbol(
+            "paper", "BTC/USDT", {"error_code": "51001"},
+        )
 
     reason = service._entry_gate_reason_with_market_boundary(
         decision,
