@@ -46,6 +46,44 @@ def number(value):
         return None
 
 
+def close_category(raw, execution, stage_summary):
+    receipt = dictionary(execution.get("raw_response"))
+    status = execution.get("status")
+    final_stage = stage_summary.get("final_stage")
+    final_status = stage_summary.get("final_status")
+    if dictionary(raw.get("local_order_persistence")).get("status") == "failed":
+        return "close_failed"
+    if receipt.get("exit_singleflight_wait") is True:
+        if receipt.get("singleflight_state") == "profit_lock_no_fill":
+            return "profit_limit_cooldown"
+        if receipt.get("singleflight_state") == "no_local_position":
+            return "close_skipped"
+        return "close_pending_confirmation"
+    if (
+        status in {"cancelled", "canceled"}
+        and receipt.get("profit_lock_ioc_unfilled") is True
+        and number(execution.get("quantity")) == 0
+        and not execution.get("exchange_confirmed")
+        and not execution.get("exit_progress")
+    ):
+        return "profit_limit_unfilled"
+    if receipt.get("execution_transport_unknown") is True or final_status == "unknown":
+        return "close_result_unknown"
+    if status == "partial" and execution.get("exit_progress") is True:
+        return "close_partial"
+    if stage_summary.get("failed") is True or final_status == "failed" or status == "rejected":
+        return "close_failed"
+    if stage_summary.get("blocked") is True or final_status == "blocked":
+        return "close_blocked"
+    if status in {"open", "pending"} or (
+        final_stage in {"exchange_submit", "exchange_confirm"} and final_status == "pending"
+    ):
+        return "close_pending_confirmation"
+    if final_status == "skipped":
+        return "close_skipped"
+    return "close_not_executed"
+
+
 def compact_decision(row, order_facts):
     raw = dictionary(row.raw_llm_response)
     dynamic = dictionary(raw.get("dynamic_exit_policy"))
@@ -62,17 +100,17 @@ def compact_decision(row, order_facts):
         final_reason = str(dictionary(stages[-1]).get("reason") or "")
     action = str(row.action or "").lower()
     is_close = action in {"close_long", "close_short"}
+    execution = dictionary(raw.get("execution_result"))
     if fast_scan.get("skipped_llm") is True:
         category = "budget_deferred"
     elif is_close and row.was_executed is True:
         category = "close_executed"
     elif is_close:
-        category = "close_not_executed"
+        category = close_category(raw, execution, stage_summary)
     elif action == "hold":
         category = "model_hold"
     else:
         category = "other"
-    execution = dictionary(raw.get("execution_result"))
     return {
         "id": row.id,
         "created_at": row.created_at,
@@ -202,7 +240,8 @@ async def main():
     ]
     close_not_executed = [
         item for item in records
-        if item["category"] == "close_not_executed"
+        if item["action"] in {"close_long", "close_short"}
+        and item["category"] not in {"close_executed", "budget_deferred"}
     ]
     eligible_hold = [
         item for item in records
@@ -257,6 +296,7 @@ async def main():
         "eligible_budget_deferred_count": len(deferred_eligible),
         "eligible_model_hold_count": len(eligible_hold),
         "close_not_executed_count": len(close_not_executed),
+        "close_failed_count": category_counts["close_failed"],
         "okx_price_limit_rejection_count": sum(
             "OKX API error [51006]" in item["execution_reason"]
             for item in close_not_executed
