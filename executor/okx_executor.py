@@ -9253,10 +9253,14 @@ class OKXExecutor(AbstractExecutor):
             row = rows[0] if isinstance(rows, list) and rows else {}
             row = row if isinstance(row, dict) else {}
             observed_at_ms = self._safe_float(row.get("ts"), 0.0)
-            if observed_at_ms <= receipt.timestamp() * 1000:
+            source_ahead_seconds = (observed_at_ms / 1000.0) - receipt.timestamp()
+            if source_ahead_seconds <= 0:
                 break
             if attempt:
                 raise ValueError("account_fee_source_after_receipt")
+            # Give a slightly ahead source clock time to catch up before
+            # fetching a new observation. The second receipt is checked again.
+            await asyncio.sleep(min(source_ahead_seconds, 0.25))
         received_at = receipt.isoformat()
         taker_rate = 0.0
         taker_field = ""

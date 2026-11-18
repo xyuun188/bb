@@ -379,19 +379,24 @@ async def test_fee_receipt_and_source_observation_keep_separate_identities(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("persistent", [False, True])
 async def test_future_fee_clock_retries_actual_request_or_fails_closed(
-    receipt_clock, persistent,
+    monkeypatch, receipt_clock, persistent,
 ) -> None:
     source_ms = int(receipt_clock.current.timestamp() * 1000) + 10
     calls = 0
+    delays = []
+
+    async def wait(seconds):
+        delays.append(seconds)
+        receipt_clock.current += timedelta(seconds=seconds)
 
     class FeeExchange:
         async def privateGetAccountFeeRates(self, params):
             nonlocal calls
             calls += 1
-            if calls == 2 and not persistent:
-                receipt_clock.current += timedelta(milliseconds=20)
-            return {"data": [{"takerU": "-0.0005", "ts": str(source_ms)}]}
+            timestamp = source_ms if not persistent else source_ms + (calls - 1) * 1000
+            return {"data": [{"takerU": "-0.0005", "ts": str(timestamp)}]}
 
+    monkeypatch.setattr(okx_executor.asyncio, "sleep", wait)
     executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
     executor._exchange = FeeExchange()
     if persistent:
@@ -404,6 +409,7 @@ async def test_future_fee_clock_retries_actual_request_or_fails_closed(
             source_ms / 1000, UTC,
         ).isoformat()
     assert calls == 2
+    assert delays == [pytest.approx(0.01, abs=1e-6)]
 
 
 @pytest.mark.asyncio
