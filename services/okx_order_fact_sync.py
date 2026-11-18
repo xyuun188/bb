@@ -13,6 +13,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from math import isclose, isfinite
+from random import sample
 from types import SimpleNamespace
 from typing import Any
 
@@ -84,6 +85,9 @@ ORDER_FACT_SYNC_DB_STATEMENT_TIMEOUT_MILLISECONDS = 10000
 DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC = 4
 DEFAULT_MAX_ORDER_GAP_QUERIES = 4
 PROTECTION_ALGO_HISTORY_TIMEOUT_SECONDS = 3.0
+ACCOUNT_DISCOVERY_MIN_REMAINING_SECONDS = 1.0
+STOP_FILL_RECOVERY_LOOKBACK_HOURS = 72
+STOP_FILL_RECOVERY_MAX_PAGES = 4
 ACCOUNT_HISTORY_MAX_PAGES = 5
 TARGET_ORDER_FILL_MAX_PAGES = 20
 ACCOUNT_HISTORY_OVERLAP_HOURS = 6
@@ -469,6 +473,7 @@ class OkxOrderFactSyncService:
         fills: list[OkxNativeFillGroup] = []
         order_rows: list[dict[str, Any]] = []
         protection_algo_rows: list[dict[str, Any]] = []
+        historical_stops: dict[str, tuple[OkxNativeFillGroup, dict[str, Any]]] = {}
         protection_execution_error: str | None = None
         contract_sizes: dict[str, float] = {}
         priority_confirmed_count = 0
@@ -647,8 +652,14 @@ class OkxOrderFactSyncService:
                         completed_stages.append("exit_decision_lineage_auto_recovered")
                     if priority_missing_closed_position_recovered_count:
                         completed_stages.append("missing_closed_position_auto_recovered")
-                    if not self.recovery_order_ids and urgent_target_order_ids.issubset(
-                        targeted_fill_ids
+                    if (
+                        (
+                            self.priority_only
+                            or _remaining_stage_timeout(deadline, self.timeout_seconds)
+                            < ACCOUNT_DISCOVERY_MIN_REMAINING_SECONDS
+                        )
+                        and not self.recovery_order_ids
+                        and urgent_target_order_ids.issubset(targeted_fill_ids)
                     ):
                         status = (
                             "warning"
@@ -927,6 +938,19 @@ class OkxOrderFactSyncService:
                     ),
                     None,
                 )
+            stop_recovery_since = max(
+                since, started_at - timedelta(hours=STOP_FILL_RECOVERY_LOOKBACK_HOURS)
+            )
+            stop_recovery, _ = await run_stage(
+                "stop_fill_history_recovery",
+                lambda: self._pull_missing_signed_stop_fills(
+                    native_facts, fills=fills, since=stop_recovery_since,
+                ),
+                cap_seconds=PROTECTION_ALGO_HISTORY_TIMEOUT_SECONDS,
+            )
+            if stop_recovery is not None:
+                historical_stops, recovered_algos = stop_recovery
+                protection_algo_rows = [*protection_algo_rows, *recovered_algos]
             required_contract_inst_ids = (
                 {fill.inst_id for fill in fills if fill.inst_id}
                 | _order_rows_inst_ids(order_rows)
@@ -1110,6 +1134,26 @@ class OkxOrderFactSyncService:
                 )
                 if contract_size_deferred_count:
                     deferred_stages.append("order_facts_missing_public_contract_size")
+                if historical_stops:
+                    stop_rows = await session.execute(
+                        select(Order).where(
+                            Order.execution_mode == self.mode,
+                            Order.exchange_order_id.in_(sorted(historical_stops)),
+                        ).with_for_update(skip_locked=True)
+                    )
+                    stop_orders = authoritative_orders_by_exchange_id(stop_rows.scalars().all())
+                    for order_id, (fill, lifecycle) in historical_stops.items():
+                        order = stop_orders.get(order_id)
+                        if (
+                            order is not None
+                            and _historical_stop_matches_stored_fill(order, fill)
+                            and _stored_protection_execution_needs_refresh(order, lifecycle)
+                        ):
+                            order.okx_raw_fills = {
+                                **order.okx_raw_fills, "protection_execution": lifecycle,
+                            }
+                            confirmed_count += 1
+                            samples.append(_sample(order, kind="historical_signed_stop_recovered"))
             else:
                 confirmed_count += self._recover_local_stored_order_facts(
                     stored_repair_orders,
@@ -1203,6 +1247,73 @@ class OkxOrderFactSyncService:
             error=pull_error,
             samples=_diagnostic_samples(samples),
         ).as_dict()
+
+    async def _pull_missing_signed_stop_fills(
+        self,
+        native_facts: OkxNativeFactsClient,
+        *,
+        fills: list[OkxNativeFillGroup],
+        since: datetime,
+    ) -> tuple[dict[str, tuple[OkxNativeFillGroup, dict[str, Any]]], list[dict[str, Any]]]:
+        algos = await native_facts.fetch_protection_algo_history_rows(
+            since=since, ord_types=("oco", "conditional"),
+            limit=100, max_pages=STOP_FILL_RECOVERY_MAX_PAGES, strict=True,
+        )
+        stop_algos = {
+            order_id: algo
+            for algo in algos
+            if algo.get("actualSide") == "sl" and algo.get("_bb_okx_credential_scope")
+            for order_id in okx_algo_generated_order_ids(algo)
+        }
+        if not stop_algos:
+            return {}, []
+
+        complete_fills = {
+            fill.order_id: fill for fill in fills if fill.pagination_complete
+        }
+        known = authoritative_orders_by_exchange_id(
+            await self._load_discovered_orders(set(stop_algos))
+        )
+        joined: dict[str, dict[str, Any]] = {}
+        missing: list[str] = []
+        for order_id, algo in stop_algos.items():
+            fill = complete_fills.get(order_id)
+            if fill is not None and _signed_stop_from_algo(fill, algo) is not None:
+                joined[order_id] = algo
+                continue
+            order = known.get(order_id)
+            if (
+                order is None
+                or str(order.status or "").lower() != "filled"
+                or not _order_has_authoritative_stored_okx_fill_fact(order)
+            ):
+                continue
+            stored = confirmed_protection_lifecycle(order)
+            if stored and stored.get("stop_loss_slippage_credential_scope") == algo[
+                "_bb_okx_credential_scope"
+            ]:
+                continue
+            missing.append(order_id)
+        recovered: dict[str, tuple[OkxNativeFillGroup, dict[str, Any]]] = {}
+        if missing:
+            # One unavailable historical receipt must not monopolize future batches.
+            batch = sample(missing, min(len(missing), DEFAULT_TARGET_FILL_ORDER_QUERIES_PER_SYNC))
+            targeted = await native_facts.fetch_fill_groups(
+                order_ids=batch, since=since, limit=100, max_pages=TARGET_ORDER_FILL_MAX_PAGES,
+                target_orders_only=True, target_order_query_limit=len(batch),
+                include_historical=False, historical_only=True, strict=True,
+            )
+            for fill in targeted:
+                algo = stop_algos.get(fill.order_id)
+                order = known.get(fill.order_id)
+                if (
+                    algo is not None
+                    and fill.order_id in batch
+                    and (lifecycle := _signed_stop_from_algo(fill, algo)) is not None
+                    and _historical_stop_matches_stored_fill(order, fill)
+                ):
+                    recovered[fill.order_id] = (fill, lifecycle)
+        return recovered, list(joined.values())
 
     async def _sync_from_stored_facts(
         self,
@@ -4607,6 +4718,25 @@ def _fill_completeness_key(fill: OkxNativeFillGroup) -> tuple[float, bool, int, 
 
 def _algo_ids_from_order_rows(rows: list[dict[str, Any]]) -> set[str]:
     return {algo_id for row in rows if (algo_id := str(row.get("algoId") or "").strip())}
+
+
+def _signed_stop_from_algo(
+    fill: OkxNativeFillGroup, algo: dict[str, Any],
+) -> dict[str, Any] | None:
+    lifecycle = build_okx_protection_execution_lifecycle(fill, algo_row=algo)
+    if lifecycle and lifecycle.get("stop_loss_slippage_credential_scope"):
+        return lifecycle
+    return None
+
+
+def _historical_stop_matches_stored_fill(order: Order | None, fill: OkxNativeFillGroup) -> bool:
+    if order is None or not _stored_fill_matches_order_history(order, None, fill):
+        return False
+    raw = order.okx_raw_fills
+    return (
+        set(fill.trade_ids) == _trade_id_set(raw.get("trade_ids"))
+        and _relative_close_enough(fill.contracts, _safe_float(raw.get("contracts"), 0.0), 0.000001)
+    )
 
 
 def _protection_execution_by_order_id(

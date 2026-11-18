@@ -1894,6 +1894,92 @@ async def test_account_discovery_persists_signed_stop_fill(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("matching_scope", [True, False])
+async def test_account_discovery_recovers_signed_stop_outside_recent_fill_pages(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, matching_scope: bool,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "historical-signed-stop.db")
+    now = datetime.now(UTC)
+    old = now - timedelta(hours=36)
+    order_id = "historical-stop-close"
+    filled = {
+        **_fill_row(old, order_id=order_id),
+        "side": "sell",
+        "fillPx": "59400",
+        "fillPnl": "-12",
+    }
+    signed_fill = {
+        **filled,
+        "_bb_okx_credential_scope": "same-key" if matching_scope else "another-key",
+    }
+    algo = {
+        "algoId": "historical-stop",
+        "ordIdList": [order_id],
+        "instId": "BTC-USDT-SWAP",
+        "side": "sell",
+        "posSide": "long",
+        "state": "effective",
+        "reduceOnly": "true",
+        "actualSide": "sl",
+        "slTriggerPx": "60000",
+        "triggerTime": _ms(old - timedelta(seconds=1)),
+        "_bb_okx_credential_scope": "same-key",
+    }
+
+    class HistoricalStopCcxt(_FakeCcxt):
+        async def privateGetTradeFills(self, params):
+            return {"data": [row for row in self.fills if row["ordId"] != order_id]}
+
+        async def privateGetTradeOrdersAlgoHistory(self, params):
+            return {"data": [algo] if params.get("ordType") == "oco" else []}
+
+    service = OkxOrderFactSyncService(
+        mode="paper", limit=1, phase3_order_sync_start=now - timedelta(days=7),
+        executor_factory=_executor_factory(HistoricalStopCcxt(
+            fills=[signed_fill, _fill_row(now, order_id="recent-fill")],
+        )),
+    )
+    async with get_session_ctx() as session:
+        stop = Order(
+            model_name="ensemble_trader", execution_mode="paper", order_type="market",
+            created_at=old,
+        )
+        service._apply_fill_to_order(
+            stop, order_fact_sync_module.group_okx_native_fill_rows([filled])[0],
+            now=old, sync_status=OKX_SYNC_CONFIRMED, contract_size=0.01,
+            contract_size_source="okx_public_instruments",
+        )
+        session.add(stop)
+        session.add(Order(
+            model_name="ensemble_trader", execution_mode="paper", symbol="BTC/USDT",
+            side="buy", order_type="market", quantity=0.02, price=60000.0,
+            status="filled", fee=0.0, exchange_order_id="recent-fill",
+            created_at=now, filled_at=now,
+        ))
+
+    try:
+        report = await service.sync()
+        assert "priority_order_facts_persisted" in report["completed_stages"]
+        assert "stop_fill_history_recovery" in report["completed_stages"]
+        async with get_session_ctx() as session:
+            order = (
+                await session.execute(select(Order).where(Order.exchange_order_id == order_id))
+            ).scalar_one()
+            assert order.quantity == pytest.approx(0.02)
+            assert order.price == pytest.approx(59400.0)
+            assert order.okx_fill_pnl == pytest.approx(-12.0)
+            assert order.fee == pytest.approx(0.12)
+            execution = order.okx_raw_fills.get("protection_execution")
+            if matching_scope:
+                assert execution["stop_loss_slippage_credential_scope"] == "same-key"
+                assert execution["stop_loss_slippage_pct"] == pytest.approx(1.0)
+            else:
+                assert execution is None
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_recovery_order_continues_through_protection_history(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
