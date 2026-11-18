@@ -5797,6 +5797,53 @@ def test_entry_unavailable_cache_survives_restart_and_expires(
     assert restored._entry_unavailable_cache_for_mode("paper") == {}
 
 
+@pytest.mark.asyncio
+async def test_leverage_probe_cannot_clear_order_compliance_rejection() -> None:
+    service = TradingService.__new__(TradingService)
+    symbol = "RESOLV/USDT"
+    service._remember_unavailable_entry_symbol(
+        "paper", symbol, {
+            "reason": "okx_private_entry_instrument_unavailable",
+            "error_code": "51155",
+        },
+    )
+    cached = service._entry_unavailable_cache_for_mode("paper")[symbol]
+    service._remember_unavailable_entry_symbol(
+        "paper", symbol, {
+            "reason": "okx_private_entry_instrument_unavailable",
+            "error_code": "51001",
+        },
+    )
+
+    class FakeExecutor:
+        async def entry_instrument_availability_shortlist(self, *_args, **_kwargs):
+            return {"availability": {symbol: {"available": True}}, "evaluated_count": 1}
+
+    service._schedule_market_instrument_availability_refresh(
+        FakeExecutor(), [symbol], target_count=1, mode="paper",
+    )
+    await service._market_instrument_refresh_tasks["paper"]
+
+    assert service._entry_unavailable_cache_for_mode("paper")[symbol] == cached
+    assert symbol not in service._verified_entry_symbols_by_mode["paper"]
+    decision = _decision(Action.LONG)
+    decision.symbol = symbol
+    assert await service.pre_order_execution_facts("paper", decision) == {
+        "production_eligible": False,
+        "available": False,
+        "reason": "okx_entry_pair_compliance_restricted",
+    }
+
+    cached["expires_at"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    service._schedule_market_instrument_availability_refresh(
+        FakeExecutor(), [symbol], target_count=1, mode="paper",
+    )
+    await service._market_instrument_refresh_tasks["paper"]
+
+    assert symbol not in service._entry_unavailable_cache_for_mode("paper")
+    assert symbol in service._verified_entry_symbols_by_mode["paper"]
+
+
 def test_legacy_transient_entry_cache_is_clamped_during_restart_migration(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

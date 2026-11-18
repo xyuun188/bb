@@ -272,6 +272,8 @@ class EntryPriceGuardPolicy:
                 return "Authoritative pre-order execution facts are unavailable; entry fails closed."
             if execution_facts.get("production_eligible") is not True:
                 reasons = execution_facts.get("reasons") or [execution_facts.get("reason")]
+                if "okx_entry_pair_compliance_restricted" in reasons:
+                    return "OKX 曾因账户地区或合规限制拒绝该合约，当前仍在复查冷却期，本次未提交订单。"
                 if "okx_pre_order_account_direction_capacity_zero" in reasons:
                     return (
                         "OKX 账户当前该合约方向最大可开数量为 0 张，未提交订单；"

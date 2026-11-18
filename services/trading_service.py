@@ -173,7 +173,10 @@ from services.okx_balance_snapshot import (
 from services.okx_entry_environment_compatibility import (
     entry_instrument_unavailable_cache_ttl,
 )
-from services.okx_error_classifier import is_okx_temporary_service_error
+from services.okx_error_classifier import (
+    is_okx_pair_compliance_restriction,
+    is_okx_temporary_service_error,
+)
 from services.okx_order_fact_sync import (
     OKX_ORDER_FACT_SYNC_RESULT_PREFIX,
     OkxOrderFactSyncService,
@@ -4626,6 +4629,14 @@ class TradingService(ModelTrainingCoordinatorMixin):
     ) -> dict[str, Any]:
         """Load immediate native market and account cost facts before submit."""
 
+        symbol = self._normalize_position_symbol(decision.symbol)
+        restricted = self._entry_unavailable_cache_for_mode(model_mode).get(symbol)
+        if is_okx_pair_compliance_restriction(restricted):
+            return {
+                "production_eligible": False,
+                "available": False,
+                "reason": "okx_entry_pair_compliance_restricted",
+            }
         market_analysis_reason = self._market_analysis_only_entry_reason(
             decision,
             model_mode=model_mode,
@@ -9364,6 +9375,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if not normalized_symbol:
             return
         rows = self._entry_unavailable_cache_for_mode(mode)
+        if is_okx_pair_compliance_restriction(rows.get(normalized_symbol)) and (
+            not is_okx_pair_compliance_restriction(dict(facts))
+        ):
+            return
         ttl = (
             float(ttl_seconds)
             if ttl_seconds is not None
@@ -9837,6 +9852,14 @@ class TradingService(ModelTrainingCoordinatorMixin):
                         if not isinstance(facts, dict):
                             continue
                         normalized_symbol = self._normalize_position_symbol(str(symbol))
+                        # A leverage lookup does not authorize an order that OKX
+                        # already rejected for account compliance.
+                        if is_okx_pair_compliance_restriction(
+                            unavailable_rows.get(normalized_symbol)
+                        ):
+                            merged.discard(normalized_symbol)
+                            verified.discard(str(symbol))
+                            continue
                         if facts.get("available") is True:
                             merged.add(normalized_symbol)
                             batch_unavailable_changed = (

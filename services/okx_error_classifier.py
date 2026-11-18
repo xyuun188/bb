@@ -146,6 +146,8 @@ def is_okx_entry_instrument_unavailable(value: Any) -> bool:
 def is_okx_pair_compliance_restriction(value: Any) -> bool:
     """Recognize pair restrictions in raw responses and legacy display text."""
     code, _ = extract_okx_error(value)
+    if not code and isinstance(value, dict):
+        code = str(value.get("error_code") or value.get("okx_error_code") or "").strip()
     if code and code != "1":
         return code == "51155"
     text = _stringify(value).lower()
