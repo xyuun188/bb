@@ -4283,6 +4283,13 @@ class OKXExecutor(AbstractExecutor):
                     timestamp=datetime.now(UTC),
                     raw_response={
                         **raw_response,
+                        "profit_lock_ioc_unfilled": (
+                            order_status == OrderStatus.CANCELLED
+                            and self._safe_float(
+                                native_order_detail["info"].get("accFillSz"), -1.0
+                            ) == 0.0
+                            and reported_filled_contracts == 0.0
+                        ),
                         "message": "盈利限价未成交，剩余委托已撤销，保留仓位继续复评。",
                     },
                 )

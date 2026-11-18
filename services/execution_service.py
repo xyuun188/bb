@@ -23,6 +23,7 @@ from core.safe_output import safe_error_text
 from core.symbols import normalize_trading_symbol
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.decision_state import DecisionStage, DecisionStageStatus
+from services.exit_execution_singleflight import PROFIT_LOCK_NO_FILL_STATE
 from services.normal_paper_trade import attach_normal_paper_order_identity
 from services.okx_error_classifier import (
     is_okx_entry_instrument_unavailable,
@@ -1671,15 +1672,17 @@ class ExecutionService:
                 and str(execution_result.exchange_order_id or "").strip()
                 and execution_result.quantity > 0
             )
+            profit_lock_ioc_unfilled = execution_raw.get("profit_lock_ioc_unfilled") is True
+            singleflight_state = execution_raw.get("singleflight_state")
+            exit_singleflight_terminal_skip = bool(
+                decision.is_exit
+                and execution_raw.get("exit_singleflight_wait")
+                and singleflight_state == "no_local_position"
+            )
             exit_waiting_confirmation = bool(
                 decision.is_exit
                 and execution_raw.get("exit_tracking")
                 and execution_result.status in {OrderStatus.OPEN, OrderStatus.PENDING}
-            )
-            exit_singleflight_terminal_skip = bool(
-                decision.is_exit
-                and execution_raw.get("exit_singleflight_wait")
-                and execution_raw.get("singleflight_state") == "no_local_position"
             )
             confirm_reason = execution_reason_from_result(execution_result)
             local_order_persisted = True
@@ -1793,7 +1796,10 @@ class ExecutionService:
                         "recovery_requested": recovery_requested,
                     },
                 )
-            elif exit_singleflight_terminal_skip:
+            elif exit_singleflight_terminal_skip or (
+                decision.is_exit
+                and (profit_lock_ioc_unfilled or singleflight_state == PROFIT_LOCK_NO_FILL_STATE)
+            ):
                 await mark_stage(
                     DecisionStage.EXCHANGE_CONFIRM,
                     DecisionStageStatus.SKIPPED,
@@ -1802,8 +1808,11 @@ class ExecutionService:
                         "order_id": execution_result.order_id,
                         "exchange_order_id": execution_result.exchange_order_id,
                         "status": execution_result.status.value,
-                        "skip_kind": "position_already_closed",
-                        "singleflight_state": execution_raw.get("singleflight_state"),
+                        "skip_kind": (
+                            "position_already_closed" if exit_singleflight_terminal_skip
+                            else PROFIT_LOCK_NO_FILL_STATE
+                        ),
+                        "singleflight_state": singleflight_state,
                     },
                 )
             elif exit_waiting_confirmation:

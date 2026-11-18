@@ -20,6 +20,7 @@ from services.current_position_management import (
     PROFIT_LOCK_LEDGER_VERSION,
 )
 from services.okx_error_classifier import is_okx_temporary_service_error
+from services.profit_lock_execution import profit_lock_execution_required
 
 EXIT_INTENT_KEY = "exit_execution_intent"
 EXIT_INTENT_VERSION = "2026-08-20.exit-singleflight.v1"
@@ -29,6 +30,8 @@ UNKNOWN_RESULT_RETRY_SECONDS = 180.0
 TEMPORARY_OUTAGE_RETRY_SECONDS = 60.0
 REJECTED_RETRY_SECONDS = 45.0
 COMPLETED_CONFIRMATION_SECONDS = 300.0
+PROFIT_LOCK_NO_FILL_RETRY_SECONDS = 300.0
+PROFIT_LOCK_NO_FILL_STATE = "profit_lock_no_fill"
 
 SessionContextFactory = Callable[[], AbstractAsyncContextManager[Any]]
 TradeRepoFactory = Callable[[Any], TradeRepository]
@@ -112,7 +115,15 @@ class ExitExecutionSingleFlightService:
             key = self._position_group_key(mode, symbol, side, positions)
             current = self._current_group_intent(positions)
             retry_at = self._parse_time(current.get("retry_after_at"))
-            if current.get("key") == key and retry_at is not None and retry_at > now:
+            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+            profit_no_fill = current.get("state") == PROFIT_LOCK_NO_FILL_STATE
+            bypass_profit_cooldown = profit_no_fill and not profit_lock_execution_required(raw)
+            if (
+                current.get("key") == key
+                and retry_at is not None
+                and retry_at > now
+                and not bypass_profit_cooldown
+            ):
                 retry_after = max((retry_at - now).total_seconds(), 0.0)
                 return ExitExecutionLease(
                     acquired=False,
@@ -123,15 +134,18 @@ class ExitExecutionSingleFlightService:
                     attempt_count=self._safe_int(current.get("attempt_count"), 0),
                     retry_after_seconds=retry_after,
                     reason=(
-                        "A previous exit submission for this position is still awaiting "
-                        "exchange confirmation. No duplicate exit was submitted."
+                        "盈利限价单已确认未成交，稍后重新评估，本轮未再次提交。"
+                        if profit_no_fill
+                        else (
+                            "A previous exit submission for this position is still awaiting "
+                            "exchange confirmation. No duplicate exit was submitted."
+                        )
                     ),
                 )
 
             token = secrets.token_hex(12)
             attempt_count = self._safe_int(current.get("attempt_count"), 0) + 1
             profit_lock_exit = self._is_profit_lock_exit(decision)
-            raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
             dynamic_exit = raw.get("dynamic_exit_policy")
             dynamic_exit = dynamic_exit if isinstance(dynamic_exit, dict) else {}
             intent = {
@@ -192,6 +206,18 @@ class ExitExecutionSingleFlightService:
             if not matching:
                 return
             intent = dict(self._position_intent(matching[0]))
+            if (
+                lease.key.startswith("paper:")
+                and state == "retry_wait"
+                and result is not None
+                and result.status == OrderStatus.CANCELLED
+                and result.order_type == "limit"
+                and result.quantity == 0.0
+                and result.exchange_order_id
+            ):
+                raw = result.raw_response
+                if isinstance(raw, dict) and raw.get("profit_lock_ioc_unfilled") is True:
+                    state, delay = PROFIT_LOCK_NO_FILL_STATE, PROFIT_LOCK_NO_FILL_RETRY_SECONDS
             intent.update(
                 {
                     "state": state,
@@ -238,7 +264,7 @@ class ExitExecutionSingleFlightService:
             order_id="exit_singleflight_wait",
             symbol=decision.symbol,
             side=side,
-            order_type="market",
+            order_type="limit" if lease.state == PROFIT_LOCK_NO_FILL_STATE else "market",
             quantity=0.0,
             price=0.0,
             status=OrderStatus.OPEN,
@@ -334,6 +360,15 @@ class ExitExecutionSingleFlightService:
             return {}
         intent = contract.get(EXIT_INTENT_KEY)
         return dict(intent) if isinstance(intent, dict) else {}
+
+    @classmethod
+    def profit_lock_in_cooldown(cls, position: dict[str, Any], now: datetime) -> bool:
+        contract = position.get("current_management_contract")
+        intent = contract.get(EXIT_INTENT_KEY) if isinstance(contract, dict) else None
+        if not isinstance(intent, dict) or intent.get("state") != PROFIT_LOCK_NO_FILL_STATE:
+            return False
+        retry_at = cls._parse_time(intent.get("retry_after_at"))
+        return retry_at is not None and retry_at > now
 
     @staticmethod
     def _apply_intent(positions: list[Any], intent: dict[str, Any]) -> None:

@@ -14324,6 +14324,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """Run hard protection and eligible paper profit locks before AI review."""
         auto_closes: list[dict[str, Any]] = []
         paper_profit_lock: dict[str, Any] | None = None
+        scan_time = datetime.now(UTC)
         if open_positions is None:
             open_positions = await self.okx_sync_service.get_open_positions_context()
         if not open_positions:
@@ -14476,6 +14477,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 "current_price": current_price,
             }
             if trigger == FAST_PROFIT_LOCK_TRIGGER:
+                if ExitExecutionSingleFlightService.profit_lock_in_cooldown(
+                    position_snapshot, scan_time
+                ):
+                    continue
                 if paper_profit_lock is None or close_fraction > paper_profit_lock["close_fraction"]:
                     paper_profit_lock = execution_args
                 continue

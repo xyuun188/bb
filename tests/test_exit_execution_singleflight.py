@@ -209,6 +209,43 @@ async def test_temporary_exchange_error_uses_wait_state_instead_of_duplicate_sub
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("risk_override", [False, True])
+async def test_proven_unfilled_profit_ioc_cools_only_profit_exits(risk_override: bool) -> None:
+    position = _position()
+    repo = _Repo([position])
+    session = _Session()
+    now = [datetime(2026, 11, 18, 12, 0, tzinfo=UTC)]
+    service = _service(repo, session, now)
+    kwargs = {"model_name": "ensemble_trader", "execution_mode": "paper"}
+    lease = await service.acquire(**kwargs, decision=_profit_lock_decision(), decision_id=1)
+    await service.finish(lease, ExecutionResult(
+        order_id="ioc",
+        exchange_order_id="ioc",
+        symbol="ZAMA/USDT",
+        side="buy",
+        order_type="limit",
+        quantity=0.0,
+        price=0.04,
+        status=OrderStatus.CANCELLED,
+        raw_response={"profit_lock_ioc_unfilled": True},
+    ))
+    restarted = _service(repo, session, now)
+    blocked = await restarted.acquire(**kwargs, decision=_profit_lock_decision(), decision_id=2)
+    assert not blocked.acquired
+    assert blocked.state == "profit_lock_no_fill"
+    assert blocked.retry_after_seconds == 300.0
+    assert PROFIT_LOCK_LEDGER_KEY not in position.current_management_contract
+
+    if risk_override:
+        next_exit = _decision()
+        next_exit.raw_response = {"dynamic_exit_policy": {"hard_risk": True}}
+    else:
+        now[0] += timedelta(seconds=300)
+        next_exit = _profit_lock_decision()
+    assert (await restarted.acquire(**kwargs, decision=next_exit, decision_id=3)).acquired
+
+
+@pytest.mark.asyncio
 async def test_no_local_position_is_terminal_skip_and_never_a_submit_lease() -> None:
     repo = _Repo([])
     session = _Session()

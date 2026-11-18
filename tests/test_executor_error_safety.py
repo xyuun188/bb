@@ -1814,6 +1814,7 @@ async def test_profit_lock_uses_ioc_and_never_falls_back_to_market(
     assert result.quantity == filled
     assert result.order_type == "limit"
     assert result.raw_response["okx_native_reduce_market_order"] is False
+    assert bool(result.raw_response.get("profit_lock_ioc_unfilled")) is (filled == 0)
     assert result.status == (OrderStatus.CANCELLED if not filled else (
         OrderStatus.FILLED if filled == 10 * fraction else OrderStatus.PARTIAL
     ))

@@ -6417,6 +6417,16 @@ async def test_fast_dynamic_position_scan_allows_only_hard_risk_or_profit_lock(
         ("LTC/USDT", "profit_drawdown_dynamic_position_scan", 0.62)
     ]
 
+    position["current_management_contract"] = {
+        "exit_execution_intent": {
+            "state": "profit_lock_no_fill",
+            "retry_after_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        },
+    }
+    assert await service._enforce_sl_tp({}, open_positions=[position, peer]) == [
+        {"symbol": "ETH/USDT"}
+    ]
+
     hard_risk[0] = True
     position["stop_loss"] = 50.5
     assert await service._enforce_sl_tp({}, open_positions=[position]) == [
