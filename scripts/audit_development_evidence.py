@@ -24,7 +24,6 @@ from sqlalchemy import select  # noqa: E402
 from db.session import close_db, get_read_session_ctx  # noqa: E402
 from models.learning import ShadowBacktest  # noqa: E402
 from services.execution_cost_model import execution_cost_provenance_blocker  # noqa: E402
-from services.ml_development_snapshot import load_development_snapshot  # noqa: E402
 from services.ml_nested_development import _folds  # noqa: E402
 from services.ml_signal_service import FEATURE_KEYS, build_training_frame  # noqa: E402
 from services.ml_training_dataset import (  # noqa: E402
@@ -35,11 +34,11 @@ from services.ml_training_dataset import (  # noqa: E402
 from services.training_data_quality import assess_shadow_sample  # noqa: E402
 
 CUTOFF = "2026-09-26T22:11:51.501105+00:00"
-SNAPSHOT = Path("data/strategy_replay/frozen_development_v1.json")
+SNAPSHOT = ROOT / "data/strategy_replay/frozen_development_v1.json"
+SNAPSHOT_VERSION = "2026-10-21.frozen-development.v1"
 EXPECTED_SNAPSHOT_SHA256 = "afced19c8876ec2fc8237b298f22248d326160e6bdc83a754df1bc431cc9cec3"
 AUDIT_DEPENDENCIES = (
     "scripts/audit_development_evidence.py",
-    "services/ml_development_snapshot.py",
     "services/ml_nested_development.py",
     "services/ml_signal_service.py",
     "services/ml_training_dataset.py",
@@ -51,10 +50,57 @@ AUDIT_DEPENDENCIES = (
     "core/market_facts.py",
     "models/learning.py",
 )
-COMPARE_NUMERIC = list(dict.fromkeys([
-    *FEATURE_KEYS, "long_return_pct", "short_return_pct",
+ECONOMICS_COLUMNS = (
+    "long_return_pct", "short_return_pct",
     "long_execution_cost_pct", "short_execution_cost_pct",
-]))
+)
+SNAPSHOT_METADATA_COLUMNS = {
+    "id", "decision_group", "decision_timestamp", "label_timestamp", "sample_weight",
+}
+COMPARE_NUMERIC = tuple(dict.fromkeys([*FEATURE_KEYS, *ECONOMICS_COLUMNS]))
+
+
+def load_historical_snapshot() -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Verify the pinned v1 artifact without routing it into current training."""
+    snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    payload = {key: value for key, value in snapshot.items() if key != "snapshot_sha256"}
+    digest = hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    if (
+        snapshot.get("version") != SNAPSHOT_VERSION
+        or digest != snapshot.get("snapshot_sha256")
+        or digest != EXPECTED_SNAPSHOT_SHA256
+    ):
+        raise ValueError("historical development snapshot integrity failure")
+    if pd.Timestamp(snapshot["development_cutoff"]) != pd.Timestamp(CUTOFF):
+        raise ValueError("frozen development cutoff cannot change")
+
+    # The pinned payload authenticates the original columns and numeric types.
+    # v1 hashed sorted records with pandas timestamps serialized via str().
+    development = pd.DataFrame(snapshot["records"])
+    for column in ("decision_timestamp", "label_timestamp"):
+        development[column] = pd.to_datetime(development[column], format="ISO8601", utc=True)
+    development = development.sort_values([
+        "decision_timestamp", "decision_group", "horizon_minutes", "id",
+    ]).reset_index(drop=True)
+    input_digest = hashlib.sha256(json.dumps(
+        development.to_dict("records"), sort_keys=True, default=str, allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    if input_digest != snapshot["development_input_sha256"]:
+        raise ValueError("historical development frame fingerprint mismatch")
+    if (
+        len(development) != snapshot["row_count"]
+        or development["decision_group"].nunique() != snapshot["decision_group_count"]
+        or development["id"].duplicated().any()
+        or development.duplicated(["decision_group", "horizon_minutes"]).any()
+        or not (
+            (development["decision_timestamp"] < development["label_timestamp"])
+            & (development["label_timestamp"] < pd.Timestamp(CUTOFF))
+        ).all()
+    ):
+        raise ValueError("historical development snapshot boundary or accounting mismatch")
+    return development, snapshot
 
 
 def audit_code_identity() -> dict[str, Any]:
@@ -92,6 +138,7 @@ def inspect_source_batch(
     source = {row.id: row for row in rows}
     if len(source) != len(rows):
         raise ValueError("duplicate source identity")
+    compare_columns = frozen.columns.intersection(COMPARE_NUMERIC)
     rebuilt = build_training_frame(rows)
     rebuilt_by_id = {
         int(row["id"]): row for row in rebuilt.to_dict("records")
@@ -155,7 +202,7 @@ def inspect_source_batch(
             continue
         if str(actual["decision_group"]) != str(expected["decision_group"]):
             issues["source_decision_group_mismatch"] += 1
-        for column in COMPARE_NUMERIC:
+        for column in compare_columns:
             observed, original = float(actual[column]), float(expected[column])
             if not math.isfinite(observed) or not math.isclose(
                 observed, original, rel_tol=1e-10, abs_tol=1e-10
@@ -165,13 +212,13 @@ def inspect_source_batch(
 
 
 def inspect_snapshot(frame: pd.DataFrame, snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Integrity is enforced by load_development_snapshot before this inspection."""
     delay_seconds = (
         frame["label_timestamp"] - frame["decision_timestamp"]
         - pd.to_timedelta(frame["horizon_minutes"], unit="m")
     ).dt.total_seconds().abs()
     folds = _folds(frame, 3)
     return {
+        "version": snapshot["version"],
         "snapshot_sha256": snapshot["snapshot_sha256"],
         "development_input_sha256": snapshot["development_input_sha256"],
         "cutoff": snapshot["development_cutoff"],
@@ -195,13 +242,18 @@ def inspect_snapshot(frame: pd.DataFrame, snapshot: dict[str, Any]) -> dict[str,
         "purged_fold_boundaries": [boundary for _, _, boundary in folds],
         "sample_weight_policy": "frozen_values_integrity_checked_not_reestimated_by_page",
         "feature_component_availability": "requires_separate_component_lineage_review",
+        "numeric_comparison": {
+            "compared_columns": sorted(set(frame.columns).intersection(COMPARE_NUMERIC)),
+            "frozen_only_columns": sorted(
+                set(frame.columns).difference(SNAPSHOT_METADATA_COLUMNS, COMPARE_NUMERIC)
+            ),
+            "current_only_columns": sorted(set(COMPARE_NUMERIC).difference(frame.columns)),
+        },
     }
 
 
 async def audit(*, max_rows: int) -> dict[str, Any]:
-    frame, snapshot = load_development_snapshot(SNAPSHOT, cutoff=CUTOFF)
-    if snapshot["snapshot_sha256"] != EXPECTED_SNAPSHOT_SHA256:
-        raise ValueError("unexpected frozen snapshot identity")
+    frame, snapshot = load_historical_snapshot()
     checked = frame.iloc[:max_rows]
     issues: Counter = Counter()
     identities = []
@@ -233,8 +285,9 @@ async def audit(*, max_rows: int) -> dict[str, Any]:
     ).encode()).hexdigest()
     future_observation_offsets = [-value for value in feature_ages if value < 0]
     nonnegative_feature_ages = [value for value in feature_ages if value >= 0]
+    snapshot_report = inspect_snapshot(frame, snapshot)
     return {
-        "audit_version": "development-evidence.v2",
+        "audit_version": "development-evidence.v3",
         "audit_code_identity": audit_code_identity(),
         "audit_source_sha256": hashlib.sha256(
             await asyncio.to_thread(Path(__file__).read_bytes)
@@ -242,7 +295,7 @@ async def audit(*, max_rows: int) -> dict[str, Any]:
         "generated_at": datetime.now(UTC).isoformat(),
         "read_only": True, "exam_labels_read": False,
         "production_permission": False,
-        "snapshot": inspect_snapshot(frame, snapshot),
+        "snapshot": snapshot_report,
         "source_rows_requested": len(checked),
         "source_row_budget": max_rows,
         "source_rows_found": len(identities),
@@ -293,9 +346,7 @@ async def audit(*, max_rows: int) -> dict[str, Any]:
             "historical_builder_uses_close_but_source_timestamp_is_1m_bar_open;"
             "close_availability_is_at_least_bar_open_plus_1m"
         ),
-        "frozen_creation_time_purged_fold_count": inspect_snapshot(
-            frame, snapshot
-        )["purged_fold_count"],
+        "frozen_creation_time_purged_fold_count": snapshot_report["purged_fold_count"],
         "g2_acceptance": "pending_component_lineage_review" if not issues else "blocked_by_evidence",
         "profitability_acceptance": "not_evaluated",
     }

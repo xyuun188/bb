@@ -25,17 +25,14 @@ from models.decision import AIDecision  # noqa: E402
 from models.learning import ShadowBacktest  # noqa: E402
 from scripts.audit_development_evidence import (  # noqa: E402
     CUTOFF,
-    EXPECTED_SNAPSHOT_SHA256,
-    SNAPSHOT,
     _timestamp,
+    load_historical_snapshot,
 )
 from services.execution_cost_model import _parse_timestamp  # noqa: E402
-from services.ml_development_snapshot import load_development_snapshot  # noqa: E402
 
 DEPENDENCIES = (
     "scripts/audit_development_timing.py",
     "scripts/audit_development_evidence.py",
-    "services/ml_development_snapshot.py",
     "models/decision.py",
     "models/learning.py",
     "core/market_facts.py",
@@ -267,9 +264,7 @@ def inspect_timing(row: dict[str, Any]) -> dict[str, Any]:
 
 
 async def audit(*, max_rows: int) -> dict[str, Any]:
-    frame, snapshot = load_development_snapshot(SNAPSHOT, cutoff=CUTOFF)
-    if snapshot["snapshot_sha256"] != EXPECTED_SNAPSHOT_SHA256:
-        raise ValueError("unexpected frozen snapshot identity")
+    frame, snapshot = load_historical_snapshot()
     ids = frame.iloc[:max_rows]["id"].astype(int).tolist()
     counts: Counter = Counter()
     components: dict[str, Counter] = defaultdict(Counter)

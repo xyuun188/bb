@@ -9,6 +9,88 @@ import pandas as pd
 import pytest
 
 from scripts import audit_development_evidence as audit
+from services.ml_development_snapshot import load_development_snapshot
+
+
+@pytest.fixture
+def historical_snapshot(tmp_path, monkeypatch):
+    path = tmp_path / "frozen_development_v1.json"
+    monkeypatch.setattr(audit, "SNAPSHOT", path)
+    records = [{
+        "id": 7, "decision_group": "decision:seven", "horizon_minutes": 5,
+        "decision_timestamp": "2026-08-01T00:00:00+00:00",
+        "label_timestamp": "2026-08-01T00:05:00.123456+00:00",
+        "decision_confidence": 0.9, "spread_pct": 0.1, "sample_weight": 1.0,
+        **dict.fromkeys(audit.ECONOMICS_COLUMNS, 0.0),
+    }]
+    legacy_input = [{
+        **records[0],
+        "decision_timestamp": "2026-08-01 00:00:00+00:00",
+        "label_timestamp": "2026-08-01 00:05:00.123456+00:00",
+    }]
+    payload = {
+        "version": "2026-10-21.frozen-development.v1",
+        "development_cutoff": audit.CUTOFF,
+        "row_count": 1,
+        "decision_group_count": 1,
+        "development_input_sha256": hashlib.sha256(
+            json.dumps(legacy_input, sort_keys=True).encode()
+        ).hexdigest(),
+        "records": records,
+    }
+
+    def write():
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        path.write_text(json.dumps({**payload, "snapshot_sha256": digest}), encoding="utf-8")
+        return digest
+
+    monkeypatch.setattr(audit, "EXPECTED_SNAPSHOT_SHA256", write())
+    return path, payload, write
+
+
+def test_v1_snapshot_is_read_only_and_not_a_current_training_input(historical_snapshot):
+    path, _, _ = historical_snapshot
+    original = path.read_bytes()
+
+    frame, snapshot = audit.load_historical_snapshot()
+
+    assert frame["id"].tolist() == [7]
+    assert frame.iloc[0]["label_timestamp"] == pd.Timestamp("2026-08-01T00:05:00.123456Z")
+    comparison = audit.inspect_snapshot(frame, snapshot)["numeric_comparison"]
+    assert comparison["frozen_only_columns"] == ["decision_confidence"]
+    assert "technical_indicator_timeframe_minutes" in comparison["current_only_columns"]
+    assert "spread_pct" in comparison["compared_columns"]
+    with pytest.raises(ValueError, match="snapshot integrity failure"):
+        load_development_snapshot(path, cutoff=audit.CUTOFF)
+    assert path.read_bytes() == original
+
+
+def test_mutated_v1_snapshot_cannot_replace_pinned_evidence(historical_snapshot):
+    _, payload, write = historical_snapshot
+    payload["records"][0]["sample_weight"] = 2.0
+    write()
+    with pytest.raises(ValueError, match="snapshot integrity failure"):
+        audit.load_historical_snapshot()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("development_input_sha256", "wrong", "frame fingerprint mismatch"),
+        ("development_cutoff", "2026-09-27T00:00:00Z", "cutoff cannot change"),
+        ("row_count", 2, "boundary or accounting mismatch"),
+    ],
+)
+def test_v1_payload_integrity_does_not_bypass_other_checks(
+    historical_snapshot, monkeypatch, field, value, error,
+):
+    _, payload, write = historical_snapshot
+    payload[field] = value
+    monkeypatch.setattr(audit, "EXPECTED_SNAPSHOT_SHA256", write())
+    with pytest.raises(ValueError, match=error):
+        audit.load_historical_snapshot()
 
 
 @pytest.fixture
@@ -106,6 +188,17 @@ def test_modified_feature_cost_and_label_are_not_silently_replaced(source):
     assert issues["source_value_mismatch:long_return_pct"] == 1
     assert issues["source_value_mismatch:short_execution_cost_pct"] == 1
     assert frozen.iloc[0]["long_return_pct"] == 0.1
+
+
+def test_old_feature_set_does_not_impute_new_columns(source):
+    frozen, row, rebuilt = source
+    new_column = "technical_indicator_timeframe_minutes"
+    frozen = frozen.drop(columns=new_column)
+    rebuilt[new_column] = 5
+    rebuilt["long_execution_cost_pct"] = 2
+    issues, _, _, _, _ = audit.inspect_source_batch(frozen, [row])
+    assert f"source_value_mismatch:{new_column}" not in issues
+    assert issues["source_value_mismatch:long_execution_cost_pct"] == 1
 
 
 def test_excluded_or_no_longer_cost_complete_source_blocks_research(source, monkeypatch):
