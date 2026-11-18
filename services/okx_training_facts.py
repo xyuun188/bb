@@ -591,6 +591,36 @@ def _protection_execution(order: Any) -> dict[str, Any]:
     return {}
 
 
+def verified_stop_loss_fills(
+    history: Any, orders_by_exchange_id: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return signed OKX stop fills linked to this exact instrument and side."""
+    inst_id = _text(_value(history, "inst_id")).upper()
+    side = _text(_value(history, "side")).lower()
+    result = []
+    for order_id in _list(_value(history, "close_order_ids")):
+        order = orders_by_exchange_id.get(order_id)
+        execution = _protection_execution(order)
+        slippage = _safe_float(execution.get("stop_loss_slippage_pct"), None)
+        if (
+            _text(execution.get("actual_side")).lower() == "sl"
+            and execution.get("stop_loss_slippage_source") == OKX_STOP_LOSS_SLIPPAGE_SOURCE
+            and execution.get("stop_loss_slippage_credential_scope")
+            and _text(execution.get("inst_id")).upper() == inst_id
+            and _text(execution.get("position_side")).lower() == side
+            and order_id == _text(execution.get("generated_order_id"))
+            and order_id == _text(_value(order, "exchange_order_id"))
+            and slippage is not None
+            and slippage >= 0.0
+        ):
+            result.append({
+                "order_id": order_id,
+                "slippage_pct": slippage,
+                "credential_scope": execution["stop_loss_slippage_credential_scope"],
+            })
+    return result
+
+
 def _protection_submission(order: Any) -> dict[str, Any]:
     raw = _dict(_value(order, "okx_raw_fills", {}))
     submission = _dict(raw.get("protection_submission"))
@@ -1319,29 +1349,7 @@ def build_okx_history_training_sample(
     stop_loss_fill_confirmed = bool(
         protection_execution and _text(protection_execution.get("actual_side")).lower() == "sl"
     )
-    # The first protection fill can be a TP or an older, unscoped stop.
-    verified_stops = []
-    for order in close_orders:
-        execution = _protection_execution(order)
-        order_id = _text(execution.get("generated_order_id"))
-        slippage = _safe_float(execution.get("stop_loss_slippage_pct"), None)
-        if (
-            _text(execution.get("actual_side")).lower() == "sl"
-            and execution.get("stop_loss_slippage_source") == OKX_STOP_LOSS_SLIPPAGE_SOURCE
-            and execution.get("stop_loss_slippage_credential_scope")
-            and _text(execution.get("inst_id")).upper()
-            == _text(_value(history, "inst_id")).upper()
-            and _text(execution.get("position_side")).lower() == side
-            and order_id in close_order_ids
-            and order_id == _text(_value(order, "exchange_order_id"))
-            and slippage is not None
-            and slippage >= 0.0
-        ):
-            verified_stops.append({
-                "order_id": order_id,
-                "slippage_pct": slippage,
-                "credential_scope": execution["stop_loss_slippage_credential_scope"],
-            })
+    verified_stops = verified_stop_loss_fills(history, orders_by_exchange_id)
     entry_execution_slippage_usdt = _safe_float(
         entry_fill_group.get("execution_slippage_usdt"),
         None,

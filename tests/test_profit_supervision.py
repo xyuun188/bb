@@ -228,6 +228,14 @@ def test_stop_slippage_requires_a_complete_okx_stop_fill_lifecycle() -> None:
     )
     assert stop_only["profiles"] == {}
     assert stop_only["stop_loss_slippage_profiles"]["BTC/USDT|long"] == exact
+    dedicated = authoritative_execution_cost_calibration(
+        [verified], execution_mode="paper", credential_scope="current", stop_outcomes=[],
+    )
+    assert dedicated["profiles"] == calibration["profiles"]
+    assert dedicated["stop_loss_slippage_profiles"] == {}
+    assert authoritative_execution_cost_calibration(
+        [verified], execution_mode="paper", credential_scope="current", stop_outcomes=[verified],
+    ) == calibration
 
     for field, invalid_value in (
         ("verified_stop_loss_fills", []),

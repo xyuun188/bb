@@ -61,7 +61,10 @@ from services.analysis_services import (
     PositionReviewService,
     round_cancellation_state,
 )
-from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
+from services.authoritative_trade_outcome import (
+    load_authoritative_stop_outcomes,
+    load_authoritative_trade_outcomes,
+)
 from services.continuous_model_weight import (
     ContinuousModelWeightEvidenceService,
     ContinuousModelWeightPolicy,
@@ -8446,14 +8449,14 @@ class TradingService(ModelTrainingCoordinatorMixin):
         return await service.recent(mode)
 
     async def _execution_trade_calibration(self, mode: str) -> dict[str, Any]:
-        outcomes = await load_authoritative_trade_outcomes(
-            mode=mode,
-            since=datetime.now(UTC) - timedelta(hours=72),
-            limit=500,
-            compact=True,
+        since = datetime.now(UTC) - timedelta(hours=72)
+        scope = okx_credential_scope(mode)
+        outcomes, stop_outcomes = await asyncio.gather(
+            load_authoritative_trade_outcomes(mode=mode, since=since, limit=500, compact=True),
+            load_authoritative_stop_outcomes(mode=mode, since=since, credential_scope=scope),
         )
         calibration = authoritative_execution_cost_calibration(
-            outcomes, execution_mode=mode, credential_scope=okx_credential_scope(mode)
+            outcomes, execution_mode=mode, credential_scope=scope, stop_outcomes=stop_outcomes,
         )
         calibration["generated_at"] = datetime.now(UTC).isoformat()
         return calibration

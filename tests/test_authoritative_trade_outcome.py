@@ -9,19 +9,84 @@ import pytest
 import services.authoritative_trade_outcome as authoritative_trade_outcome
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
-from models.trade import OkxPositionHistory
+from models.trade import OkxPositionHistory, Order
 from services.authoritative_trade_outcome import (
     AUTHORITATIVE_TRADE_LABEL_VERSION,
     AUTHORITATIVE_TRADE_OUTCOME_VERSION,
     _decision_feature_projection,
     _decision_learning_projection,
     build_authoritative_trade_outcome,
+    load_authoritative_stop_outcomes,
     load_authoritative_trade_outcomes,
 )
 from services.okx_execution_slippage import OKX_ROUND_TRIP_SLIPPAGE_SOURCE
+from services.okx_native_facts import OKX_STOP_LOSS_SLIPPAGE_SOURCE
 from services.okx_position_history_store import load_okx_position_history_records
 from services.training_data_quality import annotate_training_payload
 from tests.feature_availability_fixtures import seal_synthetic_feature_availability
+
+
+@pytest.mark.asyncio
+async def test_stop_loader_uses_own_window_and_exact_close_link(tmp_path, monkeypatch) -> None:
+    await close_db()
+    monkeypatch.setattr(
+        settings, "database_url", f"sqlite+aiosqlite:///{(tmp_path / 'stop-facts.db').as_posix()}",
+    )
+    await init_db()
+    now = datetime.now(UTC)
+
+    def history(key, age, ids):
+        closed_at = now - timedelta(hours=age)
+        opened_at = closed_at - timedelta(hours=1)
+        return OkxPositionHistory(
+            mode="paper", row_identity=key, pos_id=key, pos_side="long", side="long",
+            inst_id="BTC-USDT-SWAP", symbol="BTC/USDT", close_order_ids=ids,
+            opened_at=opened_at, updated_at_okx=closed_at,
+            raw_row={
+                "instId": "BTC-USDT-SWAP", "posId": key, "posSide": "long", "type": "2",
+                "cTime": str(int(opened_at.timestamp() * 1000)),
+                "uTime": str(int(closed_at.timestamp() * 1000)),
+            },
+        )
+
+    def stop(key, *, mode="paper", scope="current", side="long"):
+        return Order(
+            model_name="okx", execution_mode=mode, symbol="BTC/USDT", side="sell",
+            order_type="market", quantity=0.01, price=99, status="filled",
+            exchange_order_id=key, okx_raw_fills={
+                "protection_execution": {
+                    "actual_side": "sl", "lifecycle_complete": True,
+                    "source_authority": "okx_algo_history_plus_fills_history",
+                    "generated_order_id": key, "inst_id": "BTC-USDT-SWAP",
+                    "position_side": side, "stop_loss_slippage_pct": 0.2,
+                    "stop_loss_slippage_source": OKX_STOP_LOSS_SLIPPAGE_SOURCE,
+                    "stop_loss_slippage_credential_scope": scope,
+                },
+            },
+        )
+
+    try:
+        async with get_session_ctx() as session:
+            session.add_all([
+                history("latest", 1, []),
+                history("within-window", 48, ["valid", "stale-key", "other-mode", "wrong-side"]),
+                history("expired", 73, ["expired-order"]),
+                stop("valid"), stop("stale-key", scope="rotated"), stop("other-mode", mode="live"),
+                stop("wrong-side", side="short"), stop("expired-order"), stop("unlinked"),
+            ])
+        monkeypatch.setattr(authoritative_trade_outcome, "_COMPACT_OUTCOME_REFRESH_BATCH_ROWS", 1)
+        actual = await load_authoritative_stop_outcomes(
+            mode="paper", since=now - timedelta(hours=72), credential_scope="current",
+        )
+        assert actual == [{
+            "source": "okx_position_history", "execution_mode": "paper",
+            "symbol": "BTC/USDT", "inst_id": "BTC-USDT-SWAP", "side": "long",
+            "verified_stop_loss_fills": [{
+                "order_id": "valid", "slippage_pct": 0.2, "credential_scope": "current",
+            }],
+        }]
+    finally:
+        await close_db()
 
 
 def test_compact_decision_projection_keeps_training_facts_without_large_payloads() -> None:

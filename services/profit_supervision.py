@@ -754,6 +754,7 @@ def authoritative_execution_cost_calibration(
     *,
     execution_mode: str,
     credential_scope: str = "",
+    stop_outcomes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Reprice execution from settled lifecycles, including costly losing fills.
 
@@ -767,11 +768,7 @@ def authoritative_execution_cost_calibration(
     stop_buckets: dict[str, list[tuple[float, float]]] = defaultdict(list)
     seen: set[str] = set()
     seen_stops: set[tuple[str, str]] = set()
-    for outcome in outcomes:
-        label = _safe_dict(outcome.get("training_label_contract"))
-        lifecycle = _safe_text(outcome.get("lifecycle_key"))
-        slippage = _safe_float(label.get("slippage_pct"))
-        net = _safe_float(label.get(PROFIT_TRAINING_TARGET))
+    for outcome in outcomes if stop_outcomes is None else stop_outcomes:
         side = _safe_text(outcome.get("side")).lower()
         symbol = normalize_trading_symbol(outcome.get("symbol"))
         # A stop fill can be verified even when the trade has no training label.
@@ -799,6 +796,13 @@ def authoritative_execution_cost_calibration(
                     seen_stops.add(stop_key)
                     stop_buckets[f"{symbol}|{side}"].append((slippage_pct, 1.0))
 
+    for outcome in outcomes:
+        label = _safe_dict(outcome.get("training_label_contract"))
+        lifecycle = _safe_text(outcome.get("lifecycle_key"))
+        slippage = _safe_float(label.get("slippage_pct"))
+        net = _safe_float(label.get(PROFIT_TRAINING_TARGET))
+        side = _safe_text(outcome.get("side")).lower()
+        symbol = normalize_trading_symbol(outcome.get("symbol"))
         if (
             outcome.get("execution_mode") != execution_mode
             or label.get("execution_mode") != execution_mode

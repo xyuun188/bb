@@ -40,6 +40,7 @@ from services.okx_training_facts import (
     REALIZED_NET_PNL_FORMULA,
     build_funding_bill_lifecycle_facts,
     build_okx_history_training_sample,
+    verified_stop_loss_fills,
 )
 from services.profit_training_contract import (
     PROFIT_TRAINING_TARGET,
@@ -636,6 +637,57 @@ def build_authoritative_trade_outcome(
     outcome["trade_fact_trusted"] = bool(sample.get("trade_fact_trusted")) and not gaps
     outcome["trade_fact_trust_reason"] = gaps[0] if gaps else ""
     return outcome
+
+
+async def load_authoritative_stop_outcomes(
+    *,
+    mode: str,
+    since: datetime,
+    credential_scope: str,
+    limit: int = _COMPACT_OUTCOME_MAX_HISTORY_ROWS,
+) -> list[dict[str, Any]]:
+    """Read recent stop evidence without reconstructing return-training labels."""
+    if not credential_scope:
+        return []
+    async with get_read_session_ctx() as session:
+        histories = await load_okx_position_history_records(
+            session, mode=mode, since=since, limit=limit,
+        )
+        settled_histories = [
+            history for history in histories
+            if history.updated_at_okx is not None and isinstance(history.close_order_ids, list)
+        ]
+        close_order_ids = sorted({
+            str(order_id).strip()
+            for history in settled_histories
+            for order_id in history.close_order_ids
+            if order_id is not None and str(order_id).strip()
+        })
+        orders: list[Order] = []
+        scope = Order.okx_raw_fills["protection_execution"][
+            "stop_loss_slippage_credential_scope"
+        ].as_string()
+        for offset in range(0, len(close_order_ids), 500):
+            result = await session.execute(select(Order).where(
+                Order.execution_mode == mode,
+                Order.status == "filled",
+                Order.exchange_order_id.in_(close_order_ids[offset : offset + 500]),
+                scope == credential_scope,
+            ))
+            orders.extend(result.scalars().all())
+        orders_by_id = authoritative_orders_by_exchange_id(orders)
+        return [
+            {
+                "source": "okx_position_history",
+                "execution_mode": mode,
+                "symbol": history.symbol,
+                "inst_id": history.inst_id,
+                "side": history.side,
+                "verified_stop_loss_fills": stops,
+            }
+            for history in settled_histories
+            if (stops := verified_stop_loss_fills(history, orders_by_id))
+        ]
 
 
 async def load_authoritative_trade_outcomes(
