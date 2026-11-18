@@ -171,6 +171,8 @@ def test_time_coverage_sampling_preserves_old_groups_and_all_horizons() -> None:
     )
     sql = str(statement.compile(dialect=postgresql.dialect()))
     assert "research_ids AS MATERIALIZED" in sql
+    assert "research_candidates AS MATERIALIZED" in sql
+    assert sql.count("FROM shadow_backtests") == 2
     with engine.begin() as connection:
         connection.execute(table.insert(), rows)
         selected = list(connection.execute(statement).mappings())

@@ -90,13 +90,24 @@ def _build_development_statement(
         ShadowBacktest.created_at < cutoff,
         ShadowBacktest.due_at < cutoff,
     )
-    groups = (
+    # Reuse the bounded scalar scan for group selection and horizon expansion.
+    # Re-reading the wide table for both steps exhausts the online read budget.
+    candidates = (
         select(
+            ShadowBacktest.id,
             group_key.label("decision_group_key"),
-            func.min(ShadowBacktest.created_at).label("decision_at"),
+            ShadowBacktest.created_at,
         )
         .where(*filters)
-        .group_by(group_key)
+        .cte("research_candidates")
+        .prefix_with("MATERIALIZED", dialect="postgresql")
+    )
+    groups = (
+        select(
+            candidates.c.decision_group_key,
+            func.min(candidates.c.created_at).label("decision_at"),
+        )
+        .group_by(candidates.c.decision_group_key)
         .cte("research_groups")
         .prefix_with("MATERIALIZED", dialect="postgresql")
     )
@@ -118,8 +129,8 @@ def _build_development_statement(
     # Bound identities before parsing snapshots. Source/quality rejection
     # cannot cherry-pick a different outcome from the same time bucket.
     selected_ids = (
-        select(ShadowBacktest.id)
-        .where(*filters, group_key.in_(selected_groups))
+        select(candidates.c.id)
+        .where(candidates.c.decision_group_key.in_(selected_groups))
         .cte("research_ids")
         .prefix_with("MATERIALIZED", dialect="postgresql")
     )
