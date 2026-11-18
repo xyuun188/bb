@@ -105,7 +105,7 @@ def _online_report_command(args: argparse.Namespace) -> str:
         "scripts/run_okx_daily_reconciliation_report.py",
         "--stdout-only",
         "--json-indent",
-        str(int(args.json_indent or 0)),
+        "0",
     ]
     if args.allow_cache:
         remote_args.append("--allow-cache")
@@ -131,11 +131,13 @@ def run_online_report(args: argparse.Namespace) -> int:
         )
     finally:
         ssh.close()
-    print(output)
     try:
         report = _last_json_object(output)
     except json.JSONDecodeError:
+        print(output, file=sys.stderr)
         return 2
+    indent = args.json_indent if args.json_indent > 0 else None
+    print(json.dumps(report, ensure_ascii=False, indent=indent, sort_keys=True))
     return exit_code_for_report(report)
 
 

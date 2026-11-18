@@ -17,13 +17,14 @@ def test_okx_daily_reconciliation_report_uses_online_runtime_bootstrap() -> None
 
 
 def test_online_report_command_forces_read_only_online_runtime() -> None:
-    args = report_script._parse_args(["--online", "--json-indent", "0"])
+    args = report_script._parse_args(["--online", "--json-indent", "4"])
 
     command = report_script._online_report_command(args)
 
     assert "cd /data/bb/app" in command
     assert "postgresql+asyncpg://bb@/bb_trading?host=/var/run/postgresql" in command
     assert "--stdout-only" in command
+    assert "--json-indent 0" in command
     assert "--online" not in command
     assert "--output-dir" not in command
 
@@ -44,7 +45,7 @@ def test_run_online_report_relays_status_without_writing_or_mutating(
 
     def fake_run_remote_text(_ssh, command, **kwargs):
         calls.append({"command": command, **kwargs})
-        return json.dumps(
+        return "runtime finished\n" + json.dumps(
             {
                 "status": "ok",
                 "issue_ledger": {"summary": {"unresolved": 0}},
@@ -62,7 +63,9 @@ def test_run_online_report_relays_status_without_writing_or_mutating(
     assert ssh.closed is True
     assert calls[0]["check"] is False
     assert "--stdout-only" in str(calls[0]["command"])
-    assert json.loads(capsys.readouterr().out)["mutates_database"] is False
+    stdout = capsys.readouterr().out
+    assert '\n  "status": "ok"' in stdout
+    assert json.loads(stdout)["mutates_database"] is False
 
 
 def test_online_report_parser_ignores_runtime_logs_before_json() -> None:
