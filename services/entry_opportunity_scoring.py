@@ -717,18 +717,28 @@ class EntryOpportunityScoringPolicy:
                 "_slippage_upper_hinge",
             ),
         )
-        current_calibration = safe_dict(
-            safe_dict(strategy).get("execution_trade_calibration")
-        )
-        stop_profile = safe_dict(
-            safe_dict(current_calibration.get("stop_loss_slippage_profiles")).get(
-                f"{self.normalize_symbol(decision.symbol)}|{side}"
+        strategy_context = safe_dict(strategy)
+        current_calibration = safe_dict(strategy_context.get("execution_trade_calibration"))
+        symbol = self.normalize_symbol(decision.symbol)
+        stop_profile: dict[str, Any] = {}
+        if current_calibration.get("execution_mode") == execution_scope:
+            stop_profile = safe_dict(
+                safe_dict(current_calibration.get("stop_loss_slippage_profiles")).get(
+                    f"{symbol}|{side}"
+                )
             )
-        )
+        elif "execution_trade_calibration" not in strategy_context:
+            # Pre-order repricing uses compact decision context. Preserve only
+            # the stop evidence for this candidate; sizing rechecks the signing key.
+            stop_profile = safe_dict(
+                safe_dict(raw.get("opportunity_score")).get("stop_loss_slippage_calibration")
+            )
         current_stop_slippage_calibration = (
             stop_profile
-            if current_calibration.get("execution_mode") == execution_scope
-            and stop_profile.get("execution_mode") == execution_scope
+            if stop_profile.get("execution_mode") == execution_scope
+            and self.normalize_symbol(stop_profile.get("symbol")) == symbol
+            and stop_profile.get("side") == side
+            and stop_profile.get("profile_source") == "symbol_side"
             and stop_profile.get("stop_loss_slippage_source") == OKX_STOP_LOSS_SLIPPAGE_SOURCE
             else {}
         )

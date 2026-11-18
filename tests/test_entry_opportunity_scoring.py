@@ -5,6 +5,7 @@ import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_opportunity_scoring import EntryOpportunityScoringPolicy
+from services.entry_profit_risk_sizing import _same_mode_stop_slippage_distribution
 from services.model_strategy_blueprint import build_model_strategy_blueprint
 from services.normal_paper_trade import build_normal_paper_trade_contract
 from services.okx_native_facts import OKX_STOP_LOSS_SLIPPAGE_SOURCE
@@ -22,6 +23,7 @@ from services.return_objective import (
     RETURN_OBJECTIVE_VERSION,
     standardized_return_distribution,
 )
+from services.trading_policies import EntryPolicy
 from tests.normal_paper_test_fixtures import paper_quality_permissions
 from tests.paper_canary_fixtures import complete_paper_canary_raw
 
@@ -743,7 +745,9 @@ def test_paper_scoring_keeps_only_direction_support_selected_quant_families() ->
     )
 
 
-def test_paper_scoring_uses_fresh_execution_costs_without_artifact_promotion() -> None:
+def test_paper_scoring_uses_fresh_execution_costs_without_artifact_promotion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     decision = _decision()
     decision.raw_response["ml_signal"] = {}
     decision.raw_response["local_ai_tools"] = {
@@ -791,6 +795,21 @@ def test_paper_scoring_uses_fresh_execution_costs_without_artifact_promotion() -
         initial_net - max(0.3 - initial_slippage, 0.0)
     )
     assert opportunity["expected_net_breakdown"]["authoritative_trade_calibration_count"] == 1
+    # Final sizing reruns scoring from the compact context saved on the decision.
+    monkeypatch.setattr(
+        "services.entry_profit_risk_sizing.okx_credential_scope", lambda _: "current"
+    )
+    compact_context = EntryPolicy.strategy_context_from_decision(decision, "paper")
+    _scorer().score_candidate(decision, compact_context)
+    assert _same_mode_stop_slippage_distribution(
+        decision.raw_response["opportunity_score"], "paper", symbol=decision.symbol, side="long"
+    ) == stop_profile["stop_loss_slippage_pct"]
+    monkeypatch.setattr(
+        "services.entry_profit_risk_sizing.okx_credential_scope", lambda _: "rotated"
+    )
+    assert _same_mode_stop_slippage_distribution(
+        decision.raw_response["opportunity_score"], "paper", symbol=decision.symbol, side="long"
+    ) == {}
     context["execution_trade_calibration"]["profiles"] = {"*|long": {**profile, "symbol": "*"}}
     _scorer().score_candidate(decision, context)
     assert decision.raw_response["opportunity_score"]["stop_loss_slippage_calibration"] == stop_profile

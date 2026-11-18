@@ -1834,6 +1834,66 @@ def test_stored_first_page_is_not_permanently_authoritative() -> None:
 
 
 @pytest.mark.asyncio
+async def test_account_discovery_persists_signed_stop_fill(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "signed-stop-discovery.db")
+    now = datetime.now(UTC)
+    order_id = "new-stop-close"
+    filled = {
+        **_fill_row(now, order_id=order_id),
+        "side": "sell",
+        "fillPx": "59400",
+        "fillPnl": "-12",
+        "_bb_okx_credential_scope": "paper-signing-key",
+    }
+    algo = {
+        "algoId": "stop-protection",
+        "ordId": "another-child",
+        "ordIdList": ["another-child", order_id],
+        "instId": "BTC-USDT-SWAP",
+        "side": "sell",
+        "posSide": "long",
+        "state": "effective",
+        "reduceOnly": "true",
+        "actualSide": "sl",
+        "slTriggerPx": "60000",
+        "triggerTime": _ms(now - timedelta(seconds=1)),
+        "_bb_okx_credential_scope": "paper-signing-key",
+    }
+
+    class StopHistoryCcxt(_FakeCcxt):
+        async def privateGetTradeOrdersAlgoHistory(self, params):
+            return {"data": [algo] if params.get("ordType") == "oco" else []}
+
+    ccxt = StopHistoryCcxt(
+        fills=[filled],
+        orders=[{
+            **_order_row(now, order_id=order_id),
+            "side": "sell",
+            "posSide": "long",
+            "accFillSz": "2",
+            "avgPx": "59400",
+        }],
+    )
+    try:
+        report = await OkxOrderFactSyncService(
+            mode="paper", executor_factory=_executor_factory(ccxt),
+        ).sync()
+
+        assert "protection_algo_history" in report["completed_stages"]
+        async with get_session_ctx() as session:
+            order = (
+                await session.execute(select(Order).where(Order.exchange_order_id == order_id))
+            ).scalar_one()
+            protection = order.okx_raw_fills["protection_execution"]
+            assert protection["stop_loss_slippage_credential_scope"] == "paper-signing-key"
+            assert protection["stop_loss_slippage_pct"] == pytest.approx(1.0)
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_recovery_order_continues_through_protection_history(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
