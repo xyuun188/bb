@@ -15,12 +15,15 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import select
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.exceptions import ExchangeAPIError  # noqa: E402
 from db.session import close_db, get_read_session_ctx  # noqa: E402
+from models.decision import AIDecision  # noqa: E402
 from services.authoritative_trade_outcome import load_authoritative_trade_outcomes  # noqa: E402
 from services.okx_native_facts import (  # noqa: E402
     _account_bill_from_row,
@@ -51,7 +54,111 @@ def _utc(value: str) -> datetime:
     return result.astimezone(UTC)
 
 
-def summarize_lifecycles(outcomes: list[dict[str, Any]], *, since: datetime) -> dict[str, Any]:
+def _single_entry_decision_id(row: dict[str, Any]) -> int | None:
+    decision_id = row.get("decision_id")
+    if (
+        type(decision_id) is int and decision_id > 0
+        and row.get("entry_decision_ids") == [decision_id]
+    ):
+        return decision_id
+    return None
+
+
+async def _load_entry_evidence(
+    outcomes: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    ids = sorted({
+        decision_id for row in outcomes if row.get("close_status") == "full"
+        and (decision_id := _single_entry_decision_id(row)) is not None
+    })
+    result = {}
+    contract = AIDecision.decision_learning_snapshot["normal_paper_trade"]
+    async with get_read_session_ctx(
+        statement_timeout_ms=15_000, transaction_isolation="REPEATABLE READ READ ONLY",
+    ) as session:
+        for offset in range(0, len(ids), 50):
+            statement = select(
+                AIDecision.id,
+                contract["quant_evidence_families"].label("families"),
+                contract["selection_reason"].as_string().label("selection_reason"),
+                contract["side"].as_string().label("side"),
+            ).where(AIDecision.id.in_(ids[offset : offset + 50]))
+            rows = (await session.execute(statement)).mappings()
+            result.update({row["id"]: dict(row) for row in rows})
+    return result
+
+
+def _entry_signal_economics(
+    rows: list[dict[str, Any]], evidence: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    cohorts: dict[tuple[str, str, str, tuple[str, ...]], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        decision_id = _single_entry_decision_id(row)
+        side = str(row.get("side") or "unknown")
+        route = str(row.get("strategy_selection_reason") or "unknown")
+        entry = evidence.get(decision_id) if decision_id else None
+        objective = None
+        families: tuple[str, ...] = ()
+        if decision_id:
+            frozen = row.get("normal_paper_trade_evidence") or {}
+            objective = _finite(frozen.get("objective_net_return_pct"))
+            if (
+                entry and entry["selection_reason"] == route and entry["side"] == side
+                and isinstance(entry["families"], list)
+            ):
+                families = tuple(sorted({
+                    family for family in entry["families"] if isinstance(family, str) and family
+                }))
+        quality = (
+            "unattributed" if objective is None else "positive_objective" if objective > 0
+            else "non_positive_objective"
+        )
+        cohorts[side, route, quality, families].append(row)
+    summaries = []
+    for (side, route, quality, families), cohort in sorted(cohorts.items()):
+        pnl = [
+            row["realized_net_pnl_components"]["reported_realized_net_pnl_usdt"] for row in cohort
+        ]
+        returns = [
+            value for row in cohort if (value := _finite(row.get("net_return_after_all_cost_pct")))
+            is not None
+        ]
+        gross_loss = -math.fsum(value for value in pnl if value < 0)
+        equity = peak = drawdown = 0.0
+        dated_pnl: dict[datetime, list[float]] = defaultdict(list)
+        for row, value in zip(cohort, pnl, strict=True):
+            if row.get("label_timestamp"):
+                dated_pnl[_utc(row["label_timestamp"])].append(value)
+        for _, values in sorted(dated_pnl.items()):
+            equity += math.fsum(values)
+            peak = max(peak, equity)
+            drawdown = max(drawdown, peak - equity)
+        summaries.append({
+            "side": side,
+            "entry_selection_reason": route,
+            "objective_at_entry": quality,
+            "quant_evidence_families": list(families),
+            "count": len(cohort),
+            "realized_net_pnl_usdt": math.fsum(pnl),
+            "fee_after_return_count": len(returns),
+            "mean_fee_after_return_pct": math.fsum(returns) / len(returns) if returns else None,
+            "profit_factor": math.fsum(value for value in pnl if value > 0) / gross_loss
+            if gross_loss > 0 else None,
+            "settled_pnl_drawdown_usdt": drawdown
+            if sum(map(len, dated_pnl.values())) == len(pnl) else None,
+        })
+    return {
+        "rows": summaries,
+        "scope": "observed_closed_lifecycles_only",
+        "return_confidence_bound": None,
+        "counterfactual_execution_or_portfolio_equity_evaluated": False,
+    }
+
+
+def summarize_lifecycles(
+    outcomes: list[dict[str, Any]], *, since: datetime,
+    entry_evidence: dict[int, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Summarize canonical facts; do not invent a second settlement formula."""
     unique: dict[str, dict[str, Any]] = {}
     duplicates = 0
@@ -138,6 +245,7 @@ def summarize_lifecycles(outcomes: list[dict[str, Any]], *, since: datetime) -> 
             and _utc(row["decision_timestamp"]) < since for row in valid
         ),
         "full_lifecycle_totals": totals,
+        "entry_signal_economics": _entry_signal_economics(valid, entry_evidence or {}),
         "full_lifecycles_by_side": {
             side: {
                 **pnl_stats([value for values in entries.values() for value in values]),
@@ -313,6 +421,7 @@ async def audit(*, until: datetime, hours: int, limit: int, bill_pages: int) -> 
         if row.get("label_timestamp") and since <= _utc(row["label_timestamp"]) < until
     ]
     outcomes = outcomes[-limit:]
+    entry_evidence = await _load_entry_evidence(outcomes)
     executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
     try:
         exchange = await executor._get_ccxt()
@@ -322,7 +431,7 @@ async def audit(*, until: datetime, hours: int, limit: int, bill_pages: int) -> 
     finally:
         await executor.shutdown()
     return {
-        "audit_version": "profitability-economics.v1",
+        "audit_version": "profitability-economics.v2",
         "generated_at": datetime.now(UTC).isoformat(),
         "window_start_utc": since.isoformat(),
         "window_end_utc_exclusive": until.isoformat(),
@@ -333,7 +442,7 @@ async def audit(*, until: datetime, hours: int, limit: int, bill_pages: int) -> 
         "canonical_rows_loaded_before_cutoff_filter": canonical_rows_loaded,
         "lifecycle_limit_reached": lifecycle_limit_reached,
         "lifecycle_window_complete": not lifecycle_limit_reached,
-        "lifecycles": summarize_lifecycles(outcomes, since=since),
+        "lifecycles": summarize_lifecycles(outcomes, since=since, entry_evidence=entry_evidence),
         "bill_coverage": coverage,
         "bills": summarize_bills(bills, outcomes=outcomes),
     }

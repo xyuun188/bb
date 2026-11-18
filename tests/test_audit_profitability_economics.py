@@ -82,6 +82,41 @@ def test_profit_breakdown_uses_only_consistent_full_lifecycles():
     assert sides["short"]["profit_factor"] is None
 
 
+def test_entry_signal_economics_does_not_attribute_aggregate_or_mismatched_entries():
+    entry = {
+        "side": "long",
+        "strategy_selection_reason": "paper_training_entry",
+        "normal_paper_trade_evidence": {"objective_net_return_pct": -0.2},
+        "net_return_after_all_cost_pct": -0.15,
+        "label_timestamp": SINCE.isoformat(),
+    }
+    exact = outcome(decision_id=1, entry_decision_ids=[1], **entry)
+    aggregate = outcome("aggregate", decision_id=1, entry_decision_ids=[1, 2], **entry)
+    mismatched = outcome("mismatched", decision_id=3, entry_decision_ids=[3], **entry)
+    report = summarize_lifecycles(
+        [exact, aggregate, mismatched],
+        since=SINCE,
+        entry_evidence={
+            1: {"side": "long", "selection_reason": "paper_training_entry",
+                "families": ["local_ai_tools", "local_ai_tools"]},
+            3: {"side": "short", "selection_reason": "paper_training_entry",
+                "families": ["local_ml"]},
+        },
+    )["entry_signal_economics"]
+
+    assert {
+        (row["objective_at_entry"], tuple(row["quant_evidence_families"])): row["count"]
+        for row in report["rows"]
+    } == {
+        ("non_positive_objective", ("local_ai_tools",)): 1,
+        ("non_positive_objective", ()): 1,
+        ("unattributed", ()): 1,
+    }
+    assert report["rows"][1]["mean_fee_after_return_pct"] == -0.15
+    assert report["rows"][1]["settled_pnl_drawdown_usdt"] == 0.75
+    assert report["return_confidence_bound"] is None
+
+
 def test_slippage_is_measured_but_never_deducted_twice_and_horizon_is_diagnostic():
     result = summarize_lifecycles([outcome()], since=SINCE)
     assert result["full_lifecycle_totals"]["realized_net_pnl_usdt"] == -0.75
