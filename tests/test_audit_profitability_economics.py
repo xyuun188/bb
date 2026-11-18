@@ -54,6 +54,32 @@ def test_partial_updates_do_not_enter_full_round_trip_totals():
     assert result["full_lifecycles_opened_before_window_count"] == 1
 
 
+def test_profit_breakdown_uses_only_consistent_full_lifecycles():
+    long_training = outcome(side="long", strategy_selection_reason="paper_training_entry")
+    short_validated = outcome(
+        "short", side="short", strategy_selection_reason="strategy_edge_selected"
+    )
+    short_validated["realized_net_pnl_components"]["reported_realized_net_pnl_usdt"] = 2.0
+    inconsistent = outcome("bad", side="long", strategy_selection_reason="invalid")
+    inconsistent["realized_net_pnl_components"]["formula_consistent"] = False
+    partial = outcome("partial", side="short", close_status="partial")
+
+    result = summarize_lifecycles(
+        [long_training, short_validated, inconsistent, partial], since=SINCE
+    )
+
+    sides = result["full_lifecycles_by_side"]
+    assert sides["long"]["by_entry_selection_reason"]["paper_training_entry"] == {
+        "count": 1, "profitable_count": 0, "losing_count": 1,
+        "winning_net_pnl_usdt": 0.0, "losing_net_pnl_usdt": -0.75,
+        "realized_net_pnl_usdt": -0.75, "profit_factor": 0.0,
+    }
+    assert set(sides["long"]["by_entry_selection_reason"]) == {"paper_training_entry"}
+    assert sides["short"]["count"] == 1
+    assert sides["short"]["realized_net_pnl_usdt"] == 2.0
+    assert sides["short"]["profit_factor"] is None
+
+
 def test_slippage_is_measured_but_never_deducted_twice_and_horizon_is_diagnostic():
     result = summarize_lifecycles([outcome()], since=SINCE)
     assert result["full_lifecycle_totals"]["realized_net_pnl_usdt"] == -0.75

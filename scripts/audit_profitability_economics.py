@@ -81,6 +81,30 @@ def summarize_lifecycles(outcomes: list[dict[str, Any]], *, since: datetime) -> 
         key: math.fsum(row["realized_net_pnl_components"][source] for row in valid)
         for key, source in fields.items()
     }
+    by_side_and_entry: dict[str, dict[str, list[float]]] = {}
+    for row in valid:
+        side = str(row.get("side") or "").lower()
+        if side not in {"long", "short"}:
+            side = "unknown"
+        entry = str(row.get("strategy_selection_reason") or "unknown")
+        net_pnl = row["realized_net_pnl_components"]["reported_realized_net_pnl_usdt"]
+        by_side_and_entry.setdefault(side, {}).setdefault(entry, []).append(net_pnl)
+
+    def pnl_stats(values: list[float]) -> dict[str, Any]:
+        wins = [value for value in values if value > 0]
+        losses = [value for value in values if value < 0]
+        gross_profit = math.fsum(wins)
+        gross_loss = -math.fsum(losses)
+        return {
+            "count": len(values),
+            "profitable_count": len(wins),
+            "losing_count": len(losses),
+            "winning_net_pnl_usdt": gross_profit,
+            "losing_net_pnl_usdt": math.fsum(losses),
+            "realized_net_pnl_usdt": math.fsum(values),
+            "profit_factor": gross_profit / gross_loss if gross_loss > 0 else None,
+        }
+
     gap_counts = Counter(
         str(gap) for row in rows for gap in set(row.get("outcome_evidence_gaps") or [])
     )
@@ -110,6 +134,15 @@ def summarize_lifecycles(outcomes: list[dict[str, Any]], *, since: datetime) -> 
             and _utc(row["decision_timestamp"]) < since for row in valid
         ),
         "full_lifecycle_totals": totals,
+        "full_lifecycles_by_side": {
+            side: {
+                **pnl_stats([value for values in entries.values() for value in values]),
+                "by_entry_selection_reason": {
+                    entry: pnl_stats(values) for entry, values in entries.items()
+                },
+            }
+            for side, entries in by_side_and_entry.items()
+        },
         "profitable_full_count": sum(
             row["realized_net_pnl_components"]["reported_realized_net_pnl_usdt"] > 0
             for row in valid
