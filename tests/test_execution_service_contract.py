@@ -10,8 +10,10 @@ import pytest
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.authoritative_trade_outcome import build_authoritative_trade_outcome
-from services.decision_state import DecisionStage, DecisionStageStatus
+from services.decision_execution_trace import build_execution_trace
+from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
 from services.entry_profit_risk_sizing import _fingerprint
+from services.execution_result_classifier import ExecutionResultClassifier
 from services.execution_result_factory import ExecutionResultFactory
 from services.execution_service import ExecutionService, _return_entry_contract_result
 from services.exit_execution_singleflight import ExitExecutionLease
@@ -77,11 +79,14 @@ def _test_execution_service(
         stage: str,
         status: str,
         reason: str,
-        _data: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if stages is not None:
             stages.append((stage, status, reason))
-        return _decision.raw_response if isinstance(_decision.raw_response, dict) else {}
+        _decision.raw_response = append_decision_stage(
+            _decision.raw_response, stage, status, reason, data,
+        )
+        return _decision.raw_response
 
     async def allow_entry(*_args: Any, **_kwargs: Any) -> PolicyGateResult:
         return PolicyGateResult.allow()
@@ -101,7 +106,7 @@ def _test_execution_service(
         allocated_order_balance_provider=lambda *_args: _noop_async(),
         rejected_execution_result_factory=ExecutionResultFactory().rejected,
         execution_leverage_summary_attacher=lambda *_args: None,
-        execution_reason_provider=lambda result: result.raw_response.get("error") if result else "",
+        execution_reason_provider=ExecutionResultClassifier().reason_from_result,
         pending_execution_marker=_noop_async,
         trade_logger=trade_logger or _noop_async,
         exchange_confirmed_checker=lambda result: bool(
@@ -2061,28 +2066,10 @@ async def test_confirmed_exit_rebalances_protection_after_position_persistence()
     assert raw_updates[-1]["post_exit_protection_rebalance"]["verified"] is True
 
 
-@pytest.mark.asyncio
-async def test_unknown_exit_result_does_not_immediately_submit_a_second_order() -> None:
-    calls = 0
-
-    class UnknownExitExecutor:
-        async def place_order(
-            self,
-            _decision: DecisionOutput,
-            account_id: str | None = None,
-            override_balance: float | None = None,
-        ) -> None:
-            nonlocal calls
-            calls += 1
-            return None
-
-    async def okx_executor_provider(_mode: str) -> Any:
-        return UnknownExitExecutor()
-
-    service = _test_execution_service(okx_executor_provider=okx_executor_provider)
-    decision = DecisionOutput(
+def _full_exit_decision(symbol: str = "ZAMA/USDT") -> DecisionOutput:
+    return DecisionOutput(
         model_name="ensemble_trader",
-        symbol="ZAMA/USDT",
+        symbol=symbol,
         action=Action.CLOSE_SHORT,
         confidence=1.0,
         reasoning="hard stop",
@@ -2104,6 +2091,20 @@ async def test_unknown_exit_result_does_not_immediately_submit_a_second_order() 
         },
     )
 
+
+@pytest.mark.asyncio
+async def test_unknown_exit_result_does_not_immediately_submit_a_second_order() -> None:
+    calls = 0
+
+    async def place_order(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        return SimpleNamespace(place_order=place_order)
+
+    service = _test_execution_service(okx_executor_provider=okx_executor_provider)
+    decision = _full_exit_decision()
     result = await service.execute_candidate(
         "ZAMA/USDT",
         "ensemble_trader",
@@ -2116,7 +2117,7 @@ async def test_unknown_exit_result_does_not_immediately_submit_a_second_order() 
 
     assert calls == 1
     assert result is not None
-    assert result.status == OrderStatus.OPEN
+    assert result.status == OrderStatus.PENDING
     assert result.order_id == "exit_submission_result_unknown"
     assert result.raw_response["execution_transport_unknown"] is True
     assert result.raw_response["do_not_persist_order"] is True
@@ -2298,16 +2299,78 @@ async def test_outer_cancellation_then_exchange_timeout_cancels_detached_submit(
         return PendingExecutor()
 
     monkeypatch.setattr("services.execution_service.asyncio.wait_for", short_exchange_timeout)
-    service = _test_execution_service(okx_executor_provider=provider)
+    stages = []
+    recovery_modes = []
+    service = _test_execution_service(
+        okx_executor_provider=provider,
+        stages=stages,
+        order_fact_recovery_trigger=recovery_modes.append,
+    )
+    decision = _full_exit_decision("BTC/USDT")
     task = asyncio.create_task(service.execute_candidate(
-        "BTC/USDT", "ensemble_trader", _profit_first_ready_position_review_decision(),
+        "BTC/USDT", "ensemble_trader", decision,
         SimpleNamespace(warnings=[]), 993,
         {"warnings": [], "decisions": [], "executions": []}, open_positions=[],
     ))
     await real_wait_for(started.wait(), timeout=1)
     task.cancel()
-    await real_wait_for(task, timeout=1)
+    result = await real_wait_for(task, timeout=1)
     assert cleaned.is_set()
+    assert result is not None and result.status == OrderStatus.PENDING
+    assert result.raw_response["do_not_persist_order"] is True
+    assert recovery_modes == ["paper"]
+    assert [(stage, status) for stage, status, _ in stages if stage in {
+        DecisionStage.EXCHANGE_SUBMIT, DecisionStage.EXCHANGE_CONFIRM, DecisionStage.LOCAL_SYNC,
+    }] == [
+        (DecisionStage.EXCHANGE_SUBMIT, DecisionStageStatus.PENDING),
+        (DecisionStage.EXCHANGE_SUBMIT, DecisionStageStatus.UNKNOWN),
+        (DecisionStage.EXCHANGE_CONFIRM, DecisionStageStatus.UNKNOWN),
+    ]
+    trace = build_execution_trace(decision.raw_response, order_status="pending")
+    assert trace["final_result"]["status"] == "unknown"
+    assert trace["failed_step"] is None
+
+
+@pytest.mark.asyncio
+async def test_pending_profit_limit_transport_triggers_authoritative_recovery() -> None:
+    stages = []
+    recovery_modes = []
+    position_writes = []
+
+    async def place_order(decision, **_kwargs):
+        return ExecutionResult(
+            order_id="profit_lock_result_unknown", symbol=decision.symbol,
+            side="sell", order_type="limit", quantity=0.0, price=100.0,
+            status=OrderStatus.PENDING,
+            raw_response={"execution_transport_unknown": True, "do_not_persist_order": True},
+        )
+
+    async def write_position(*args):
+        position_writes.append(args)
+
+    async def provider(_mode):
+        return SimpleNamespace(place_order=place_order)
+
+    service = _test_execution_service(
+        okx_executor_provider=provider,
+        stages=stages,
+        order_fact_recovery_trigger=recovery_modes.append,
+        position_execution_persister=write_position,
+    )
+    results = {"warnings": [], "decisions": [], "executions": []}
+    result = await service.execute_candidate(
+        "BTC/USDT", "ensemble_trader", _full_exit_decision("BTC/USDT"),
+        SimpleNamespace(warnings=[]), 994, results, open_positions=[],
+    )
+
+    assert result is not None and result.status == OrderStatus.PENDING
+    assert recovery_modes == ["paper"]
+    assert not position_writes
+    assert results["decisions"][0]["executed"] is False
+    assert any(
+        stage == DecisionStage.EXCHANGE_CONFIRM and status == DecisionStageStatus.UNKNOWN
+        for stage, status, _ in stages
+    )
 
 
 @pytest.mark.asyncio

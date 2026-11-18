@@ -39,6 +39,7 @@ UNTRADABLE_EXCHANGE_ERROR_MARKERS = (
     "当前不支持交易",
     "暂停交易",
 )
+EXIT_TRANSPORT_UNKNOWN_REASON = "OKX 平仓结果暂未确认，系统将通过订单与成交对账核实。"
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -132,6 +133,12 @@ class ExecutionResultClassifier:
             return "交易接口未返回执行结果。"
 
         raw = result.raw_response or {}
+        if (
+            isinstance(raw, dict)
+            and raw.get("execution_transport_unknown") is True
+            and result.status in {OrderStatus.OPEN, OrderStatus.PENDING}
+        ):
+            return EXIT_TRANSPORT_UNKNOWN_REASON
         if isinstance(raw, dict) and raw.get("entry_residual_terminal"):
             protection = (
                 raw.get("entry_partial_fill_protection")

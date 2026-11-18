@@ -565,7 +565,7 @@ class ExecutionService:
         return self.position_protection_rebalancer
 
     def _trigger_order_fact_recovery(self, execution_mode: str) -> bool:
-        """Request non-blocking authoritative OKX facts after a confirmed execution."""
+        """Request non-blocking authoritative OKX order and fill reconciliation."""
 
         trigger = self.order_fact_recovery_trigger
         if trigger is None:
@@ -924,7 +924,9 @@ class ExecutionService:
                     if not order_task.done():
                         order_task.cancel()
                     with suppress(asyncio.CancelledError, Exception):
-                        await order_task
+                        late_result = await order_task
+                        if decision.is_exit and late_result is not None:
+                            return late_result
                     raise
 
         async def mark_stage(
@@ -965,6 +967,23 @@ class ExecutionService:
                     reason,
                     payload,
                 )
+
+        def unknown_exit_result() -> ExecutionResult:
+            return ExecutionResult(
+                order_id="exit_submission_result_unknown",
+                symbol=decision.symbol,
+                side="sell" if decision.action.value == "close_long" else "buy",
+                order_type="market",
+                quantity=0.0,
+                price=0.0,
+                status=OrderStatus.PENDING,
+                raw_response={
+                    "exit_tracking": True,
+                    "execution_transport_unknown": True,
+                    "do_not_persist_order": True,
+                    "message": "OKX 平仓结果暂未确认，系统将通过订单与成交对账核实。",
+                },
+            )
 
         async def mark_blocked(reason: str, data: dict[str, Any] | None = None) -> None:
             await mark_stage(
@@ -1466,7 +1485,11 @@ class ExecutionService:
                             await mark_decision_raw_response(
                                 decision_db_id, decision.raw_response,
                             )
-            if submitted_to_exchange and (decision.is_entry or decision.is_exit):
+            if (
+                submitted_to_exchange
+                and (decision.is_entry or decision.is_exit)
+                and (execution_result is not None or not decision.is_exit)
+            ):
                 await mark_stage(
                     DecisionStage.EXCHANGE_SUBMIT,
                     DecisionStageStatus.PASSED,
@@ -1492,32 +1515,33 @@ class ExecutionService:
                 action=decision.action.value,
                 mode=model_mode,
             )
-            execution_result = rejected_execution_result(
-                decision,
-                (
-                    "OKX 下单或确认超时，系统没有拿到最终订单结果；"
-                    "本轮按未执行处理，下一轮会继续复盘该仓位。"
-                ),
-            )
-            if decision.is_exit and isinstance(execution_result.raw_response, dict):
-                execution_result.raw_response["execution_transport_unknown"] = True
-                execution_result.raw_response["exit_tracking"] = True
-            if decision.is_entry or decision.is_exit:
-                await mark_stage(
-                    DecisionStage.EXCHANGE_SUBMIT,
-                    DecisionStageStatus.FAILED,
-                    "OKX 下单请求超时，未拿到交易所明确接收结果。",
-                    {
-                        "error_type": "timeout",
-                        "submitted_to_exchange": bool(submitted_to_exchange),
-                    },
+            if decision.is_exit and submitted_to_exchange:
+                if execution_result is None:
+                    execution_result = unknown_exit_result()
+                    await mark_stage(
+                        DecisionStage.EXCHANGE_SUBMIT,
+                        DecisionStageStatus.UNKNOWN,
+                        "平仓请求已交给执行器，超时前未取得明确回执。",
+                        {"error_type": "timeout", "executor_called": True},
+                    )
+            else:
+                execution_result = rejected_execution_result(
+                    decision,
+                    (
+                        "OKX 下单或确认超时，系统没有拿到最终订单结果；"
+                        "本轮按未执行处理，下一轮会继续复盘该仓位。"
+                    ),
                 )
-            await mark_stage(
-                DecisionStage.EXCHANGE_CONFIRM,
-                DecisionStageStatus.FAILED,
-                execution_reason_from_result(execution_result),
-                {"error_type": "timeout"},
-            )
+                if decision.is_entry or decision.is_exit:
+                    await mark_stage(
+                        DecisionStage.EXCHANGE_SUBMIT,
+                        DecisionStageStatus.FAILED,
+                        "OKX 下单流程超时，未取得订单结果。",
+                        {
+                            "error_type": "timeout",
+                            "submitted_to_exchange": submitted_to_exchange,
+                        },
+                    )
             await log_risk_event(
                 "warning",
                 symbol,
@@ -1528,7 +1552,8 @@ class ExecutionService:
             preserve_exchange_result = bool(
                 execution_result is not None
                 and (
-                    is_exchange_confirmed_execution(execution_result)
+                    (decision.is_exit and submitted_to_exchange)
+                    or is_exchange_confirmed_execution(execution_result)
                     or is_exit_progress_execution(execution_result)
                 )
             )
@@ -1550,12 +1575,14 @@ class ExecutionService:
                     },
                 }
                 attach_execution_result_snapshot(
-                    "exchange_confirmed_after_outer_cancellation",
+                    "exchange_confirmed_after_outer_cancellation"
+                    if is_exchange_confirmed_execution(execution_result)
+                    else "exchange_result_after_outer_cancellation",
                     exchange_confirmed=is_exchange_confirmed_execution(execution_result),
                     exit_progress=is_exit_progress_execution(execution_result),
                 )
                 logger.warning(
-                    "outer cancellation arrived after exchange result; preserving result",
+                    "outer cancellation arrived after execution result; preserving result",
                     model=model_name,
                     symbol=symbol,
                     action=decision.action.value,
@@ -1571,24 +1598,24 @@ class ExecutionService:
                     action=decision.action.value,
                     mode=model_mode,
                 )
-                execution_result = rejected_execution_result(decision, reason)
+                execution_result = (
+                    unknown_exit_result()
+                    if decision.is_exit and submitted_to_exchange
+                    else rejected_execution_result(decision, reason)
+                )
             if not preserve_exchange_result and (decision.is_entry or decision.is_exit):
+                exit_unknown = decision.is_exit and submitted_to_exchange
                 await mark_stage(
                     DecisionStage.EXCHANGE_SUBMIT,
-                    DecisionStageStatus.FAILED,
-                    "OKX 下单流程被外层超时保护取消，未拿到交易所明确接收结果。",
+                    DecisionStageStatus.UNKNOWN if exit_unknown else DecisionStageStatus.FAILED,
+                    "平仓请求已交给执行器，取消时未取得明确回执。"
+                    if exit_unknown else "OKX 下单流程被外层超时保护取消。",
                     {
                         "error_type": "cancelled",
-                        "submitted_to_exchange": bool(submitted_to_exchange),
+                        "executor_called": submitted_to_exchange,
                     },
                 )
             if not preserve_exchange_result:
-                await mark_stage(
-                    DecisionStage.EXCHANGE_CONFIRM,
-                    DecisionStageStatus.FAILED,
-                    execution_reason_from_result(execution_result),
-                    {"error_type": "cancelled"},
-                )
                 await log_risk_event(
                     "warning",
                     symbol,
@@ -1625,24 +1652,13 @@ class ExecutionService:
                 model_name,
             )
 
-        if execution_result is None and decision.is_exit:
-            execution_result = ExecutionResult(
-                order_id="exit_submission_result_unknown",
-                symbol=decision.symbol,
-                side="sell" if decision.action.value == "close_long" else "buy",
-                order_type="market",
-                quantity=0.0,
-                price=0.0,
-                status=OrderStatus.OPEN,
-                raw_response={
-                    "exit_tracking": True,
-                    "execution_transport_unknown": True,
-                    "do_not_persist_order": True,
-                    "message": (
-                        "The exit submission result is unknown. The system will confirm the "
-                        "exchange position before any later retry; no immediate duplicate was sent."
-                    ),
-                },
+        if execution_result is None and decision.is_exit and submitted_to_exchange:
+            execution_result = unknown_exit_result()
+            await mark_stage(
+                DecisionStage.EXCHANGE_SUBMIT,
+                DecisionStageStatus.UNKNOWN,
+                "平仓执行器未返回订单回执。",
+                {"error_type": "missing_execution_result", "executor_called": submitted_to_exchange},
             )
 
         if (
@@ -1708,6 +1724,11 @@ class ExecutionService:
             exit_waiting_confirmation = bool(
                 decision.is_exit
                 and execution_raw.get("exit_tracking")
+                and execution_result.status in {OrderStatus.OPEN, OrderStatus.PENDING}
+            )
+            exit_transport_unknown = bool(
+                decision.is_exit
+                and execution_raw.get("execution_transport_unknown") is True
                 and execution_result.status in {OrderStatus.OPEN, OrderStatus.PENDING}
             )
             confirm_reason = execution_reason_from_result(execution_result)
@@ -1841,10 +1862,10 @@ class ExecutionService:
                         "singleflight_state": singleflight_state,
                     },
                 )
-            elif exit_waiting_confirmation:
+            elif exit_waiting_confirmation or exit_transport_unknown:
                 await mark_stage(
                     DecisionStage.EXCHANGE_CONFIRM,
-                    DecisionStageStatus.PENDING,
+                    DecisionStageStatus.UNKNOWN if exit_transport_unknown else DecisionStageStatus.PENDING,
                     confirm_reason,
                     {
                         "order_id": execution_result.order_id,
@@ -2022,7 +2043,7 @@ class ExecutionService:
                             "recovery_requested": recovery_requested,
                         },
                     )
-            else:
+            elif not exit_transport_unknown:
                 await mark_stage(
                     DecisionStage.LOCAL_SYNC,
                     DecisionStageStatus.SKIPPED,
@@ -2083,6 +2104,8 @@ class ExecutionService:
                     exit_progress=exit_progress,
                 )
                 await mark_decision_raw_response(decision_db_id, decision.raw_response)
+            if exit_transport_unknown:
+                self._trigger_order_fact_recovery(model_mode)
             if model_mode != "paper" and decision.is_exit and execution_result.pnl != 0.0:
                 await persist_account_update(model_name, decision.model_name, execution_result)
                 if decision_db_id is not None:
@@ -2148,5 +2171,4 @@ class ExecutionService:
                 "is_paper": (model_mode == "paper"),
             }
         )
-        return execution_result
         return execution_result

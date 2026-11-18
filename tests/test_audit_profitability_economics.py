@@ -127,6 +127,29 @@ def test_slippage_is_measured_but_never_deducted_twice_and_horizon_is_diagnostic
     assert result["holding_vs_forecast_horizon"]["causal_exit_loss_inferred"] is False
 
 
+def test_risk_summary_distinguishes_missing_evidence_from_no_budget_overrun():
+    report = summarize_lifecycles(
+        [
+            outcome(notional=200, execution_risk_budget_usdt=8,
+                    execution_planned_stressed_loss_usdt=5,
+                    execution_actual_over_budget_loss_usdt=0),
+            outcome("over", notional=100, execution_risk_budget_usdt=4,
+                    execution_planned_stressed_loss_usdt=3,
+                    execution_actual_over_budget_loss_usdt=2),
+            outcome("missing", execution_risk_budget_usdt=9),
+        ],
+        since=SINCE,
+    )["entry_signal_economics"]["rows"][0]
+
+    assert report["count"] == 3
+    assert report["entry_notional_count"] == report["risk_evidence_count"] == 2
+    assert report["mean_entry_notional_usdt"] == 150
+    assert report["mean_planned_risk_budget_usdt"] == 6
+    assert report["mean_planned_stressed_loss_usdt"] == 4
+    assert report["realized_loss_over_budget_count"] == 1
+    assert report["realized_loss_over_budget_usdt"] == 2
+
+
 def test_missing_cost_or_broken_settlement_is_excluded_instead_of_imputed():
     missing = outcome("missing")
     missing["realized_net_pnl_components"]["official_fee_signed_usdt"] = None

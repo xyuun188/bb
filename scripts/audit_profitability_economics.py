@@ -133,6 +133,19 @@ def _entry_signal_economics(
             equity += math.fsum(values)
             peak = max(peak, equity)
             drawdown = max(drawdown, peak - equity)
+        notional = [
+            value for row in cohort
+            if (value := _finite(row.get("notional"))) is not None and value > 0
+        ]
+        risk = [
+            (budget, stress, excess) for row in cohort
+            if (budget := _finite(row.get("execution_risk_budget_usdt"))) is not None
+            and budget > 0
+            and (stress := _finite(row.get("execution_planned_stressed_loss_usdt"))) is not None
+            and stress >= 0
+            and (excess := _finite(row.get("execution_actual_over_budget_loss_usdt"))) is not None
+            and excess >= 0
+        ]
         summaries.append({
             "side": side,
             "entry_selection_reason": route,
@@ -146,6 +159,16 @@ def _entry_signal_economics(
             if gross_loss > 0 else None,
             "settled_pnl_drawdown_usdt": drawdown
             if sum(map(len, dated_pnl.values())) == len(pnl) else None,
+            "entry_notional_count": len(notional),
+            "mean_entry_notional_usdt": math.fsum(notional) / len(notional) if notional else None,
+            "risk_evidence_count": len(risk),
+            "mean_planned_risk_budget_usdt": math.fsum(item[0] for item in risk) / len(risk)
+            if risk else None,
+            "mean_planned_stressed_loss_usdt": math.fsum(item[1] for item in risk) / len(risk)
+            if risk else None,
+            "realized_loss_over_budget_count": sum(item[2] > 0 for item in risk),
+            "realized_loss_over_budget_usdt": math.fsum(item[2] for item in risk)
+            if risk else None,
         })
     return {
         "rows": summaries,
