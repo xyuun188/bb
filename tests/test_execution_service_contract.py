@@ -2093,6 +2093,65 @@ def _full_exit_decision(symbol: str = "ZAMA/USDT") -> DecisionOutput:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("duplicate, hard_stop", [(True, False), (True, True), (False, False)])
+async def test_position_analysis_without_id_does_not_submit(
+    duplicate: bool, hard_stop: bool,
+) -> None:
+    async def unexpected_exchange_access(_mode: str) -> Any:
+        pytest.fail("position replay or missing audit record must not reach OKX")
+
+    service = _test_execution_service(okx_executor_provider=unexpected_exchange_access)
+    decision = _full_exit_decision()
+    decision.raw_response["analysis_idempotency"] = {"analysis_type": "position"}
+    if duplicate:
+        decision.raw_response["duplicate_analysis"] = {"skipped": True, "existing_decision_id": 42}
+    if hard_stop:
+        policy = decision.raw_response["dynamic_exit_policy"]
+        policy.update(hard_risk=True, planned_stop_crossed=True)
+        policy["policy_provenance"]["source"] = (
+            "current_position_fee_after_pnl_peak_planned_stop_and_market_returns"
+        )
+
+    result = await service.execute_candidate(
+        decision.symbol, decision.model_name, decision, SimpleNamespace(warnings=[]), None,
+        {"warnings": [], "decisions": [], "executions": []}, open_positions=[],
+    )
+
+    assert result is not None
+    assert result.raw_response["execution_skipped"] is True
+    assert result.raw_response["skip_kind"] == (
+        "duplicate_analysis" if duplicate else "position_decision_not_persisted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_position_analysis_record_still_allows_governed_stop() -> None:
+    submissions = []
+
+    async def place_order(*_args: Any, **_kwargs: Any) -> None:
+        submissions.append(True)
+
+    async def okx_executor_provider(_mode: str) -> Any:
+        return SimpleNamespace(place_order=place_order)
+
+    service = _test_execution_service(okx_executor_provider=okx_executor_provider)
+    decision = _full_exit_decision()
+    decision.raw_response["analysis_idempotency"] = {"analysis_type": "position"}
+    policy = decision.raw_response["dynamic_exit_policy"]
+    policy.update(hard_risk=True, planned_stop_crossed=True)
+    policy["policy_provenance"]["source"] = (
+        "current_position_fee_after_pnl_peak_planned_stop_and_market_returns"
+    )
+
+    await service.execute_candidate(
+        decision.symbol, decision.model_name, decision, SimpleNamespace(warnings=[]), None,
+        {"warnings": [], "decisions": [], "executions": []}, open_positions=[],
+    )
+
+    assert submissions == [True]
+
+
+@pytest.mark.asyncio
 async def test_unknown_exit_result_does_not_immediately_submit_a_second_order() -> None:
     calls = 0
 

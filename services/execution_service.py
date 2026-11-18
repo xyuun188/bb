@@ -28,6 +28,7 @@ from services.exit_execution_singleflight import (
     PROFIT_LOCK_NO_FILL_STATE,
     PROFIT_LOCK_WAIT_STATES,
 )
+from services.forced_exit import ForcedExitPolicy
 from services.normal_paper_trade import attach_normal_paper_order_identity
 from services.okx_error_classifier import (
     is_okx_entry_instrument_unavailable,
@@ -730,6 +731,30 @@ class ExecutionService:
         open_positions: list[dict] | None = None,
         refresh_exit_positions: bool = True,
     ) -> ExecutionResult | None:
+        if decision_db_id is None:
+            raw = _safe_dict(decision.raw_response)
+            analysis_identity = _safe_dict(raw.get("analysis_idempotency"))
+            duplicate = _safe_dict(raw.get("duplicate_analysis")).get("skipped") is True
+            unrecorded_position = analysis_identity.get("analysis_type") == "position"
+            if duplicate or (
+                unrecorded_position
+                and not (decision.is_exit and ForcedExitPolicy().is_forced_exit(decision))
+            ):
+                skip_kind = "duplicate_analysis" if duplicate else "position_decision_not_persisted"
+                reason = (
+                    "该分析已处理，本次重复请求未提交 OKX。"
+                    if duplicate
+                    else "持仓分析未成功入库，本轮未提交 OKX。"
+                )
+                result = self._required_rejected_execution_result_factory()(decision, reason)
+                result.raw_response = {
+                    **_safe_dict(result.raw_response),
+                    "stage_status": DecisionStageStatus.SKIPPED,
+                    "execution_skipped": True,
+                    "execution_policy_terminal": True,
+                    "skip_kind": skip_kind,
+                }
+                return result
         if (
             decision.is_exit
             and decision_db_id is not None

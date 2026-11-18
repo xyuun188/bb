@@ -425,7 +425,20 @@ async def fetch_bills(
     return rows, {"complete": False, "pages": max_pages, "reason": "page_budget_exhausted"}
 
 
-async def audit(*, until: datetime, hours: int, limit: int, bill_pages: int) -> dict[str, Any]:
+def _opened_since(
+    outcomes: list[dict[str, Any]], *, cutoff: datetime, until: datetime,
+) -> list[dict[str, Any]]:
+    # Canonical OKX outcomes use the position history open time for this field.
+    return [
+        row for row in outcomes
+        if row.get("decision_timestamp") and cutoff <= _utc(row["decision_timestamp"]) < until
+    ]
+
+
+async def audit(
+    *, until: datetime, hours: int, limit: int, bill_pages: int,
+    opened_since: datetime | None = None,
+) -> dict[str, Any]:
     from executor.okx_executor import OKXExecutor
 
     since = until - timedelta(hours=hours)
@@ -453,7 +466,7 @@ async def audit(*, until: datetime, hours: int, limit: int, bill_pages: int) -> 
         )
     finally:
         await executor.shutdown()
-    return {
+    report = {
         "audit_version": "profitability-economics.v2",
         "generated_at": datetime.now(UTC).isoformat(),
         "window_start_utc": since.isoformat(),
@@ -469,6 +482,15 @@ async def audit(*, until: datetime, hours: int, limit: int, bill_pages: int) -> 
         "bill_coverage": coverage,
         "bills": summarize_bills(bills, outcomes=outcomes),
     }
+    if opened_since is not None:
+        cohort = _opened_since(outcomes, cutoff=opened_since, until=until)
+        report["opened_since_cohort"] = {
+            "opened_at_utc_inclusive": opened_since.isoformat(),
+            "unknown_open_time_count": sum(not row.get("decision_timestamp") for row in outcomes),
+            "lifecycle_window_complete": not lifecycle_limit_reached,
+            **summarize_lifecycles(cohort, since=opened_since, entry_evidence=entry_evidence),
+        }
+    return report
 
 
 def audit_online(args: argparse.Namespace) -> dict[str, Any]:
@@ -492,6 +514,8 @@ def audit_online(args: argparse.Namespace) -> dict[str, Any]:
         "--limit", str(args.limit), "--bill-pages", str(args.bill_pages),
         "--output", remote_output,
     ]
+    if args.opened_since is not None:
+        command.extend(("--opened-since", args.opened_since.isoformat()))
     # Capture diagnostic logs on the host; transport only the aggregate JSON.
     runner = (
         "import pathlib,subprocess,sys; "
@@ -518,6 +542,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--until", required=True, type=_utc)
     parser.add_argument("--hours", type=int, choices=range(1, 169), default=24)
+    parser.add_argument("--opened-since", type=_utc, help="Report a separate OKX open-time cohort.")
     parser.add_argument("--limit", type=int, choices=range(1, 501), default=120)
     parser.add_argument("--bill-pages", type=int, choices=range(1, 21), default=8)
     parser.add_argument("--output", type=Path)
@@ -527,11 +552,18 @@ def main() -> None:
         parser.error("cutoff must be within the past six days")
     if args.until - timedelta(hours=args.hours) < datetime.now(UTC) - timedelta(days=7):
         parser.error("window must fit the current-bills seven-day history")
+    if args.opened_since is not None and not (
+        args.until - timedelta(hours=args.hours) <= args.opened_since < args.until
+    ):
+        parser.error("--opened-since must be inside the frozen audit window")
 
     async def run() -> dict[str, Any]:
         try:
             return await asyncio.wait_for(
-                audit(until=args.until, hours=args.hours, limit=args.limit, bill_pages=args.bill_pages),
+                audit(
+                    until=args.until, hours=args.hours, limit=args.limit, bill_pages=args.bill_pages,
+                    opened_since=args.opened_since,
+                ),
                 timeout=210,
             )
         finally:

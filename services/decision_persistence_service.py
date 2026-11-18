@@ -16,6 +16,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from ai_brain.analysis_quality import analysis_quality_reason_code, analysis_quality_stage_status
 from ai_brain.base_model import DecisionOutput
@@ -61,6 +62,7 @@ class DecisionPersistenceService:
     async def log_decision(self, decision: DecisionOutput, is_paper: bool) -> int | None:
         """Insert one AI decision row and attach the initial AI-analysis stage."""
 
+        idempotency_key = ""
         try:
             completed_at = availability_timestamp(decision.timestamp)
             if isinstance(decision.feature_snapshot, dict) and completed_at is not None:
@@ -114,20 +116,7 @@ class DecisionPersistenceService:
                 if idempotency_key:
                     existing = await repo.get_by_analysis_idempotency_key(idempotency_key)
                     if existing is not None:
-                        decision.raw_response = {
-                            **raw_response,
-                            "duplicate_analysis": {
-                                "skipped": True,
-                                "existing_decision_id": int(existing.id),
-                                "analysis_idempotency_key": idempotency_key,
-                            },
-                        }
-                        logger.warning(
-                            "duplicate analysis persistence skipped",
-                            existing_decision_id=int(existing.id),
-                            symbol=display_symbol,
-                            analysis_type=analysis_type,
-                        )
+                        self._mark_duplicate_analysis(decision, idempotency_key, existing.id)
                         return None
                 record = await repo.log_decision(
                     {
@@ -148,9 +137,39 @@ class DecisionPersistenceService:
                     }
                 )
                 return record.id
+        except IntegrityError as exc:
+            if idempotency_key:
+                try:
+                    # The transaction has rolled back. Look up the winner of a racing insert.
+                    async with self._session_context_factory() as session:
+                        repo = self._decision_repo_factory(session)
+                        existing = await repo.get_by_analysis_idempotency_key(idempotency_key)
+                        if existing is not None:
+                            self._mark_duplicate_analysis(decision, idempotency_key, existing.id)
+                            return None
+                except Exception as lookup_exc:
+                    logger.error("failed to check analysis replay", error=safe_error_text(lookup_exc))
+            logger.error("failed to log decision", error=safe_error_text(exc))
+            return None
         except Exception as exc:
             logger.error("failed to log decision", error=safe_error_text(exc))
             return None
+
+    @staticmethod
+    def _mark_duplicate_analysis(decision: DecisionOutput, key: str, existing_id: int) -> None:
+        decision.raw_response = {
+            **decision.raw_response,
+            "duplicate_analysis": {
+                "skipped": True,
+                "existing_decision_id": existing_id,
+                "analysis_idempotency_key": key,
+            },
+        }
+        logger.info(
+            "duplicate analysis replay skipped",
+            existing_decision_id=existing_id,
+            symbol=decision.symbol,
+        )
 
     @staticmethod
     def _runtime_failure_quality(raw_response: dict[str, Any]) -> dict[str, Any]:

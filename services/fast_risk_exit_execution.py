@@ -16,7 +16,7 @@ from executor.base_executor import ExecutionResult, OrderStatus
 logger = structlog.get_logger(__name__)
 
 ModelExecutionModeProvider = Callable[[str], str]
-DecisionLogger = Callable[..., Awaitable[int]]
+DecisionLogger = Callable[..., Awaitable[int | None]]
 DecisionCountIncrementer = Callable[[], None]
 CandidateExecutor = Callable[..., Awaitable[ExecutionResult | None]]
 ExecutionClassifier = Callable[[ExecutionResult | None], bool]
@@ -87,7 +87,11 @@ class FastRiskExitExecutionProcessor:
                 open_positions=[position],
                 refresh_exit_positions=False,
             )
-            if execution_result is None:
+            if execution_result is None or (
+                isinstance(execution_result.raw_response, dict)
+                and execution_result.raw_response.get("skip_kind")
+                in {"duplicate_analysis", "position_decision_not_persisted"}
+            ):
                 logger.info(
                     "fast risk close skipped by execution service",
                     model=model_name,

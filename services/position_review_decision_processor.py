@@ -183,8 +183,17 @@ class PositionReviewDecisionProcessor:
             return PositionReviewProcessResult(handled=True)
 
         executed = assessment.decision if assessment.decision else decision
-        if executed is not decision and decision.raw_response and not executed.raw_response:
-            executed.raw_response = decision.raw_response
+        if executed is not decision and decision.raw_response:
+            original = decision.raw_response
+            adjusted = executed.raw_response if isinstance(executed.raw_response, dict) else {}
+            executed.raw_response = {
+                **(adjusted or original),
+                **{
+                    key: original[key]
+                    for key in ("analysis_idempotency", "analysis_idempotency_key", "duplicate_analysis")
+                    if key in original
+                },
+            }
             executed.feature_snapshot = executed.feature_snapshot or decision.feature_snapshot
 
         if model_mode == "paper":

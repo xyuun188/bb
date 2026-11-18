@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 import services.decision_persistence_service as decision_persistence_module
 from ai_brain.base_model import Action, DecisionOutput
@@ -338,6 +339,26 @@ async def test_log_decision_rejects_duplicate_analysis_idempotency_key() -> None
 
     assert decision_id is None
     assert repo.logged == []
+    assert decision.raw_response["duplicate_analysis"]["existing_decision_id"] == 88
+
+
+@pytest.mark.asyncio
+async def test_log_decision_marks_replay_when_insert_loses_unique_key_race() -> None:
+    key = "analysis-v2:test"
+
+    class RacingDecisionRepo(FakeDecisionRepo):
+        async def log_decision(self, data: dict[str, Any]) -> SimpleNamespace:
+            self.by_idempotency_key[key] = SimpleNamespace(id=88)
+            raise IntegrityError("insert", {}, ValueError("unique key conflict"))
+
+    decision = _decision(Action.CLOSE_LONG)
+    decision.raw_response["analysis_idempotency_key"] = key
+
+    decision_id = await _service(FakeSession(), RacingDecisionRepo()).log_decision(
+        decision, is_paper=True,
+    )
+
+    assert decision_id is None
     assert decision.raw_response["duplicate_analysis"]["existing_decision_id"] == 88
 
 

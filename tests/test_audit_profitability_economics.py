@@ -56,6 +56,17 @@ def test_partial_updates_do_not_enter_full_round_trip_totals():
     assert result["full_lifecycles_opened_before_window_count"] == 1
 
 
+def test_open_time_cohort_excludes_old_positions_and_unknown_times():
+    until = SINCE + timedelta(hours=1)
+    new = outcome("new", decision_timestamp=SINCE.isoformat())
+    assert audit_profitability_economics._opened_since(
+        [outcome(), new, outcome("unknown", decision_timestamp=None),
+         outcome("upper_boundary", decision_timestamp=until.isoformat())],
+        cutoff=SINCE,
+        until=until,
+    ) == [new]
+
+
 def test_profit_breakdown_uses_only_consistent_full_lifecycles():
     long_training = outcome(side="long", strategy_selection_reason="paper_training_entry")
     short_validated = outcome(

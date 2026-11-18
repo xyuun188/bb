@@ -16249,7 +16249,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         return self.execution_result_factory.rejected(decision, error)
 
     async def _log_decision(self, decision: DecisionOutput, is_paper: bool) -> int | None:
-        self._attach_analysis_idempotency(decision)
+        self._attach_analysis_idempotency(decision, is_paper=is_paper)
         if is_paper:
             raw = self._safe_dict(decision.raw_response)
             attach_initial_trade_recommendation(
@@ -16275,7 +16275,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             )
         return decision_id
 
-    def _attach_analysis_idempotency(self, decision: DecisionOutput) -> None:
+    def _attach_analysis_idempotency(self, decision: DecisionOutput, *, is_paper: bool) -> None:
         round_id = _analysis_round_id_context.get()
         if not round_id:
             return
@@ -16294,11 +16294,25 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "timeframe": timeframe,
             "analysis_type": analysis_type,
         }
+        key_version = "analysis-v1"
+        if analysis_type == "position":
+            key_version = "analysis-v2"
+            # A position group's phase is stable even if its feature snapshot changes.
+            del components["timeframe"]
+            components["model_name"] = decision.model_name
+            components["execution_mode"] = "paper" if is_paper else "live"
+            if decision.is_exit and raw.get("fast_risk_trigger"):
+                components["phase"] = "fast_risk_exit"
+                components["side"] = "long" if decision.action == Action.CLOSE_LONG else "short"
+            elif raw.get("position_fast_scan"):
+                components["phase"] = "fast_scan_observation"
+            else:
+                components["phase"] = "position_review"
         digest = hashlib.sha256(
             json.dumps(components, ensure_ascii=True, sort_keys=True).encode("utf-8")
         ).hexdigest()
         raw["analysis_idempotency"] = components
-        raw["analysis_idempotency_key"] = f"analysis-v1:{digest}"
+        raw["analysis_idempotency_key"] = f"{key_version}:{digest}"
         decision.raw_response = raw
 
     def _json_safe_payload(self, value: Any) -> Any:

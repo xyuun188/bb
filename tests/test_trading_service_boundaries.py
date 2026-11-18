@@ -29,6 +29,7 @@ from services.analysis_services import (
     round_cancellation_state,
 )
 from services.decision_final_state_ensurer import DecisionFinalStateEnsurer
+from services.decision_persistence_service import DecisionPersistenceService
 from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
 from services.entry_fee_provider import EntryFeeProvider
 from services.entry_market_data_quality import EntryMarketDataQualityPolicy, MarketValueReader
@@ -69,6 +70,51 @@ from services.trading_service import (
     _feature_fetch_wave_count,
 )
 from services.training_data_quality import DATA_QUALITY_VERSION
+
+
+def test_position_analysis_identity_separates_phases_and_fast_exit_sides() -> None:
+    service = TradingService.__new__(TradingService)
+    service.decision_persistence = DecisionPersistenceService(
+        normalize_symbol=normalize_trading_symbol,
+    )
+
+    def identity(
+        action: Action, *, is_paper: bool = True, timeframe: str = "5m",
+        raw: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, str]]:
+        decision = DecisionOutput(
+            model_name="ensemble_trader",
+            symbol="BTC/USDT:USDT",
+            action=action,
+            confidence=0.0,
+            reasoning="position analysis",
+            raw_response={"analysis_type": "position_review", **(raw or {})},
+            feature_snapshot={"technical_indicator_timeframe": timeframe},
+        )
+        service._attach_analysis_idempotency(decision, is_paper=is_paper)
+        return (
+            decision.raw_response["analysis_idempotency_key"],
+            decision.raw_response["analysis_idempotency"],
+        )
+
+    token = trading_service._analysis_round_id_context.set("position-round")
+    try:
+        fast = {"fast_risk_trigger": "profit_drawdown_dynamic_position_scan"}
+        fast_long, details = identity(Action.CLOSE_LONG, raw=fast)
+        fast_short, _ = identity(Action.CLOSE_SHORT, raw=fast)
+        review, _ = identity(Action.CLOSE_LONG)
+        observation, _ = identity(Action.HOLD, raw={"position_fast_scan": {"skipped_llm": True}})
+        live, _ = identity(Action.CLOSE_LONG, is_paper=False, raw=fast)
+        replay, _ = identity(Action.CLOSE_LONG, timeframe="15m", raw=fast)
+        review_replay, _ = identity(Action.CLOSE_SHORT, timeframe="15m")
+    finally:
+        trading_service._analysis_round_id_context.reset(token)
+
+    assert len({fast_long, fast_short, review, observation, live}) == 5
+    assert replay == fast_long
+    assert review_replay == review
+    assert details["phase"] == "fast_risk_exit"
+    assert details["side"] == "long"
 
 
 def _current_funding_fields() -> dict[str, Any]:
