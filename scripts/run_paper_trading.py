@@ -11,6 +11,7 @@ import asyncio
 import importlib
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import Any, TextIO
@@ -84,6 +85,31 @@ def acquire_single_instance_lock() -> None:
     _lock_handle.truncate()
     _lock_handle.write(str(os.getpid()))
     _lock_handle.flush()
+
+
+async def _wait_for_headless_runtime(trading_task: asyncio.Task) -> None:
+    """Let systemd stop the headless runtime through the normal cleanup path."""
+    loop = asyncio.get_running_loop()
+    stop_requested = asyncio.Event()
+    try:
+        loop.add_signal_handler(signal.SIGTERM, stop_requested.set)
+    except NotImplementedError:
+        await asyncio.shield(trading_task)
+        return
+
+    signal_waiter = asyncio.create_task(stop_requested.wait())
+    try:
+        done, _ = await asyncio.wait(
+            (trading_task, signal_waiter), return_when=asyncio.FIRST_COMPLETED
+        )
+        if trading_task in done:
+            await trading_task
+        else:
+            logger.info("paper trading stop requested by SIGTERM")
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+        signal_waiter.cancel()
+        await asyncio.gather(signal_waiter, return_exceptions=True)
 
 
 async def main():
@@ -211,33 +237,21 @@ async def main():
             await server.serve()
         else:
             print("  Trading engine only; dashboard runs in scripts/run_dashboard.py")
-            await trading_task
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-
-    # Cleanup
-    trading_service._running = False
-    if not trading_task.done():
-        trading_task.cancel()
-    ws_push_task.cancel()
-    shadow_training_repair_task.cancel()
-    try:
-        await trading_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await ws_push_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await shadow_training_repair_task
-    except asyncio.CancelledError:
-        pass
-
-    await data_service.stop()
-    await model_registry.shutdown_all()
-    await close_db()
-    print("Shutdown complete.")
+            await _wait_for_headless_runtime(trading_task)
+    finally:
+        trading_service._running = False
+        tasks = (trading_task, ws_push_task, shadow_training_repair_task)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await trading_service.stop()
+        finally:
+            try:
+                await data_service.stop()
+            finally:
+                await close_db()
+        print("Shutdown complete.")
 
 
 if __name__ == "__main__":
