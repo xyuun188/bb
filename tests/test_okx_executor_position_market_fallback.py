@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
@@ -97,6 +99,12 @@ class _MissingLabMarketExchange:
         return {"code": "0", "data": [{
             "instId": params["instId"], "buyLmt": "18", "sellLmt": "17",
         }]}
+
+    async def executionFetchOrderBook(self, _symbol):
+        return {
+            "bids": [[17.787, 4.5]], "asks": [[17.788, 4.5]],
+            "timestamp": datetime.now(UTC).timestamp() * 1000,
+        }
 
     async def privateGetTradeOrder(self, params):
         self.native_detail_requests.append(dict(params))

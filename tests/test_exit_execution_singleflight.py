@@ -210,7 +210,8 @@ async def test_temporary_exchange_error_uses_wait_state_instead_of_duplicate_sub
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("risk_override", [False, True])
-async def test_proven_unfilled_profit_ioc_cools_only_profit_exits(risk_override: bool) -> None:
+@pytest.mark.parametrize("pre_submit", [False, True])
+async def test_profit_lock_wait_cools_only_profit_exits(risk_override: bool, pre_submit: bool) -> None:
     position = _position()
     repo = _Repo([position])
     session = _Session()
@@ -220,27 +221,31 @@ async def test_proven_unfilled_profit_ioc_cools_only_profit_exits(risk_override:
     lease = await service.acquire(**kwargs, decision=_profit_lock_decision(), decision_id=1)
     await service.finish(lease, ExecutionResult(
         order_id="ioc",
-        exchange_order_id="ioc",
+        exchange_order_id=None if pre_submit else "ioc",
         symbol="ZAMA/USDT",
         side="buy",
         order_type="limit",
         quantity=0.0,
         price=0.04,
-        status=OrderStatus.CANCELLED,
-        raw_response={"profit_lock_ioc_unfilled": True},
+        status=OrderStatus.REJECTED if pre_submit else OrderStatus.CANCELLED,
+        raw_response=(
+            {"execution_blocker": "profit_lock_execution_liquidity", "system_pre_submit_rejection": True}
+            if pre_submit else {"profit_lock_ioc_unfilled": True}
+        ),
     ))
     restarted = _service(repo, session, now)
     blocked = await restarted.acquire(**kwargs, decision=_profit_lock_decision(), decision_id=2)
     assert not blocked.acquired
-    assert blocked.state == "profit_lock_no_fill"
-    assert blocked.retry_after_seconds == 300.0
+    assert blocked.state == ("profit_lock_liquidity_wait" if pre_submit else "profit_lock_no_fill")
+    delay = 45.0 if pre_submit else 300.0
+    assert blocked.retry_after_seconds == delay
     assert PROFIT_LOCK_LEDGER_KEY not in position.current_management_contract
 
     if risk_override:
         next_exit = _decision()
         next_exit.raw_response = {"dynamic_exit_policy": {"hard_risk": True}}
     else:
-        now[0] += timedelta(seconds=300)
+        now[0] += timedelta(seconds=delay)
         next_exit = _profit_lock_decision()
     assert (await restarted.acquire(**kwargs, decision=next_exit, decision_id=3)).acquired
 

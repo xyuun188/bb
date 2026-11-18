@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
-from math import isclose
+from math import isclose, isfinite
 from typing import Any
 
 import structlog
@@ -62,6 +62,7 @@ from services.okx_native_facts import OkxNativeFactsClient
 from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
 from services.profit_lock_execution import (
     FAST_PROFIT_LOCK_TRIGGER,
+    PROFIT_LOCK_LIQUIDITY_BLOCKER,
     fast_profit_lock_eligible,
     profit_lock_execution_required,
     profit_lock_limit,
@@ -81,6 +82,9 @@ OKX_PRIVATE_API_CIRCUIT_BASE_SECONDS = 5.0
 OKX_PRIVATE_API_CIRCUIT_MAX_SECONDS = 30.0
 OKX_PRIVATE_API_CIRCUIT_PROBE_STALE_SECONDS = 30.0
 EXIT_ORDER_REPLACE_AFTER_SECONDS = 20.0
+PROFIT_LOCK_BOOK_MAX_AGE_MS = 2000
+PROFIT_LOCK_BOOK_CLOCK_SKEW_MS = 100
+PROFIT_LOCK_BOOK_TIMEOUT_SECONDS = 2.0
 OKX_CONTRACT_DELIVERY_LOCK_SECONDS = 3600.0
 OKX_EXIT_INSTRUMENT_REJECTION_COOLDOWN_SECONDS = 900.0
 OKX_ENTRY_INSTRUMENT_AVAILABILITY_CACHE_SECONDS = 1800.0
@@ -986,6 +990,8 @@ class OKXExecutor(AbstractExecutor):
         entry_submit_started = False
         raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
         fast_profit_lock = decision.is_exit and raw.get("fast_risk_trigger") == FAST_PROFIT_LOCK_TRIGGER
+        guarded_profit_lock = decision.is_exit and profit_lock_execution_required(raw)
+        preserve_pending_exit = guarded_profit_lock and self.executor_mode == "paper"
         if fast_profit_lock and (
             self.executor_mode != "paper" or not fast_profit_lock_eligible(raw)
         ):
@@ -1320,7 +1326,7 @@ class OKXExecutor(AbstractExecutor):
                         exit_liquidity = await self._pending_exit_liquidity(decision.symbol, side)
                     liquidity_blocked = exit_liquidity.get("blocked") is True
                     if (
-                        not fast_profit_lock
+                        not (fast_profit_lock or preserve_pending_exit)
                         and order_id and order_age >= EXIT_ORDER_REPLACE_AFTER_SECONDS
                         and not liquidity_blocked
                     ):
@@ -1456,6 +1462,8 @@ class OKXExecutor(AbstractExecutor):
                             f"OKX 已有平仓订单正在追单或部分成交，已等待约 {order_age:.0f} 秒；"
                             f"若约 {wait_seconds:.0f} 秒后仍未成交，系统会撤单并按最新仓位重提平仓。"
                         )
+                        if preserve_pending_exit:
+                            wait_note = "OKX 已有平仓委托，盈利减仓不会撤销或替换该委托。"
                         if liquidity_blocked:
                             wait_note = (
                                 "OKX 执行盘在允许价格范围内暂无对手盘，市价平仓尚未成交。"
@@ -2148,7 +2156,6 @@ class OKXExecutor(AbstractExecutor):
                     params["positionSide"] = position_side
                 params["reduceOnly"] = True
                 raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-                guarded_profit_lock = profit_lock_execution_required(raw)
                 if guarded_profit_lock:
                     policy = raw["dynamic_exit_policy"]
                     try:
@@ -3939,6 +3946,13 @@ class OKXExecutor(AbstractExecutor):
                 lock_hit=True,
             )
 
+        if execution_order_type == "limit" and self.executor_mode == "paper":
+            deferred = await self._check_paper_profit_lock_book(
+                ccxt, decision, side, price, contracts, profit_guard,
+            )
+            if deferred is not None:
+                return deferred
+
         submission_error: ExchangeAPIError | None = None
         try:
             response = await self._with_retry(
@@ -3994,18 +4008,29 @@ class OKXExecutor(AbstractExecutor):
                         refreshed_guard["previous_limit_price"] = profit_guard.get(
                             "limit_price"
                         )
-                        profit_guard = refreshed_guard
-                        params["profit_lock_execution"] = refreshed_guard
-                        decision.raw_response["profit_lock_execution"] = refreshed_guard
-                        request_params["px"] = self._format_okx_number(
-                            refreshed_guard["limit_price"]
-                        )
-                        response = await self._with_retry(
-                            place_order,
-                            request_params,
-                            _max_attempts=1,
-                        )
-                        submission_error = None
+                        if self.executor_mode == "paper":
+                            deferred = await self._check_paper_profit_lock_book(
+                                ccxt, decision, side, price, contracts, refreshed_guard,
+                            )
+                            if deferred is not None:
+                                profit_guard["blocked_51006_retry_book"] = refreshed_guard[
+                                    "execution_book_check"
+                                ]
+                        else:
+                            deferred = None
+                        if deferred is None:
+                            profit_guard = refreshed_guard
+                            params["profit_lock_execution"] = refreshed_guard
+                            decision.raw_response["profit_lock_execution"] = refreshed_guard
+                            request_params["px"] = self._format_okx_number(
+                                refreshed_guard["limit_price"]
+                            )
+                            response = await self._with_retry(
+                                place_order,
+                                request_params,
+                                _max_attempts=1,
+                            )
+                            submission_error = None
                 except ExchangeAPIError as retry_error:
                     submission_error = retry_error
                 except Exception as refresh_error:
@@ -5414,6 +5439,80 @@ class OKXExecutor(AbstractExecutor):
             "price_limit_info": dict(row),
             "price_limit_source_endpoint": endpoint,
         }
+
+    async def _check_paper_profit_lock_book(
+        self,
+        ccxt: Any,
+        decision: DecisionOutput,
+        side: str,
+        price: float,
+        contracts: float,
+        guard: dict[str, Any],
+    ) -> ExecutionResult | None:
+        """Check the opposing simulated book at the exact IOC price."""
+        limit = guard["limit_price"]
+        evidence: dict[str, Any] = {
+            "source": "okx_execution_order_book",
+            "limit_price": limit,
+            "requested_contracts": contracts,
+            "reason": "execution_book_unavailable",
+        }
+        fetch_book = getattr(ccxt, "executionFetchOrderBook", None)
+        if callable(fetch_book):
+            try:
+                async with asyncio.timeout(PROFIT_LOCK_BOOK_TIMEOUT_SECONDS):
+                    book = await self._with_retry(
+                        fetch_book, self._to_swap_symbol(decision.symbol), _max_attempts=1,
+                    )
+                if isinstance(book, dict):
+                    timestamp = self._safe_float(book.get("timestamp"))
+                    age = time.time() * 1000 - timestamp
+                    if isfinite(timestamp):
+                        evidence["quote_timestamp_ms"] = timestamp
+                    if -PROFIT_LOCK_BOOK_CLOCK_SKEW_MS <= age <= PROFIT_LOCK_BOOK_MAX_AGE_MS:
+                        levels = []
+                        for level in book.get("asks" if side == "buy" else "bids") or []:
+                            if isinstance(level, (tuple, list)) and len(level) >= 2:
+                                quote, size = map(self._safe_float, level[:2])
+                                if all(isfinite(value) and value > 0 for value in (quote, size)):
+                                    levels.append((quote, size))
+                        depth = sum(
+                            size for quote, size in levels
+                            if (quote <= limit if side == "buy" else quote >= limit)
+                        )
+                        evidence.update({
+                            "opposing_quote": (
+                                (min if side == "buy" else max)(quote for quote, _ in levels)
+                                if levels else None
+                            ),
+                            "executable_contracts": depth,
+                            "reason": "crosses_limit" if depth > 0 else "no_quote_at_profit_limit",
+                        })
+                    else:
+                        evidence["reason"] = "execution_book_stale"
+            except Exception as exc:
+                evidence["error"] = safe_error_text(exc, limit=180)
+        guard["execution_book_check"] = evidence
+        if evidence["reason"] == "crosses_limit":
+            return None
+        reason = (
+            "OKX 模拟盘暂无满足费后止盈限价的对手盘，将重新评估。"
+            if evidence["reason"] == "no_quote_at_profit_limit"
+            else "OKX 模拟盘盘口暂不可用，盈利减仓将重新评估。"
+        )
+        return ExecutionResult(
+            order_id="profit_lock_deferred", symbol=decision.symbol,
+            side=side, order_type="limit", quantity=0.0, price=price,
+            status=OrderStatus.REJECTED,
+            raw_response={
+                "execution_blocker": PROFIT_LOCK_LIQUIDITY_BLOCKER,
+                "system_pre_submit_rejection": True,
+                "okx_rejection": False,
+                "do_not_persist_order": True,
+                "profit_lock_execution": guard,
+                "error": reason,
+            },
+        )
 
     async def _pending_exit_liquidity(self, symbol: str, side: str) -> dict[str, Any]:
         """Check market-close liquidity using only fresh execution-venue facts."""

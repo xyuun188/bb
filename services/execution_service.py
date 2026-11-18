@@ -23,13 +23,18 @@ from core.safe_output import safe_error_text
 from core.symbols import normalize_trading_symbol
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.decision_state import DecisionStage, DecisionStageStatus
-from services.exit_execution_singleflight import PROFIT_LOCK_NO_FILL_STATE
+from services.exit_execution_singleflight import (
+    PROFIT_LOCK_LIQUIDITY_WAIT_STATE,
+    PROFIT_LOCK_NO_FILL_STATE,
+    PROFIT_LOCK_WAIT_STATES,
+)
 from services.normal_paper_trade import attach_normal_paper_order_identity
 from services.okx_error_classifier import (
     is_okx_entry_instrument_unavailable,
     is_okx_temporary_service_error,
 )
 from services.production_trade_gate import validate_production_trade_gate
+from services.profit_lock_execution import PROFIT_LOCK_LIQUIDITY_BLOCKER
 from services.strategy_arbitration import arbitrate_decision
 from services.trade_execution_contract import (
     build_live_rules_canary_entry_contract,
@@ -1490,10 +1495,20 @@ class ExecutionService:
                 and (decision.is_entry or decision.is_exit)
                 and (execution_result is not None or not decision.is_exit)
             ):
+                result_raw = _safe_dict(getattr(execution_result, "raw_response", None))
+                liquidity_deferred = (
+                    decision.is_exit
+                    and result_raw.get("execution_blocker") == PROFIT_LOCK_LIQUIDITY_BLOCKER
+                    and result_raw.get("system_pre_submit_rejection") is True
+                )
                 await mark_stage(
                     DecisionStage.EXCHANGE_SUBMIT,
-                    DecisionStageStatus.PASSED,
-                    "OKX 提交阶段已返回订单响应，进入成交确认阶段。",
+                    DecisionStageStatus.SKIPPED if liquidity_deferred else DecisionStageStatus.PASSED,
+                    (
+                        execution_reason_from_result(execution_result)
+                        if liquidity_deferred
+                        else "OKX 提交阶段已返回订单响应，进入成交确认阶段。"
+                    ),
                     {
                         "has_execution_result": execution_result is not None,
                         "status": getattr(getattr(execution_result, "status", None), "value", None),
@@ -1715,6 +1730,10 @@ class ExecutionService:
                 and execution_result.quantity > 0
             )
             profit_lock_ioc_unfilled = execution_raw.get("profit_lock_ioc_unfilled") is True
+            profit_lock_liquidity_deferred = (
+                execution_raw.get("execution_blocker") == PROFIT_LOCK_LIQUIDITY_BLOCKER
+                and execution_raw.get("system_pre_submit_rejection") is True
+            )
             singleflight_state = execution_raw.get("singleflight_state")
             exit_singleflight_terminal_skip = bool(
                 decision.is_exit
@@ -1845,7 +1864,11 @@ class ExecutionService:
                 )
             elif exit_singleflight_terminal_skip or (
                 decision.is_exit
-                and (profit_lock_ioc_unfilled or singleflight_state == PROFIT_LOCK_NO_FILL_STATE)
+                and (
+                    profit_lock_ioc_unfilled
+                    or profit_lock_liquidity_deferred
+                    or singleflight_state in PROFIT_LOCK_WAIT_STATES
+                )
             ):
                 await mark_stage(
                     DecisionStage.EXCHANGE_CONFIRM,
@@ -1857,6 +1880,9 @@ class ExecutionService:
                         "status": execution_result.status.value,
                         "skip_kind": (
                             "position_already_closed" if exit_singleflight_terminal_skip
+                            else PROFIT_LOCK_LIQUIDITY_WAIT_STATE
+                            if profit_lock_liquidity_deferred
+                            or singleflight_state == PROFIT_LOCK_LIQUIDITY_WAIT_STATE
                             else PROFIT_LOCK_NO_FILL_STATE
                         ),
                         "singleflight_state": singleflight_state,

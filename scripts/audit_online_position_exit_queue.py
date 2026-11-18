@@ -53,9 +53,16 @@ def close_category(raw, execution, stage_summary):
     final_status = stage_summary.get("final_status")
     if dictionary(raw.get("local_order_persistence")).get("status") == "failed":
         return "close_failed"
+    if (
+        receipt.get("execution_blocker") == "profit_lock_execution_liquidity"
+        and receipt.get("system_pre_submit_rejection") is True
+    ):
+        return "profit_limit_liquidity_deferred"
     if receipt.get("exit_singleflight_wait") is True:
         if receipt.get("singleflight_state") == "profit_lock_no_fill":
             return "profit_limit_cooldown"
+        if receipt.get("singleflight_state") == "profit_lock_liquidity_wait":
+            return "profit_limit_liquidity_cooldown"
         if receipt.get("singleflight_state") == "no_local_position":
             return "close_skipped"
         return "close_pending_confirmation"
@@ -101,6 +108,9 @@ def compact_decision(row, order_facts):
     action = str(row.action or "").lower()
     is_close = action in {"close_long", "close_short"}
     execution = dictionary(raw.get("execution_result"))
+    receipt = dictionary(execution.get("raw_response"))
+    profit_guard = dictionary(receipt.get("profit_lock_execution"))
+    profit_book = dictionary(profit_guard.get("execution_book_check"))
     if fast_scan.get("skipped_llm") is True:
         category = "budget_deferred"
     elif is_close and row.was_executed is True:
@@ -174,6 +184,8 @@ def compact_decision(row, order_facts):
             "exchange_order_id": execution.get("exchange_order_id"),
             "quantity": number(execution.get("quantity")),
             "price": number(execution.get("price")),
+            "profit_limit_price": number(profit_guard.get("limit_price")),
+            "profit_limit_execution_book": profit_book,
         },
     }
 
@@ -297,6 +309,10 @@ async def main():
         "eligible_model_hold_count": len(eligible_hold),
         "close_not_executed_count": len(close_not_executed),
         "close_failed_count": category_counts["close_failed"],
+        "profit_limit_book_reason_counts": dict(Counter(
+            book["reason"] for item in records
+            if (book := item["execution_result"]["profit_limit_execution_book"]).get("reason")
+        )),
         "okx_price_limit_rejection_count": sum(
             "OKX API error [51006]" in item["execution_reason"]
             for item in close_not_executed

@@ -7,6 +7,7 @@ from math import isfinite
 from typing import Any
 
 FAST_PROFIT_LOCK_TRIGGER = "profit_drawdown_dynamic_position_scan"
+PROFIT_LOCK_LIQUIDITY_BLOCKER = "profit_lock_execution_liquidity"
 
 
 def fast_profit_lock_eligible(raw: dict[str, Any]) -> bool:

@@ -20,7 +20,10 @@ from services.current_position_management import (
     PROFIT_LOCK_LEDGER_VERSION,
 )
 from services.okx_error_classifier import is_okx_temporary_service_error
-from services.profit_lock_execution import profit_lock_execution_required
+from services.profit_lock_execution import (
+    PROFIT_LOCK_LIQUIDITY_BLOCKER,
+    profit_lock_execution_required,
+)
 
 EXIT_INTENT_KEY = "exit_execution_intent"
 EXIT_INTENT_VERSION = "2026-08-20.exit-singleflight.v1"
@@ -32,6 +35,8 @@ REJECTED_RETRY_SECONDS = 45.0
 COMPLETED_CONFIRMATION_SECONDS = 300.0
 PROFIT_LOCK_NO_FILL_RETRY_SECONDS = 300.0
 PROFIT_LOCK_NO_FILL_STATE = "profit_lock_no_fill"
+PROFIT_LOCK_LIQUIDITY_WAIT_STATE = "profit_lock_liquidity_wait"
+PROFIT_LOCK_WAIT_STATES = {PROFIT_LOCK_NO_FILL_STATE, PROFIT_LOCK_LIQUIDITY_WAIT_STATE}
 
 SessionContextFactory = Callable[[], AbstractAsyncContextManager[Any]]
 TradeRepoFactory = Callable[[Any], TradeRepository]
@@ -116,8 +121,9 @@ class ExitExecutionSingleFlightService:
             current = self._current_group_intent(positions)
             retry_at = self._parse_time(current.get("retry_after_at"))
             raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
-            profit_no_fill = current.get("state") == PROFIT_LOCK_NO_FILL_STATE
-            bypass_profit_cooldown = profit_no_fill and not profit_lock_execution_required(raw)
+            cooldown_state = current.get("state")
+            profit_cooldown = cooldown_state in PROFIT_LOCK_WAIT_STATES
+            bypass_profit_cooldown = profit_cooldown and not profit_lock_execution_required(raw)
             if (
                 current.get("key") == key
                 and retry_at is not None
@@ -135,7 +141,9 @@ class ExitExecutionSingleFlightService:
                     retry_after_seconds=retry_after,
                     reason=(
                         "盈利限价单已确认未成交，稍后重新评估，本轮未再次提交。"
-                        if profit_no_fill
+                        if cooldown_state == PROFIT_LOCK_NO_FILL_STATE
+                        else "盈利减仓正在等待符合限价的模拟盘报价，本轮未提交。"
+                        if cooldown_state == PROFIT_LOCK_LIQUIDITY_WAIT_STATE
                         else (
                             "A previous exit submission for this position is still awaiting "
                             "exchange confirmation. No duplicate exit was submitted."
@@ -264,7 +272,7 @@ class ExitExecutionSingleFlightService:
             order_id="exit_singleflight_wait",
             symbol=decision.symbol,
             side=side,
-            order_type="limit" if lease.state == PROFIT_LOCK_NO_FILL_STATE else "market",
+            order_type="limit" if lease.state in PROFIT_LOCK_WAIT_STATES else "market",
             quantity=0.0,
             price=0.0,
             status=OrderStatus.OPEN,
@@ -307,6 +315,13 @@ class ExitExecutionSingleFlightService:
             return "exchange_temporarily_unavailable", TEMPORARY_OUTAGE_RETRY_SECONDS, error
         if raw.get("execution_transport_unknown"):
             return "submitted_result_unknown", UNKNOWN_RESULT_RETRY_SECONDS, error
+        if (
+            result.status == OrderStatus.REJECTED
+            and not result.exchange_order_id
+            and raw.get("system_pre_submit_rejection") is True
+            and raw.get("execution_blocker") == PROFIT_LOCK_LIQUIDITY_BLOCKER
+        ):
+            return PROFIT_LOCK_LIQUIDITY_WAIT_STATE, REJECTED_RETRY_SECONDS, ""
         if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL} and result.quantity > 0:
             return "exchange_progress_confirmed", COMPLETED_CONFIRMATION_SECONDS, error
         if result.order_id == "no_position":
@@ -365,7 +380,7 @@ class ExitExecutionSingleFlightService:
     def profit_lock_in_cooldown(cls, position: dict[str, Any], now: datetime) -> bool:
         contract = position.get("current_management_contract")
         intent = contract.get(EXIT_INTENT_KEY) if isinstance(contract, dict) else None
-        if not isinstance(intent, dict) or intent.get("state") != PROFIT_LOCK_NO_FILL_STATE:
+        if not isinstance(intent, dict) or intent.get("state") not in PROFIT_LOCK_WAIT_STATES:
             return False
         retry_at = cls._parse_time(intent.get("retry_after_at"))
         return retry_at is not None and retry_at > now

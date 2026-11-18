@@ -1654,6 +1654,25 @@ async def test_pending_exit_does_not_replace_a_market_order_without_legal_liquid
 
 
 @pytest.mark.asyncio
+async def test_profit_lock_does_not_cancel_an_existing_market_exit():
+    exchange = _PriceLimitedExitCcxt(blocked=False)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.raw_response = {"dynamic_exit_policy": {
+        "lifecycle_net_pnl_usdt": 0.5, "profit_lock_pressure": 0.5,
+    }}
+
+    result = await executor.place_order(decision)
+
+    assert result.status == OrderStatus.OPEN
+    assert result.exchange_order_id == "pending-close"
+    assert exchange.cancel_calls == []
+    assert exchange.close_position_calls == []
+    assert exchange.create_calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stale", [False, True])
 async def test_pending_exit_retries_when_liquidity_returns_or_quote_is_stale(monkeypatch, stale):
     exchange = _PriceLimitedExitCcxt(blocked=stale, stale=stale)
@@ -1768,6 +1787,9 @@ async def test_profit_lock_uses_ioc_and_never_falls_back_to_market(
             result["info"]["tickSz"] = "0.001"
             return result
 
+        async def executionFetchOrderBook(self, _symbol):
+            return {"bids": [[2.32, 2.0]], "timestamp": datetime.now(UTC).timestamp() * 1000}
+
         async def executionGetPublicPriceLimit(self, params):
             return {"code": "0", "data": [{
                 "instId": params["instId"], "buyLmt": "3.06", "sellLmt": "2.32",
@@ -1822,11 +1844,56 @@ async def test_profit_lock_uses_ioc_and_never_falls_back_to_market(
     assert decision.raw_response["profit_lock_execution"]["execution_price_limit"][
         "price_limit_source_endpoint"
     ] == "executionGetPublicPriceLimit"
+    assert result.raw_response["profit_lock_execution"]["execution_book_check"][
+        "executable_contracts"
+    ] == 2.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("side", "book_bid", "book_ask", "delay_ms", "expected"), [
+    ("buy", 0.004450, 0.004576, 0, "no_quote_at_profit_limit"),
+    ("buy", 0.004450, 0.004457, 0, "crosses_limit"),
+    ("sell", 0.004450, 0.004576, 0, "no_quote_at_profit_limit"),
+    ("sell", 0.004457, 0.004576, 0, "crosses_limit"),
+    ("sell", 0.004457, 0.004576, 2500, "execution_book_stale"),
+    ("sell", 0.004457, 0.004576, -1000, "execution_book_stale"),
+])
+async def test_paper_profit_lock_checks_the_opposing_book_at_the_ioc_limit(
+    side, book_bid, book_ask, delay_ms, expected,
+):
+    class Exchange(_ExitMaxMarketSizeCcxt):
+        async def executionFetchOrderBook(self, _symbol):
+            return {
+                "bids": [[book_bid, 4.0], [float("inf"), 7.0]],
+                "asks": [[book_ask, 2.0], [0.004457, 0.0]],
+                "timestamp": datetime.now(UTC).timestamp() * 1000 - delay_ms,
+            }
+
+    exchange = Exchange(position_contracts=10.0)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "HOME/USDT"
+    guard = {"limit_price": 0.004457}
+    result = await executor._check_paper_profit_lock_book(
+        exchange, decision, side, 0.004389, 5.0, guard,
+    )
+
+    assert guard["execution_book_check"]["reason"] == expected
+    assert guard["limit_price"] == 0.004457
+    if expected == "crosses_limit":
+        assert result is None
+        assert guard["execution_book_check"]["executable_contracts"] in {2.0, 4.0}
+    else:
+        assert result is not None
+        assert result.status == OrderStatus.REJECTED
+        assert result.exchange_order_id is None
+        assert result.raw_response["do_not_persist_order"] is True
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("scenario", "submissions"), [
     ("repriced", 2), ("same_price", 1), ("rejected_again", 2), ("unknown", 1),
+    ("no_liquidity", 0), ("reprice_without_liquidity", 1),
 ])
 async def test_profit_lock_51006_refreshes_price_limit_and_retries_once(
     monkeypatch: pytest.MonkeyPatch,
@@ -1843,6 +1910,14 @@ async def test_profit_lock_51006_refreshes_price_limit_and_retries_once(
             result = super().market(symbol)
             result["info"]["tickSz"] = "0.001"
             return result
+
+        async def executionFetchOrderBook(self, _symbol: str) -> dict[str, Any]:
+            bid = (
+                2.29 if scenario == "no_liquidity"
+                or (scenario == "reprice_without_liquidity" and self.native_calls)
+                else 2.32
+            )
+            return {"bids": [[bid, 5.0]], "timestamp": datetime.now(UTC).timestamp() * 1000}
 
         async def executionGetPublicPriceLimit(
             self, params: dict[str, Any],
@@ -1913,13 +1988,22 @@ async def test_profit_lock_51006_refreshes_price_limit_and_retries_once(
     result = await executor.place_order(decision)
 
     assert len(exchange.native_calls) == submissions
-    assert exchange.price_limit_calls == (1 if scenario == "unknown" else 2)
+    assert exchange.price_limit_calls == (1 if scenario in {"unknown", "no_liquidity"} else 2)
     assert not exchange.close_position_calls
     assert not exchange.create_calls
     assert all(order["ordType"] == "ioc" for order in exchange.native_calls)
     if scenario == "unknown":
         assert result.status == OrderStatus.PENDING
         assert result.raw_response["execution_transport_unknown"] is True
+    if scenario == "no_liquidity":
+        assert result.raw_response["execution_blocker"] == "profit_lock_execution_liquidity"
+        assert result.raw_response["okx_rejection"] is False
+    if scenario == "reprice_without_liquidity":
+        assert "51006" in result.raw_response["error"]
+        assert result.raw_response["request_params"] == exchange.native_calls[0]
+        guard = decision.raw_response["profit_lock_execution"]
+        assert guard["limit_price"] == pytest.approx(2.32)
+        assert guard["blocked_51006_retry_book"]["reason"] == "no_quote_at_profit_limit"
     if scenario != "repriced":
         assert result.quantity == 0.0
         assert result.status != OrderStatus.FILLED
