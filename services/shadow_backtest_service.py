@@ -51,9 +51,7 @@ LOCAL_ML_SHADOW_VERSION = "2026-11-09.local-ml-shadow.v1"
 SHADOW_RESULT_FACT_CONCURRENCY = 8
 SHADOW_RESULT_FACT_TIMEOUT_SECONDS = 3.0
 SHADOW_RESULT_FACT_BATCH_TIMEOUT_SECONDS = 6.0
-# A timed-out market-fact build is kept alive by DataService single-flight.
-# Do not hammer the same symbol every maintenance round while that refresh is
-# still pending; retry after a short bounded cooldown instead.
+# Back off when the provider fails or returns an incomplete observation.
 SHADOW_RESULT_FACT_RETRY_COOLDOWN_SECONDS = 15.0
 SHADOW_RESULT_COST_FACT_TIMEOUT_SECONDS = 5.0
 SHADOW_RESULT_COST_FACT_BATCH_TIMEOUT_SECONDS = 6.0
@@ -1127,10 +1125,21 @@ class ShadowBacktestService:
                         return symbol, {}
                     try:
                         if self.latest_market_fact_provider is not None:
-                            fact = await asyncio.wait_for(
-                                self.latest_market_fact_provider(symbol),
-                                timeout=SHADOW_RESULT_FACT_TIMEOUT_SECONDS,
-                            )
+                            wait_budget = asyncio.timeout(SHADOW_RESULT_FACT_TIMEOUT_SECONDS)
+                            try:
+                                async with wait_budget:
+                                    fact = await self.latest_market_fact_provider(symbol)
+                            except TimeoutError:
+                                if not wait_budget.expired():
+                                    raise
+                                # DataService shields the shared fetch. The next
+                                # pass can join it or use its short-lived cache.
+                                logger.info(
+                                    "shadow result market fact wait deferred",
+                                    symbol=symbol,
+                                    timeout_seconds=SHADOW_RESULT_FACT_TIMEOUT_SECONDS,
+                                )
+                                return symbol, {}
                         else:
                             fact = await fallback_market_fact(
                                 symbol,

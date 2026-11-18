@@ -17,6 +17,7 @@ from core.training_contracts import (
     shadow_label_contract_reasons,
 )
 from core.training_feature_snapshot import compact_training_feature_snapshot
+from services.data_service import DataService
 from services.ml_prediction_contract import PREDICTION_SCORE_POLICY_VERSION
 from services.profit_supervision import shadow_fee_after_return_labels
 from services.shadow_backtest_service import (
@@ -163,6 +164,7 @@ def _market_fact(
     timestamp_ms: int,
     *,
     notional_24h_usdt: float = 100_000.0,
+    received_at: datetime | None = None,
 ) -> dict[str, Any]:
     normalized = symbol.upper()
     base = normalized.split("/")[0]
@@ -200,7 +202,7 @@ def _market_fact(
             "tickSz": "0.0001",
             "state": "live",
         },
-        received_at=datetime.fromtimestamp(timestamp_ms / 1000.0, tz=UTC),
+        received_at=received_at or datetime.fromtimestamp(timestamp_ms / 1000.0, tz=UTC),
     )
 
 
@@ -1159,6 +1161,65 @@ async def test_shadow_backtest_market_fact_error_keeps_authoritative_sample_pend
     assert repo.completed == []
     assert row.status == "pending"
     assert historical_calls == []
+    assert row.symbol in service._market_fact_retry_after
+
+
+@pytest.mark.asyncio
+async def test_shadow_backtest_reuses_market_fact_completed_after_wait_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result_at = datetime.fromtimestamp(_RESULT_TIMESTAMP_MS / 1000.0, tz=UTC)
+    received_at = result_at + timedelta(seconds=4)
+    repo = _FakeRepo()
+    row = SimpleNamespace(
+        id=98, decision_id=998, symbol="BTC/USDT", decision_action="hold",
+        execution_mode="paper", entry_price=100.0, horizon_minutes=60,
+        status="pending", note="", due_at=result_at,
+        feature_snapshot={
+            "bid": 99.99,
+            "ask": 100.01,
+            "orderbook_bid_depth": 100_000.0,
+            "orderbook_ask_depth": 100_000.0,
+            "taker_fee_rate": 0.0005,
+            "fee_rate_source": "original_account_trade_fee",
+            "fee_rate_observed_at": "2026-07-13T07:00:00+00:00",
+            "funding_rate": 0.0,
+            "funding_data_available": True,
+            "funding_interval_minutes": 480.0,
+        },
+    )
+    repo.due_rows = [row]
+    service = _service(repo)
+    data_service = object.__new__(DataService)
+    release = asyncio.Event()
+    provider_calls = 0
+
+    async def build(symbol: str) -> dict[str, Any]:
+        nonlocal provider_calls
+        provider_calls += 1
+        await release.wait()
+        return _market_fact(symbol, 101.0, _RESULT_TIMESTAMP_MS, received_at=received_at)
+
+    monkeypatch.setattr(data_service, "_build_latest_market_fact", build)
+    monkeypatch.setattr(shadow_backtest_module, "SHADOW_RESULT_FACT_TIMEOUT_SECONDS", 0.01)
+    service.latest_market_fact_provider = data_service.get_latest_market_fact
+
+    assert await service.update_due() == 0
+    assert row.status == "pending"
+    assert provider_calls == 1
+    assert row.symbol not in service._market_fact_retry_after
+    task = data_service._latest_market_fact_tasks[row.symbol]
+    assert not task.done()
+    release.set()
+    await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+
+    assert await service.update_due() == 1
+    assert provider_calls == 1
+    assert repo.completed[0]["actual_price"] == pytest.approx(101.0)
+    label = row.feature_snapshot["training_label_contract"]
+    assert label["label_timestamp"] == received_at.isoformat()
+    assert label["scheduled_label_at"] == result_at.isoformat()
+    assert label["fee_after_complete"] is True
 
 
 @pytest.mark.asyncio
