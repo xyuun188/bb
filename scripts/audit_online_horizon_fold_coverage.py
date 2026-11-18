@@ -17,6 +17,25 @@ if str(ROOT) not in sys.path:
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 
+
+def _row_clocks(
+    row: dict, *, since: datetime, cutoff: datetime,
+) -> tuple[datetime, datetime] | None:
+    try:
+        decision = datetime.fromisoformat(row["original_decision_at"])
+        available = datetime.fromisoformat(row["label_available_at"])
+    except (TypeError, ValueError):
+        return None
+    if decision.utcoffset() is None or available.utcoffset() is None:
+        return None
+    if not (
+        since <= decision <= row["created_at"] < cutoff
+        and decision < row["due_at"] <= available < cutoff
+    ):
+        return None
+    return decision.astimezone(UTC), available.astimezone(UTC)
+
+
 REMOTE_SCRIPT = r"""
 import asyncio
 import json
@@ -25,6 +44,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import text
 
 from db.session import get_read_session_ctx
+from scripts.audit_online_horizon_fold_coverage import _row_clocks
 
 CUTOFF = datetime.fromisoformat(__CUTOFF__.replace("Z", "+00:00")).astimezone(UTC)
 HOURS = __HOURS__
@@ -43,14 +63,24 @@ async def main():
     ) as session:
         result = await session.execute(text('''
             WITH filtered AS (
-                SELECT decision_id, horizon_minutes, created_at, updated_at, due_at
+                SELECT decision_id, horizon_minutes, created_at, due_at,
+                       training_feature_snapshot->>'original_decision_timestamp'
+                           AS original_decision_at,
+                       coalesce(
+                           training_feature_snapshot
+                               #>>'{training_label_contract,labels,label_timestamp}',
+                           training_feature_snapshot
+                               #>>'{training_label_contract,label_timestamp}'
+                       ) AS label_available_at
                 FROM shadow_backtests
                 WHERE execution_mode='paper'
                   AND status='completed'
                   AND analysis_type='market'
                   AND decision_id > 0
                   AND horizon_minutes IN (5, 15, 60, 240)
-                  AND updated_at >= :since
+                  AND created_at >= :since
+                  AND created_at < :cutoff
+                  AND due_at < :cutoff
                   AND updated_at < :cutoff
                   AND training_feature_snapshot
                       ->'training_market_fact_contract'->>'source'
@@ -60,13 +90,13 @@ async def main():
                       = 'true'
             ),
             selected AS (
-                SELECT decision_id, max(updated_at) AS max_updated_at
+                SELECT decision_id, min(created_at) AS first_created_at
                 FROM filtered
                 GROUP BY decision_id
-                ORDER BY max_updated_at, decision_id
+                ORDER BY first_created_at, decision_id
                 LIMIT :group_limit
             )
-            SELECT f.decision_id, f.horizon_minutes, f.created_at, f.updated_at, f.due_at
+            SELECT f.*
             FROM filtered f
             JOIN selected s ON s.decision_id = f.decision_id
             ORDER BY f.created_at, f.decision_id, f.horizon_minutes
@@ -79,33 +109,25 @@ async def main():
         rows = [dict(row) for row in result.mappings()]
 
     groups = {}
+    excluded_clock_rows = 0
     for row in rows:
+        clocks = _row_clocks(row, since=since, cutoff=CUTOFF)
+        if clocks is None:
+            excluded_clock_rows += 1
+            continue
+        decision, available = clocks
         group = str(row["decision_id"])
-        item = groups.setdefault(group, {"horizons": {}, "rows": []})
-        item["horizons"][int(row["horizon_minutes"])] = row
-        item["rows"].append(row)
+        item = groups.setdefault(group, {})
+        horizon = int(row["horizon_minutes"])
+        if horizon in item:
+            raise ValueError("duplicate decision-group/horizon rows in source projection")
+        item[horizon] = (decision, available)
 
     complete = []
     for group, item in groups.items():
-        if set(HORIZONS) != set(item["horizons"]):
+        if set(HORIZONS) != set(item):
             continue
-        rows_for_group = item["rows"]
-        if len(rows_for_group) != len(HORIZONS):
-            raise ValueError("duplicate decision-group/horizon rows in source projection")
-        decision_timestamps = []
-        label_ends = []
-        for row in rows_for_group:
-            created = row.get("created_at")
-            due = row.get("due_at")
-            if created is None or due is None:
-                continue
-            decision_timestamps.append(created)
-            label_ends.append(due)
-        if (
-            len(decision_timestamps) != len(rows_for_group)
-            or len(label_ends) != len(rows_for_group)
-        ):
-            continue
+        decision_timestamps, label_ends = zip(*item.values(), strict=True)
         complete.append({
             "group": group,
             "decision_start": min(decision_timestamps),
@@ -161,6 +183,9 @@ async def main():
             "source": NATIVE_SOURCE,
         },
         "rows": len(rows),
+        "excluded_clock_rows": excluded_clock_rows,
+        "projection": "declared_decision_and_label_availability_complete_groups",
+        "full_training_eligibility_checked": False,
         "complete_four_horizon_groups": len(complete),
         "initial_training_group_count_before_purge": initial,
         "validation_group_count_after_initial_split": len(validation_groups),
