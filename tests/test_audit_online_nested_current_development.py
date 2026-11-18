@@ -1,8 +1,19 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from scripts import audit_online_nested_current_development as audit
+
+
+def test_primary_groups_are_sampled_across_the_full_window() -> None:
+    start = datetime(2026, 11, 18, tzinfo=UTC)
+    decisions = {
+        key: start + timedelta(minutes=key)
+        for key in (7, 3, 9, 0, 1, 4, 8, 2, 5, 6)
+    }
+    assert audit._sample_chronological_groups(decisions, 4) == [0, 3, 6, 9]
+    assert audit._sample_chronological_groups(decisions, 1) == [9]
+    assert audit._sample_chronological_groups({}, 4) == []
 
 
 def test_remote_nested_research_query_is_bounded_native_and_cost_complete() -> None:
@@ -16,15 +27,19 @@ def test_remote_nested_research_query_is_bounded_native_and_cost_complete() -> N
 
     assert "ShadowBacktest.updated_at >= since" in source
     assert "ShadowBacktest.updated_at < CUTOFF" in source
+    assert "ShadowBacktest.created_at >= DECISION_SINCE" in source
+    assert "ShadowBacktest.created_at < CUTOFF" in source
+    assert "label_available_at < CUTOFF" in source
     assert "original_decision_timestamp" in source
     assert "decision_timestamp >= DECISION_SINCE" in source
     assert "decision_timestamp < CUTOFF" in source
     assert "== NATIVE_SOURCE" in source
     assert '.as_boolean().is_(True)' in source
-    assert ".limit(GROUP_LIMIT)" in source
-    assert ".group_by(group_key)" in source
-    assert ".order_by(func.max(ShadowBacktest.updated_at).desc(), group_key.desc())" in source
-    assert "group_key.in_(select(selected_groups.c.decision_group_key))" in source
+    assert ")[:GROUP_LIMIT]" in source
+    assert 'transaction_isolation="REPEATABLE READ READ ONLY"' in source
+    assert "ShadowBacktest.created_at >= page_start" in source
+    assert "ShadowBacktest.created_at < page_end" in source
+    assert "ShadowBacktest.id.in_(ids)" in source
     assert "exam_labels_evaluated" in source
     assert "outer_fold_coverage" in source
     assert "legacy_all_horizon_development_sha256" in source

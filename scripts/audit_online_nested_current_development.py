@@ -20,6 +20,20 @@ if str(ROOT) not in sys.path:
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 
+
+def _sample_chronological_groups(
+    decision_times: dict[int, datetime], limit: int,
+) -> list[int]:
+    ordered = sorted(decision_times, key=lambda key: (decision_times[key], key))
+    if len(ordered) <= limit:
+        return ordered
+    if limit == 1:
+        return ordered[-1:]
+    return [
+        ordered[round(index * (len(ordered) - 1) / (limit - 1))]
+        for index in range(limit)
+    ]
+
 DEPENDENCIES = (
     "services/ml_nested_development.py",
     "services/ml_nested_development_tree.py",
@@ -41,10 +55,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 from sqlalchemy import DateTime, cast, func, select
 
 from db.session import close_db, get_read_session_ctx
 from models.learning import ShadowBacktest
+from scripts.audit_online_nested_current_development import _sample_chronological_groups
 from services.ml_development_baselines import _development_input_sha256
 from services.ml_nested_development import build_nested_development_report
 from services.ml_nested_development_tree import (
@@ -234,6 +250,8 @@ async def main():
     filters = (
         ShadowBacktest.execution_mode == "paper",
         ShadowBacktest.status == "completed",
+        ShadowBacktest.created_at >= DECISION_SINCE,
+        ShadowBacktest.created_at < CUTOFF,
         ShadowBacktest.updated_at >= since,
         ShadowBacktest.updated_at < CUTOFF,
         decision_timestamp >= DECISION_SINCE,
@@ -245,31 +263,67 @@ async def main():
             "training_label_contract"
         ]["fee_after_complete"].as_boolean().is_(True),
     )
-    selected_groups = (
-        select(group_key.label("decision_group_key"))
-        .where(*filters)
-        .group_by(group_key)
-        .order_by(func.max(ShadowBacktest.updated_at).desc(), group_key.desc())
-        .limit(GROUP_LIMIT)
-        .subquery()
-    )
-    statement = (
-        select(*shadow_training_columns())
-        .where(
-            *filters,
-            group_key.in_(select(selected_groups.c.decision_group_key)),
-        )
-        .order_by(ShadowBacktest.updated_at, ShadowBacktest.id)
-    )
+    eligibility = select(
+        ShadowBacktest.id,
+        group_key,
+        ShadowBacktest.updated_at,
+        ShadowBacktest.horizon_minutes,
+        decision_timestamp,
+    ).where(*filters)
     try:
-        async with get_read_session_ctx(statement_timeout_ms=15000) as session:
-            result = await session.execute(statement)
-            rows = [
-                shadow_training_row_from_mapping(row)
-                for row in result.mappings()
+        async with get_read_session_ctx(
+            statement_timeout_ms=15000,
+            transaction_isolation="REPEATABLE READ READ ONLY",
+        ) as session:
+            # Keep JSON reads bounded per statement and hydrate only selected groups.
+            groups_by_key = {}
+            primary_decision_times = {}
+            page_start = DECISION_SINCE
+            while page_start < CUTOFF:
+                page_end = min(page_start + timedelta(hours=2), CUTOFF)
+                result = await session.execute(eligibility.where(
+                    ShadowBacktest.created_at >= page_start,
+                    ShadowBacktest.created_at < page_end,
+                ))
+                for row_id, key, updated_at, horizon, decided_at in result:
+                    groups_by_key.setdefault(key, []).append((updated_at, row_id))
+                    if horizon == PRIMARY_PREDICTION_HORIZON_MINUTES:
+                        primary_decision_times[key] = min(
+                            decided_at, primary_decision_times.get(key, decided_at),
+                        )
+                page_start = page_end
+
+            if REVISION == "v5":
+                selected_groups = _sample_chronological_groups(
+                    primary_decision_times, GROUP_LIMIT,
+                )
+            else:
+                selected_groups = sorted(
+                    groups_by_key,
+                    key=lambda key: (max(groups_by_key[key])[0], key),
+                    reverse=True,
+                )[:GROUP_LIMIT]
+            selected_ids = [
+                row_id
+                for _, row_id in sorted(
+                    pair for key in selected_groups for pair in groups_by_key[key]
+                )
             ]
+            rows = []
+            for offset in range(0, len(selected_ids), 200):
+                ids = selected_ids[offset:offset + 200]
+                result = await session.execute(
+                    select(*shadow_training_columns()).where(ShadowBacktest.id.in_(ids)),
+                )
+                by_id = {row["id"]: row for row in result.mappings()}
+                rows.extend(shadow_training_row_from_mapping(by_id[row_id]) for row_id in ids)
 
         frame = build_training_frame(rows)
+        if not frame.empty:
+            label_available_at = pd.to_datetime(
+                frame["label_timestamp"], utc=True, errors="coerce", format="mixed",
+            )
+            frame = frame.loc[label_available_at < CUTOFF].copy()
         if FAMILY == "ridge":
             nested = build_nested_development_report(frame)
         elif FAMILY == "tree":
@@ -361,6 +415,10 @@ async def main():
                 "decision_cutoff_exclusive": CUTOFF.isoformat(),
                 "hours": HOURS,
                 "decision_group_limit": GROUP_LIMIT,
+                "sampling_policy": (
+                    "primary_horizon_groups_stratified_by_decision_time"
+                    if REVISION == "v5" else "latest_updated_groups"
+                ),
                 "source": NATIVE_SOURCE,
                 "filter": "completed paper labels with fee_after_complete=true",
             },
@@ -539,7 +597,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--revision",
-        choices=("v1", "v2", "v3", "v4"),
+        choices=("v1", "v2", "v3", "v4", "v5"),
         default="v1",
     )
     parser.add_argument(
