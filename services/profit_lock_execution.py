@@ -6,6 +6,20 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from math import isfinite
 from typing import Any
 
+FAST_PROFIT_LOCK_TRIGGER = "profit_drawdown_dynamic_position_scan"
+
+
+def fast_profit_lock_eligible(raw: dict[str, Any]) -> bool:
+    if not profit_lock_execution_required(raw):
+        return False
+    policy = raw["dynamic_exit_policy"]
+    try:
+        pnl = float(policy.get("fee_after_unrealized_pnl_usdt"))
+        pressure = float(policy.get("profit_lock_pressure"))
+    except (TypeError, ValueError):
+        return False
+    return isfinite(pnl) and pnl > 0.0 and isfinite(pressure) and pressure > 0.0
+
 
 def profit_lock_execution_required(raw: dict[str, Any]) -> bool:
     policy = raw.get("dynamic_exit_policy") or {}
@@ -96,6 +110,8 @@ def profit_lock_limit(
         "fee_after_limit_price": float(fee_after_limit),
         "execution_price_limit": price_limit,
         "break_even_price": float(boundary),
+        "entry_price": entry_price,
+        "quantity": quantity,
         "entry_fee_usdt": entry_fee_usdt,
         "exit_fee_rate": exit_fee_rate,
         "adverse_funding_usdt": adverse_funding_usdt,

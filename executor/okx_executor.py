@@ -60,7 +60,12 @@ from services.okx_entry_environment_compatibility import (
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.okx_native_facts import OkxNativeFactsClient
 from services.okx_perpetual_sdk import OkxPerpetualSdkExchange
-from services.profit_lock_execution import profit_lock_execution_required, profit_lock_limit
+from services.profit_lock_execution import (
+    FAST_PROFIT_LOCK_TRIGGER,
+    fast_profit_lock_eligible,
+    profit_lock_execution_required,
+    profit_lock_limit,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -979,6 +984,22 @@ class OKXExecutor(AbstractExecutor):
         attached_protection_recovery: dict[str, Any] = {}
         post_only_fact: dict[str, Any] = {}
         entry_submit_started = False
+        raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        fast_profit_lock = decision.is_exit and raw.get("fast_risk_trigger") == FAST_PROFIT_LOCK_TRIGGER
+        if fast_profit_lock and (
+            self.executor_mode != "paper" or not fast_profit_lock_eligible(raw)
+        ):
+            return ExecutionResult(
+                order_id="profit_lock_deferred", symbol=decision.symbol,
+                side="sell" if decision.action == Action.CLOSE_LONG else "buy",
+                order_type="limit", quantity=0.0, price=0.0,
+                status=OrderStatus.REJECTED,
+                raw_response={
+                    "execution_blocker": "fast_profit_lock_requires_paper_fee_after_profit",
+                    "system_pre_submit_rejection": True,
+                    "error": "Fast profit-lock evidence is no longer valid; no order submitted.",
+                },
+            )
 
         try:
             okx_symbol = await self._resolve_swap_symbol(decision.symbol)
@@ -1299,7 +1320,8 @@ class OKXExecutor(AbstractExecutor):
                         exit_liquidity = await self._pending_exit_liquidity(decision.symbol, side)
                     liquidity_blocked = exit_liquidity.get("blocked") is True
                     if (
-                        order_id and order_age >= EXIT_ORDER_REPLACE_AFTER_SECONDS
+                        not fast_profit_lock
+                        and order_id and order_age >= EXIT_ORDER_REPLACE_AFTER_SECONDS
                         and not liquidity_blocked
                     ):
                         cancel_result = await self._cancel_stale_exit_order(
@@ -3106,6 +3128,14 @@ class OKXExecutor(AbstractExecutor):
                 result=result,
             )
             return
+        if raw.get("execution_transport_unknown"):
+            self._set_exit_submission_state(
+                key,
+                state="submitted_result_unknown",
+                delay_seconds=OKX_EXIT_SINGLEFLIGHT_UNKNOWN_SECONDS,
+                result=result,
+            )
+            return
         if result.status in {OrderStatus.OPEN, OrderStatus.PENDING}:
             self._set_exit_submission_state(
                 key,
@@ -3909,10 +3939,99 @@ class OKXExecutor(AbstractExecutor):
                 lock_hit=True,
             )
 
+        submission_error: ExchangeAPIError | None = None
         try:
-            response = await self._with_retry(place_order, request_params)
+            response = await self._with_retry(
+                place_order,
+                request_params,
+                _max_attempts=1 if isinstance(profit_guard, dict) else None,
+            )
         except ExchangeAPIError as exc:
+            submission_error = exc
             error_text = safe_error_text(exc)
+            if (
+                isinstance(profit_guard, dict)
+                and profit_guard.get("eligible") is True
+                and self._exchange_error_code(exc, error_text) == "51006"
+            ):
+                # An explicit rejection permits one retry, only at a new price
+                # from the execution venue and still inside the fee-after floor.
+                try:
+                    refreshed_limits = await self._fetch_native_price_limit(
+                        decision.symbol,
+                        execution_market=True,
+                    )
+                    refreshed_guard = profit_lock_limit(
+                        side=side,
+                        entry_price=self._safe_float(profit_guard.get("entry_price"), 0.0),
+                        quantity=self._safe_float(profit_guard.get("quantity"), 0.0),
+                        entry_fee_usdt=self._safe_float(
+                            profit_guard.get("entry_fee_usdt"),
+                            -1.0,
+                        ),
+                        exit_fee_rate=self._safe_float(
+                            profit_guard.get("exit_fee_rate"),
+                            -1.0,
+                        ),
+                        tick_size=self._market_info_float(
+                            market,
+                            "tickSz",
+                            "price_tick",
+                        ),
+                        adverse_funding_usdt=self._safe_float(
+                            profit_guard.get("adverse_funding_usdt"),
+                            0.0,
+                        ),
+                        price_limit=refreshed_limits,
+                    )
+                    if (
+                        refreshed_limits.get("price_limit_source_endpoint")
+                        == "executionGetPublicPriceLimit"
+                        and refreshed_guard.get("eligible") is True
+                        and refreshed_guard["limit_price"] != profit_guard["limit_price"]
+                    ):
+                        refreshed_guard["reprice_after_51006"] = True
+                        refreshed_guard["previous_limit_price"] = profit_guard.get(
+                            "limit_price"
+                        )
+                        profit_guard = refreshed_guard
+                        params["profit_lock_execution"] = refreshed_guard
+                        decision.raw_response["profit_lock_execution"] = refreshed_guard
+                        request_params["px"] = self._format_okx_number(
+                            refreshed_guard["limit_price"]
+                        )
+                        response = await self._with_retry(
+                            place_order,
+                            request_params,
+                            _max_attempts=1,
+                        )
+                        submission_error = None
+                except ExchangeAPIError as retry_error:
+                    submission_error = retry_error
+                except Exception as refresh_error:
+                    logger.warning(
+                        "OKX profit-lock price-limit refresh failed after 51006",
+                        symbol=okx_symbol,
+                        error=safe_error_text(refresh_error, limit=180),
+                    )
+
+        if submission_error is not None:
+            exc = submission_error
+            error_text = safe_error_text(exc)
+            if execution_order_type == "limit" and (
+                isinstance(exc.__cause__, TimeoutError)
+                or self._is_network_retryable_error(error_text)
+            ):
+                return ExecutionResult(
+                    order_id="profit_lock_result_unknown", symbol=decision.symbol,
+                    side=side, order_type="limit", quantity=0.0, price=price,
+                    status=OrderStatus.PENDING,
+                    raw_response={
+                        "execution_transport_unknown": True,
+                        "do_not_persist_order": True,
+                        "error": error_text,
+                    },
+                )
             if self._exchange_error_code(exc, error_text) == "51001":
                 self._remember_exit_instrument_rejection(inst_id, error_text)
                 logger.warning(

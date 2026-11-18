@@ -230,6 +230,7 @@ from services.position_settlement import (
 from services.position_snapshot_syncer import PositionSnapshotSyncer
 from services.position_time import PositionTimeParser
 from services.production_trade_gate import evaluate_production_trade_gate
+from services.profit_lock_execution import FAST_PROFIT_LOCK_TRIGGER, fast_profit_lock_eligible
 from services.profit_supervision import authoritative_execution_cost_calibration
 from services.profit_training_contract import PROFIT_TRAINING_TARGET
 from services.same_symbol_reentry import SameSymbolReentryGuard
@@ -14320,8 +14321,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
         *,
         open_positions: list[dict[str, Any]] | None = None,
     ) -> list[dict]:
-        """Execute only hard protection before the governed position review."""
+        """Run hard protection and eligible paper profit locks before AI review."""
         auto_closes: list[dict[str, Any]] = []
+        paper_profit_lock: dict[str, Any] | None = None
         if open_positions is None:
             open_positions = await self.okx_sync_service.get_open_positions_context()
         if not open_positions:
@@ -14450,17 +14452,34 @@ class TradingService(ModelTrainingCoordinatorMixin):
             execution_contract = evaluate_dynamic_exit_execution_contract(assessment)
             if not execution_contract["allowed"]:
                 continue
-            # The fast path is reserved for exchange/fee hard protection and
-            # explicit stop or target crossings. Ordinary dynamic pressure must
-            # go through the governed position review, where expert evidence
-            # and conflict gates are available before an order is submitted.
-            if trigger == "dynamic_position_scan" and not (
-                self._fast_dynamic_position_scan_is_allowed(assessment)
-            ):
-                continue
+            if trigger == "dynamic_position_scan" and not execution_contract["hard_risk"]:
+                if (
+                    not fast_profit_lock_eligible(close_decision.raw_response)
+                    or self._get_model_execution_mode(model_name) != "paper"
+                ):
+                    continue
+                trigger = FAST_PROFIT_LOCK_TRIGGER
+                close_decision.raw_response["fast_risk_trigger"] = trigger
 
             close_fraction = assessment.close_fraction
             reason = assessment.reason
+            execution_args = {
+                "model_name": model_name,
+                "symbol": symbol,
+                "side": side,
+                "position": position_snapshot,
+                "decision": close_decision,
+                "trigger": trigger,
+                "reason": reason,
+                "close_fraction": close_fraction,
+                "entry_price": entry_price,
+                "current_price": current_price,
+            }
+            if trigger == FAST_PROFIT_LOCK_TRIGGER:
+                if paper_profit_lock is None or close_fraction > paper_profit_lock["close_fraction"]:
+                    paper_profit_lock = execution_args
+                continue
+
             logger.info(
                 "dynamic position risk triggered",
                 model=model_name,
@@ -14471,16 +14490,16 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 policy_version=assessment.policy_provenance.get("strategy_version"),
             )
             execution = await self._fast_risk_exit_execution_processor().execute(
-                model_name=model_name,
-                symbol=symbol,
-                side=side,
-                position=position_snapshot,
-                decision=close_decision,
-                trigger=trigger,
-                reason=reason,
-                close_fraction=close_fraction,
-                entry_price=entry_price,
-                current_price=current_price,
+                **execution_args,
+            )
+            if not execution.skipped and execution.auto_close is not None:
+                auto_closes.append(execution.auto_close)
+
+        # Do not spend this round's protection time on discretionary orders
+        # if a hard or target exit was already processed.
+        if paper_profit_lock is not None and not auto_closes:
+            execution = await self._fast_risk_exit_execution_processor().execute(
+                **paper_profit_lock,
             )
             if not execution.skipped and execution.auto_close is not None:
                 auto_closes.append(execution.auto_close)
@@ -14958,13 +14977,6 @@ class TradingService(ModelTrainingCoordinatorMixin):
 
     def _is_urgent_position_exit_scan(self, scan: dict[str, Any] | None) -> bool:
         return self._position_review_priority_policy().is_urgent_exit_scan(scan)
-
-    @staticmethod
-    def _fast_dynamic_position_scan_is_allowed(assessment: Any) -> bool:
-        """Reserve the fast path for explicit, evidence-backed hard risk."""
-
-        contract = evaluate_dynamic_exit_execution_contract(assessment)
-        return bool(contract["allowed"] and contract["hard_risk"])
 
     def _position_review_batch_policy(self) -> PositionReviewBatchPolicy:
         policy = getattr(self, "position_review_batch", None)

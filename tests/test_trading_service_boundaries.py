@@ -6309,10 +6309,15 @@ async def test_fast_protection_keeps_valuation_and_execution_snapshot_consistent
 
 
 @pytest.mark.asyncio
-async def test_fast_dynamic_position_scan_requires_hard_risk(monkeypatch) -> None:
+async def test_fast_dynamic_position_scan_allows_only_hard_risk_or_profit_lock(
+    monkeypatch,
+) -> None:
     service = TradingService.__new__(TradingService)
     calls: list[tuple[str, str, float]] = []
     hard_risk = [False]
+    profit_lock = [False]
+    conflicting_exit = [False]
+    execution_mode = ["paper"]
 
     class FakePositionTime:
         def position_age_minutes(self, _created_at):
@@ -6336,28 +6341,47 @@ async def test_fast_dynamic_position_scan_requires_hard_risk(monkeypatch) -> Non
                 auto_close={"symbol": kwargs["symbol"]},
             )
 
+    def fake_assess_dynamic_exit(decision, _positions):
+        policy = {
+            "eligible": True,
+            "close_fraction": 0.62,
+            "hard_risk": hard_risk[0],
+            "planned_stop_crossed": hard_risk[0],
+            "funding_loss_budget_crossed": False,
+            "projected_funding_budget_crossed": False,
+            "execution_cost_complete": True,
+            "current_management_contract_complete": True,
+            "position_age_evidence_complete": True,
+            "position_age_minutes": 30.0,
+            "early_exit_observation_active": False,
+            "economic_exit_evidence_complete": True,
+            "exit_reassessment_ready": True,
+            "lifecycle_net_pnl_usdt": 2.0 if profit_lock[0] else -2.0,
+            "fee_after_unrealized_pnl_usdt": 2.0 if profit_lock[0] else -2.0,
+            "gross_unrealized_pnl_usdt": 2.0 if profit_lock[0] else -2.0,
+            "profit_lock_pressure": 0.3 if profit_lock[0] else 0.0,
+            "profit_retrace_ratio": 0.0,
+            "stop_risk_usage": 0.0,
+            "continuation_deterioration": 0.0,
+            "opposite_pressure": 0.2 if conflicting_exit[0] else 0.0,
+            "model_exit_pressure": 0.0,
+            "reason": "dynamic_exit_policy_passed",
+            "policy_provenance": {},
+        }
+        decision.raw_response["dynamic_exit_policy"] = policy
+        return SimpleNamespace(
+            **policy,
+            to_dict=lambda: policy,
+        )
+
     monkeypatch.setattr(
         "services.trading_service.apply_dynamic_exit",
-        lambda _decision, _positions: SimpleNamespace(
-            eligible=True,
-            close_fraction=0.62,
-            hard_risk=hard_risk[0],
-            planned_stop_crossed=hard_risk[0],
-            funding_loss_budget_crossed=False,
-            projected_funding_budget_crossed=False,
-            execution_cost_complete=True,
-            current_management_contract_complete=True,
-            position_age_evidence_complete=True,
-            position_age_minutes=30.0,
-            early_exit_observation_active=False,
-            economic_exit_evidence_complete=True,
-            reason="dynamic_exit_policy_passed",
-            policy_provenance={},
-        ),
+        fake_assess_dynamic_exit,
     )
     service.position_time = FakePositionTime()
     service.position_profit_peaks = FakeProfitPeaks()
     service.fast_risk_exit_execution_processor = FakeProcessor()
+    service._get_model_execution_mode = lambda _model: execution_mode[0]
     position = {
         "model_name": "ensemble_trader",
         "symbol": "LTC/USDT",
@@ -6374,11 +6398,31 @@ async def test_fast_dynamic_position_scan_requires_hard_risk(monkeypatch) -> Non
     assert await service._enforce_sl_tp({}, open_positions=[position]) == []
     assert calls == []
 
+    profit_lock[0] = True
+    conflicting_exit[0] = True
+    assert await service._enforce_sl_tp({}, open_positions=[position]) == []
+    assert calls == []
+
+    conflicting_exit[0] = False
+    execution_mode[0] = "live"
+    assert await service._enforce_sl_tp({}, open_positions=[position]) == []
+    assert calls == []
+
+    execution_mode[0] = "paper"
+    peer = {**position, "symbol": "ETH/USDT"}
+    assert await service._enforce_sl_tp({}, open_positions=[position, peer]) == [
+        {"symbol": "LTC/USDT"}
+    ]
+    assert calls == [
+        ("LTC/USDT", "profit_drawdown_dynamic_position_scan", 0.62)
+    ]
+
     hard_risk[0] = True
+    position["stop_loss"] = 50.5
     assert await service._enforce_sl_tp({}, open_positions=[position]) == [
         {"symbol": "LTC/USDT"}
     ]
-    assert calls == [("LTC/USDT", "dynamic_position_scan", 0.62)]
+    assert calls[-1] == ("LTC/USDT", "stop_loss", 0.62)
 
 
 @pytest.mark.asyncio

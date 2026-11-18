@@ -1824,6 +1824,115 @@ async def test_profit_lock_uses_ioc_and_never_falls_back_to_market(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("scenario", "submissions"), [
+    ("repriced", 2), ("same_price", 1), ("rejected_again", 2), ("unknown", 1),
+])
+async def test_profit_lock_51006_refreshes_price_limit_and_retries_once(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    submissions: int,
+) -> None:
+    class Exchange(_ExitMaxMarketSizeCcxt):
+        def __init__(self) -> None:
+            super().__init__(position_contracts=10.0)
+            self.native_calls: list[dict[str, Any]] = []
+            self.price_limit_calls = 0
+
+        def market(self, symbol: str) -> dict[str, Any]:
+            result = super().market(symbol)
+            result["info"]["tickSz"] = "0.001"
+            return result
+
+        async def executionGetPublicPriceLimit(
+            self, params: dict[str, Any],
+        ) -> dict[str, Any]:
+            self.price_limit_calls += 1
+            sell_limit = "2.32" if self.price_limit_calls == 1 or scenario == "same_price" else "2.30"
+            return {"code": "0", "data": [{
+                "instId": params["instId"],
+                "buyLmt": "3.06",
+                "sellLmt": sell_limit,
+                "ts": str(int(datetime.now(UTC).timestamp() * 1000)),
+            }]}
+
+        async def privatePostTradeOrder(self, params: dict[str, Any]) -> dict[str, Any]:
+            self.native_calls.append(dict(params))
+            if scenario == "unknown":
+                raise TimeoutError
+            if len(self.native_calls) == 1 or scenario == "rejected_again":
+                raise ExchangeAPIError(
+                    "OKX API error [51006]: Order price is not within the price limit",
+                    code="51006",
+                )
+            self.position_contracts -= 5.0
+            self.orders["profit-repriced"] = {
+                "id": "profit-repriced",
+                "symbol": "USAR/USDT",
+                "type": "limit",
+                "side": "sell",
+                "amount": 5.0,
+                "filled": 5.0,
+                "price": float(params["px"]),
+                "average": float(params["px"]),
+                "status": "closed",
+                "fee": {"cost": 0.001},
+                "info": {
+                    "state": "filled",
+                    "ordId": "profit-repriced",
+                    "side": "sell",
+                    "ordType": "ioc",
+                    "reduceOnly": "true",
+                },
+            }
+            return {"code": "0", "data": [{
+                "sCode": "0",
+                "ordId": "profit-repriced",
+            }]}
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    exchange = Exchange()
+    executor = _executor(exchange)
+
+    async def fee() -> dict[str, Any]:
+        return {"taker_fee_rate": 0.0005}
+
+    executor.fetch_account_fee_snapshot = fee
+    monkeypatch.setattr(okx_module.asyncio, "sleep", no_sleep)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.position_size_pct = 0.5
+    decision.raw_response = {"dynamic_exit_policy": {
+        "lifecycle_net_pnl_usdt": 0.5,
+        "profit_lock_pressure": 0.5,
+        "entry_fee_usdt": 0.01,
+    }}
+
+    result = await executor.place_order(decision)
+
+    assert len(exchange.native_calls) == submissions
+    assert exchange.price_limit_calls == (1 if scenario == "unknown" else 2)
+    assert not exchange.close_position_calls
+    assert not exchange.create_calls
+    assert all(order["ordType"] == "ioc" for order in exchange.native_calls)
+    if scenario == "unknown":
+        assert result.status == OrderStatus.PENDING
+        assert result.raw_response["execution_transport_unknown"] is True
+    if scenario != "repriced":
+        assert result.quantity == 0.0
+        assert result.status != OrderStatus.FILLED
+        return
+    assert float(exchange.native_calls[1]["px"]) != float(exchange.native_calls[0]["px"])
+    assert result.quantity == 5.0
+    assert result.status == OrderStatus.FILLED
+    guard = decision.raw_response["profit_lock_execution"]
+    assert guard["reprice_after_51006"] is True
+    assert guard["market_fallback_allowed"] is False
+    assert guard["limit_price"] >= guard["break_even_price"]
+
+
+@pytest.mark.asyncio
 async def test_profit_lock_missing_native_limit_support_cannot_use_full_market_close() -> None:
     exchange = _ExitMaxMarketSizeCcxt(position_contracts=10.0)
     decision = _exit_decision()
