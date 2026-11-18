@@ -14379,9 +14379,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
     ) -> list[dict]:
         """Run hard protection and eligible paper profit locks before AI review."""
         auto_closes: list[dict[str, Any]] = []
-        paper_profit_lock: dict[str, Any] | None = None
-        profit_lock_priority: tuple[datetime, float] | None = None
-        profit_lock_key: tuple[str, str, str] | None = None
+        paper_profit_locks: list[
+            tuple[tuple[datetime, float], tuple[str, str, str], dict[str, Any]]
+        ] = []
         last_attempts = getattr(self, "_paper_profit_lock_attempts", {})
         scan_time = datetime.now(UTC)
         if open_positions is None:
@@ -14543,10 +14543,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     last_attempts.get(key, datetime.min.replace(tzinfo=UTC)),
                     -close_fraction,
                 )
-                if profit_lock_priority is None or priority < profit_lock_priority:
-                    profit_lock_priority = priority
-                    profit_lock_key = key
-                    paper_profit_lock = execution_args
+                paper_profit_locks.append((priority, key, execution_args))
                 continue
 
             logger.info(
@@ -14569,13 +14566,19 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self._paper_profit_lock_attempts = {
             key: stamp for key, stamp in last_attempts.items() if key in handled
         }
-        if paper_profit_lock is not None and profit_lock_key is not None and not auto_closes:
-            self._paper_profit_lock_attempts[profit_lock_key] = datetime.now(UTC)
-            execution = await self._fast_risk_exit_execution_processor().execute(
-                **paper_profit_lock,
-            )
-            if not execution.skipped and execution.auto_close is not None:
-                auto_closes.append(execution.auto_close)
+        if not auto_closes:
+            paper_profit_locks.sort(key=lambda candidate: candidate[0])
+            # Only a fresh book rejection before submission can release the slot.
+            # Bound the extra book check and keep at most one submission per pass.
+            for _, profit_lock_key, execution_args in paper_profit_locks[:2]:
+                self._paper_profit_lock_attempts[profit_lock_key] = datetime.now(UTC)
+                execution = await self._fast_risk_exit_execution_processor().execute(
+                    **execution_args,
+                )
+                if not execution.skipped and execution.auto_close is not None:
+                    auto_closes.append(execution.auto_close)
+                if not execution.profit_limit_has_no_quote:
+                    break
 
         return auto_closes
 

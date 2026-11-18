@@ -6411,6 +6411,7 @@ async def test_fast_dynamic_position_scan_allows_only_hard_risk_or_profit_lock(
     profit_lock = [False]
     conflicting_exit = [False]
     execution_mode = ["paper"]
+    no_quote_symbols: set[str] = set()
 
     class FakePositionTime:
         def position_age_minutes(self, _created_at):
@@ -6432,6 +6433,7 @@ async def test_fast_dynamic_position_scan_allows_only_hard_risk_or_profit_lock(
             return SimpleNamespace(
                 skipped=False,
                 auto_close={"symbol": kwargs["symbol"]},
+                profit_limit_has_no_quote=kwargs["symbol"] in no_quote_symbols,
             )
 
     def fake_assess_dynamic_exit(decision, _positions):
@@ -6536,6 +6538,25 @@ async def test_fast_dynamic_position_scan_allows_only_hard_risk_or_profit_lock(
     assert calls[-1] == ("LTC/USDT", "stop_loss", 0.62)
     assert await service._enforce_sl_tp({}, open_positions=[]) == []
     assert service._paper_profit_lock_attempts == {}
+
+    hard_risk[0] = False
+    position.pop("stop_loss")
+    position.pop("current_management_contract")
+    third = {**position, "symbol": "BTC/USDT"}
+    no_quote_symbols.add("LTC/USDT")
+    assert await service._enforce_sl_tp({}, open_positions=[position, peer, third]) == [
+        {"symbol": "LTC/USDT"},
+        {"symbol": "ETH/USDT"},
+    ]
+    assert [symbol for symbol, _, _ in calls[-2:]] == ["LTC/USDT", "ETH/USDT"]
+
+    await service._enforce_sl_tp({}, open_positions=[])
+    no_quote_symbols.update({"ETH/USDT", "BTC/USDT"})
+    assert await service._enforce_sl_tp({}, open_positions=[position, peer, third]) == [
+        {"symbol": "LTC/USDT"},
+        {"symbol": "ETH/USDT"},
+    ]
+    assert [symbol for symbol, _, _ in calls[-2:]] == ["LTC/USDT", "ETH/USDT"]
 
 
 @pytest.mark.asyncio

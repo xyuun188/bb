@@ -7,6 +7,7 @@ import pytest
 from ai_brain.base_model import Action, DecisionOutput
 from executor.base_executor import ExecutionResult, OrderStatus
 from services.fast_risk_exit_execution import FastRiskExitExecutionProcessor
+from services.profit_lock_execution import FAST_PROFIT_LOCK_TRIGGER, PROFIT_LOCK_LIQUIDITY_BLOCKER
 
 
 def _decision() -> DecisionOutput:
@@ -152,6 +153,43 @@ async def test_fast_risk_exit_execution_reports_skipped_when_executor_returns_no
 
     assert result.skipped is True
     assert result.auto_close is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("book_reason", "exchange_order_id", "pre_submit", "expected"),
+    [
+        ("no_quote_at_profit_limit", None, True, True),
+        ("execution_book_stale", None, True, False),
+        ("no_quote_at_profit_limit", "okx-1", True, False),
+        ("no_quote_at_profit_limit", None, False, False),
+    ],
+)
+async def test_fast_profit_lock_releases_slot_only_on_proven_no_quote(
+    book_reason, exchange_order_id, pre_submit, expected,
+) -> None:
+    receipt = _execution_result(OrderStatus.REJECTED)
+    receipt.exchange_order_id = exchange_order_id
+    receipt.raw_response = {
+        "execution_blocker": PROFIT_LOCK_LIQUIDITY_BLOCKER,
+        "system_pre_submit_rejection": pre_submit,
+        "profit_lock_execution": {"execution_book_check": {"reason": book_reason}},
+    }
+    result = await _processor([], execution_result=receipt).execute(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        side="long",
+        position={},
+        decision=_decision(),
+        trigger=FAST_PROFIT_LOCK_TRIGGER,
+        reason="lock profit",
+        close_fraction=0.5,
+        entry_price=100.0,
+        current_price=101.0,
+    )
+
+    assert result.profit_limit_has_no_quote is expected
+    assert result.auto_close["status"] == "rejected"
 
 
 @pytest.mark.asyncio

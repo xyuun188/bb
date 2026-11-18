@@ -12,6 +12,7 @@ import structlog
 from ai_brain.base_model import DecisionOutput
 from core.safe_output import safe_error_text
 from executor.base_executor import ExecutionResult, OrderStatus
+from services.profit_lock_execution import FAST_PROFIT_LOCK_TRIGGER, PROFIT_LOCK_LIQUIDITY_BLOCKER
 
 logger = structlog.get_logger(__name__)
 
@@ -35,6 +36,7 @@ class FastRiskExitExecutionResult:
     auto_close: dict[str, Any] | None = None
     skipped: bool = False
     error: str | None = None
+    profit_limit_has_no_quote: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +131,23 @@ class FastRiskExitExecutionProcessor:
                 ),
                 model_name,
             )
-            return FastRiskExitExecutionResult(auto_close=auto_close)
+            raw = execution_result.raw_response
+            guard = raw.get("profit_lock_execution") if isinstance(raw, dict) else None
+            book = guard.get("execution_book_check") if isinstance(guard, dict) else None
+            profit_limit_has_no_quote = (
+                trigger == FAST_PROFIT_LOCK_TRIGGER
+                and execution_result.status == OrderStatus.REJECTED
+                and not execution_result.exchange_order_id
+                and isinstance(raw, dict)
+                and raw.get("system_pre_submit_rejection") is True
+                and raw.get("execution_blocker") == PROFIT_LOCK_LIQUIDITY_BLOCKER
+                and isinstance(book, dict)
+                and book.get("reason") == "no_quote_at_profit_limit"
+            )
+            return FastRiskExitExecutionResult(
+                auto_close=auto_close,
+                profit_limit_has_no_quote=profit_limit_has_no_quote,
+            )
         except Exception as exc:
             error_text = safe_error_text(exc, limit=160)
             logger.error("failed to execute fast risk close", error=error_text)
