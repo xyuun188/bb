@@ -6389,11 +6389,12 @@ async def test_fast_dynamic_position_scan_allows_only_hard_risk_or_profit_lock(
             )
 
     def fake_assess_dynamic_exit(decision, _positions):
+        stop_crossed = hard_risk[0] and decision.symbol == "LTC/USDT"
         policy = {
             "eligible": True,
-            "close_fraction": 0.62,
-            "hard_risk": hard_risk[0],
-            "planned_stop_crossed": hard_risk[0],
+            "close_fraction": 0.62 if decision.symbol == "LTC/USDT" else 0.40,
+            "hard_risk": stop_crossed,
+            "planned_stop_crossed": stop_crossed,
             "funding_loss_budget_crossed": False,
             "projected_funding_budget_crossed": False,
             "execution_cost_complete": True,
@@ -6463,6 +6464,13 @@ async def test_fast_dynamic_position_scan_allows_only_hard_risk_or_profit_lock(
     assert calls == [
         ("LTC/USDT", "profit_drawdown_dynamic_position_scan", 0.62)
     ]
+    assert await service._enforce_sl_tp({}, open_positions=[position, peer]) == [
+        {"symbol": "ETH/USDT"}
+    ]
+    assert calls[-1] == ("ETH/USDT", "profit_drawdown_dynamic_position_scan", 0.40)
+    assert await service._enforce_sl_tp({}, open_positions=[position, peer]) == [
+        {"symbol": "LTC/USDT"}
+    ]
 
     position["current_management_contract"] = {
         "exit_execution_intent": {
@@ -6476,10 +6484,12 @@ async def test_fast_dynamic_position_scan_allows_only_hard_risk_or_profit_lock(
 
     hard_risk[0] = True
     position["stop_loss"] = 50.5
-    assert await service._enforce_sl_tp({}, open_positions=[position]) == [
+    assert await service._enforce_sl_tp({}, open_positions=[peer, position]) == [
         {"symbol": "LTC/USDT"}
     ]
     assert calls[-1] == ("LTC/USDT", "stop_loss", 0.62)
+    assert await service._enforce_sl_tp({}, open_positions=[]) == []
+    assert service._paper_profit_lock_attempts == {}
 
 
 @pytest.mark.asyncio

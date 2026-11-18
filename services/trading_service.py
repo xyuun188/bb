@@ -1121,6 +1121,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self._stale_entry_expire_failure_count = 0
         self._position_review_cursor = 0
         self._position_review_priority_cursor = 0
+        self._paper_profit_lock_attempts: dict[tuple[str, str, str], datetime] = {}
         self._auto_scan_feature_cursor = 0
         # Symbols admitted only to widen market observation must never be
         # treated as entry candidates later in the same round.  Keep this
@@ -14352,14 +14353,14 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """Run hard protection and eligible paper profit locks before AI review."""
         auto_closes: list[dict[str, Any]] = []
         paper_profit_lock: dict[str, Any] | None = None
+        profit_lock_priority: tuple[datetime, float] | None = None
+        profit_lock_key: tuple[str, str, str] | None = None
+        last_attempts = getattr(self, "_paper_profit_lock_attempts", {})
         scan_time = datetime.now(UTC)
         if open_positions is None:
             open_positions = await self.okx_sync_service.get_open_positions_context()
-        if not open_positions:
-            return auto_closes
-
         handled: set[tuple[str, str, str]] = set()
-        for position in open_positions:
+        for position in open_positions or []:
             if position.get("is_open", True) is False:
                 continue
             model_name = str(position.get("model_name") or ENSEMBLE_TRADER_NAME)
@@ -14509,7 +14510,15 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     position_snapshot, scan_time
                 ):
                     continue
-                if paper_profit_lock is None or close_fraction > paper_profit_lock["close_fraction"]:
+                # Rotate the single profit-lock slot so repeated checks on one
+                # position cannot crowd out peers with smaller close fractions.
+                priority = (
+                    last_attempts.get(key, datetime.min.replace(tzinfo=UTC)),
+                    -close_fraction,
+                )
+                if profit_lock_priority is None or priority < profit_lock_priority:
+                    profit_lock_priority = priority
+                    profit_lock_key = key
                     paper_profit_lock = execution_args
                 continue
 
@@ -14530,7 +14539,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
 
         # Do not spend this round's protection time on discretionary orders
         # if a hard or target exit was already processed.
-        if paper_profit_lock is not None and not auto_closes:
+        self._paper_profit_lock_attempts = {
+            key: stamp for key, stamp in last_attempts.items() if key in handled
+        }
+        if paper_profit_lock is not None and profit_lock_key is not None and not auto_closes:
+            self._paper_profit_lock_attempts[profit_lock_key] = datetime.now(UTC)
             execution = await self._fast_risk_exit_execution_processor().execute(
                 **paper_profit_lock,
             )

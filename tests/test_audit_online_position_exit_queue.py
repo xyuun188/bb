@@ -17,6 +17,7 @@ def test_remote_position_exit_audit_is_bounded_and_read_only() -> None:
     assert "LIMIT = 250" in script
     assert "HOURS = 12" in script
     assert "get_read_session_ctx" in script
+    assert 'transaction_isolation="REPEATABLE READ READ ONLY"' in script
     assert '"total_matching_count"' in script
     assert '"truncated"' in script
     assert "UPDATE " not in script

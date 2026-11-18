@@ -199,7 +199,10 @@ async def main():
         AIDecision.created_at >= since,
         AIDecision.created_at <= now,
     )
-    async with get_read_session_ctx(statement_timeout_ms=30000) as session:
+    async with get_read_session_ctx(
+        statement_timeout_ms=30000,
+        transaction_isolation="REPEATABLE READ READ ONLY",
+    ) as session:
         total_matching_count = await session.scalar(
             select(func.count(AIDecision.id)).where(*window)
         )
