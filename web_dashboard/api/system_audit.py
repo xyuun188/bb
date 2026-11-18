@@ -192,10 +192,8 @@ PHASE3_PAPER_RESUME_OBSERVATION_REPORT_REL_PATH = (
 PHASE3_OPERATOR_APPROVAL_REPORT_MAX_AGE_SECONDS = 3 * 3600
 OKX_POSITION_FACT_LINK_AUDIT_DAYS = 14
 OKX_POSITION_FACT_LINK_AUDIT_MAX_POSITIONS = 300
-# Keep the dashboard dry-run ahead of the current history while retaining a
-# bounded query.  The previous 1,000-row cap started reporting seven
-# unscanned orders as an unresolved incident once history grew to 1,007 rows.
-OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS = 2000
+# Allow for busier 14-day paper windows while keeping the dashboard scan bounded.
+OKX_RECONCILIATION_AUDIT_MAX_CLOSE_ORDERS = 5000
 HISTORICAL_TRADE_FACT_AUDIT_DAYS = 180
 HISTORICAL_TRADE_FACT_AUDIT_LIMIT = 2000
 PHASE3_SERVER_MIGRATION_AUDIT_TIMEOUT_SECONDS = 45
