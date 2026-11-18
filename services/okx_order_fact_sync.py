@@ -2215,6 +2215,7 @@ class OkxOrderFactSyncService:
             recovered_from_submit_stage = bool(
                 decision is not None
                 and fill.order_id in _decision_completed_submit_exchange_order_ids(decision)
+                and not _decision_has_final_confirmed_fill(decision, fill.order_id)
             )
             if recovered_from_submit_stage:
                 _apply_completed_submit_fill_recovery_to_decision(
@@ -3382,6 +3383,22 @@ def _order_exchange_ids_with_completed_submit(
     ) | _decision_completed_submit_exchange_order_ids(decision)
 
 
+def _decision_has_final_confirmed_fill(decision: AIDecision, order_id: str) -> bool:
+    raw = decision.raw_llm_response if isinstance(decision.raw_llm_response, dict) else {}
+    receipt = raw.get("execution_result")
+    machine = raw.get("decision_state_machine")
+    return (
+        decision.was_executed is True
+        and isinstance(receipt, dict)
+        and receipt.get("exchange_confirmed") is True
+        and receipt.get("status") == "filled"
+        and str(receipt.get("exchange_order_id") or "") == order_id
+        and isinstance(machine, dict)
+        and machine.get("current_status") == DecisionStageStatus.COMPLETED
+        and not is_pending_execution_reason(decision.execution_reason or "")
+    )
+
+
 def _apply_completed_submit_fill_recovery_to_decision(
     decision: AIDecision,
     *,
@@ -3397,7 +3414,7 @@ def _apply_completed_submit_fill_recovery_to_decision(
     decision.executed_at = fill.timestamp or now
     decision.execution_price = fill.avg_price
     decision.execution_reason = (
-        "OKX 原生成交已确认；系统已从提交成功阶段恢复被外层超时覆盖的执行结果。"
+        "OKX 原生成交已确认，系统已根据交易所回报补齐执行结果。"
     )
     raw = getattr(decision, "raw_llm_response", None)
     raw = dict(raw) if isinstance(raw, dict) else {}

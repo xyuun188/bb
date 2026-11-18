@@ -2591,11 +2591,13 @@ async def test_targeted_recent_fill_is_persisted_before_slow_account_history(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action,exit_progress", [("long", False), ("close_short", True)])
-async def test_completed_submit_stage_recovers_fill_overwritten_by_outer_timeout(
+@pytest.mark.parametrize("already_confirmed", [False, True])
+async def test_completed_submit_stage_recovers_only_unconfirmed_execution(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
     action: str,
     exit_progress: bool,
+    already_confirmed: bool,
 ) -> None:
     await _init_test_db(tmp_path, monkeypatch, "completed-submit-fill-recovery.db")
     now = datetime.now(UTC)
@@ -2612,10 +2614,12 @@ async def test_completed_submit_stage_recovers_fill_overwritten_by_outer_timeout
                 confidence=0.5,
                 reasoning="test",
                 is_paper=True,
-                was_executed=False,
-                execution_reason="outer timeout",
+                was_executed=already_confirmed,
+                execution_reason="exchange confirmed" if already_confirmed else "outer timeout",
                 raw_llm_response={
                     "decision_state_machine": {
+                        "current_stage": "local_sync" if already_confirmed else "exchange_submit",
+                        "current_status": "completed" if already_confirmed else "failed",
                         "stages": [
                             {
                                 "stage": "exchange_submit",
@@ -2627,16 +2631,17 @@ async def test_completed_submit_stage_recovers_fill_overwritten_by_outer_timeout
                                 },
                             },
                             {
-                                "stage": "exchange_submit",
-                                "status": "failed",
-                                "data": {"error_type": "cancelled"},
+                                "stage": "local_sync" if already_confirmed else "exchange_submit",
+                                "status": "completed" if already_confirmed else "failed",
+                                "data": {} if already_confirmed else {"error_type": "cancelled"},
                             },
                         ]
                     },
                     "execution_result": {
-                        "source": "exchange_not_confirmed",
-                        "status": "rejected",
-                        "exchange_order_id": None,
+                        "source": "exchange_confirmed" if already_confirmed else "exchange_not_confirmed",
+                        "status": "filled" if already_confirmed else "rejected",
+                        "exchange_confirmed": already_confirmed,
+                        "exchange_order_id": "okx-timeout-fill" if already_confirmed else None,
                         "raw_response": {"protection_submission": {"state": "confirmed"}},
                     },
                     "trade_recommendation_contract": {"execution": {"status": "pending"}},
@@ -2675,7 +2680,10 @@ async def test_completed_submit_stage_recovers_fill_overwritten_by_outer_timeout
         assert ccxt.calls[0] == "fills_targeted"
         assert "fills_account" not in ccxt.calls
         assert report["confirmed_count"] == 1
-        assert report["samples"][0]["kind"] == ("local_order_confirmed_from_completed_submit_stage")
+        assert report["samples"][0]["kind"] == (
+            "local_order_confirmed" if already_confirmed
+            else "local_order_confirmed_from_completed_submit_stage"
+        )
         assert order.status == "filled"
         assert order.exchange_order_id == "okx-timeout-fill"
         assert order.quantity == pytest.approx(0.02)
@@ -2683,6 +2691,12 @@ async def test_completed_submit_stage_recovers_fill_overwritten_by_outer_timeout
         assert recovered_decision.was_executed is True
         assert recovered_decision.raw_llm_response["execution_result"]["exchange_confirmed"] is True
         raw = recovered_decision.raw_llm_response
+        if already_confirmed:
+            assert recovered_decision.execution_reason == "exchange confirmed"
+            assert raw["execution_result"]["source"] == "exchange_confirmed"
+            assert raw["decision_state_machine"]["current_stage"] == "local_sync"
+            assert "completed_submit_fill_recovery" not in raw
+            return
         assert raw["execution_result"]["exit_progress"] is exit_progress
         assert raw["execution_result"]["raw_response"]["protection_submission"]["state"] == "confirmed"
         assert raw["trade_recommendation_contract"]["execution"]["exit_progress"] is exit_progress
