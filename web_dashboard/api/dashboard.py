@@ -46,6 +46,11 @@ from services.continuous_observation import (
     ContinuousObservationStore,
     ContinuousObservationWorkerState,
 )
+from services.decision_execution_trace import (
+    EXECUTION_OUTCOME_LABELS,
+    build_execution_trace,
+    execution_receipt_has_pair_restriction,
+)
 from services.decision_reason_recovery import DecisionReasonRecoveryPolicy
 from services.decision_state import decision_state_from_raw
 from services.entry_funnel_diagnostics import (
@@ -12205,6 +12210,17 @@ async def _get_analysis_records_uncached(
             if len(records) >= effective_page_size:
                 continue
         local_ai_tools_payload = _normalized_local_ai_tools_payload(raw)
+        execution_outcome_label = None
+        receipt_status = _safe_dict(raw.get("execution_result")).get("status")
+        if include_detail and receipt_status:
+            execution = build_execution_trace(
+                raw, order_status=receipt_status, fallback_reason=display_execution_reason or "",
+            )["final_result"]
+            execution_outcome_label = EXECUTION_OUTCOME_LABELS.get(execution["status"])
+            if execution_outcome_label or (
+                receipt_status == "rejected" and execution_receipt_has_pair_restriction(raw)
+            ):
+                display_execution_reason = execution["reason"] or display_execution_reason
         vector_memory_context = (
             await _safe_analysis_detail_vector_memory_context(d, raw)
             if include_detail and settings.vector_memory_enabled
@@ -12354,6 +12370,7 @@ async def _get_analysis_records_uncached(
             "disagreement": raw.get("disagreement"),
             "was_executed": d.was_executed,
             "execution_reason": display_execution_reason,
+            "execution_outcome_label": execution_outcome_label,
             "is_paper": d.is_paper,
             "flow_summary": (
                 f"{pre_expert_skip.get('label')}：{pre_expert_skip.get('reason')}"

@@ -3891,6 +3891,19 @@ def test_trade_history_translates_okx_50001_as_temporary_exchange_failure() -> N
     assert _execution_status_label("rejected", translated) == "交易所临时不可用"
 
 
+@pytest.mark.parametrize("reason", [
+    'okx {"code":"1","data":[{"sCode":"51155","sMsg":"Local compliance restrictions"}]}',
+    "OKX API error [51155]: You can't trade this pair due to local compliance restrictions.",
+    "51155",
+])
+def test_trade_history_translates_okx_51155_as_pair_restriction(reason) -> None:
+    translated = _translate_execution_text(reason)
+
+    assert "合规限制" in translated
+    assert "数量" not in translated
+    assert _execution_status_label("rejected", translated) == "执行失败"
+
+
 def test_trade_history_marks_no_position_exit_as_reconciled_terminal_state() -> None:
     reason = "OKX no matching position to close"
 
@@ -3978,6 +3991,61 @@ async def test_no_position_trade_list_and_detail_agree(tmp_path, monkeypatch) ->
         assert detail["failed_step"] is None
         assert detail["repair_suggestions"] == []
         assert detail["stage_events"][0]["status"] == "failed"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
+async def test_profit_lock_zero_fill_trade_list_and_detail_agree(tmp_path, monkeypatch) -> None:
+    from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
+
+    await close_db()
+    monkeypatch.setattr(settings, "database_url",
+                        f"sqlite+aiosqlite:///{(tmp_path / 'profit-lock.db').as_posix()}")
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            raw = append_decision_stage(
+                {"execution_result": {
+                    "status": "cancelled",
+                    "exchange_confirmed": False,
+                    "exit_progress": False,
+                    "raw_response": {"profit_lock_ioc_unfilled": True},
+                }},
+                DecisionStage.EXCHANGE_CONFIRM, DecisionStageStatus.SKIPPED,
+                "Profit lock cancelled", data={"skip_kind": "profit_lock_no_fill"},
+            )
+            raw = append_decision_stage(
+                raw, DecisionStage.LOCAL_SYNC, DecisionStageStatus.SKIPPED, "No position mutation",
+            )
+            decision = AIDecision(
+                model_name="ensemble_trader", symbol="MAGIC/USDT", action="close_short",
+                confidence=0.8, reasoning="Profit lock", position_size_pct=0.5,
+                suggested_leverage=3.0, is_paper=True, was_executed=False,
+                execution_reason="Profit lock cancelled", raw_llm_response=raw,
+            )
+            session.add(decision)
+            await session.flush()
+            order = await TradeRepository(session).create_order({
+                "model_name": "ensemble_trader", "execution_mode": "paper",
+                "symbol": "MAGIC/USDT", "side": "buy", "order_type": "limit",
+                "quantity": 0.0, "price": 0.12, "status": "cancelled",
+                "decision_id": decision.id, "exchange_order_id": "12345678901234",
+            })
+            order_id = order.id
+
+        listing = await get_trades(model_name=None, symbol=None, mode="paper", limit=10, page=1)
+        detail = await get_trade_detail(order_id)
+        row = next(item for item in listing["trades"] if item["id"] == order_id)
+
+        for payload in (row, detail):
+            assert payload["execution_failure_kind"] == "profit_lock_unfilled"
+            assert payload["execution_status_label"] == "未成交"
+            assert payload["success"] is False
+            assert "零成交" in payload["reason"]
+        assert detail["final_result"]["status"] == "profit_lock_unfilled"
+        assert detail["failed_step"] is None
+        assert detail["repair_suggestions"] == []
     finally:
         await close_db()
 

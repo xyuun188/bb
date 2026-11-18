@@ -21,6 +21,7 @@ OKX_TEMPORARY_SERVICE_MARKERS = (
     "max retries exceeded",
 )
 OKX_ENTRY_UNAVAILABLE_CODES = frozenset({"51001", "51155"})
+OKX_PAIR_RESTRICTION_CODE_PATTERN = re.compile(r"(?<!\d)51155(?!\d)")
 OKX_ENTRY_UNAVAILABLE_MARKERS = (
     "can't trade this pair",
     "cannot trade this pair",
@@ -140,6 +141,22 @@ def is_okx_entry_instrument_unavailable(value: Any) -> bool:
     if code in OKX_ENTRY_UNAVAILABLE_CODES:
         return True
     return any(marker in combined for marker in OKX_ENTRY_UNAVAILABLE_MARKERS)
+
+
+def is_okx_pair_compliance_restriction(value: Any) -> bool:
+    """Recognize pair restrictions in raw responses and legacy display text."""
+    code, _ = extract_okx_error(value)
+    if code and code != "1":
+        return code == "51155"
+    text = _stringify(value).lower()
+    return "local compliance restrictions" in text or bool(
+        (text.strip() == "51155" or "okx" in text)
+        and OKX_PAIR_RESTRICTION_CODE_PATTERN.search(text)
+    )
+
+
+def okx_pair_compliance_restriction_message() -> str:
+    return "OKX 返回错误码 51155：当前账户交易该合约受地区或合规限制。"
 
 
 def okx_temporary_service_error_message(value: Any | None = None) -> str:

@@ -407,3 +407,44 @@ async def test_dashboard_does_not_infer_attempts_without_call_evidence(
         )
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_analysis_detail_shows_proven_no_fill_without_an_order_row(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
+
+    await close_db()
+    monkeypatch.setattr(
+        settings, "database_url", f"sqlite+aiosqlite:///{(tmp_path / 'no-fill.db').as_posix()}",
+    )
+    monkeypatch.setattr(settings, "vector_memory_enabled", False)
+    await init_db()
+    try:
+        async with get_session_ctx() as session:
+            raw = append_decision_stage(
+                {"execution_result": {
+                    "status": "cancelled",
+                    "raw_response": {"profit_lock_ioc_unfilled": True},
+                }},
+                DecisionStage.EXCHANGE_CONFIRM, DecisionStageStatus.SKIPPED, "Profit lock cancelled",
+            )
+            decision = AIDecision(
+                model_name=ENSEMBLE_TRADER_NAME, symbol="PEPE/USDT", action="close_short",
+                confidence=0.8, reasoning="Profit lock", raw_llm_response=raw,
+                analysis_type="position", is_paper=True, was_executed=False,
+            )
+            session.add(decision)
+            await session.flush()
+            decision_id = decision.id
+
+        response = await dashboard.get_analysis_records(
+            decision_id=decision_id, include_detail=True, is_paper=True,
+        )
+        record = response["records"][0]
+        assert record["execution_outcome_label"] == "未成交"
+        assert "零成交" in record["execution_reason"]
+        assert record["was_executed"] is False
+    finally:
+        await close_db()

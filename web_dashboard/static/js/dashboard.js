@@ -4591,7 +4591,7 @@ function renderAnalysisReasonModal(record) {
                             ${analysisPill(`分析信心 ${finalConfidence}`, Number(record.final_confidence || 0) >= 0.6 ? 'good' : 'muted')}
                             ${analysisPill(`下单信心 ${tradeConfidence}`, Number(record.trade_confidence || 0) >= 0.6 ? 'good' : 'muted')}
                             ${analysisPill(`仓位 ${positionSize}`, Number(record.position_size_pct || 0) > 0 ? 'good' : 'muted')}
-                            ${analysisPill(record.was_executed ? '已执行' : '未执行', record.was_executed ? 'good' : 'warn')}
+                            ${analysisPill(record.execution_outcome_label || (record.was_executed ? '已执行' : '未执行'), record.was_executed && !record.execution_outcome_label ? 'good' : 'warn')}
                         </div>
                     </div>
                     <div class="analysis-card-text">
@@ -4600,7 +4600,7 @@ function renderAnalysisReasonModal(record) {
                             <span>分歧度：${escHtml(record.disagreement ?? '-')}</span>
                         </div>
                         ${analysisOpportunityScoreHtml(record.opportunity_score, record)}
-                        ${record.execution_reason ? `<div class="analysis-note"><span>未执行原因</span>${analysisText(record.execution_reason)}</div>` : ''}
+                        ${record.execution_reason ? `<div class="analysis-note"><span>${record.execution_outcome_label || record.was_executed ? '执行说明' : '未执行原因'}</span>${analysisText(record.execution_reason)}</div>` : ''}
                         ${record.confidence_note ? `<div class="analysis-note analysis-note-muted"><span>信心说明</span>${analysisText(record.confidence_note)}</div>` : ''}
                         <div class="analysis-note analysis-note-muted"><span>裁决理由</span>${analysisText(record.final_reasoning || '-')}</div>
                     </div>
@@ -8719,6 +8719,14 @@ function executionStatusPresentation(record, explicitSuccess = null) {
     const isTransientExchange = kind === 'transient_exchange_error';
     const isNoExchangePosition = kind === 'no_exchange_position';
     const isPreSubmit = ['pre_submit_return_guard', 'profit_gate_blocked', 'business_cooldown', 'pre_submit_blocked'].includes(kind);
+    const outcomeLabels = {
+        profit_lock_unfilled: '未成交',
+        partial: '部分成交',
+        pending: '待确认',
+        unknown: '结果未知',
+        local_sync_failed: '本地同步失败'
+    };
+    const outcomeLabel = outcomeLabels[kind];
     const fallbackLabel = kind === 'pre_submit_return_guard'
         ? '未提交：收益/价格保护'
         : kind === 'profit_gate_blocked'
@@ -8728,11 +8736,11 @@ function executionStatusPresentation(record, explicitSuccess = null) {
                 : kind === 'pre_submit_blocked'
                     ? '未提交：交易前保护'
                     : success ? '执行成功' : (isTransientExchange ? '交易所临时不可用' : '执行失败');
-    const label = record?.execution_status_label || fallbackLabel;
-    const color = success || isNoExchangePosition
+    const label = outcomeLabel || record?.execution_status_label || fallbackLabel;
+    const color = kind === 'local_sync_failed' ? 'var(--red)' : success || isNoExchangePosition
         ? 'var(--green)'
-        : (isTransientExchange || isPreSubmit ? 'var(--orange)' : 'var(--red)');
-    return { label, color, kind, success, isTransientExchange, isNoExchangePosition, isPreSubmit };
+        : (isTransientExchange || isPreSubmit || outcomeLabel ? 'var(--orange)' : 'var(--red)');
+    return { label, color, kind, success, isTransientExchange, isNoExchangePosition, isPreSubmit, outcomeLabel };
 }
 function fmtPrice(p) {
     if (p === null || p === undefined || p === '') return '-';
@@ -11097,10 +11105,13 @@ function renderExecutionDetailModal(trade, detailData = null) {
     );
     const finalTitle = finalResult?.success
         ? '执行成功'
+        : detailStatusInfo.outcomeLabel ? detailStatusInfo.outcomeLabel
         : detailStatusInfo.isNoExchangePosition ? '无需重复平仓'
         : detailStatusInfo.isPreSubmit ? '未提交（系统保护）'
         : (detailStatusInfo.isTransientExchange ? '交易所临时不可用' : '执行未完成/失败');
-    const reasonLabel = success
+    const reasonLabel = detailStatusInfo.outcomeLabel
+        ? '订单说明'
+        : success
         ? '执行原因'
         : detailStatusInfo.isNoExchangePosition ? '同步说明'
         : detailStatusInfo.isPreSubmit ? '未提交原因'
@@ -11146,7 +11157,7 @@ function renderExecutionDetailModal(trade, detailData = null) {
             ${timelineHtml}
         </div>
         <div class="reason-block">
-            <div class="reason-label">${success ? '执行补充' : '失败补充'}</div>
+            <div class="reason-label">${success || detailStatusInfo.outcomeLabel ? '执行补充' : '失败补充'}</div>
             <div>${escapeMultiline(detail)}</div>
         </div>
         <div class="reason-block">

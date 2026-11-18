@@ -14,10 +14,22 @@ from services.decision_state import (
     decision_state_from_raw,
 )
 from services.execution_result_classifier import ExecutionResultClassifier
-from services.okx_error_classifier import is_okx_temporary_service_error
+from services.okx_error_classifier import (
+    is_okx_pair_compliance_restriction,
+    is_okx_temporary_service_error,
+    okx_pair_compliance_restriction_message,
+)
 
 PROBLEM_STATUSES = {DecisionStageStatus.BLOCKED, DecisionStageStatus.FAILED}
 SUCCESS_STATUSES = {DecisionStageStatus.PASSED, DecisionStageStatus.COMPLETED}
+EXECUTION_OUTCOME_LABELS = {
+    "profit_lock_unfilled": "未成交",
+    "partial": "部分成交",
+    "pending": "待确认",
+    "unknown": "结果未知",
+    "local_sync_failed": "本地同步失败",
+}
+PROFIT_LOCK_UNFILLED_REASON = "OKX 已确认盈利限价单零成交并撤销，持仓未因本单变动。"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -98,10 +110,25 @@ def _synthesized_order_steps(
     order_created_at: Any = None,
     order_filled_at: Any = None,
     reason: str = "",
+    outcome: str | None = None,
 ) -> list[dict[str, Any]]:
     status = str(order_status or "").lower()
     success = status == "filled"
     duration_sec = _duration_between(order_created_at, order_filled_at)
+    if outcome in {"profit_lock_unfilled", "partial", "pending", "unknown"}:
+        confirm_status = {
+            "profit_lock_unfilled": DecisionStageStatus.SKIPPED,
+            "unknown": DecisionStageStatus.UNKNOWN,
+        }.get(outcome, DecisionStageStatus.PENDING)
+        return [_normal_event({
+            "stage": DecisionStage.EXCHANGE_CONFIRM,
+            "status": confirm_status,
+            "reason": PROFIT_LOCK_UNFILLED_REASON if outcome == "profit_lock_unfilled" else (
+                reason or EXECUTION_OUTCOME_LABELS[outcome]
+            ),
+            "at": order_filled_at or order_created_at,
+            "data": {"source": "order_snapshot", "order_status": status},
+        }, 1)]
     submit_status = DecisionStageStatus.PASSED if success else DecisionStageStatus.FAILED
     local_status = DecisionStageStatus.COMPLETED if success else DecisionStageStatus.SKIPPED
     return [
@@ -133,6 +160,34 @@ def _synthesized_order_steps(
     ]
 
 
+def _order_outcome(
+    raw_response: dict[str, Any] | None, order_status: str | None,
+) -> str | None:
+    status = str(order_status or "").lower()
+    receipt = _safe_dict(_safe_dict(raw_response).get("execution_result"))
+    execution_raw = _safe_dict(receipt.get("raw_response"))
+    if status in {"canceled", "cancelled"} and (
+        execution_raw.get("profit_lock_ioc_unfilled") is True
+        and not receipt.get("exchange_confirmed")
+        and not receipt.get("exit_progress")
+    ):
+        return "profit_lock_unfilled"
+    if status == "partial":
+        return "partial"
+    if status in {"open", "pending"}:
+        return "unknown" if execution_raw.get("execution_transport_unknown") is True else "pending"
+    return None
+
+
+def execution_receipt_has_pair_restriction(raw_response: dict[str, Any] | None) -> bool:
+    receipt = _safe_dict(_safe_dict(raw_response).get("execution_result"))
+    execution_raw = _safe_dict(receipt.get("raw_response"))
+    return any(
+        is_okx_pair_compliance_restriction(value)
+        for value in (execution_raw.get("raw_error"), execution_raw.get("error"), execution_raw)
+    )
+
+
 def build_execution_trace(
     raw_response: dict[str, Any] | None,
     *,
@@ -144,6 +199,7 @@ def build_execution_trace(
     """Return a stable API payload for execution detail timelines."""
 
     machine = decision_state_from_raw(raw_response)
+    outcome = _order_outcome(raw_response, order_status)
     raw_events = machine.get("stages")
     events = [
         _normal_event(event, index)
@@ -157,6 +213,7 @@ def build_execution_trace(
             order_created_at=order_created_at,
             order_filled_at=order_filled_at,
             reason=fallback_reason,
+            outcome=outcome,
         )
 
     latest_by_stage: dict[str, dict[str, Any]] = {}
@@ -186,6 +243,17 @@ def build_execution_trace(
             event["duration_sec"] is None or missing_duration_by_stage.get(stage)
         )
         steps.append(event)
+
+    confirm_step = next(
+        (step for step in steps if step["stage"] == DecisionStage.EXCHANGE_CONFIRM),
+        None,
+    )
+    if outcome == "profit_lock_unfilled":
+        if confirm_step and confirm_step["status"] == DecisionStageStatus.SKIPPED:
+            confirm_step["status_label"] = EXECUTION_OUTCOME_LABELS[outcome]
+            confirm_step["reason"] = PROFIT_LOCK_UNFILLED_REASON
+        else:
+            outcome = None
 
     # Preserve the original events for audit, but project obsolete no-position
     # failures as skipped reconciliation rather than a failed order.
@@ -219,14 +287,40 @@ def build_execution_trace(
         for step in steps
     )
 
+    local_sync_step = next(
+        (step for step in steps if step["stage"] == DecisionStage.LOCAL_SYNC),
+        None,
+    )
+    if (
+        local_sync_step and local_sync_step["status"] == DecisionStageStatus.SKIPPED
+        and _safe_dict(_safe_dict(raw_response).get("local_order_persistence")).get("status")
+        == "failed"
+    ):
+        local_sync_step.update(
+            status=DecisionStageStatus.FAILED,
+            status_label=_status_label(DecisionStageStatus.FAILED),
+            reason="本地订单执行记录写入失败。",
+        )
     failed_step = next(
         (step for step in steps if str(step.get("status") or "") in PROBLEM_STATUSES),
         None,
     )
-    final_step = failed_step or (steps[-1] if steps else None)
+    compliance_rejection = bool(
+        failed_step
+        and failed_step["stage"] in {DecisionStage.EXCHANGE_SUBMIT, DecisionStage.EXCHANGE_CONFIRM}
+        and execution_receipt_has_pair_restriction(raw_response)
+    )
+    if compliance_rejection:
+        failed_step["reason"] = okx_pair_compliance_restriction_message()
+    if failed_step:
+        outcome = "local_sync_failed" if failed_step["stage"] == DecisionStage.LOCAL_SYNC else None
+    if outcome == "pending" and confirm_step and confirm_step["status"] == DecisionStageStatus.UNKNOWN:
+        outcome = "unknown"
+    final_step = failed_step or (confirm_step if outcome else None) or (steps[-1] if steps else None)
     success = bool(
         not failed_step
         and not no_position
+        and not outcome
         and final_step
         and (
             str(final_step.get("status") or "") in SUCCESS_STATUSES
@@ -240,7 +334,7 @@ def build_execution_trace(
             fallback_reason,
         )
     )
-    transient_exchange_error = is_okx_temporary_service_error(final_reason)
+    transient_exchange_error = not outcome and is_okx_temporary_service_error(final_reason)
     total_duration = sum(
         float(step["duration_sec"]) for step in steps if step.get("duration_sec") is not None
     )
@@ -255,6 +349,8 @@ def build_execution_trace(
             fallback_reason
             or "OKX 当前已无对应方向持仓，本次未重复提交平仓；本地状态已刷新。"
         )
+    if outcome and not failed_step:
+        repair_suggestions = []
     return {
         "execution_steps": steps,
         "stage_events": events,
@@ -263,6 +359,8 @@ def build_execution_trace(
             "status": (
                 "success"
                 if success
+                else outcome
+                if outcome
                 else "no_exchange_position"
                 if no_position and failed_step is None
                 else ("transient_exchange_error" if transient_exchange_error else "failed")
@@ -272,6 +370,8 @@ def build_execution_trace(
             "status_label": (
                 "交易所临时不可用"
                 if transient_exchange_error
+                else EXECUTION_OUTCOME_LABELS[outcome]
+                if outcome
                 else "已同步，无需重复平仓"
                 if no_position and failed_step is None
                 else (final_step.get("status_label") if final_step else "")
@@ -293,6 +393,7 @@ def repair_suggestions_for_trace(
 ) -> list[str]:
     """Return safe, concrete remediation hints without performing risky actions."""
 
+    failed_reason = str(failed_step.get("reason") or "") if failed_step else ""
     reason = " ".join(
         str(part or "")
         for part in (
@@ -302,12 +403,20 @@ def repair_suggestions_for_trace(
         )
     ).lower()
     suggestions: list[str] = []
+    stage = str(failed_step.get("stage") or "") if failed_step else ""
+    if stage == DecisionStage.LOCAL_SYNC:
+        return ["刷新持仓同步任务并核对 OKX 实际仓位，避免本地记录与交易所不一致。"]
+    if (
+        is_okx_pair_compliance_restriction(failed_reason)
+        or is_okx_pair_compliance_restriction(fallback_reason)
+        or str(_safe_dict(failed_step.get("data") if failed_step else None).get("okx_code")) == "51155"
+    ):
+        return ["核对该 OKX 账户是否获准交易此合约，或联系 OKX 确认地区及合规限制。"]
     if is_okx_temporary_service_error(reason):
         return [
             "OKX 交易所服务临时不可用：系统未拿到成交确认，本地仓位未改动；已临时跳过该币种，稍后自动重试。"
         ]
     if failed_step:
-        stage = str(failed_step.get("stage") or "")
         if stage == DecisionStage.RISK_CHECK:
             suggestions.append(
                 "检查该步骤的 blocker/data 字段，确认是风控拦截、重复订单还是账户配置问题。"
@@ -316,12 +425,10 @@ def repair_suggestions_for_trace(
             suggestions.append(
                 "检查 OKX 返回码、交易对最小张数/最小名义价值、杠杆模式和账户可用保证金。"
             )
-        elif stage == DecisionStage.LOCAL_SYNC:
-            suggestions.append("刷新持仓同步任务并核对 OKX 实际仓位，避免本地记录与交易所不一致。")
 
     if any(code in reason for code in ("51008", "51004", "insufficient")):
         suggestions.append("OKX 保证金不足：降低订单名义价值或释放占用保证金后再执行。")
-    if any(code in reason for code in ("51155", "51169", "minimum", "min size")):
+    if any(token in reason for token in ("最小下单数量", "minimum", "min size")):
         suggestions.append(
             "下单数量不符合交易规则：按 OKX 合约最小张数、精度和最小名义价值重新计算。"
         )

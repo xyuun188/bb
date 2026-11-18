@@ -20,11 +20,20 @@ from db.session import get_read_session_ctx, get_session_ctx
 from models.account import OkxAccountBill
 from models.decision import AIDecision
 from models.trade import OkxPositionHistory, Order, Position
-from services.decision_execution_trace import build_execution_trace
+from services.decision_execution_trace import (
+    EXECUTION_OUTCOME_LABELS,
+    build_execution_trace,
+    execution_receipt_has_pair_restriction,
+)
 from services.execution_reason_localizer import localize_execution_reason
 from services.execution_result_classifier import ExecutionResultClassifier
 from services.manual_close_marker import MANUAL_CLOSE_LABEL, is_manual_close_order
-from services.okx_error_classifier import is_okx_temporary_service_error
+from services.okx_error_classifier import (
+    extract_okx_error,
+    is_okx_pair_compliance_restriction,
+    is_okx_temporary_service_error,
+    okx_pair_compliance_restriction_message,
+)
 from services.okx_order_fact_sync import (
     OKX_SYNC_CONFIRMED,
     OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
@@ -221,25 +230,6 @@ def _looks_mojibake(text: str) -> bool:
     return looks_mojibake(text)
 
 
-def _extract_okx_error(text: str) -> tuple[str | None, str | None]:
-    match = re.search(r"okx\s+(\{.*\})", text, re.IGNORECASE | re.DOTALL)
-    if not match:
-        return None, None
-    try:
-        payload = json.loads(match.group(1))
-    except Exception:
-        return None, None
-
-    code = str(payload.get("code") or "").strip() or None
-    msg = str(payload.get("msg") or "").strip() or None
-    for item in payload.get("data") or []:
-        if isinstance(item, dict):
-            code = str(item.get("sCode") or code or "").strip() or code
-            msg = str(item.get("sMsg") or msg or "").strip() or msg
-            break
-    return code, msg
-
-
 def _translate_execution_text(message: str | None) -> str:
     text = str(localize_execution_reason(message) or "").strip()
     if not text:
@@ -259,7 +249,11 @@ def _translate_execution_text(message: str | None) -> str:
             "这不是 AI 方向或下单数量计算错误；系统会临时跳过该币种，稍后等 OKX 限制解除再重新分析。"
         )
 
-    okx_code, okx_msg = _extract_okx_error(text)
+    okx_code, okx_msg = extract_okx_error(text)
+    if is_okx_pair_compliance_restriction(text):
+        return okx_pair_compliance_restriction_message()
+    if ExecutionResultClassifier.is_no_exchange_position_error(text):
+        return "OKX 当前没有对应方向的可平仓位。"
     if okx_code:
         if okx_code == "51008":
             return (
@@ -278,16 +272,6 @@ def _translate_execution_text(message: str | None) -> str:
                 "系统需要先撤掉该交易对多余挂单，再重新设置杠杆和下单。"
                 f"OKX 原文：{okx_msg or text}"
             )
-        if okx_code == "51155":
-            return (
-                "OKX 返回错误码 51155：订单数量、价格或合约面值不符合交易所限制。"
-                f"OKX 原文：{okx_msg or text}"
-            )
-        if okx_code == "51169":
-            return (
-                "OKX 返回错误码 51169：订单不符合当前合约交易规则，通常与最小张数、价格精度或仓位模式有关。"
-                f"OKX 原文：{okx_msg or text}"
-            )
         return f"OKX 返回错误码 {okx_code}：{okx_msg or text}"
 
     checks = [
@@ -299,10 +283,6 @@ def _translate_execution_text(message: str | None) -> str:
         ("51008", "OKX 返回错误码 51008：账户 USDT 保证金不足，订单没有成交。"),
         ("Insufficient USDT margin", "OKX 返回错误码 51008：账户 USDT 保证金不足，订单没有成交。"),
         ("51004", "OKX 提示账户可用保证金不足或订单金额超过可用额度。"),
-        ("51155", "OKX 提示订单数量、价格或合约面值不符合交易所限制。"),
-        ("51169", "OKX 提示订单不符合当前合约交易规则。"),
-        ("local compliance restrictions", "OKX 提示该交易受地区或账户合规限制。"),
-        ("don't have any positions in this direction", "OKX 当前没有这个方向的可平仓位。"),
         ("No current price available", "系统没有拿到当前价格，未提交订单。"),
         (
             "Order size is below OKX minimum contract size",
@@ -376,13 +356,17 @@ def _execution_status_label(
     status: str | None,
     reason: str | None,
     raw_response: dict[str, Any] | None = None,
+    *,
+    kind: str | None = None,
 ) -> str:
     """Return a stable, human-readable terminal state for execution history."""
 
     normalized_status = str(status or "").lower()
+    if kind in EXECUTION_OUTCOME_LABELS:
+        return EXECUTION_OUTCOME_LABELS[kind]
     if normalized_status == "filled":
         return "执行成功"
-    kind = _execution_failure_kind(reason, raw_response)
+    kind = kind or _execution_failure_kind(reason, raw_response)
     if kind == "no_exchange_position":
         return "\u5df2\u540c\u6b65\uff0c\u65e0\u9700\u91cd\u590d\u5e73\u4ed3"
     if kind == "transient_exchange_error":
@@ -396,6 +380,16 @@ def _execution_status_label(
     if kind == "pre_submit_blocked":
         return "未提交：交易前保护"
     return "执行失败"
+
+
+def _execution_history_presentation(
+    status: str, reason: str, raw_response: dict[str, Any], final_result: dict[str, Any],
+) -> tuple[str, str | None, str]:
+    outcome = final_result["status"]
+    if outcome in EXECUTION_OUTCOME_LABELS:
+        return final_result["reason"] or reason, outcome, EXECUTION_OUTCOME_LABELS[outcome]
+    kind = _execution_failure_kind(reason, raw_response)
+    return reason, kind, _execution_status_label(status, reason, raw_response, kind=kind)
 
 
 CORRUPTED_HISTORY_REASON = "该笔历史记录的原始说明已损坏，无法准确还原"
@@ -440,6 +434,8 @@ def _readable_execution_reason(
     """Choose a human-readable reason without treating order ids as reasons."""
 
     raw = raw_response if isinstance(raw_response, dict) else {}
+    if str(status or "").lower() == "rejected" and execution_receipt_has_pair_restriction(raw):
+        return okx_pair_compliance_restriction_message()
     blocker = str(raw.get("execution_blocker") or "").strip().lower()
     if raw.get("system_pre_submit_rejection") is True or blocker:
         if "entry_execution_return_budget" in blocker:
@@ -1222,8 +1218,12 @@ async def get_trades(
         )
         reason = sanitize_text(display_reason(order))
         raw_response = raw_for_order(order)
-        failure_kind = _execution_failure_kind(reason, raw_response)
-        execution_status_label = _execution_status_label(order.status, reason, raw_response)
+        final_result = build_execution_trace(
+            raw_response, order_status=order.status, fallback_reason=reason,
+        )["final_result"]
+        reason, failure_kind, execution_status_label = _execution_history_presentation(
+            order.status, reason, raw_response, final_result,
+        )
         return {
             "id": order.id,
             "decision_id": order.decision_id,
@@ -1393,8 +1393,9 @@ async def get_trade_detail(trade_id: int):
         order_filled_at=order.filled_at,
         fallback_reason=fallback_reason,
     )
-    failure_kind = _execution_failure_kind(fallback_reason, raw_response)
-    execution_status_label = _execution_status_label(order.status, fallback_reason, raw_response)
+    fallback_reason, failure_kind, execution_status_label = _execution_history_presentation(
+        order.status, fallback_reason, raw_response, trace["final_result"],
+    )
 
     return sanitize_payload(
         {
