@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from collections import Counter
-from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Any
+
+from services.shadow_development_split import split_shadow_development_rows
 
 FAST_EXIT_TARGETS_PCT = (0.15, 0.20, 0.30, 0.50, 0.75)
 FAST_EXIT_MIN_DEVELOPMENT_GROUPS = 16
 FAST_EXIT_LABEL_HORIZON_MINUTES = 5
-FAST_EXIT_POLICY_VERSION = "2026-10-28.fast-exit-mfe-shadow.v1"
+FAST_EXIT_POLICY_VERSION = "2026-11-18.fast-exit-mfe-shadow.v2"
 
 
 def _number(value: Any) -> float | None:
@@ -19,21 +19,6 @@ def _number(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if isfinite(result) else None
-
-
-def _timestamp(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        parsed = value
-    elif value:
-        try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    else:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(UTC)
 
 
 def _metrics(values: list[float]) -> dict[str, Any]:
@@ -63,52 +48,26 @@ def _metrics(values: list[float]) -> dict[str, Any]:
     }
 
 
-def _normalize_rows(
-    rows: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int, int]:
+def _normalize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized = []
-    group_counts = Counter(
-        str(row.get("decision_id") or row.get("id") or "").strip()
-        for row in rows
-    )
-    duplicate_groups = {
-        group for group, count in group_counts.items() if group and count > 1
-    }
-    duplicate_rows = sum(group_counts[group] for group in duplicate_groups)
     for row in rows:
         side = str(row.get("selected_side") or "").strip().lower()
-        group = str(row.get("decision_id") or row.get("id") or "").strip()
-        timestamp = _timestamp(row.get("decision_at"))
-        mfe = _number(row.get(f"{side}_mfe_pct")) if side in {"long", "short"} else None
-        gross = _number(row.get(f"{side}_gross_return_pct")) if side in {"long", "short"} else None
-        net = _number(row.get(f"{side}_net_return_pct")) if side in {"long", "short"} else None
-        if (
-            not group
-            or group in duplicate_groups
-            or timestamp is None
-            or mfe is None
-            or gross is None
-            or net is None
-        ):
+        if side not in {"long", "short"}:
+            continue
+        mfe = _number(row.get(f"{side}_mfe_pct"))
+        gross = _number(row.get(f"{side}_gross_return_pct"))
+        net = _number(row.get(f"{side}_net_return_pct"))
+        if mfe is None or gross is None or net is None:
             continue
         normalized.append(
             {
-                "id": int(row.get("id") or 0),
-                "decision_id": int(row.get("decision_id") or 0) or None,
-                "symbol": str(row.get("symbol") or ""),
-                "side": side,
-                "decision_at": timestamp,
                 "mfe_pct": max(mfe, 0.0),
                 "baseline_gross_pct": gross,
                 "cost_pct": gross - net,
                 "baseline_net_pct": net,
             }
         )
-    return (
-        sorted(normalized, key=lambda item: (item["decision_at"], item["id"])),
-        len(duplicate_groups),
-        duplicate_rows,
-    )
+    return normalized
 
 
 def _counterfactual_net(row: dict[str, Any], target_pct: float) -> float:
@@ -137,28 +96,11 @@ def build_fast_exit_shadow_report(
 ) -> dict[str, Any]:
     """Select a fixed target on earlier development rows and report one later fold."""
 
-    observations, duplicate_group_count, duplicate_row_count = _normalize_rows(rows)
-    split_index = max(1, int(len(observations) * 0.70)) if observations else 0
-    validation_start = (
-        observations[split_index]["decision_at"]
-        if split_index < len(observations)
-        else None
+    development_rows, validation_rows, timing = split_shadow_development_rows(
+        [{**row, "horizon_minutes": FAST_EXIT_LABEL_HORIZON_MINUTES} for row in rows]
     )
-    purge_start = (
-        validation_start - timedelta(minutes=FAST_EXIT_LABEL_HORIZON_MINUTES)
-        if validation_start is not None
-        else None
-    )
-    development = (
-        [row for row in observations if row["decision_at"] < purge_start]
-        if purge_start is not None
-        else observations
-    )
-    validation = (
-        [row for row in observations if row["decision_at"] >= validation_start]
-        if validation_start is not None
-        else []
-    )
+    development = _normalize_rows(development_rows)
+    validation = _normalize_rows(validation_rows)
     candidates = []
     for target in FAST_EXIT_TARGETS_PCT:
         metrics = _policy_metrics(development, target_pct=target)
@@ -171,7 +113,6 @@ def build_fast_exit_shadow_report(
         ):
             candidates.append((metrics["mean_net_return_pct"], target))
     selected_target = max(candidates)[1] if candidates else None
-    group_count = len(observations)
     report = {
         "experiment": "bounded-fast-exit-mfe-shadow-development",
         "policy_version": FAST_EXIT_POLICY_VERSION,
@@ -182,16 +123,16 @@ def build_fast_exit_shadow_report(
         ),
         "window": window,
         "input": {
-            "selected_decision_group_count": group_count,
-            "duplicate_decision_group_count": duplicate_group_count,
-            "duplicate_row_count_excluded": duplicate_row_count,
+            **timing,
+            "selected_decision_group_count": timing["decision_group_count"],
+            "duplicate_row_count_excluded": timing["excluded_row_counts"].get("duplicate_group", 0),
             "duplicate_policy": "exclude every row belonging to a duplicate decision group",
             "development_group_count": len(development),
             "validation_group_count": len(validation),
-            "validation_start": (
-                validation_start.isoformat() if validation_start is not None else None
+            "invalid_outcome_row_count": (
+                len(development_rows) + len(validation_rows) - len(development) - len(validation)
             ),
-            "purge_minutes": FAST_EXIT_LABEL_HORIZON_MINUTES,
+            "minimum_label_horizon_minutes": FAST_EXIT_LABEL_HORIZON_MINUTES,
             "deduplicated_by": "decision_id",
         },
         "baseline_five_minute": {

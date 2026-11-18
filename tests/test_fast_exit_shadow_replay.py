@@ -7,11 +7,14 @@ from services.fast_exit_shadow_replay import (
 
 
 def _row(index: int, *, net: float, mfe: float, gross: float = 0.1) -> dict:
+    decision_at = datetime(2026, 10, 27, tzinfo=UTC) + timedelta(minutes=index)
+    label_at = decision_at + timedelta(minutes=5)
     return {
         "id": index + 1,
         "decision_id": index + 1,
-        "decision_at": datetime(2026, 10, 27, tzinfo=UTC)
-        + timedelta(minutes=index),
+        "decision_at": decision_at,
+        "label_at": label_at,
+        "updated_at": label_at,
         "symbol": f"S{index}",
         "selected_side": "long",
         "long_mfe_pct": mfe,
@@ -51,7 +54,7 @@ def test_fast_exit_replay_uses_a_five_minute_purged_temporal_split() -> None:
 
     assert report["input"]["development_group_count"] == 65
     assert report["input"]["validation_group_count"] == 30
-    assert report["input"]["purge_minutes"] == 5
+    assert report["input"]["minimum_label_horizon_minutes"] == 5
     assert report["input"]["selected_decision_group_count"] == 100
 
 
@@ -78,3 +81,14 @@ def test_fast_exit_replay_excludes_duplicate_decision_groups() -> None:
     assert report["input"]["duplicate_decision_group_count"] == 1
     assert report["input"]["duplicate_row_count_excluded"] == 2
     assert report["input"]["selected_decision_group_count"] == 99
+
+
+def test_fast_exit_replay_purges_late_persisted_win_from_target_selection() -> None:
+    rows = [_row(index, net=-0.05, mfe=0.1) for index in range(100)]
+    rows[0].update(long_mfe_pct=1.0, updated_at=rows[70]["decision_at"])
+
+    report = build_fast_exit_shadow_report(rows[::-1], window={})
+
+    assert report["input"]["validation_start"] == rows[70]["decision_at"].isoformat()
+    assert report["input"]["development_group_count"] == 64
+    assert report["fixed_target_candidates"]["0.75"]["development"]["positive_count"] == 0

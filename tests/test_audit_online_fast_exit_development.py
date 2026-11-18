@@ -27,7 +27,7 @@ def test_remote_script_renders_all_bounded_query_parameters() -> None:
     assert f"MAX_SCAN_ROWS = {audit.MAX_SCAN_ROWS}" in rendered
 
 
-def test_remote_query_keeps_created_window_and_reports_scan_counts() -> None:
+def test_remote_query_keeps_update_window_and_projects_decision_and_label_times() -> None:
     assert "ShadowBacktest.updated_at >= since" in audit.REMOTE_SCRIPT
     assert "ShadowBacktest.updated_at < CUTOFF" in audit.REMOTE_SCRIPT
     assert '"selected"].as_boolean()' in audit.REMOTE_SCRIPT
@@ -36,6 +36,8 @@ def test_remote_query_keeps_created_window_and_reports_scan_counts() -> None:
     assert '"source_row_count": source_row_count' in audit.REMOTE_SCRIPT
     assert "len(source_rows)" not in audit.REMOTE_SCRIPT
     assert "query_scan_limit_reached" in audit.REMOTE_SCRIPT
+    assert '"original_decision_timestamp"' in audit.REMOTE_SCRIPT
+    assert '["label_timestamp"].as_string().label("label_at")' in audit.REMOTE_SCRIPT
     assert '"outcome_updated_at within [since, cutoff); updated_at is pagination key"' in (
         audit.REMOTE_SCRIPT
     )

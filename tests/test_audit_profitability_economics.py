@@ -3,6 +3,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from core.exceptions import ExchangeAPIError
+from scripts import audit_profitability_economics
 from scripts.audit_profitability_economics import (
     fetch_bills,
     summarize_bills,
@@ -149,7 +151,10 @@ class Exchange:
 
     async def privateGetAccountBills(self, params):
         self.calls.append(params)
-        return next(self.pages)
+        result = next(self.pages)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 def page(rows):
@@ -182,9 +187,51 @@ async def test_full_page_exhaustion_never_claims_complete_window():
 
 @pytest.mark.asyncio
 async def test_failed_official_response_is_not_an_empty_success():
-    exchange = Exchange([{"code": "50011", "data": []}])
+    exchange = Exchange([{"code": "50001", "data": []}])
     with pytest.raises(ValueError, match="request failed"):
         await fetch_bills(exchange, since=SINCE, until=SINCE + timedelta(days=1), max_pages=2)
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_retries_same_cursor_and_preserves_pagination(monkeypatch):
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(audit_profitability_economics.asyncio, "sleep", sleep)
+    exchange = Exchange([
+        page([bill(str(index)) for index in range(100)]),
+        ExchangeAPIError("limited", code="50011"),
+        {"code": "50011"},
+        page([]),
+    ])
+    rows, coverage = await fetch_bills(
+        exchange, since=SINCE, until=SINCE + timedelta(days=1), max_pages=2
+    )
+    assert len(rows) == 100
+    assert coverage == {"complete": True, "pages": 2, "reason": "end_of_history"}
+    assert exchange.calls[1] == exchange.calls[2] == exchange.calls[3]
+    assert "after" in exchange.calls[1]
+    assert delays == [0.5, 1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_persistent_rate_limit_retains_partial_coverage(monkeypatch):
+    async def sleep(_delay):
+        pass
+
+    monkeypatch.setattr(audit_profitability_economics.asyncio, "sleep", sleep)
+    exchange = Exchange([
+        page([bill(str(index)) for index in range(100)]),
+        *[ExchangeAPIError("limited", code="50011")] * 4,
+    ])
+    rows, coverage = await fetch_bills(
+        exchange, since=SINCE, until=SINCE + timedelta(days=1), max_pages=2
+    )
+    assert len(rows) == 100
+    assert coverage == {"complete": False, "pages": 1, "reason": "okx_rate_limited"}
+    assert len(exchange.calls) == 5
 
 
 @pytest.mark.asyncio

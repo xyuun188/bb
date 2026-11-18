@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
+import secrets
 import shlex
 import sys
-import zlib
 from collections import Counter
+from contextlib import suppress
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -27,7 +27,7 @@ from services.normal_paper_trade import (  # noqa: E402
 )
 
 REMOTE_CODE = """
-import asyncio, base64, json, zlib
+import asyncio, json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from scripts.runtime_env_bootstrap import load_runtime_env_files, drop_privileges_to_runtime_user_if_needed
@@ -52,8 +52,7 @@ async def main():
                 AIDecision.raw_llm_response['paper_trade_selection'].label('selection'),
                 AIDecision.raw_llm_response['strategy_mode'].label('strategy_mode'),
             ).where(AIDecision.id.in_(ids)).order_by(AIDecision.id.desc()))).all()
-        payload = json.dumps([dict(row._mapping) for row in rows], default=str).encode()
-        print('BB_POLICY_DATA=' + base64.b64encode(zlib.compress(payload)).decode())
+        print(json.dumps([dict(row._mapping) for row in rows], default=str))
     finally:
         await close_db()
 asyncio.run(main())
@@ -132,26 +131,41 @@ def replay_policy(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def load_online_rows(*, minutes: int, limit: int) -> list[dict[str, Any]]:
+    code = REMOTE_CODE.replace("__MINUTES__", str(max(1, min(minutes, 1440))))
+    code = code.replace("__LIMIT__", str(max(1, min(limit, 256))))
+    directory = "/data/bb/app/tmp/codex-paper-entry-policy"
+    result_path = f"{directory}/result_{secrets.token_hex(12)}.json"
+    ssh = connect_remote_ssh(ROOT, timeout=25)
+    try:
+        with ssh.open_sftp() as sftp:
+            try:
+                command = (
+                    "set -e\numask 077\n"
+                    f"install -d -m 0700 {shlex.quote(directory)}\n"
+                    "cd /data/bb/app\n"
+                    f".venv/bin/python -c {shlex.quote(code)} > {shlex.quote(result_path)}"
+                )
+                run_remote_text(ssh, command, timeout=60, max_output_chars=4000)
+                with sftp.file(result_path, "r") as remote_file:
+                    rows = json.loads(remote_file.read())
+            finally:
+                with suppress(OSError):
+                    sftp.remove(result_path)
+    finally:
+        ssh.close()
+
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError("online policy evidence must be an array of decision objects")
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--minutes", type=int, default=420)
     parser.add_argument("--limit", type=int, default=128)
     args = parser.parse_args()
-    code = REMOTE_CODE.replace("__MINUTES__", str(max(1, min(args.minutes, 1440))))
-    code = code.replace("__LIMIT__", str(max(1, min(args.limit, 256))))
-    ssh = connect_remote_ssh(ROOT, timeout=25)
-    try:
-        output = run_remote_text(
-            ssh, "cd /data/bb/app && .venv/bin/python -c " + shlex.quote(code),
-            timeout=60, max_output_chars=200_000,
-        )
-    finally:
-        ssh.close()
-    payloads = [line.removeprefix("BB_POLICY_DATA=") for line in output.splitlines()
-                if line.startswith("BB_POLICY_DATA=")]
-    if len(payloads) != 1:
-        raise ValueError("online policy evidence missing or ambiguous")
-    rows = json.loads(zlib.decompress(base64.b64decode(payloads[0], validate=True)))
+    rows = load_online_rows(minutes=args.minutes, limit=args.limit)
     safe_print(json.dumps(replay_policy(rows), ensure_ascii=False, default=str))
 
 

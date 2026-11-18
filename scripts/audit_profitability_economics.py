@@ -19,12 +19,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core.exceptions import ExchangeAPIError  # noqa: E402
 from db.session import close_db, get_read_session_ctx  # noqa: E402
 from services.authoritative_trade_outcome import load_authoritative_trade_outcomes  # noqa: E402
 from services.okx_native_facts import (  # noqa: E402
     _account_bill_from_row,
     _oldest_account_bill_pagination_cursor,
 )
+
+BILL_PAGE_INTERVAL_SECONDS = 0.5
+BILL_RATE_LIMIT_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 
 
 def _fingerprint(value: Any) -> str:
@@ -249,7 +253,22 @@ async def fetch_bills(
         params = {"instType": "SWAP", "ccy": "USDT", "limit": "100"}
         if cursor:
             params["after"] = cursor
-        response = await exchange.privateGetAccountBills(params)
+        if page_number > 1:
+            await asyncio.sleep(BILL_PAGE_INTERVAL_SECONDS)
+        for delay in (*BILL_RATE_LIMIT_BACKOFF_SECONDS, None):
+            try:
+                response = await exchange.privateGetAccountBills(params)
+            except ExchangeAPIError as exc:
+                if exc.code != "50011":
+                    raise
+                response = {"code": exc.code}
+            if not isinstance(response, dict) or str(response.get("code")) != "50011":
+                break
+            if delay is None:
+                return rows, {
+                    "complete": False, "pages": page_number - 1, "reason": "okx_rate_limited",
+                }
+            await asyncio.sleep(delay)
         if not isinstance(response, dict) or str(response.get("code")) != "0":
             raise ValueError("official bill request failed")
         page = response.get("data")
@@ -346,7 +365,8 @@ def audit_online(args: argparse.Namespace) -> dict[str, Any]:
         "import pathlib,subprocess,sys; "
         "result=subprocess.run(sys.argv[2:],capture_output=True); "
         "assert result.returncode == 0, 'bounded economics audit failed; inspect its named unit'; "
-        "print(pathlib.Path(sys.argv[1]).read_text())"
+        "import json; print(json.dumps(json.loads(pathlib.Path(sys.argv[1]).read_bytes()), "
+        "separators=(',', ':'), allow_nan=False))"
     )
     ssh = connect_remote_ssh(ROOT, timeout=25)
     try:

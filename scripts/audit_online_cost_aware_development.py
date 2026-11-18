@@ -30,8 +30,9 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
-from db.session import get_read_session_ctx
+from db.session import close_db, get_read_session_ctx
 from models.learning import ShadowBacktest
+from services.shadow_development_split import split_shadow_development_rows
 
 LIMIT = __LIMIT__
 HOURS = __HOURS__
@@ -67,6 +68,18 @@ def _baseline(rows, key):
     return _metrics([row.get(key) for row in rows])
 
 
+def _fold(rows):
+    return {
+        "rows": len(rows),
+        "always_long": _baseline(rows, "long_net"),
+        "always_short": _baseline(rows, "short_net"),
+        "hindsight_best_action_upper_bound": _baseline(rows, "best_net"),
+        "observed_decision_action": _metrics([
+            row.get(f"{row['decision_action']}_net") for row in rows
+        ]),
+    }
+
+
 async def main():
     now = datetime.now(UTC)
     since = now - timedelta(hours=HOURS)
@@ -82,8 +95,10 @@ async def main():
         )
         .where(
             ShadowBacktest.execution_mode == "paper",
+            ShadowBacktest.analysis_type == "market",
             ShadowBacktest.status == "completed",
             ShadowBacktest.updated_at >= since,
+            ShadowBacktest.updated_at < now,
             ShadowBacktest.training_feature_snapshot[
                 "training_market_fact_contract"
             ]["source"].as_string()
@@ -96,24 +111,19 @@ async def main():
         .order_by(ShadowBacktest.updated_at.desc(), ShadowBacktest.id.desc())
         .limit(LIMIT)
     )
-    async with get_read_session_ctx(statement_timeout_ms=15000) as session:
-        result = await session.execute(statement)
-        raw_rows = list(result.mappings())
+    try:
+        async with get_read_session_ctx(statement_timeout_ms=15000) as session:
+            result = await session.execute(statement)
+            raw_rows = list(result.mappings())
+    finally:
+        await close_db()
 
-    raw_rows.reverse()
     rows = []
     for raw in raw_rows:
         snapshot = _dict(raw.get("training_feature_snapshot"))
         label = _dict(snapshot.get("training_label_contract"))
         long_net = _float(label.get("long_net_return_after_all_cost_pct"))
         short_net = _float(label.get("short_net_return_after_all_cost_pct"))
-        if long_net is None or short_net is None:
-            continue
-        best = "hold"
-        if long_net > 0 and long_net >= short_net:
-            best = "long"
-        elif short_net > 0 and short_net > long_net:
-            best = "short"
         action = str(raw.get("decision_action") or "hold").lower()
         rows.append(
             {
@@ -122,58 +132,46 @@ async def main():
                 "symbol": str(raw.get("symbol") or ""),
                 "horizon_minutes": int(raw["horizon_minutes"]),
                 "decision_action": action,
-                "updated_at": raw["updated_at"].isoformat()
-                if raw.get("updated_at")
-                else None,
+                "decision_at": snapshot.get("original_decision_timestamp"),
+                "label_at": label.get("label_timestamp"),
+                "updated_at": raw.get("updated_at"),
                 "long_net": long_net,
                 "short_net": short_net,
-                "best_net": max(long_net, short_net, 0.0),
-                "best_action": best,
+                "best_net": (
+                    max(long_net, short_net, 0.0)
+                    if long_net is not None and short_net is not None else None
+                ),
             }
         )
 
-    by_horizon = defaultdict(list)
-    for row in rows:
-        by_horizon[row["horizon_minutes"]].append(row)
+    development_rows, validation_rows, timing = split_shadow_development_rows(rows)
+    by_horizon = defaultdict(lambda: ([], []))
+    missing_return_count = 0
+    for fold_number, fold_rows in enumerate((development_rows, validation_rows)):
+        for row in fold_rows:
+            if row["best_net"] is None:
+                missing_return_count += 1
+                continue
+            by_horizon[row["horizon_minutes"]][fold_number].append(row)
     horizons = {}
-    for horizon, horizon_rows in sorted(by_horizon.items()):
-        ordered = sorted(horizon_rows, key=lambda row: (row["updated_at"], row["id"]))
-        split = max(1, int(len(ordered) * 0.7))
-        development = ordered[:split]
-        validation = ordered[split:]
-        observed = [
-            row["long_net"] if row["decision_action"] == "long"
-            else row["short_net"] if row["decision_action"] == "short"
-            else None
-            for row in ordered
-        ]
+    for horizon in sorted({row["horizon_minutes"] for row in rows}):
+        development, validation = by_horizon[horizon]
+        ordered = development + validation
         horizons[str(horizon)] = {
             "rows": len(ordered),
             "distinct_decision_groups": len(
                 {row["decision_id"] for row in ordered if row["decision_id"] is not None}
             ),
             "time_range": {
-                "first": ordered[0]["updated_at"] if ordered else None,
-                "last": ordered[-1]["updated_at"] if ordered else None,
+                "first": ordered[0]["decision_at"].isoformat() if ordered else None,
+                "last": ordered[-1]["decision_at"].isoformat() if ordered else None,
             },
             "decision_action_counts": {
                 action: sum(row["decision_action"] == action for row in ordered)
                 for action in ("long", "short", "hold")
             },
-            "development_fold": {
-                "rows": len(development),
-                "always_long": _baseline(development, "long_net"),
-                "always_short": _baseline(development, "short_net"),
-                "hindsight_best_action_upper_bound": _baseline(development, "best_net"),
-                "observed_decision_action": _metrics(observed[:split]),
-            },
-            "validation_fold": {
-                "rows": len(validation),
-                "always_long": _baseline(validation, "long_net"),
-                "always_short": _baseline(validation, "short_net"),
-                "hindsight_best_action_upper_bound": _baseline(validation, "best_net"),
-                "observed_decision_action": _metrics(observed[split:]),
-            },
+            "development_fold": _fold(development),
+            "validation_fold": _fold(validation),
         }
 
     print(
@@ -189,9 +187,9 @@ async def main():
                     "exam_opened": False,
                 },
                 "row_count": len(rows),
-                "distinct_decision_groups": len(
-                    {row["decision_id"] for row in rows if row["decision_id"] is not None}
-                ),
+                "distinct_decision_groups": timing["decision_group_count"],
+                "split": timing,
+                "invalid_outcome_row_count": missing_return_count,
                 "horizons": horizons,
                 "candidate_status": (
                     "no candidate selected; transparent baselines only"

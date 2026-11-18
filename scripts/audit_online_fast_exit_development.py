@@ -20,7 +20,10 @@ if str(ROOT) not in sys.path:
 from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
 from core.safe_output import safe_print  # noqa: E402
 
-DEPENDENCIES = ("services/fast_exit_shadow_replay.py",)
+DEPENDENCIES = (
+    "services/fast_exit_shadow_replay.py",
+    "services/shadow_development_split.py",
+)
 SCAN_BATCH_SIZE = 250
 MAX_SCAN_MULTIPLIER = 20
 MAX_SCAN_ROWS = 50_000
@@ -107,9 +110,14 @@ async def main():
                     select(
                         ShadowBacktest.id,
                         ShadowBacktest.decision_id,
-                        ShadowBacktest.created_at,
                         ShadowBacktest.updated_at,
                         ShadowBacktest.symbol,
+                        ShadowBacktest.training_feature_snapshot[
+                            "original_decision_timestamp"
+                        ].as_string().label("decision_at"),
+                        ShadowBacktest.training_feature_snapshot[
+                            "training_label_contract"
+                        ]["label_timestamp"].as_string().label("label_at"),
                         ShadowBacktest.training_feature_snapshot[
                             "training_label_contract"
                         ]["long_mfe_pct"].label("long_mfe_pct"),
@@ -147,26 +155,7 @@ async def main():
                 source_row_count += len(batch)
                 cursor_updated_at = batch[-1]["updated_at"]
                 cursor_id = batch[-1]["id"]
-                for row in batch:
-                    decision_id = int(row.get("decision_id") or 0) or None
-                    rows.append(
-                        {
-                            "id": row.get("id"),
-                            "decision_id": decision_id,
-                            "decision_at": row.get("created_at"),
-                            "symbol": row.get("symbol"),
-                            "selected_side": row.get("selected_side"),
-                            "long_mfe_pct": row.get("long_mfe_pct"),
-                            "short_mfe_pct": row.get("short_mfe_pct"),
-                            "long_gross_return_pct": row.get("long_gross_return_pct"),
-                            "short_gross_return_pct": row.get("short_gross_return_pct"),
-                            "long_net_return_pct": row.get("long_net_return_pct"),
-                            "short_net_return_pct": row.get("short_net_return_pct"),
-                        }
-                    )
-                    if len(rows) >= LIMIT:
-                        break
-            rows.reverse()
+                rows.extend(dict(row) for row in batch[:LIMIT - len(rows)])
         report = build_fast_exit_shadow_report(
             rows,
             window={
