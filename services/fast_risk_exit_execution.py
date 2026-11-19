@@ -12,6 +12,7 @@ import structlog
 from ai_brain.base_model import DecisionOutput
 from core.safe_output import safe_error_text
 from executor.base_executor import ExecutionResult, OrderStatus
+from services.exit_execution_singleflight import ExitExecutionSingleFlightService
 from services.profit_lock_execution import FAST_PROFIT_LOCK_TRIGGER, PROFIT_LOCK_LIQUIDITY_BLOCKER
 
 logger = structlog.get_logger(__name__)
@@ -37,6 +38,7 @@ class FastRiskExitExecutionResult:
     skipped: bool = False
     error: str | None = None
     profit_limit_has_no_quote: bool = False
+    tracking_unfilled_paper_close: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +134,30 @@ class FastRiskExitExecutionProcessor:
                 model_name,
             )
             raw = execution_result.raw_response
+            tracking_unfilled_paper_close = (
+                model_exec_mode == "paper"
+                and not exchange_confirmed
+                and not exit_progress
+                and execution_result.status == OrderStatus.OPEN
+                and execution_result.quantity == 0.0
+                and isinstance(raw, dict)
+                and (
+                    (
+                        raw.get("existing_exit_order") is True
+                        and bool(execution_result.exchange_order_id)
+                        and raw.get("filled_contracts") == 0.0
+                        and not raw.get("exit_replace_attempted")
+                        and raw.get("execution_blocker") == "okx_exit_price_limit_liquidity"
+                    )
+                    or (
+                        raw.get("exit_singleflight_wait") is True
+                        and raw.get("singleflight_state") == "submitted_unconfirmed"
+                        and ExitExecutionSingleFlightService.pending_full_native_close_within_retry(
+                            position, execution_result.timestamp,
+                        )
+                    )
+                )
+            )
             guard = raw.get("profit_lock_execution") if isinstance(raw, dict) else None
             book = guard.get("execution_book_check") if isinstance(guard, dict) else None
             profit_limit_has_no_quote = (
@@ -147,6 +173,7 @@ class FastRiskExitExecutionProcessor:
             return FastRiskExitExecutionResult(
                 auto_close=auto_close,
                 profit_limit_has_no_quote=profit_limit_has_no_quote,
+                tracking_unfilled_paper_close=tracking_unfilled_paper_close,
             )
         except Exception as exc:
             error_text = safe_error_text(exc, limit=160)

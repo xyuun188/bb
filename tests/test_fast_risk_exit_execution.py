@@ -193,6 +193,39 @@ async def test_fast_profit_lock_releases_slot_only_on_proven_no_quote(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filled_contracts", "replace_attempted", "expected"),
+    [(0.0, False, True), (1.0, False, False), (0.0, True, False), (None, False, False)],
+)
+async def test_fast_risk_close_releases_slot_only_when_tracking_unfilled_order(
+    filled_contracts, replace_attempted, expected,
+) -> None:
+    receipt = _execution_result(OrderStatus.OPEN)
+    receipt.quantity = 0.0
+    receipt.raw_response = {
+        "existing_exit_order": True,
+        "filled_contracts": filled_contracts,
+        "exit_replace_attempted": replace_attempted,
+        "execution_blocker": "okx_exit_price_limit_liquidity",
+    }
+    result = await _processor([], execution_result=receipt).execute(
+        model_name="ensemble_trader",
+        symbol="BTC/USDT",
+        side="long",
+        position={},
+        decision=_decision(),
+        trigger="stop_loss",
+        reason="risk",
+        close_fraction=1.0,
+        entry_price=100.0,
+        current_price=98.0,
+    )
+
+    assert result.tracking_unfilled_paper_close is expected
+    assert result.auto_close["status"] == "open"
+
+
+@pytest.mark.asyncio
 async def test_fast_risk_exit_execution_records_rejected_result_on_error() -> None:
     calls: list[tuple[str, Any]] = []
     result = await _processor(calls, execute_error=RuntimeError("submit failed")).execute(

@@ -14492,6 +14492,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         loop = asyncio.get_running_loop()
         stage_started = loop.time()
         auto_closes: list[dict[str, Any]] = []
+        blocking_risk_close = False
         paper_profit_locks: list[
             tuple[tuple[datetime, float], tuple[str, str, str], dict[str, Any]]
         ] = []
@@ -14673,24 +14674,23 @@ class TradingService(ModelTrainingCoordinatorMixin):
             )
             if not execution.skipped and execution.auto_close is not None:
                 auto_closes.append(execution.auto_close)
+                if not getattr(execution, "tracking_unfilled_paper_close", False):
+                    blocking_risk_close = True
 
-        # Do not spend this round's protection time on discretionary orders
-        # if a hard or target exit was already processed.
         self._paper_profit_lock_attempts = {
             key: stamp for key, stamp in last_attempts.items() if key in handled
         }
-        if not auto_closes:
+        if not blocking_risk_close:
             paper_profit_locks.sort(key=lambda candidate: candidate[0])
             for attempt, (_, profit_lock_key, execution_args) in enumerate(paper_profit_locks[:2]):
-                # A second attempt can submit an order. Leave it for the next
-                # round when there is not enough time for the full handoff.
-                if attempt:
+                # A previous attempt may have spent part of this stage's budget.
+                if attempt or auto_closes:
                     remaining = self.position_review_stage_timeout_seconds() - (
                         loop.time() - stage_started
                     )
                     if remaining < PAPER_PROFIT_LOCK_SECOND_ATTEMPT_MIN_SECONDS:
                         logger.info(
-                            "second fast paper profit lock deferred",
+                            "fast paper profit lock deferred after earlier exit check",
                             symbol=profit_lock_key[1],
                             remaining_seconds=round(remaining, 3),
                         )
