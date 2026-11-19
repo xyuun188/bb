@@ -390,6 +390,7 @@ MARKET_ANALYSIS_ONLY_FALLBACK_LIMIT = 8
 MARKET_ENTRY_PIPELINE_MAX_CONCURRENCY = 4
 MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS = 45.0
 MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS = 12.0
+PAPER_PROFIT_LOCK_SECOND_ATTEMPT_MIN_SECONDS = 40.0
 TRAINING_PROCESS_NICE_LEVEL = 10
 TRAINING_PROCESS_MAX_WORKERS = 1
 TRAINING_STARTUP_GRACE_SECONDS = 180.0
@@ -14459,6 +14460,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
         open_positions: list[dict[str, Any]] | None = None,
     ) -> list[dict]:
         """Run hard protection and eligible paper profit locks before AI review."""
+        loop = asyncio.get_running_loop()
+        stage_started = loop.time()
         auto_closes: list[dict[str, Any]] = []
         paper_profit_locks: list[
             tuple[tuple[datetime, float], tuple[str, str, str], dict[str, Any]]
@@ -14649,11 +14652,22 @@ class TradingService(ModelTrainingCoordinatorMixin):
         }
         if not auto_closes:
             paper_profit_locks.sort(key=lambda candidate: candidate[0])
-            # Only a fresh book rejection before submission can release the slot.
-            # Bound the extra book check and keep at most one submission per pass.
-            for _, profit_lock_key, execution_args in paper_profit_locks[:2]:
+            for attempt, (_, profit_lock_key, execution_args) in enumerate(paper_profit_locks[:2]):
+                # A second attempt can submit an order. Leave it for the next
+                # round when there is not enough time for the full handoff.
+                if attempt:
+                    remaining = self.position_review_stage_timeout_seconds() - (
+                        loop.time() - stage_started
+                    )
+                    if remaining < PAPER_PROFIT_LOCK_SECOND_ATTEMPT_MIN_SECONDS:
+                        logger.info(
+                            "second fast paper profit lock deferred",
+                            symbol=profit_lock_key[1],
+                            remaining_seconds=round(remaining, 3),
+                        )
+                        break
                 self._paper_profit_lock_attempts[profit_lock_key] = datetime.now(UTC)
-                started = asyncio.get_running_loop().time()
+                started = loop.time()
                 logger.info("fast paper profit lock started", symbol=profit_lock_key[1])
                 execution = await self._fast_risk_exit_execution_processor().execute(
                     **execution_args,
@@ -14661,7 +14675,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 logger.info(
                     "fast paper profit lock finished",
                     symbol=profit_lock_key[1],
-                    duration_seconds=round(asyncio.get_running_loop().time() - started, 3),
+                    duration_seconds=round(loop.time() - started, 3),
                     no_executable_quote=execution.profit_limit_has_no_quote,
                 )
                 if not execution.skipped and execution.auto_close is not None:

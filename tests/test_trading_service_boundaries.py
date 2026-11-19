@@ -6550,6 +6550,7 @@ async def test_fast_dynamic_position_scan_allows_only_hard_risk_or_profit_lock(
     service.position_profit_peaks = FakeProfitPeaks()
     service.fast_risk_exit_execution_processor = FakeProcessor()
     service._get_model_execution_mode = lambda _model: execution_mode[0]
+    service.position_review_stage_timeout_seconds = lambda: 55.0
     position = {
         "model_name": "ensemble_trader",
         "symbol": "LTC/USDT",
@@ -6629,6 +6630,15 @@ async def test_fast_dynamic_position_scan_allows_only_hard_risk_or_profit_lock(
         {"symbol": "ETH/USDT"},
     ]
     assert [symbol for symbol, _, _ in calls[-2:]] == ["LTC/USDT", "ETH/USDT"]
+
+    await service._enforce_sl_tp({}, open_positions=[])
+    service.position_review_stage_timeout_seconds = lambda: 30.0
+    calls.clear()
+    assert await service._enforce_sl_tp({}, open_positions=[position, peer, third]) == [
+        {"symbol": "LTC/USDT"},
+    ]
+    assert [symbol for symbol, _, _ in calls] == ["LTC/USDT"]
+    assert {key[1] for key in service._paper_profit_lock_attempts} == {"LTC/USDT"}
 
 
 @pytest.mark.asyncio
