@@ -664,6 +664,42 @@ def test_validated_size_solver_selects_positive_bound_size_instead_of_rejecting_
     assert solved["return_lcb_pct"] > 0.0
 
 
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_size_solver_finds_last_profitable_contract_step_between_book_levels(side: str) -> None:
+    snapshot = _size_aware_book_snapshot(5_000.0)
+    if side == "short":
+        snapshot.update(
+            orderbook_bids=[[99.99, 5.0], [99.60, 100.0]],
+            orderbook_asks=[[100.01, 100.0]],
+            planned_order_side=side,
+        )
+    original_cost = execution_cost_estimate(snapshot).to_dict()
+    gross_expected, gross_lcb = 1.0, 0.22
+
+    solved = solve_size_aware_positive_expected_net(
+        feature_snapshot=snapshot, side=side,
+        maximum_notional_usdt=5_000.0, minimum_notional_usdt=100.0,
+        contract_step_notional_usdt=100.0,
+        expected_net_return_pct=gross_expected - original_cost["total_pct"],
+        return_lcb_pct=gross_lcb - original_cost["total_pct"],
+        execution_cost=original_cost,
+    )
+
+    candidates = [
+        (notional, execution_cost_estimate(dict(snapshot, planned_order_notional_usdt=notional)))
+        for notional in range(100, 5001, 100)
+    ]
+    best_notional, best_cost = max(
+        ((notional, cost) for notional, cost in candidates if cost.total_pct < gross_lcb),
+        key=lambda candidate: candidate[0] * (gross_expected - candidate[1].total_pct),
+    )
+    assert best_notional == 700.0
+    assert solved["production_eligible"] is True
+    assert solved["selected_notional_usdt"] == best_notional
+    assert solved["execution_cost"]["order_notional_usdt"] == best_notional
+    assert solved["return_lcb_pct"] == pytest.approx(gross_lcb - best_cost.total_pct)
+
+
 def test_size_solver_cannot_remove_measured_execution_slippage_by_shrinking() -> None:
     snapshot = _size_aware_book_snapshot(5_000.0)
     original = execution_cost_estimate(snapshot).to_dict()

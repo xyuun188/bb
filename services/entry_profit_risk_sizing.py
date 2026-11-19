@@ -107,9 +107,9 @@ def solve_size_aware_positive_expected_net(
 ) -> dict[str, Any]:
     """Maximize expected net profit within the risk budget and native book.
 
-    VWAP cost makes profit piecewise linear in size. Evaluate executable sizes
-    on both sides of each book boundary, plus the minimum and risk ceiling,
-    instead of filling to the point where the remaining edge is almost zero.
+    VWAP cost makes profit piecewise linear in size. Check the book boundaries
+    and the last executable step before depth or the return gate cuts off the
+    search, then choose the highest expected profit among those sizes.
     """
 
     maximum = max(_safe_float(maximum_notional_usdt, 0.0), 0.0)
@@ -254,16 +254,38 @@ def solve_size_aware_positive_expected_net(
         candidate = evaluate(notional)
         if candidate is not None:
             evaluated.append(candidate)
-    if not evaluated:
-        result["reason"] = "round_trip_size_cost_incomplete"
-        return result
-    profitable = [
-        candidate for candidate in evaluated
-        if normal_paper_entry_return_ready(
+
+    def passes_return_gate(candidate: dict[str, Any] | None) -> bool:
+        return candidate is not None and normal_paper_entry_return_ready(
             candidate["expected"], candidate["lcb"],
             paper_training_only=paper_training_only,
         )
-    ]
+
+    if step > 0.0 and not passes_return_gate(upper):
+        best_passing = max(
+            (candidate for candidate in evaluated if passes_return_gate(candidate)),
+            key=lambda candidate: candidate["notional"],
+            default=None,
+        )
+        if best_passing is not None:
+            lower_step = round(best_passing["notional"] / step)
+            upper_step = round(maximum / step)
+            # On an ordered book, round-trip cost and depth usage cannot
+            # improve as size increases. Only retain prices actually tested.
+            while upper_step - lower_step > 1:
+                middle_step = (lower_step + upper_step) // 2
+                candidate = evaluate(middle_step * step)
+                if candidate is not None:
+                    evaluated.append(candidate)
+                if passes_return_gate(candidate):
+                    lower_step = middle_step
+                else:
+                    upper_step = middle_step
+
+    if not evaluated:
+        result["reason"] = "round_trip_size_cost_incomplete"
+        return result
+    profitable = [candidate for candidate in evaluated if passes_return_gate(candidate)]
     selected = (
         max(
             profitable,
