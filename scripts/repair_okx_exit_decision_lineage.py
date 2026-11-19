@@ -37,6 +37,7 @@ from services.okx_position_settlement_sync import (
     SUPERSEDED_POSITION_REASON,
     SUPERSEDED_POSITION_STATUS,
 )
+from services.position_settlement import is_final_settlement_status
 
 REMOTE_APP_DIR = "/data/bb/app"
 
@@ -320,6 +321,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             realized_pnl=realized_pnl,
             closed_at=closed_at,
             entry_notional=entry_notional,
+            settlement_ready=bool(positions) and all(
+                is_final_settlement_status(position.settlement_status) for position in positions
+            ),
         )
         await session.flush()
         output.update(

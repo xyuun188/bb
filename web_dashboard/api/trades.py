@@ -38,6 +38,7 @@ from services.okx_order_fact_sync import (
     OKX_SYNC_CONFIRMED,
     OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
     OKX_SYNC_OKX_ONLY,
+    is_confirmed_terminal_partial_order,
 )
 from services.okx_position_ledger_view import build_okx_position_ledger_groups
 from services.okx_protection_position_recovery import confirmed_protection_lifecycle
@@ -1040,6 +1041,9 @@ async def get_trades(
                 return "partial", "部分平仓"
             if close_status == "full":
                 return "full", "全部平仓"
+
+        if is_confirmed_terminal_partial_order(order):
+            return "partial", "部分平仓"
 
         meta = decision_meta.get(order.decision_id) or {}
         by_pct = close_status_from_pct(

@@ -32,6 +32,7 @@ from services.external_event_service import (
     EXTERNAL_EVENT_SOURCE_HEALTH_VERSION,
     load_external_event_source_health,
 )
+from services.okx_order_fact_sync import is_confirmed_terminal_partial_order
 from services.server_monitor_status import (
     clear_server_monitor_cache,
     get_server_monitor_status_async,
@@ -1422,6 +1423,10 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
                 Order.created_at,
                 Order.decision_id,
                 Order.exchange_order_id,
+                Order.okx_state,
+                Order.okx_sync_status,
+                Order.okx_fill_contracts,
+                Order.okx_trade_ids,
             )
             .where(Order.created_at >= since)
             .order_by(Order.created_at.desc(), Order.id.desc())
@@ -1476,8 +1481,11 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
                 for row in _result_rows(linked_decisions_result)
             )
 
-    failed_orders = [row for row in orders if str(row.status or "").lower() != "filled"]
-    executed_orders = [row for row in orders if str(row.status or "").lower() == "filled"]
+    terminal_partials = [row for row in orders if is_confirmed_terminal_partial_order(row)]
+    executed_orders = [row for row in orders if _order_status(row) == "filled"]
+    executed_orders.extend(terminal_partials)
+    executed_ids = {row.id for row in executed_orders}
+    failed_orders = [row for row in orders if row.id not in executed_ids]
     decisions_by_id = {
         decision.id: decision for decision in decisions if getattr(decision, "id", None) is not None
     }
@@ -1531,6 +1539,7 @@ async def _recent_execution_items() -> list[dict[str, Any]]:
                 "window_hours": 6,
                 "orders": len(orders),
                 "filled_orders": len(executed_orders),
+                "terminal_partial_orders": len(terminal_partials),
                 "failed_or_unfilled_orders": len(failed_orders),
                 "is_system_failure": False,
             },

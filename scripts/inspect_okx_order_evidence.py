@@ -352,9 +352,11 @@ def _summarize(payload: dict[str, Any]) -> dict[str, Any]:
                     "side",
                     "quantity",
                     "price",
+                    "status",
                     "decision_id",
                     "okx_inst_id",
                     "okx_fill_contracts",
+                    "okx_state",
                     "okx_sync_status",
                 )
             }

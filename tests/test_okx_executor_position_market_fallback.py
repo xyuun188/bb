@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -356,6 +357,61 @@ async def test_profitable_exit_with_adverse_funding_uses_ioc_unless_hard_risk(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("first_fill", "final_fill", "expected_queries"),
+    [("0.5", "0.5", 1), ("0", "0.5", 2), ("0", "0", 2)],
+)
+async def test_profit_lock_ioc_distinguishes_small_partial_fill_from_zero(
+    monkeypatch, first_fill, final_fill, expected_queries,
+) -> None:
+    executor = OKXExecutor("paper")
+    exchange = _MissingLabMarketExchange()
+    monkeypatch.setattr(executor, "_check_paper_profit_lock_book", AsyncMock(return_value=None))
+    monkeypatch.setattr(executor, "_position_contracts_for_side", AsyncMock(
+        return_value=791.9 - float(final_fill),
+    ))
+    monkeypatch.setattr("executor.okx_executor.asyncio.sleep", AsyncMock())
+    original_fetch = exchange.privateGetTradeOrder
+
+    async def fetch_detail(params):
+        exchange.detail_overrides = {
+            "accFillSz": first_fill if not exchange.native_detail_requests else final_fill,
+            "state": "canceled",
+            "ordType": "ioc",
+            "posSide": "net",
+            "sz": "117.9",
+        }
+        return await original_fetch(params)
+
+    monkeypatch.setattr(exchange, "privateGetTradeOrder", fetch_detail)
+    decision = DecisionOutput(
+        model_name="position_review", symbol="LAB/USDT", action=Action.CLOSE_LONG,
+        confidence=0.95, reasoning="fee-after profit reduction",
+    )
+    result = await executor._place_okx_native_reduce_market_order(
+        ccxt=exchange, decision=decision, okx_symbol="LAB-USDT-SWAP",
+        market={"id": "LAB-USDT-SWAP", "info": {"lotSz": "0.1"}},
+        side="sell", params={"profit_lock_execution": {"eligible": True, "limit_price": 17.78}},
+        price=17.787, contract_size=0.1, pre_exit_contracts=791.9, target_side="long",
+        position_side="net", position_snapshot=[], requested_exit_fraction=0.15,
+        requested_exit_contracts=117.9, order_quantity=117.9, exit_order_replace_note=None,
+    )
+
+    assert len(exchange.native_order_requests) == 1
+    assert len(exchange.native_detail_requests) == expected_queries
+    assert result is not None
+    if float(final_fill):
+        assert result.status == OrderStatus.PARTIAL
+        assert result.quantity == pytest.approx(0.05)
+        assert result.raw_response["fill_confirmation_basis"] == "okx_order_detail"
+        assert not result.raw_response.get("profit_lock_ioc_unfilled")
+    else:
+        assert result.status == OrderStatus.CANCELLED
+        assert result.quantity == 0
+        assert result.raw_response["profit_lock_ioc_unfilled"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("overrides", "client_id_only", "expected_quantity", "confirmed"),
     [
         ({}, True, 0.45, True),
@@ -363,6 +419,7 @@ async def test_profitable_exit_with_adverse_funding_uses_ioc_unless_hard_risk(
         ({"ordId": "OTHER_ORDER"}, False, 0.45, False),
         ({"instId": "BTC-USDT-SWAP"}, False, 0.45, False),
         ({"side": "buy"}, False, 0.45, False),
+        ({"posSide": "short"}, False, 0.45, False),
         ({"clOrdId": "OTHER_CLIENT"}, True, 0.45, False),
     ],
 )

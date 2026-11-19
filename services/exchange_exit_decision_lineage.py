@@ -4,17 +4,20 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import String, cast, select
 
 from models.decision import AIDecision
 from models.trade import Order, Position
+from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
+from services.position_settlement import is_final_settlement_status
 
 RECONCILE_ORIGIN_SYSTEM_EXECUTION = "system_execution"
-EXIT_LINEAGE_VERSION = "2026-11-16.okx-exit-decision-lineage.v2"
+EXIT_LINEAGE_VERSION = "2026-11-19.okx-exit-decision-lineage.v3"
 EXIT_ACTIONS = {"close_long", "close_short", "exit_long", "exit_short"}
+UNLINKED_ORDER_MODEL = "okx_authoritative_sync"
 SUPERSEDED_POSITION_STATUS = "superseded_position_residual"
 SUPERSEDED_POSITION_REASONS = {
     "duplicate_local_open_position_for_same_okx_pos_id",
@@ -244,6 +247,37 @@ def choose_exit_decision_lineage(
     )
 
 
+def _ioc_close_fill_receipt(decision: AIDecision, order: Order) -> dict[str, Any]:
+    stored = _safe_dict(order.okx_raw_fills)
+    execution = _safe_dict(_safe_dict(decision.raw_llm_response).get("execution_result"))
+    raw = _safe_dict(execution.get("raw_response"))
+    request = _safe_dict(raw.get("request_params"))
+    order_id = str(order.exchange_order_id or "")
+    position_side = "long" if order.side == "sell" else "short"
+    if (
+        stored.get("fills_history_confirmed") is True
+        and stored.get("fills_pagination_complete") is True
+        and stored.get("contract_size_verified") is True
+        and stored.get("trade_ids")
+        and stored.get("order_id") == order_id
+        and stored.get("inst_id") == order.okx_inst_id == request.get("instId")
+        and stored.get("pos_side") in {"net", position_side}
+        and request.get("posSide", "net") == stored.get("pos_side")
+        and order.side == request.get("side")
+        and _safe_float(order.quantity) > 0
+        and _relative_close_enough(
+            _safe_float(stored.get("base_quantity")), _safe_float(order.quantity), 1e-8,
+        )
+        and 0 < _safe_float(stored.get("contracts")) <= _safe_float(request.get("sz"))
+        and execution.get("exchange_order_id") == order_id == raw.get("submitted_order_id")
+        and request.get("ordType") == "ioc"
+        and str(request.get("reduceOnly")).lower() == "true"
+        and not _observes_existing_exit_order(decision)
+    ):
+        return request
+    return {}
+
+
 async def load_exit_decision_lineage(
     session: Any,
     *,
@@ -272,17 +306,41 @@ async def load_exit_decision_lineage(
     if linked_order is not None and getattr(linked_order, "decision_id", None):
         linked_decision = await session.get(AIDecision, int(linked_order.decision_id))
 
-    decisions_result = await session.execute(
-        select(AIDecision).where(
-            AIDecision.model_name == model_name,
-            AIDecision.symbol == symbol,
-            AIDecision.action == action,
-            AIDecision.is_paper.is_(is_paper),
-            AIDecision.raw_llm_response.is_not(None),
-            cast(AIDecision.raw_llm_response, String).contains(order_id),
-        )
+    orphan = (
+        linked_order is not None
+        and linked_order.decision_id is None
+        and model_name == UNLINKED_ORDER_MODEL
     )
+    query = select(AIDecision).where(
+        AIDecision.symbol == symbol,
+        AIDecision.action == action,
+        AIDecision.is_paper.is_(is_paper),
+        AIDecision.raw_llm_response.is_not(None),
+        cast(AIDecision.raw_llm_response, String).contains(order_id),
+    )
+    if orphan:
+        stored = _safe_dict(linked_order.okx_raw_fills)
+        filled_at = linked_order.filled_at
+        if not (
+            isinstance(filled_at, datetime)
+            and stored.get("fills_history_confirmed") is True
+            and stored.get("fills_pagination_complete") is True
+            and stored.get("contract_size_verified") is True
+        ):
+            return ExitDecisionLineageResolution(None, linked_order, (), ())
+        query = query.where(
+            AIDecision.created_at >= filled_at - timedelta(hours=1),
+            AIDecision.created_at <= filled_at + timedelta(minutes=1),
+        )
+    else:
+        query = query.where(AIDecision.model_name == model_name)
+    decisions_result = await session.execute(query)
     decisions = list(decisions_result.scalars().all())
+    if orphan:
+        decisions = [
+            decision for decision in decisions
+            if _ioc_close_fill_receipt(decision, linked_order)
+        ]
     return choose_exit_decision_lineage(
         decisions,
         close_order_id=order_id,
@@ -298,34 +356,32 @@ async def recover_exit_decision_lineage_from_order_fact(
     close_fill: dict[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
-    """Repair a close order whose local decision link lost a concurrency race.
+    """Repair an authoritative close order with a missing or stale decision link.
 
-    The exchange order id is the only join key. This helper deliberately skips
-    entry actions and refuses to infer a position from a time window.
+    The exchange order id is the join key. The time bound only limits the
+    search for an unlinked IOC receipt.
     """
 
     close_order_id = str(getattr(order, "exchange_order_id", "") or "").strip()
     if not close_order_id:
         return None
     linked_decision_id = int(getattr(order, "decision_id", 0) or 0)
-    if not linked_decision_id:
+    side = str(getattr(order, "side", "") or "").strip().lower()
+    if side not in {"buy", "sell"}:
         return None
-    linked_decision = await session.get(AIDecision, linked_decision_id)
-    action = str(getattr(linked_decision, "action", "") or "").strip().lower()
-    if action not in EXIT_ACTIONS:
-        return None
-    expected_action = (
-        "close_short"
-        if str(getattr(order, "side", "") or "").strip().lower() == "buy"
-        else "close_long"
-    )
-    if action != expected_action:
+    expected_action = "close_short" if side == "buy" else "close_long"
+    model_name = str(getattr(order, "model_name", "") or "")
+    if linked_decision_id:
+        linked_decision = await session.get(AIDecision, linked_decision_id)
+        if getattr(linked_decision, "action", None) != expected_action:
+            return None
+    elif model_name != UNLINKED_ORDER_MODEL:
         return None
     resolution = await load_exit_decision_lineage(
         session,
-        model_name=str(getattr(order, "model_name", "") or ""),
+        model_name=model_name,
         symbol=str(getattr(order, "symbol", "") or ""),
-        action=action,
+        action=expected_action,
         is_paper=str(getattr(order, "execution_mode", "") or "").lower() != "live",
         execution_mode=str(getattr(order, "execution_mode", "") or "paper"),
         close_order_id=close_order_id,
@@ -333,7 +389,14 @@ async def recover_exit_decision_lineage_from_order_fact(
     authoritative = resolution.authoritative
     if authoritative is None:
         return None
-    if int(getattr(order, "decision_id", 0) or 0) == int(authoritative.id) and not resolution.superseded:
+    if (
+        linked_decision_id == int(authoritative.id)
+        and not resolution.superseded
+        and (
+            authoritative.was_executed
+            or not _ioc_close_fill_receipt(authoritative, order)
+        )
+    ):
         return None
 
     raw_fill = dict(close_fill or {})
@@ -428,6 +491,10 @@ async def recover_exit_decision_lineage_from_order_fact(
         realized_pnl=realized_pnl,
         closed_at=closed_at,
         entry_notional=entry_notional,
+        settlement_ready=bool(settlement_positions) and all(
+            is_final_settlement_status(position.settlement_status)
+            for position in settlement_positions
+        ),
     )
 
 
@@ -441,6 +508,7 @@ def apply_exit_decision_lineage(
     realized_pnl: float,
     closed_at: datetime,
     entry_notional: float,
+    settlement_ready: bool = True,
 ) -> dict[str, Any] | None:
     """Complete the original decision and retire duplicate reconciliation rows."""
 
@@ -453,17 +521,65 @@ def apply_exit_decision_lineage(
         reconcile_origin if original_system_sync else RECONCILE_ORIGIN_SYSTEM_EXECUTION
     )
     execution = dict(_safe_dict(raw.get("execution_result")))
+    order = resolution.linked_order
+    ioc_request = (
+        _ioc_close_fill_receipt(decision, order)
+        if order is not None and not decision.was_executed
+        else {}
+    )
+    partial = bool(ioc_request) and not _relative_close_enough(
+        _safe_float(order.okx_fill_contracts), _safe_float(ioc_request.get("sz")), 1e-9,
+    )
     execution.update(
         {
             "source": "okx_authoritative_reconcile",
             "order_id": close_order_id,
             "exchange_order_id": close_order_id,
-            "status": "filled",
+            "status": "partial" if partial else "filled",
             "price": exit_price,
             "pnl": realized_pnl,
             "exchange_confirmed": True,
         }
     )
+    if ioc_request:
+        evidence = _safe_dict(order.okx_raw_fills)
+        execution.update(
+            quantity=order.quantity,
+            fee=order.fee,
+            exit_progress=True,
+        )
+        raw = append_decision_stage(
+            raw,
+            DecisionStage.EXCHANGE_CONFIRM,
+            DecisionStageStatus.COMPLETED,
+            "OKX 已按原订单号确认部分平仓。" if partial else "OKX 已按原订单号确认平仓成交。",
+            {"exchange_order_id": close_order_id, "quantity": order.quantity},
+        )
+        raw = append_decision_stage(
+            raw,
+            DecisionStage.LOCAL_SYNC,
+            DecisionStageStatus.COMPLETED,
+            "已补回成交对应的原始平仓决策。",
+            {"exchange_order_id": close_order_id},
+        )
+        order.model_name = decision.model_name
+        if partial:
+            order.status = "partial"
+            details = _safe_dict(_safe_dict(execution.get("raw_response")).get("order_detail"))
+            native = _safe_dict(details.get("info"))
+            if (
+                native.get("ordId") == close_order_id
+                and native.get("instId") == order.okx_inst_id
+                and native.get("side") == order.side
+                and native.get("state") == "canceled"
+                and _relative_close_enough(
+                    _safe_float(native.get("accFillSz")), _safe_float(order.okx_fill_contracts), 1e-9,
+                )
+            ):
+                order.okx_state = "canceled"
+            elif order.okx_state == "filled":
+                order.okx_state = "partially_filled"
+        close_fill = {**evidence, **close_fill}
     raw["execution_result"] = execution
     raw["authoritative_close_reconciliation"] = {
         "version": EXIT_LINEAGE_VERSION,
@@ -480,8 +596,12 @@ def apply_exit_decision_lineage(
     decision.execution_reason = None
     decision.executed_at = closed_at
     decision.execution_price = exit_price
-    decision.outcome = "profit" if realized_pnl > 0 else "loss" if realized_pnl < 0 else "flat"
-    decision.outcome_pnl_pct = realized_pnl / entry_notional * 100 if entry_notional > 0 else 0.0
+    if ioc_request and not settlement_ready:
+        decision.outcome = None
+        decision.outcome_pnl_pct = None
+    else:
+        decision.outcome = "profit" if realized_pnl > 0 else "loss" if realized_pnl < 0 else "flat"
+        decision.outcome_pnl_pct = realized_pnl / entry_notional * 100 if entry_notional > 0 else 0.0
 
     if resolution.linked_order is not None:
         resolution.linked_order.decision_id = int(decision.id)

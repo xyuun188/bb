@@ -3894,7 +3894,8 @@ class OKXExecutor(AbstractExecutor):
         if not callable(place_order):
             return None
 
-        tolerance = max(pre_exit_contracts * 0.001, 1e-8)
+        # A position-relative tolerance can exceed an entire exchange fill.
+        tolerance = max(self._amount_step(market) * 1e-6, 1e-8)
         contracts = min(
             max(self._safe_float(order_quantity, 0.0), 0.0),
             max(self._safe_float(requested_exit_contracts, 0.0), 0.0),
@@ -4177,53 +4178,55 @@ class OKXExecutor(AbstractExecutor):
         native_order_detail: dict[str, Any] | None = None
         order_detail_error: str | None = None
         order_detail_identity_error: str | None = None
-        if order_id:
+        if order_id and success_code:
             native_fetch = getattr(ccxt, "privateGetTradeOrder", None)
             if callable(native_fetch):
                 order_id_field = "ordId" if first_item.get("ordId") else "clOrdId"
-                try:
-                    detail_response = await self._with_retry(
-                        native_fetch,
-                        {"instId": inst_id, order_id_field: order_id},
-                    )
-                    detail_rows = (
-                        detail_response.get("data")
-                        if isinstance(detail_response, dict)
-                        else None
-                    )
-                    detail_row = (
-                        detail_rows[0]
-                        if isinstance(detail_rows, list) and detail_rows
-                        else None
-                    )
-                    if isinstance(detail_row, dict):
+                query = {"instId": inst_id, order_id_field: order_id}
+                for attempt in range(2 if execution_order_type == "limit" else 1):
+                    if attempt:
+                        await asyncio.sleep(0.35)
+                    try:
+                        detail_response = await self._with_retry(native_fetch, query)
+                        detail_rows = (
+                            detail_response.get("data") if isinstance(detail_response, dict) else None
+                        )
+                        detail_row = detail_rows[0] if isinstance(detail_rows, list) and detail_rows else None
+                        if not isinstance(detail_row, dict):
+                            continue
                         detail_order_id = str(detail_row.get("ordId") or "").strip()
                         detail_client_order_id = str(detail_row.get("clOrdId") or "").strip()
                         detail_inst_id = str(detail_row.get("instId") or "").strip().upper()
                         detail_side = str(detail_row.get("side") or "").strip().lower()
+                        detail_pos_side = str(detail_row.get("posSide") or "").strip().lower()
                         if (
-                            str(detail_row.get(order_id_field) or "").strip() == order_id
+                            str(detail_row.get(order_id_field) or "").strip() == query[order_id_field]
                             and detail_order_id
                             and detail_inst_id == inst_id
                             and detail_side == side
+                            and detail_pos_side in {"", request_params.get("posSide", "net")}
                             and str(detail_response.get("code", "0")) == "0"
                         ):
+                            if native_order_detail is not None and detail_order_id != order_id:
+                                break
                             native_order_detail = self._native_order_detail_to_execution_order(
                                 detail_row,
                                 symbol=okx_symbol,
                             )
-                            # Prefer the real OKX order id when the submit
-                            # acknowledgement only returned a client id.
-                            order_id = detail_order_id or order_id
+                            order_detail_error = order_detail_identity_error = None
+                            order_id = detail_order_id
+                            if self._safe_float(native_order_detail.get("filled"), 0.0) > 0:
+                                break
                         else:
                             order_detail_identity_error = (
                                 "OKX order detail identity did not match the submitted "
                                 f"order: submitted={order_id!r}, detail_ord_id={detail_order_id!r}, "
                                 f"detail_cl_ord_id={detail_client_order_id!r}, "
-                                f"detail_inst_id={detail_inst_id!r}, detail_side={detail_side!r}."
+                                f"detail_inst_id={detail_inst_id!r}, detail_side={detail_side!r}, "
+                                f"detail_pos_side={detail_pos_side!r}."
                             )
-                except Exception as exc:
-                    order_detail_error = safe_error_text(exc)
+                    except Exception as exc:
+                        order_detail_error = safe_error_text(exc)
 
         submit_ack_filled_contracts = self._safe_float(
             first_item.get("accFillSz") or first_item.get("fillSz"),
@@ -4250,7 +4253,7 @@ class OKXExecutor(AbstractExecutor):
             pre_exit_contracts,
         )
         position_delta_unattributed = (
-            position_delta_contracts > tolerance and order_scoped_fill <= tolerance
+            position_delta_contracts > tolerance and order_scoped_fill <= 0
         )
         raw_response = {
             **(response if isinstance(response, dict) else {"response": response}),
@@ -4295,7 +4298,7 @@ class OKXExecutor(AbstractExecutor):
                 timestamp=datetime.now(UTC),
                 raw_response={**raw_response, "do_not_persist_order": True},
             )
-        if order_scoped_fill <= tolerance:
+        if order_scoped_fill <= 0:
             if (
                 isinstance(profit_guard, dict)
                 and native_order_detail is not None

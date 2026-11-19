@@ -1111,6 +1111,45 @@ async def test_recent_execution_old_missing_score_downgrades_after_new_scored_en
 
 
 @pytest.mark.asyncio
+async def test_recent_execution_counts_terminal_partial_but_warns_for_open_remainder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = system_health.datetime.now(system_health.UTC)
+    orders = [
+        SimpleNamespace(
+            id=order_id,
+            status="partial",
+            created_at=now,
+            decision_id=None,
+            okx_state=state,
+            okx_sync_status=sync_status,
+            okx_fill_contracts=0.5,
+            okx_trade_ids=f"trade-{order_id}",
+        )
+        for order_id, state, sync_status in [
+            (1, "canceled", "okx_only_backfilled"),
+            (2, "partially_filled", "okx_confirmed"),
+            (3, "canceled", "okx_order_only"),
+        ]
+    ]
+    results = iter([orders, []])
+
+    async def execute(_stmt):
+        return SimpleNamespace(all=lambda: next(results))
+
+    @asynccontextmanager
+    async def fake_session_ctx():
+        yield SimpleNamespace(execute=execute)
+
+    monkeypatch.setattr(system_health, "get_session_ctx", fake_session_ctx)
+    items = {item["key"]: item for item in await system_health._recent_execution_items()}
+
+    assert items["recent_execution"]["details"]["terminal_partial_orders"] == 1
+    assert items["recent_failed_orders"]["details"]["sample_order_ids"] == [2, 3]
+    assert items["recent_failed_orders"]["status"] == "warning"
+
+
+@pytest.mark.asyncio
 async def test_recent_execution_no_orders_is_info_not_system_warning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

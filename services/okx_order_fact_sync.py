@@ -35,6 +35,7 @@ from models.decision import AIDecision
 from models.trade import Order, Position
 from services.decision_state import DecisionStage, DecisionStageStatus, append_decision_stage
 from services.exchange_exit_decision_lineage import (
+    UNLINKED_ORDER_MODEL,
     ExitDecisionLineageAmbiguous,
     recover_exit_decision_lineage_from_order_fact,
 )
@@ -1466,6 +1467,20 @@ class OkxOrderFactSyncService:
             for exchange_order_id, order in orders_by_exchange_id.items()
             if _order_has_confirmed_okx_fill_fact(order)
         )
+        missing_order_ids = set(fills_by_exchange_id) - set(orders_by_exchange_id)
+        if missing_order_ids:
+            recovered_rows = await session.execute(
+                select(Order).where(
+                    Order.execution_mode == self.mode,
+                    Order.exchange_order_id.in_(missing_order_ids),
+                    Order.decision_id.is_(None),
+                    Order.model_name == UNLINKED_ORDER_MODEL,
+                ).with_for_update(skip_locked=True)
+            )
+            for order in recovered_rows.scalars():
+                if _order_has_confirmed_okx_fill_fact(order, require_verified_contract_size=True):
+                    orders_by_exchange_id[order.exchange_order_id] = order
+                    target_order_ids.add(order.exchange_order_id)
         recovered_count = 0
         errors: list[str] = []
         for close_order_id in sorted(target_order_ids):
@@ -1970,6 +1985,11 @@ class OkxOrderFactSyncService:
             )
             if backfilled_count:
                 await session.flush()
+                _, recovery_errors = await self._recover_exit_decision_lineages(
+                    session, orders=(), fills=recovery_fills, samples=samples,
+                )
+                if recovery_errors:
+                    logger.warning("OKX priority exit lineage recovery incomplete", errors=recovery_errors)
             return backfilled_count, contract_size_deferred_count, samples
 
     def _apply_local_order_facts(
@@ -2286,11 +2306,16 @@ class OkxOrderFactSyncService:
             ):
                 protection_execution = protection_execution_by_order_id.get(fill.order_id)
                 needs_slippage_refresh = _stored_slippage_fact_needs_refresh(order)
+                native_state = _order_row_state(order_row)
+                needs_state_refresh = (
+                    native_state in {"filled", "canceled", "partially_filled"}
+                    and native_state != order.okx_state
+                )
                 needs_protection_refresh = _stored_protection_execution_needs_refresh(
                     order,
                     protection_execution,
                 )
-                if needs_slippage_refresh or needs_protection_refresh:
+                if needs_slippage_refresh or needs_protection_refresh or needs_state_refresh:
                     self._apply_fill_to_order(
                         order,
                         fill,
@@ -2309,6 +2334,8 @@ class OkxOrderFactSyncService:
                                 "local_order_slippage_fact_refreshed"
                                 if needs_slippage_refresh
                                 else "local_order_protection_execution_refreshed"
+                                if needs_protection_refresh
+                                else "local_order_execution_state_refreshed"
                             ),
                         )
                     )
@@ -2334,6 +2361,7 @@ class OkxOrderFactSyncService:
                     fill=fill,
                     contract_size=contract_size,
                     now=now,
+                    status=order.status,
                 )
             confirmed_count += 1
             samples.append(
@@ -2584,12 +2612,19 @@ class OkxOrderFactSyncService:
         order.quantity = _fill_base_quantity(fill, contract_size)
         order.price = fill.avg_price
         order.fee = fill.fee_abs
-        order.status = "filled"
+        exchange_state = _order_row_state(order_row)
+        if (
+            not exchange_state
+            and order.status in {"partial", "partially_filled"}
+            and order.okx_state in {"canceled", "partially_filled"}
+        ):
+            exchange_state = order.okx_state
+        order.status = "partial" if exchange_state in {"canceled", "partially_filled"} else "filled"
         order.filled_at = fill.timestamp or getattr(order, "filled_at", None) or now
         order.okx_trade_ids = ",".join(fill.trade_ids)
         order.okx_fill_contracts = fill.contracts
         order.okx_fill_pnl = fill.fill_pnl
-        order.okx_state = "filled"
+        order.okx_state = exchange_state if order.status == "partial" else "filled"
         order.okx_sync_status = sync_status
         order.okx_synced_at = now
         order.okx_last_error = None
@@ -3105,7 +3140,8 @@ def _apply_close_fill_confirmation_to_order(order: Order, *, now: datetime) -> N
         order.filled_at = filled_at
     order.okx_trade_ids = ",".join(trade_ids) if trade_ids else None
     order.okx_fill_pnl = fill_pnl
-    order.okx_state = "filled"
+    if order.status not in {"partial", "partially_filled"}:
+        order.okx_state = "filled"
     order.okx_sync_status = OKX_SYNC_CONFIRMED
     order.okx_synced_at = now
     order.okx_last_error = None
@@ -3516,6 +3552,7 @@ def _apply_completed_submit_fill_recovery_to_decision(
     fill: OkxNativeFillGroup,
     contract_size: float,
     now: datetime,
+    status: str,
 ) -> None:
     base_quantity = _fill_base_quantity(fill, contract_size)
     exit_progress = str(getattr(decision, "action", "") or "").lower() in {
@@ -3559,7 +3596,7 @@ def _apply_completed_submit_fill_recovery_to_decision(
         "source": "okx_native_fill_recovered_after_outer_cancellation",
         "order_id": fill.order_id,
         "exchange_order_id": fill.order_id,
-        "status": "filled",
+        "status": status,
         "quantity": base_quantity,
         "price": fill.avg_price,
         "fee": fill.fee_abs,
@@ -3675,6 +3712,18 @@ def _order_has_confirmed_okx_fill_fact(
     ):
         return False
     return _order_fill_fact_matches_local(order, raw)
+
+
+def is_confirmed_terminal_partial_order(order: Any) -> bool:
+    return (
+        getattr(order, "status", None) in {"partial", "partially_filled"}
+        and getattr(order, "okx_state", None) == "canceled"
+        and getattr(order, "okx_sync_status", None) in {
+            OKX_SYNC_CONFIRMED, OKX_SYNC_OKX_ONLY, OKX_SYNC_ORDER_DETAIL_CONFIRMED,
+        }
+        and _safe_float(getattr(order, "okx_fill_contracts", None), 0.0) > 0
+        and bool(getattr(order, "okx_trade_ids", None))
+    )
 
 
 def authoritative_order_fee_fact_source(

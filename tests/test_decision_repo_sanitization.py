@@ -103,6 +103,33 @@ async def test_stale_exit_payloads_cannot_replace_claimed_execution_state() -> N
 
 
 @pytest.mark.asyncio
+async def test_stale_review_cannot_update_confirmed_exit_receipt_or_reason() -> None:
+    original = {
+        "dynamic_exit_policy": {"eligible": True, "close_fraction": 0.2},
+        "execution_result": {
+            "exchange_order_id": "close-order",
+            "exchange_confirmed": True,
+            "status": "partial",
+        },
+    }
+    row = SimpleNamespace(
+        action="close_long", was_executed=True, execution_reason=None,
+        raw_llm_response=original,
+    )
+    session = FakeSession(row=row)
+    repo = DecisionRepository(session)
+
+    await repo.mark_execution_reason(7, "dynamic_exit_risk_target_already_realized")
+    await repo.update_raw_response(7, {
+        **original, "dynamic_exit_policy": {"eligible": False, "close_fraction": 0.0},
+    })
+    await repo.update_raw_response(7, {"dynamic_exit_policy": {"eligible": False}})
+    assert row.raw_llm_response == original
+    assert row.execution_reason is None
+    assert session.flush_count == 0
+
+
+@pytest.mark.asyncio
 async def test_decision_repo_uses_unified_runtime_text_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

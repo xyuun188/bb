@@ -204,8 +204,10 @@ class DecisionRepository(BaseRepository):
     async def mark_execution_reason(
         self, decision_id: int, reason: str | None
     ) -> AIDecision | None:
-        decision = await self.get(decision_id)
-        if decision:
+        decision = await self.session.get(
+            AIDecision, decision_id, with_for_update=True, populate_existing=True,
+        )
+        if decision and not _has_confirmed_exit_receipt(decision):
             decision.execution_reason = sanitize_runtime_text(reason)
             await self.session.flush()
         return decision
@@ -216,6 +218,16 @@ class DecisionRepository(BaseRepository):
         decision = await self.session.get(AIDecision, decision_id, with_for_update=True)
         if decision:
             if _has_exit_claim(decision.raw_llm_response) and not _has_exit_claim(raw_response):
+                return None
+            if _has_confirmed_exit_receipt(decision) and (
+                not isinstance(raw_response, dict)
+                or raw_response.get("execution_result")
+                != decision.raw_llm_response.get("execution_result")
+                or raw_response.get("dynamic_exit_policy")
+                != decision.raw_llm_response.get("dynamic_exit_policy")
+                or raw_response.get("dynamic_exit_execution_contract")
+                != decision.raw_llm_response.get("dynamic_exit_execution_contract")
+            ):
                 return None
             clean_response = sanitize_runtime_text(compact_runtime_decision_payload(raw_response))
             decision.raw_llm_response = clean_response
@@ -373,6 +385,21 @@ def _sanitize_decision_payload(data: dict) -> dict:
 
 def _has_exit_claim(raw_response: Any) -> bool:
     return isinstance(raw_response, dict) and raw_response.get(EXIT_EXECUTION_CLAIM) is True
+
+
+def _has_confirmed_exit_receipt(decision: AIDecision) -> bool:
+    if not getattr(decision, "was_executed", False) or decision.action not in {
+        "close_long", "close_short",
+    }:
+        return False
+    raw = decision.raw_llm_response
+    receipt = raw.get("execution_result") if isinstance(raw, dict) else None
+    return (
+        isinstance(receipt, dict)
+        and receipt.get("exchange_confirmed") is True
+        and receipt.get("status") in {"filled", "partial"}
+        and bool(receipt.get("exchange_order_id"))
+    )
 
 
 def _sync_execution_parameters(decision: AIDecision, raw_response: Any) -> None:

@@ -811,6 +811,106 @@ async def test_order_fact_sync_auto_recovers_exact_exit_decision_lineage(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_side", ["buy", "sell"])
+async def test_order_fact_sync_recovers_unlinked_ioc_partial_without_settling_pnl(
+    tmp_path, monkeypatch, receipt_side,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "exit-ioc-lineage.db")
+    now = datetime.now(UTC)
+    order_id = "4113009162681298945"
+    fill = OkxNativeFillGroup(
+        order_id=order_id,
+        trade_ids=("353620271",),
+        inst_id="ACT-USDT-SWAP",
+        symbol="ACT/USDT",
+        side="buy",
+        pos_side="short",
+        contracts=0.5,
+        avg_price=1.0,
+        fee_abs=0.001,
+        fill_pnl=0.002,
+        timestamp_ms=float(_ms(now)),
+        timestamp=now,
+        raw_count=1,
+    )
+    service = OkxOrderFactSyncService(mode="paper")
+    try:
+        async with get_session_ctx() as session:
+            decision = AIDecision(
+                model_name="ensemble_trader", symbol=fill.symbol, action="close_short",
+                confidence=0.8, is_paper=True, was_executed=False, created_at=now,
+                raw_llm_response={
+                    "execution_result": {
+                        "exchange_order_id": order_id, "status": "cancelled",
+                        "quantity": 0, "exchange_confirmed": False,
+                        "raw_response": {
+                            "submitted_order_id": order_id,
+                            "order_detail": {"info": {
+                                "ordId": order_id, "instId": fill.inst_id, "side": fill.side,
+                                "state": "canceled", "accFillSz": "0.5",
+                            }},
+                            "request_params": {
+                                "instId": fill.inst_id, "posSide": "short",
+                                "side": receipt_side, "ordType": "ioc",
+                                "reduceOnly": "true", "sz": "117.9",
+                            },
+                        },
+                    },
+                },
+            )
+            order = Order(
+                model_name="okx_authoritative_sync", execution_mode="paper",
+                symbol=fill.symbol, side=fill.side, exchange_order_id=order_id,
+                order_type="limit", status="filled", created_at=now,
+            )
+            service._apply_fill_to_order(
+                order, fill, now=now, sync_status="okx_only_backfilled",
+                contract_size=0.1, contract_size_source="okx_public_instruments",
+            )
+            session.add_all([decision, order])
+            await session.flush()
+
+            count, errors = await service._recover_exit_decision_lineages(
+                session, orders=(), fills=[fill], samples=[],
+            )
+            assert errors == []
+            if receipt_side != fill.side:
+                assert count == 0
+                assert order.decision_id is None
+                assert decision.was_executed is False
+                return
+
+            assert count == 1
+            assert order.decision_id == decision.id
+            assert order.model_name == decision.model_name
+            assert order.status == "partial"
+            assert order.okx_state == "canceled"
+            assert decision.was_executed is True
+            assert decision.outcome is None
+            result = decision.raw_llm_response["execution_result"]
+            assert result["status"] == "partial"
+            assert result["quantity"] == pytest.approx(0.05)
+            assert result["exchange_confirmed"] is True
+            machine = decision.raw_llm_response["decision_state_machine"]
+            assert machine["current_status"] == "completed"
+            await session.flush()
+            assert await service._recover_exit_decision_lineages(
+                session, orders=[order], fills=[fill], samples=[],
+            ) == (0, [])
+            service._recover_local_stored_order_facts(
+                [order], decisions_by_id={decision.id: decision}, now=now, samples=[],
+            )
+            service._apply_fill_to_order(
+                order, fill, now=now, sync_status=order.okx_sync_status,
+                contract_size=0.1, contract_size_source="okx_public_instruments",
+            )
+            assert order.status == "partial"
+            assert order.okx_state == "canceled"
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_order_fact_sync_recovers_only_exact_confirmed_missing_closed_position(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
