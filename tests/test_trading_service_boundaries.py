@@ -59,6 +59,7 @@ from services.paper_training import (
 from services.position_margin import PositionMarginCalculator
 from services.position_profit_peaks import PositionProfitPeakTracker
 from services.position_protection_fallback import PositionProtectionFallbackPolicy
+from services.position_review_grouping import PositionReviewGroupingPolicy
 from services.position_snapshot_syncer import PositionSnapshotSyncer
 from services.position_time import PositionTimeParser
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
@@ -5962,6 +5963,77 @@ async def test_leverage_probe_cannot_clear_order_compliance_rejection() -> None:
     assert symbol in service._verified_entry_symbols_by_mode["paper"]
 
 
+@pytest.mark.asyncio
+async def test_older_shortlist_probe_cannot_clear_new_pre_order_rejection() -> None:
+    service = TradingService.__new__(TradingService)
+    symbol = "ETH/USDT"
+    service._verified_entry_symbols_by_mode = {"paper": {symbol}, "live": {symbol}}
+    observed_at = datetime.now(UTC) - timedelta(seconds=2)
+    service._remember_unavailable_entry_symbol(
+        "paper", symbol, {
+            "reason": "okx_entry_live_execution_environment_incompatible",
+            "environment_compatibility": {"blockers": ["environment_price_drift_exceeded"]},
+            "generated_at": observed_at.isoformat(),
+        },
+    )
+    assert symbol not in service._verified_entry_symbols_by_mode["paper"]
+    assert symbol in service._verified_entry_symbols_by_mode["live"]
+
+    class Executor:
+        async def entry_instrument_availability_shortlist(self, *_args, **_kwargs):
+            return {
+                "availability": {symbol: facts},
+                "evaluated_count": 1,
+            }
+
+    for offset in (-1, 0, 1):
+        facts = {
+            "available": True,
+            "generated_at": (observed_at + timedelta(seconds=offset)).isoformat(),
+            "cache_hit": offset <= 0,
+        }
+        service._schedule_market_instrument_availability_refresh(
+            Executor(), [symbol], target_count=1, mode="paper",
+        )
+        await service._market_instrument_refresh_tasks["paper"]
+        assert (symbol in service._entry_unavailable_cache_for_mode("paper")) is (offset <= 0)
+        assert (symbol in service._verified_entry_symbols_by_mode["paper"]) is (offset > 0)
+
+
+@pytest.mark.asyncio
+async def test_inflight_shortlist_probe_cannot_clear_pre_order_rejection() -> None:
+    service = TradingService.__new__(TradingService)
+    symbol = "ETH/USDT"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Executor:
+        async def entry_instrument_availability_shortlist(self, *_args, **_kwargs):
+            started.set()
+            await release.wait()
+            return {
+                "availability": {symbol: {
+                    "available": True, "generated_at": datetime.now(UTC).isoformat(),
+                }},
+                "evaluated_count": 1,
+            }
+
+    service._schedule_market_instrument_availability_refresh(
+        Executor(), [symbol], target_count=1, mode="paper",
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    service._remember_unavailable_entry_symbol(
+        "paper", symbol, {
+            "reason": "okx_entry_live_execution_environment_incompatible",
+            "environment_compatibility": {"blockers": ["environment_price_drift_exceeded"]},
+        },
+    )
+    release.set()
+    await asyncio.wait_for(service._market_instrument_refresh_tasks["paper"], timeout=1)
+    assert symbol in service._entry_unavailable_cache_for_mode("paper")
+    assert symbol not in service._verified_entry_symbols_by_mode["paper"]
+
+
 def test_legacy_transient_entry_cache_is_clamped_during_restart_migration(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -6639,6 +6711,29 @@ async def test_fast_dynamic_position_scan_allows_only_hard_risk_or_profit_lock(
     ]
     assert [symbol for symbol, _, _ in calls] == ["LTC/USDT"]
     assert {key[1] for key in service._paper_profit_lock_attempts} == {"LTC/USDT"}
+
+
+@pytest.mark.asyncio
+async def test_slow_position_review_skips_pending_full_paper_close() -> None:
+    service = TradingService.__new__(TradingService)
+    service.position_review_grouping = PositionReviewGroupingPolicy()
+    service._get_model_execution_mode = lambda _model: "paper"
+    position = {
+        "model_name": "ensemble_trader",
+        "symbol": "GMT/USDT",
+        "side": "long",
+        "entry_exchange_order_id": "entry-1",
+        "current_management_contract": {"exit_execution_intent": {
+            "key": "paper:GMT/USDT:long:entry:entry-1",
+            "state": "submitted_unconfirmed",
+            "native_close_order": True,
+            "exchange_order_id": "exit-1",
+            "requested_close_fraction": 1.0,
+            "retry_after_at": (datetime.now(UTC) + timedelta(seconds=120)).isoformat(),
+        }},
+    }
+
+    assert await service._review_open_positions([position], {}) == ([], set())
 
 
 def test_low_risk_paper_residual_requires_a_completed_profit_lock_target() -> None:

@@ -423,6 +423,31 @@ class ExitExecutionSingleFlightService:
         retry_at = cls._parse_time(intent.get("retry_after_at"))
         return retry_at is not None and retry_at > now
 
+    @classmethod
+    def pending_full_native_close_within_retry(
+        cls, position: dict[str, Any], now: datetime,
+    ) -> bool:
+        """Skip redundant expert calls while the fast path tracks a full close."""
+        contract = position.get("current_management_contract")
+        intent = contract.get(EXIT_INTENT_KEY) if isinstance(contract, dict) else None
+        if not isinstance(intent, dict):
+            return False
+        entry_id = str(position.get("entry_exchange_order_id") or "").strip()
+        symbol = normalize_trading_symbol(position.get("symbol"))
+        side = str(position.get("side") or "").lower()
+        full_close = 0.999 <= cls._safe_float(intent.get("requested_close_fraction"), 0.0) <= 1.0
+        if (
+            not entry_id or not symbol or side not in {"long", "short"}
+            or intent.get("key") != f"paper:{symbol}:{side}:entry:{entry_id}"
+            or intent.get("state") != "submitted_unconfirmed"
+            or intent.get("native_close_order") is not True
+            or not str(intent.get("exchange_order_id") or "").strip()
+            or not full_close
+        ):
+            return False
+        retry_at = cls._parse_time(intent.get("retry_after_at"))
+        return retry_at is not None and retry_at > now
+
     @staticmethod
     def _apply_intent(positions: list[Any], intent: dict[str, Any]) -> None:
         for position in positions:

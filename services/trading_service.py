@@ -9478,6 +9478,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
             }
         )
         rows[normalized_symbol] = payload
+        verified_by_mode = self._safe_dict(getattr(self, "_verified_entry_symbols_by_mode", {}))
+        selected_mode = "live" if str(mode).lower() == "live" else "paper"
+        verified = verified_by_mode.get(selected_mode)
+        if isinstance(verified, set):
+            verified.discard(normalized_symbol)
         if persist:
             self._persist_unavailable_entry_symbol_cache()
 
@@ -9890,6 +9895,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     remaining_seconds = deadline - asyncio.get_running_loop().time()
                     if remaining_seconds <= 0:
                         raise TimeoutError("market instrument refresh deadline reached")
+                    batch_started_at = datetime.now(UTC)
                     async with asyncio.timeout(remaining_seconds):
                         result = await executor.entry_instrument_availability_shortlist(
                             active_batch,
@@ -9924,6 +9930,21 @@ class TradingService(ModelTrainingCoordinatorMixin):
                             verified.discard(str(symbol))
                             continue
                         if facts.get("available") is True:
+                            negative = unavailable_rows.get(normalized_symbol)
+                            if negative is not None:
+                                positive_at = self._parse_datetime(facts.get("generated_at"))
+                                negative_at = self._parse_datetime(
+                                    negative.get("generated_at") or negative.get("cached_at")
+                                )
+                                # A cached or in-flight probe cannot undo a newer
+                                # order-time rejection of the same instrument.
+                                if positive_at is None or (
+                                    negative_at is not None
+                                    and min(positive_at, batch_started_at) <= negative_at
+                                ):
+                                    merged.discard(normalized_symbol)
+                                    verified.discard(str(symbol))
+                                    continue
                             merged.add(normalized_symbol)
                             batch_unavailable_changed = (
                                 unavailable_rows.pop(normalized_symbol, None) is not None
@@ -14716,7 +14737,24 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if not grouped:
             return candidates, handled_keys
 
-        grouped_items = list(grouped.items())
+        review_time = datetime.now(UTC)
+        grouped_items = [
+            (key, positions) for key, positions in grouped.items()
+            if not (
+                len(positions) == 1
+                and self._get_model_execution_mode(key[0]) == "paper"
+                and ExitExecutionSingleFlightService.pending_full_native_close_within_retry(
+                    positions[0], review_time,
+                )
+            )
+        ]
+        if len(grouped_items) != len(grouped):
+            logger.info(
+                "position expert review skipped while tracking pending native close",
+                deferred_count=len(grouped) - len(grouped_items),
+            )
+        if not grouped_items:
+            return candidates, handled_keys
         replacement_params = DEFAULT_TRADING_PARAMS.position_replacement
         try:
             stronger_opportunity_context = await asyncio.wait_for(

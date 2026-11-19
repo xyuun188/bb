@@ -104,6 +104,41 @@ def _service(
     )
 
 
+def test_expert_review_defers_only_for_the_same_pending_full_paper_close() -> None:
+    now = datetime(2026, 11, 20, tzinfo=UTC)
+    intent = {
+        "key": "paper:GMT/USDT:long:entry:entry-1",
+        "state": "submitted_unconfirmed",
+        "native_close_order": True,
+        "exchange_order_id": "exit-1",
+        "requested_close_fraction": 1.0,
+        "retry_after_at": (now + timedelta(seconds=120)).isoformat(),
+    }
+    position = {
+        "symbol": "GMT/USDT",
+        "side": "long",
+        "entry_exchange_order_id": "entry-1",
+        "current_management_contract": {EXIT_INTENT_KEY: intent},
+    }
+    defer_review = ExitExecutionSingleFlightService.pending_full_native_close_within_retry
+    assert defer_review(position, now)
+    assert not defer_review(position, now + timedelta(seconds=120))
+    assert not defer_review({**position, "entry_exchange_order_id": "different-entry"}, now)
+    assert not defer_review({**position, "side": "short"}, now)
+    for field, value in (
+        ("key", "live:GMT/USDT:long:entry:entry-1"),
+        ("state", "submitted_result_unknown"),
+        ("native_close_order", False),
+        ("exchange_order_id", ""),
+        ("requested_close_fraction", 0.5),
+        ("requested_close_fraction", float("nan")),
+    ):
+        snapshot = {**position, "current_management_contract": {
+            EXIT_INTENT_KEY: {**intent, field: value},
+        }}
+        assert not defer_review(snapshot, now)
+
+
 @pytest.mark.asyncio
 async def test_persistent_exit_lease_blocks_duplicate_and_survives_service_restart() -> None:
     position = _position()
