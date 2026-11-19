@@ -107,6 +107,42 @@ async def test_funding_receipt_is_distinct_from_source_and_scheduled_event(
 
 
 @pytest.mark.asyncio
+async def test_funding_cache_reloads_at_settlement(monkeypatch, receipt_clock) -> None:
+    client = OKXRestClient()
+    settlement = receipt_clock.current + timedelta(seconds=1)
+    following = settlement + timedelta(hours=8)
+    calls = 0
+
+    async def fetch(method, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        event_at = settlement if calls == 1 else following
+        return {
+            "fundingRate": 0.0001 if calls == 1 else -0.0002,
+            "info": {
+                "ts": str(int(receipt_clock.current.timestamp() * 1000)),
+                "fundingTime": str(int(event_at.timestamp() * 1000)),
+                "nextFundingTime": str(int((event_at + timedelta(hours=8)).timestamp() * 1000)),
+            },
+        }
+
+    monkeypatch.setattr(client, "_ccxt_call", fetch)
+
+    async def read_funding():
+        return await client._cached_derivatives_route(
+            "funding", "BTC/USDT", lambda: client.fetch_funding_rate("BTC/USDT"),
+        )
+
+    assert (await read_funding())["funding_rate"] == 0.0001
+    receipt_clock.current = settlement
+    refreshed = await read_funding()
+
+    assert refreshed["funding_rate"] == -0.0002
+    assert refreshed["funding_time"] == str(int(following.timestamp() * 1000))
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_failed_funding_request_has_no_received_clock(monkeypatch, receipt_clock) -> None:
     client = OKXRestClient()
 

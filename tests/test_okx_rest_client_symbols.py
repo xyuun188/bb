@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -2200,15 +2200,18 @@ async def test_stale_funding_cache_is_served_while_refresh_runs_in_background(
 ) -> None:
     client = OKXRestClient()
     key = ("funding", "BTC-USDT-SWAP")
+    now = datetime.now(UTC)
+    funding_time = (now + timedelta(hours=1)).isoformat()
+    next_funding_time = (now + timedelta(hours=9)).isoformat()
     client._derivatives_route_cache[key] = (
         time.monotonic() - 30.0,
         {
             "funding_rate": 0.0001,
             "funding_data_available": True,
             "funding_interval_minutes": 480.0,
-            "funding_time": "1783958400000",
-            "next_funding_time": "1783987200000",
-            "funding_rate_observed_at": "1783931769300",
+            "funding_time": funding_time,
+            "next_funding_time": next_funding_time,
+            "funding_rate_observed_at": now.isoformat(),
         },
     )
     refresh_started = asyncio.Event()
@@ -2221,9 +2224,9 @@ async def test_stale_funding_cache_is_served_while_refresh_runs_in_background(
             "funding_rate": 0.0002,
             "funding_data_available": True,
             "funding_interval_minutes": 480.0,
-            "funding_time": "1783958400000",
-            "next_funding_time": "1783987200000",
-            "funding_rate_observed_at": "1783931769300",
+            "funding_time": funding_time,
+            "next_funding_time": next_funding_time,
+            "funding_rate_observed_at": now.isoformat(),
         }
 
     result = await asyncio.wait_for(

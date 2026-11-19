@@ -6357,7 +6357,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
             if not getattr(candidate, "next_funding_time", None):
                 return False
             next_funding_at = availability_timestamp(
-                getattr(candidate, "next_funding_time", None)
+                getattr(candidate, "funding_time", None)
+                or getattr(candidate, "next_funding_time", None)
             )
             observed_at = availability_timestamp(
                 getattr(candidate, "funding_rate_observed_at", None)

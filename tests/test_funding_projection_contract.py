@@ -45,6 +45,43 @@ def test_projection_accepts_okx_native_epoch_millisecond_times() -> None:
     assert result.reason == "current_direction_funding_cashflow_ready"
 
 
+def test_native_funding_projection_counts_current_settlement_for_both_sides() -> None:
+    snapshot = {
+        **_snapshot(),
+        "funding_time": "1786928400000",
+        "next_funding_time": "1786957200000",
+    }
+    before = funding_cost_estimate(snapshot, side="long", horizon_minutes=59)
+    long = funding_cost_estimate(snapshot, side="long", horizon_minutes=60)
+    short = funding_cost_estimate(snapshot, side="short", horizon_minutes=60)
+    following = funding_cost_estimate(snapshot, side="long", horizon_minutes=540)
+
+    assert before.estimated_settlement_count == 0
+    assert long.next_funding_time == snapshot["funding_time"]
+    assert long.estimated_settlement_count == short.estimated_settlement_count == 1
+    assert long.signed_cashflow_pct == -0.1
+    assert short.signed_cashflow_pct == 0.1
+    assert following.estimated_settlement_count == 2
+
+
+def test_native_funding_rate_requires_refresh_at_settlement_and_valid_schedule() -> None:
+    snapshot = {
+        **_snapshot(),
+        "timestamp": "2026-08-17T01:00:00+00:00",
+        "funding_time": "2026-08-17T01:00:00+00:00",
+        "next_funding_time": "2026-08-17T09:00:00+00:00",
+    }
+    expired = funding_cost_estimate(snapshot, side="short", horizon_minutes=480)
+    assert expired.production_eligible is False
+    assert expired.signed_cashflow_pct is None
+    assert expired.reason == "funding_rate_settlement_passed"
+
+    snapshot["funding_time"] = snapshot["next_funding_time"]
+    invalid = funding_cost_estimate(snapshot, side="short", horizon_minutes=480)
+    assert invalid.production_eligible is False
+    assert invalid.reason == "funding_settlement_schedule_invalid"
+
+
 def test_production_snapshot_without_next_time_or_with_stale_rate_is_unavailable() -> None:
     missing_next = _snapshot()
     missing_next.pop("next_funding_time")

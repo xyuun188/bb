@@ -4493,6 +4493,11 @@ class DataService:
                 return False
         except (TypeError, ValueError):
             return False
+        funding_time = data.get("funding_time")
+        if funding_time:
+            current_settlement = availability_timestamp(funding_time)
+            if current_settlement is None or current_settlement <= datetime.now(UTC):
+                return False
         return bool(
             data.get("next_funding_time")
             and data.get("funding_rate_observed_at")

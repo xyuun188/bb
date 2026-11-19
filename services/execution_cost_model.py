@@ -141,9 +141,12 @@ def funding_cost_estimate(
         interval = interval_hours * 60.0 if interval_hours is not None else None
 
     reason = ""
+    current_funding_raw = str(snapshot.get("funding_time") or "").strip()
     next_funding_raw = str(snapshot.get("next_funding_time") or "").strip()
     observed_raw = str(snapshot.get("funding_rate_observed_at") or "").strip()
+    current_funding = _parse_timestamp(current_funding_raw)
     next_funding = _parse_timestamp(next_funding_raw)
+    first_settlement = current_funding if current_funding_raw else next_funding
     observed_at = _parse_timestamp(observed_raw)
     as_of_raw = (
         snapshot.get("original_decision_timestamp")
@@ -167,10 +170,18 @@ def funding_cost_estimate(
         reason = "funding_as_of_invalid"
     elif not next_funding and not legacy_projection:
         reason = "next_funding_time_missing"
+    elif current_funding_raw and (
+        current_funding is None
+        or next_funding is None
+        or current_funding >= next_funding
+    ):
+        reason = "funding_settlement_schedule_invalid"
     elif not observed_at and not legacy_projection:
         reason = "funding_rate_observed_at_missing"
     elif observed_at and observed_at > as_of and not legacy_projection:
         reason = "funding_rate_observed_after_decision"
+    elif current_funding is not None and current_funding <= as_of and not legacy_projection:
+        reason = "funding_rate_settlement_passed"
     elif observed_at and as_of > observed_at and not legacy_projection:
         max_age = max(interval * 2.0 if interval and interval > 0 else 480.0, 30.0)
         if (as_of - observed_at).total_seconds() > max_age * 60.0:
@@ -181,13 +192,16 @@ def funding_cost_estimate(
     adverse_cost = None
     settlement_count = 0
     if eligible and rate is not None and interval is not None and horizon is not None:
-        if next_funding is not None:
+        if first_settlement is not None:
             # Count (decision, exit] settlements directly. Iterating from an
             # old next-funding timestamp can otherwise stall historical replay.
+            # OKX's current rate applies at fundingTime, one interval before
+            # nextFundingTime, which describes the following period.
             step_seconds = interval * 60.0
-            first = max(floor((as_of - next_funding).total_seconds() / step_seconds) + 1, 0)
+            offset_seconds = (as_of - first_settlement).total_seconds()
+            first = max(floor(offset_seconds / step_seconds) + 1, 0)
             last = floor(
-                ((as_of - next_funding).total_seconds() + horizon * 60.0) / step_seconds
+                (offset_seconds + horizon * 60.0) / step_seconds
             )
             settlement_count = max(last - first + 1, 0)
             if settlement_count > 1000:
@@ -219,7 +233,7 @@ def funding_cost_estimate(
         funding_interval_minutes=interval,
         horizon_minutes=horizon,
         estimated_settlement_count=settlement_count,
-        next_funding_time=next_funding_raw or None,
+        next_funding_time=current_funding_raw or next_funding_raw or None,
         funding_rate_observed_at=observed_raw or None,
         signed_cashflow_pct=signed_impact,
         adverse_cost_pct=(round(adverse_cost, 10) if adverse_cost is not None else None),
@@ -235,14 +249,15 @@ def funding_cost_estimate(
             "observation_window": "current_prediction_horizon",
             "sample_count": int(eligible),
             "generated_at": datetime.now(UTC).isoformat(),
-            "strategy_version": "2026-11-10.decision-clock-funding-settlements.v2",
+            "strategy_version": "2026-11-20.decision-clock-funding-settlements.v3",
             "fallback_reason": "" if eligible else reason,
             "funding_rate_observed_at": observed_raw,
             "income_credit_policy": "signed_cashflow_positive_income_negative_cost",
             "estimated_settlement_count": settlement_count,
             "projection_method": (
-                "next_funding_time_and_interval"
-                if next_funding is not None
+                "current_funding_time_and_interval"
+                if current_funding is not None
+                else "next_funding_time_and_interval" if next_funding is not None
                 else "legacy_interval_fallback"
             ),
             "funding_evidence_status": (

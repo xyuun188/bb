@@ -1183,6 +1183,13 @@ class OKXRestClient:
             # so its last value can be used while it refreshes.
             return route != "funding" or payload.get("funding_data_available") is True
 
+        def cached_settlement_pending(payload: dict[str, Any]) -> bool:
+            funding_time = payload.get("funding_time") if route == "funding" else None
+            if not funding_time:
+                return True
+            settlement = availability_timestamp(funding_time)
+            return settlement is not None and settlement > datetime.now(UTC)
+
         def start_refresh() -> asyncio.Task[dict[str, Any]]:
             existing = self._derivatives_route_tasks.get(key)
             if existing is not None and not existing.done():
@@ -1211,6 +1218,8 @@ class OKXRestClient:
             task.add_done_callback(cleanup)
             return task
 
+        if cached is not None and not cached_settlement_pending(cached[1]):
+            cached = None
         if cached is not None and now - cached[0] <= DERIVATIVES_ROUTE_CACHE_TTL_SECONDS:
             return {**cached[1], f"{route}_cached": True}
 
