@@ -45,6 +45,44 @@ async def _noop_async(*_args: Any, **_kwargs: Any) -> Any:
     return None
 
 
+@pytest.mark.asyncio
+async def test_paper_entry_capacity_check_is_serialized_without_blocking_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = ExecutionService(
+        execution_lock=asyncio.Semaphore(2),
+        paper_entry_lock=asyncio.Lock(),
+        model_execution_mode_provider=lambda _model: "paper",
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def execute(symbol, *_args, **_kwargs):
+        calls.append(symbol)
+        if symbol == "BTC/USDT":
+            started.set()
+            await release.wait()
+
+    monkeypatch.setattr(service, "execute_candidate_locked", execute)
+
+    def submit(decision):
+        return service.execute_candidate(
+            decision.symbol, decision.model_name, decision, None, None, {},
+        )
+
+    first = asyncio.create_task(submit(_entry_decision("BTC/USDT")))
+    await started.wait()
+    second = asyncio.create_task(submit(_entry_decision("ETH/USDT")))
+    try:
+        await asyncio.wait_for(submit(_full_exit_decision()), timeout=1)
+        assert calls == ["BTC/USDT", "ZAMA/USDT"]
+    finally:
+        release.set()
+        await asyncio.gather(first, second)
+    assert calls[-1] == "ETH/USDT"
+
+
 def _test_execution_service(
     *,
     okx_executor_provider,

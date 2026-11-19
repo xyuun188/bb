@@ -75,6 +75,11 @@ NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
 NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD = 0.80
 NORMAL_PAPER_TRADE_LEVERAGE_POLICY = "dynamic_risk_and_okx_tier"
 NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION = 0.0025
+# Training positions consume the same review capacity as validated positions.
+# Four rounds at the observed two slow reviews per round is the paper workload target.
+PAPER_TRAINING_REVIEW_GROUP_LIMIT = 8
+PAPER_TRAINING_MIN_EXPECTED_PROFIT_USDT = 0.10
+PAPER_TRAINING_MIN_EXPECTED_PROFIT_TO_STRESS = 0.10
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -109,6 +114,28 @@ def normal_paper_entry_return_ready(
         and downside is not None
         and (paper_training_only or downside > 0.0)
     )
+
+
+def paper_training_order_economics(
+    notional: float, expected_net_return_pct: float, stressed_loss_fraction: float,
+) -> dict[str, Any]:
+    """Require training orders to justify an additional position to review."""
+
+    expected_profit = notional * expected_net_return_pct / 100.0
+    stressed_loss = notional * stressed_loss_fraction
+    minimum_profit = max(
+        PAPER_TRAINING_MIN_EXPECTED_PROFIT_USDT,
+        stressed_loss * PAPER_TRAINING_MIN_EXPECTED_PROFIT_TO_STRESS,
+    )
+    return {
+        "expected_profit_usdt": round(expected_profit, 8),
+        "minimum_expected_profit_usdt": round(minimum_profit, 8),
+        "stressed_loss_usdt": round(stressed_loss, 8),
+        "passed": isfinite(expected_profit)
+        and isfinite(stressed_loss)
+        and stressed_loss > 0.0
+        and expected_profit + 1e-8 >= minimum_profit,
+    }
 
 
 def _quality_permissions_ready(value: Any) -> bool:

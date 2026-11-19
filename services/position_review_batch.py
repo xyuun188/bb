@@ -54,6 +54,7 @@ class PositionReviewBatchPolicy:
         defer_count_provider: PositionReviewDeferCountProvider | None = None,
         position_entry_pause_reason: str | None = None,
         cursor: int = 0,
+        routine_review_allowed: Callable[[PositionGroupItem, dict[str, Any]], bool] | None = None,
     ) -> PositionReviewBatchSelection:
         del position_entry_pause_reason
         defer_count_provider = defer_count_provider or (lambda _key: 0)
@@ -88,7 +89,14 @@ class PositionReviewBatchPolicy:
 
         selected_items = self._unique_items(urgent_items)[:max_groups]
         selected_keys = {item[0] for item in selected_items}
-        remaining = [item for item in sorted_items if item[0] not in selected_keys]
+        remaining = [
+            item for item in sorted_items
+            if item[0] not in selected_keys
+            and (
+                routine_review_allowed is None
+                or routine_review_allowed(item, fast_scan.get(item[0], {}))
+            )
+        ]
         remaining_slots = max(max_groups - len(selected_items), 0)
         next_cursor = cursor
         if remaining_slots and remaining:

@@ -168,7 +168,10 @@ from services.model_training_coordinator import (
 from services.model_training_state import (
     ModelTrainingStateStore,
 )
-from services.normal_paper_trade import normal_paper_entry_contract_reasons
+from services.normal_paper_trade import (
+    ensure_normal_paper_trade_contract,
+    normal_paper_entry_contract_reasons,
+)
 from services.okx_balance_snapshot import (
     balance_snapshot_recovery_reason,
     balance_snapshot_verified,
@@ -638,6 +641,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         self.exit_execution_pipeline = ExitExecutionPipeline(lambda: self.exit_policy)
         self.execution_service = ExecutionService(
             execution_lock=self._execution_lock,
+            paper_entry_lock=asyncio.Lock(),
             risk_event_logger=self.log_risk_event,
             model_execution_mode_provider=self.get_model_execution_mode,
             decision_stage_recorder=self.record_and_persist_decision_stage,
@@ -4922,8 +4926,37 @@ class TradingService(ModelTrainingCoordinatorMixin):
             # entry policy so a position opened by another round cannot be
             # mistaken for an empty account.
             if getattr(self, "okx_sync_service", None) is not None:
+                paper_contract = ensure_normal_paper_trade_contract(decision, model_mode)
+                training_entry = paper_contract.get("selection_reason") == "paper_training_entry"
+                pending_orders = []
+                if training_entry:
+                    try:
+                        async with asyncio.timeout(5.0):
+                            executor = await self.get_okx_executor_for_mode("paper")
+                            pending_orders = await executor.get_open_orders_strict()
+                        if not isinstance(pending_orders, list) or any(
+                            not isinstance(order, dict) for order in pending_orders
+                        ):
+                            raise ValueError("invalid pending order snapshot")
+                    except Exception as exc:
+                        logger.warning(
+                            "paper training pending entry snapshot unavailable",
+                            error=safe_error_text(exc, limit=160),
+                        )
+                        return PolicyGateResult.block(
+                            "paper_training_pending_orders_unavailable",
+                            "模拟训练暂时无法核实待成交订单，本次信号保留为观察。",
+                            {"stage_status": "skipped"},
+                        )
                 try:
-                    refreshed_positions = await self.open_positions_context_for_execution()
+                    if training_entry:
+                        # A fill arriving during the pending read can also appear in
+                        # the later position snapshot. Count it once by symbol.
+                        refreshed_positions = (
+                            await self.okx_sync_service.get_open_positions_context(force_refresh=True)
+                        )
+                    else:
+                        refreshed_positions = await self.open_positions_context_for_execution()
                 except Exception as exc:
                     return PolicyGateResult.block(
                         "entry_position_snapshot_unavailable",
@@ -4964,6 +4997,25 @@ class TradingService(ModelTrainingCoordinatorMixin):
                                 "execution_blocker": "entry_capacity",
                                 "open_positions_refreshed": True,
                             },
+                        )
+                    training_capacity = (
+                        entry_capacity.paper_training_review_capacity(
+                            decision, refreshed_positions, pending_orders=pending_orders,
+                        )
+                        if model_mode == "paper" else None
+                    )
+                    if training_capacity is not None and training_capacity["same_symbol_pending_entry"]:
+                        return PolicyGateResult.block(
+                            "paper_training_same_symbol_pending_entry",
+                            "该交易对已有待成交开仓单，本次模拟训练信号保留为观察。",
+                            {"stage_status": "skipped", **training_capacity},
+                        )
+                    if training_capacity is not None and not training_capacity["passed"]:
+                        logger.info("paper training review capacity full", **training_capacity)
+                        return PolicyGateResult.block(
+                            "paper_training_review_capacity_full",
+                            "持仓复盘名额已满，本次模拟训练信号继续用于观察。",
+                            {"stage_status": "skipped", **training_capacity},
                         )
             okx_sync_reason = self._okx_authoritative_sync_entry_block_reason()
             if okx_sync_reason:
@@ -10709,6 +10761,31 @@ class TradingService(ModelTrainingCoordinatorMixin):
             )
             return
 
+        sizing = self._safe_dict(self._safe_dict(decision.raw_response).get("profit_risk_sizing"))
+        training_capacity = self._safe_dict(sizing.get("paper_training_review_capacity"))
+        training_economics = self._safe_dict(sizing.get("paper_training_order_economics"))
+        if model_mode == "paper" and (
+            training_capacity.get("passed") is False or training_economics.get("passed") is False
+        ):
+            if training_capacity.get("passed") is False:
+                skip_kind = "paper_training_review_capacity_full"
+                reason = "持仓复盘名额已满，本次模拟训练信号继续用于观察。"
+            else:
+                skip_kind = "paper_training_order_value_below_minimum"
+                reason = "模拟训练单的预计费后收益未达到最低价值，本次信号保留为观察。"
+            self._finalize_unsubmitted_entry_contract(decision, model_mode, reason)
+            await self.market_auto_entry_processor.record_skip(
+                symbol=symbol,
+                model_name=model_name,
+                decision=decision,
+                decision_db_id=decision_db_id,
+                results=results,
+                model_mode=model_mode,
+                reason=reason,
+                skip_kind=skip_kind,
+            )
+            return
+
         assessment = await self.market_decision_risk_assessment.assess(
             decision=decision,
             model_name=model_name,
@@ -14576,8 +14653,16 @@ class TradingService(ModelTrainingCoordinatorMixin):
             # Bound the extra book check and keep at most one submission per pass.
             for _, profit_lock_key, execution_args in paper_profit_locks[:2]:
                 self._paper_profit_lock_attempts[profit_lock_key] = datetime.now(UTC)
+                started = asyncio.get_running_loop().time()
+                logger.info("fast paper profit lock started", symbol=profit_lock_key[1])
                 execution = await self._fast_risk_exit_execution_processor().execute(
                     **execution_args,
+                )
+                logger.info(
+                    "fast paper profit lock finished",
+                    symbol=profit_lock_key[1],
+                    duration_seconds=round(asyncio.get_running_loop().time() - started, 3),
+                    no_executable_quote=execution.profit_limit_has_no_quote,
                 )
                 if not execution.skipped and execution.auto_close is not None:
                     auto_closes.append(execution.auto_close)
@@ -14650,6 +14735,22 @@ class TradingService(ModelTrainingCoordinatorMixin):
             portfolio_profit_context,
             strategy_mode_context,
         )
+        cooldowns = getattr(self, "_position_review_routine_cooldowns", {})
+        self._position_review_routine_cooldowns = {
+            key: value for key, value in cooldowns.items() if key in grouped
+        }
+        cooldowns = self._position_review_routine_cooldowns
+        now = asyncio.get_running_loop().time()
+
+        def routine_review_allowed(item, scan) -> bool:
+            key, positions = item
+            identity = self._paper_residual_review_identity(key[0], positions, scan)
+            previous = cooldowns.get(key)
+            return (
+                identity is None or previous is None
+                or previous[0] != identity or now >= previous[1]
+            )
+
         batch_selection = self._position_review_batch_policy().select(
             grouped_items,
             fast_scan,
@@ -14660,20 +14761,29 @@ class TradingService(ModelTrainingCoordinatorMixin):
             defer_count_provider=self.position_review_defer_tracker.count,
             position_entry_pause_reason=position_entry_pause_reason,
             cursor=self._position_review_cursor,
+            routine_review_allowed=routine_review_allowed,
         )
         grouped_items = batch_selection.selected_items
         self._position_review_cursor = batch_selection.next_cursor
-        self.position_review_defer_tracker.clear_many(batch_selection.selected_keys)
+        urgent_audit_items = []
+        routine_audit_items = []
+        tracker = self.position_review_defer_tracker
+        for item in batch_selection.skipped_items:
+            key = item[0]
+            scan = fast_scan.get(key, {})
+            if self._is_urgent_position_exit_scan(scan):
+                tracker.apply_plan_count(key, tracker.count(key) + 1)
+                urgent_audit_items.append(item)
+            else:
+                tracker.clear(key)
+                routine_audit_items.append(item)
+        for key, _ in grouped_items:
+            if self._is_urgent_position_exit_scan(fast_scan.get(key, {})):
+                tracker.apply_plan_count(key, tracker.count(key) + 1)
+            else:
+                tracker.clear(key)
+        audit_items = urgent_audit_items + routine_audit_items
         if batch_selection.limited:
-            self._decision_count += await self.position_review_fast_scan_recorder.record_many(
-                skipped_items=batch_selection.skipped_items,
-                fast_scan=fast_scan,
-                feature_vectors=feature_vectors,
-                portfolio_profit_context=portfolio_profit_context,
-                results=results,
-                round_decision_ids=round_decision_ids,
-                position_entry_pause_reason=position_entry_pause_reason,
-            )
             logger.info(
                 "position review batched",
                 selected=len(grouped_items),
@@ -14684,6 +14794,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 loss_watch_forced=batch_selection.loss_watch_count,
                 profit_exit_forced=batch_selection.profit_exit_count,
                 priority_selected=batch_selection.priority_selected_count,
+                low_risk_residuals_on_cooldown=sum(
+                    1 for item in batch_selection.skipped_items
+                    if not routine_review_allowed(item, fast_scan.get(item[0], {}))
+                ),
                 fast_scan=[
                     {
                         "symbol": key[1],
@@ -14888,6 +15002,16 @@ class TradingService(ModelTrainingCoordinatorMixin):
 
             if not isinstance(decision, DecisionOutput):
                 continue
+            key = (model_name, symbol)
+            self.position_review_defer_tracker.clear(key)
+            identity = self._paper_residual_review_identity(
+                model_name, positions, fast_scan.get(key, {}),
+            )
+            if identity is not None:
+                cooldowns[key] = (
+                    identity,
+                    asyncio.get_running_loop().time() + 4 * self.position_loop_interval_seconds(),
+                )
             self._attach_decision_timing(
                 decision,
                 decision_result.analysis_started,
@@ -14929,7 +15053,48 @@ class TradingService(ModelTrainingCoordinatorMixin):
             if process_result.candidate is not None:
                 candidates.append(process_result.candidate)
 
+        audit_budget = self._remaining_monotonic_seconds(round_deadline_monotonic)
+        audit_timeout = min(5.0, audit_budget) if audit_budget is not None else 5.0
+        # The caller still has to submit any returned candidates within the round budget.
+        if not candidates and audit_items and audit_timeout > 0:
+            try:
+                async with asyncio.timeout(audit_timeout):
+                    self._decision_count += await self.position_review_fast_scan_recorder.record_many(
+                        skipped_items=audit_items,
+                        fast_scan=fast_scan,
+                        feature_vectors=feature_vectors,
+                        portfolio_profit_context=portfolio_profit_context,
+                        results=results,
+                        round_decision_ids=round_decision_ids,
+                        position_entry_pause_reason=position_entry_pause_reason,
+                        update_defer_counts=False,
+                    )
+            except TimeoutError:
+                logger.info("position fast-scan audit reached time budget", queued=len(audit_items))
         return candidates, handled_keys
+
+    def _paper_residual_review_identity(
+        self, model_name: str, positions: list[dict[str, Any]], scan: dict[str, Any],
+    ) -> tuple[str, str] | None:
+        if len(positions) != 1 or self._get_model_execution_mode(model_name) != "paper":
+            return None
+        position = positions[0]
+        dynamic = self._safe_dict(scan.get("dynamic_exit_policy"))
+        if (
+            dynamic.get("current_management_contract_complete") is not True
+            or dynamic.get("economic_exit_evidence_complete") is not True
+            or dynamic.get("hard_risk")
+            or dynamic.get("eligible")
+            or self._safe_float(dynamic.get("lifecycle_closed_fraction"), 0.0) < 0.8
+            or not 0 <= self._safe_float(dynamic.get("stop_risk_usage"), 1.0) < 0.5
+            or self._safe_float(dynamic.get("profit_lock_pressure"), 0.0) > 0.0
+        ):
+            return None
+        notional = abs(self._safe_float(position.get("notional"), 0.0))
+        identity = str(position.get("entry_exchange_order_id") or "")
+        if not identity or not 0 < notional <= 10:
+            return None
+        return identity, str(position.get("side") or "")
 
     async def _await_position_review_post_decision_handoff(
         self,

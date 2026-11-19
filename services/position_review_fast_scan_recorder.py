@@ -68,6 +68,7 @@ class PositionReviewFastScanRecorder:
         results: dict[str, Any] | None,
         round_decision_ids: set[int] | None,
         position_entry_pause_reason: str | None = None,
+        update_defer_counts: bool = True,
     ) -> int:
         """Persist fast-scan HOLD decisions and return the number logged."""
 
@@ -86,6 +87,7 @@ class PositionReviewFastScanRecorder:
                 results=results,
                 round_decision_ids=round_decision_ids,
                 position_entry_pause_reason=position_entry_pause_reason,
+                update_defer_counts=update_defer_counts,
             )
         return logged_count
 
@@ -101,6 +103,7 @@ class PositionReviewFastScanRecorder:
         results: dict[str, Any] | None,
         round_decision_ids: set[int] | None,
         position_entry_pause_reason: str | None,
+        update_defer_counts: bool,
     ) -> int:
         effective_model_name = model_name or self.default_model_name
         key = (model_name, symbol)
@@ -128,7 +131,8 @@ class PositionReviewFastScanRecorder:
             agent_skill_dicts=[skill.to_dict() for skill in fast_scan_skills],
             agent_skill_summary=self.agent_skills_summary_provider(fast_scan_skills),
         )
-        self.defer_count_applier(key, hold_plan.defer_count)
+        if update_defer_counts:
+            self.defer_count_applier(key, hold_plan.defer_count)
 
         if not self._should_record_scan(
             key=key,

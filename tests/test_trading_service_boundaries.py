@@ -47,7 +47,11 @@ from services.expert_memory_service import ExpertMemoryService
 from services.market_analysis_defer_tracker import MarketAnalysisDeferTracker
 from services.memory_position_store import MemoryPositionStore
 from services.ml_signal_service import MLSignalService
-from services.normal_paper_trade import build_normal_paper_trade_contract
+from services.normal_paper_trade import (
+    NORMAL_PAPER_TRADE_VERSION,
+    PAPER_TRAINING_REVIEW_GROUP_LIMIT,
+    build_normal_paper_trade_contract,
+)
 from services.paper_bootstrap_canary import PAPER_BOOTSTRAP_POSITION_LIFECYCLE_VERSION
 from services.paper_training import (
     PAPER_TRAINING_POSITION_LIFECYCLE_VERSION,
@@ -5225,6 +5229,74 @@ async def test_entry_execution_policy_refreshes_positions_and_blocks_same_symbol
     assert result.passed is False
     assert result.blocker == "entry_capacity"
     assert open_positions[0]["symbol"] == "BTC/USDT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selection_reason", "pending", "blocker"),
+    [
+        ("paper_training_entry", "remaining_slot", "paper_training_review_capacity_full"),
+        ("paper_training_entry", "same_symbol", "paper_training_same_symbol_pending_entry"),
+        ("paper_training_entry", "existing_or_closing", None),
+        ("paper_training_entry", "unavailable", "paper_training_pending_orders_unavailable"),
+        ("paper_quality_entry", "unavailable", None),
+    ],
+)
+async def test_entry_execution_policy_counts_pending_open_orders_only_for_training(
+    selection_reason, pending, blocker,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service.entry_capacity = trading_service.EntryCapacityPolicy(
+        normalize_symbol=normalize_trading_symbol
+    )
+    positions = [
+        {"symbol": f"ASSET{index}/USDT", "quantity": 1}
+        for index in range(PAPER_TRAINING_REVIEW_GROUP_LIMIT - 1)
+    ]
+    refresh_positions = AsyncMock(return_value=positions)
+    service.okx_sync_service = SimpleNamespace(get_open_positions_context=refresh_positions)
+    service.open_positions_context_for_execution = AsyncMock(return_value=positions)
+    service._okx_authoritative_sync_entry_block_reason = lambda: None
+    pipeline = AsyncMock(return_value=PolicyGateResult.allow({}))
+    service.entry_execution_pipeline = SimpleNamespace(evaluate=pipeline)
+    fetch_orders = AsyncMock(return_value={
+        "remaining_slot": [{"symbol": "ETH-USDT-SWAP", "side": "buy"}],
+        "same_symbol": [{"symbol": "BTC-USDT-SWAP", "side": "buy"}],
+        "existing_or_closing": [
+            {"symbol": "ASSET0-USDT-SWAP", "side": "buy"},
+            {"symbol": "SOL-USDT-SWAP", "side": "sell", "reduceOnly": True},
+            {"symbol": "XRP-USDT-SWAP", "side": "buy", "info": {"posSide": "short"}},
+        ],
+        "unavailable": [],
+    }[pending])
+    if pending == "unavailable":
+        fetch_orders.side_effect = TimeoutError()
+    service.get_okx_executor_for_mode = AsyncMock(
+        return_value=SimpleNamespace(get_open_orders_strict=fetch_orders)
+    )
+    decision = _decision(Action.LONG)
+    decision.raw_response["normal_paper_trade"] = {
+        "version": NORMAL_PAPER_TRADE_VERSION,
+        "selection_reason": selection_reason,
+    }
+
+    result = await service.evaluate_entry_execution_policy(
+        decision, "ensemble_trader", "paper", [],
+    )
+
+    assert result.passed is (blocker is None)
+    assert result.blocker == blocker
+    if selection_reason != "paper_training_entry":
+        fetch_orders.assert_not_awaited()
+    else:
+        fetch_orders.assert_awaited_once_with()
+        if pending != "unavailable":
+            refresh_positions.assert_awaited_once_with(force_refresh=True)
+    if blocker:
+        assert result.data["stage_status"] == "skipped"
+        pipeline.assert_not_awaited()
+    else:
+        pipeline.assert_awaited_once()
 
 
 @pytest.mark.asyncio

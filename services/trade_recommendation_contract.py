@@ -559,6 +559,8 @@ def paper_trade_recommendation_reason_text(reasons: list[str]) -> str:
     """Return one user-facing paper-entry rejection reason."""
 
     labels = {
+        "paper_training_review_capacity_full": "模拟训练开仓的持仓复盘名额已满",
+        "paper_training_order_value_below_minimum": "模拟训练单的预计费后收益未达到最低价值",
         "trade_recommendation_contract_missing": "完整交易方案尚未生成",
         "trade_plan_symbol_missing": "交易币种缺失",
         "trade_plan_side_missing": "交易方向缺失",

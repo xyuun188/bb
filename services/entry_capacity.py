@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.normal_paper_trade import PAPER_TRAINING_REVIEW_GROUP_LIMIT
 
 NormalizeSymbol = Callable[[Any], str | None]
 StagedEntryCounts = dict[str, dict[Any, int]]
@@ -20,6 +21,58 @@ class EntryCapacityPolicy:
         """Return the per-round staged-entry counters used before orders are submitted."""
 
         return {"model_totals": {}, "symbol_side": {}, "side_totals": {}}
+
+    def paper_training_review_groups(
+        self, open_positions: list[dict[str, Any]],
+    ) -> set[tuple[str, str]]:
+        return {
+            (str(position.get("model_name") or "ensemble_trader"), symbol)
+            for position in open_positions
+            if isinstance(position, dict)
+            and self._is_effective_open_position(position)
+            and (symbol := self.normalize_symbol(position.get("symbol")))
+        }
+
+    def paper_training_review_capacity(
+        self, decision: DecisionOutput, open_positions: list[dict[str, Any]],
+        *, pending_orders: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        raw = decision.raw_response
+        trade = raw.get("normal_paper_trade") if isinstance(raw, dict) else None
+        if not decision.is_entry or not isinstance(trade, dict):
+            return None
+        if trade.get("selection_reason") != "paper_training_entry":
+            return None
+        open_groups = self.paper_training_review_groups(open_positions)
+        open_symbols = {symbol for _, symbol in open_groups}
+        pending_symbols = {
+            symbol for order in (pending_orders or [])
+            if (symbol := self._pending_entry_symbol(order))
+        }
+        pending_groups = pending_symbols - open_symbols
+        count = len(open_groups) + len(pending_groups)
+        return {
+            "open_review_groups": len(open_groups),
+            "pending_entry_review_groups": len(pending_groups),
+            "same_symbol_pending_entry": self.normalize_symbol(decision.symbol) in pending_symbols,
+            "training_review_group_limit": PAPER_TRAINING_REVIEW_GROUP_LIMIT,
+            "passed": count < PAPER_TRAINING_REVIEW_GROUP_LIMIT,
+        }
+
+    def _pending_entry_symbol(self, order: dict[str, Any]) -> str | None:
+        info = order.get("info")
+        info = info if isinstance(info, dict) else {}
+        reduce_only = order.get("reduceOnly")
+        if reduce_only in (None, ""):
+            reduce_only = info.get("reduceOnly")
+        side = str(order.get("side") or info.get("side") or "").lower()
+        position_side = str(info.get("posSide") or "").lower()
+        if (
+            str(reduce_only or "").lower() in {"true", "1"}
+            or (side, position_side) in {("sell", "long"), ("buy", "short")}
+        ):
+            return None
+        return self.normalize_symbol(order.get("symbol") or info.get("instId"))
 
     def reason(
         self,

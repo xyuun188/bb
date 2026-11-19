@@ -163,6 +163,23 @@ def classify_entry_funnel_reason(
     paper_selection = _dict(payload.get("paper_trade_selection"))
     normal_paper_trade = _dict(payload.get("normal_paper_trade"))
     entry_permission = _dict(payload.get("entry_permission"))
+    sizing = _dict(payload.get("profit_risk_sizing"))
+    capacity = _dict(sizing.get("paper_training_review_capacity"))
+    economics = _dict(sizing.get("paper_training_order_economics"))
+    execution_blocker = _text(
+        opportunity.get("execution_final_blocker") or payload.get("policy_blocker")
+    )
+    if (
+        execution_blocker in {
+            "paper_training_review_capacity_full",
+            "paper_training_pending_orders_unavailable",
+            "paper_training_same_symbol_pending_entry",
+        }
+        or capacity.get("passed") is False
+    ):
+        return "shadow_training"
+    if economics.get("passed") is False:
+        return "profit_gate_blocked"
     quality_complete = bool(
         quality.get("analysis_complete") is True
         and quality.get("decision_eligible") is True

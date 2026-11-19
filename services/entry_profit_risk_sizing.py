@@ -23,6 +23,7 @@ from core.entry_protection import entry_protection_prices
 from core.symbols import normalize_trading_symbol, okx_inst_id_from_symbol
 from core.training_contracts import AUTHORITATIVE_TRADE_OUTCOME_SOURCES
 from services.dynamic_leverage_allocator import DynamicLeverageAllocator, DynamicLeverageInput
+from services.entry_capacity import EntryCapacityPolicy
 from services.execution_cost_model import execution_cost_estimate
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD,
@@ -32,6 +33,7 @@ from services.normal_paper_trade import (
     is_normal_paper_trade_decision,
     normal_paper_entry_return_ready,
     normal_paper_trade_contract_reasons,
+    paper_training_order_economics,
     reconcile_normal_paper_trade_contract,
 )
 from services.okx_native_facts import (
@@ -974,6 +976,14 @@ def reconcile_profit_risk_sizing(
     planned_loss = notional * stress
     if risk_budget <= 0 or planned_loss > risk_budget + 1e-8:
         reasons.append("execution_stressed_loss_exceeds_risk_budget")
+    training_economics = None
+    if (
+        sizing.get("paper_training_entry_mode") is True
+        and source != "okx_confirmed_entry_fill"
+    ):
+        training_economics = paper_training_order_economics(notional, expected_net, stress)
+        if not training_economics["passed"]:
+            reasons.append("paper_training_order_value_below_minimum")
     eligible = not reasons
     generated_at = datetime.now(UTC).isoformat()
     history = _reconciliation_history(sizing)
@@ -1021,6 +1031,8 @@ def reconcile_profit_risk_sizing(
                 "fill_notional_ceiling_usdt": round(canonical_fill_ceiling, 8),
             }
         )
+    if training_economics is not None:
+        contract_updates["paper_training_order_economics"] = training_economics
     sizing.update(contract_updates)
     provenance = dict(_safe_dict(sizing.get("policy_provenance")))
     strategy_version = str(
@@ -2522,6 +2534,13 @@ class EntryProfitRiskSizingPolicy:
             final_notional = minimum_order_notional
             target_notional = max(target_notional, minimum_order_notional)
         planned_loss = final_notional * stress_fraction
+        training_capacity = EntryCapacityPolicy(
+            normalize_symbol=normalize_trading_symbol,
+        ).paper_training_review_capacity(decision, open_positions)
+        training_economics = (
+            paper_training_order_economics(final_notional, expected_net, stress_fraction)
+            if training_mode else None
+        )
         dynamic_take_profit = max(
             declared_take_profit,
             abs(expected_net) / 100.0,
@@ -2584,6 +2603,10 @@ class EntryProfitRiskSizingPolicy:
             reasons.append("normal_paper_expected_net_not_positive_after_size_cost")
         if training_mode and raw_signal_return <= 0.0:
             reasons.append("normal_paper_training_raw_return_not_positive")
+        if training_capacity is not None and not training_capacity["passed"]:
+            reasons.append("paper_training_review_capacity_full")
+        if training_economics is not None and not training_economics["passed"]:
+            reasons.append("paper_training_order_value_below_minimum")
         if not isfinite(return_lcb):
             reasons.append("normal_paper_downside_return_missing_after_size_cost")
         elif return_lcb <= 0.0 and not training_mode:
@@ -2624,6 +2647,8 @@ class EntryProfitRiskSizingPolicy:
             "final_leverage": final_leverage,
             "paper_quality_observation_mode": False,
             "paper_training_entry_mode": training_mode,
+            "paper_training_review_capacity": training_capacity,
+            "paper_training_order_economics": training_economics,
             "paper_training_shadow_only": training_shadow_only,
             "paper_quality_shadow_only": training_shadow_only,
             "paper_quality_non_positive_return_lcb": False,
@@ -2735,6 +2760,8 @@ class EntryProfitRiskSizingPolicy:
             "final_leverage": round(final_leverage if eligible else 1.0, 8),
             "paper_quality_observation_mode": False,
             "paper_training_entry_mode": training_mode,
+            "paper_training_review_capacity": training_capacity,
+            "paper_training_order_economics": training_economics,
             "paper_training_shadow_only": False,
             "paper_training_bounded_paper_only": training_mode,
             "paper_quality_shadow_only": False,

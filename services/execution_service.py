@@ -240,6 +240,7 @@ class ExecutionService:
         self,
         *,
         execution_lock: AbstractAsyncContextManager[Any] | None = None,
+        paper_entry_lock: AbstractAsyncContextManager[Any] | None = None,
         risk_event_logger: Callable[..., Awaitable[None]] | None = None,
         model_execution_mode_provider: Callable[[str], str] | None = None,
         decision_stage_recorder: Callable[..., Awaitable[dict[str, Any]]] | None = None,
@@ -331,6 +332,7 @@ class ExecutionService:
         ) = None,
     ) -> None:
         self.execution_lock = execution_lock
+        self.paper_entry_lock = paper_entry_lock
         self.risk_event_logger = risk_event_logger
         self.model_execution_mode_provider = model_execution_mode_provider
         self.decision_stage_recorder = decision_stage_recorder
@@ -708,6 +710,19 @@ class ExecutionService:
         open_positions: list[dict[str, Any]] | None = None,
         refresh_exit_positions: bool = True,
     ) -> ExecutionResult | None:
+        if (
+            decision.is_entry
+            and self.paper_entry_lock is not None
+            and self._required_model_execution_mode_provider()(model_name) == "paper"
+        ):
+            # Read capacity and finish order submission before admitting the next paper entry.
+            # Wait before taking a shared execution slot so exits can proceed.
+            async with self.paper_entry_lock, self._required_execution_lock():
+                return await self.execute_candidate_locked(
+                    symbol, model_name, decision, assessment, decision_db_id, results,
+                    open_positions=open_positions,
+                    refresh_exit_positions=refresh_exit_positions,
+                )
         async with self._required_execution_lock():
             return await self.execute_candidate_locked(
                 symbol,

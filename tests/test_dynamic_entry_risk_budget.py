@@ -17,6 +17,7 @@ from services.entry_profit_risk_sizing import (
 from services.execution_cost_model import execution_cost_estimate
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    PAPER_TRAINING_REVIEW_GROUP_LIMIT,
     _contract_fingerprint_payload,
     build_normal_paper_trade_contract,
 )
@@ -344,6 +345,66 @@ async def test_training_and_validated_entry_share_the_same_risk_sizing() -> None
         assert training.raw_response["profit_risk_sizing"][key] == pytest.approx(
             ordinary.raw_response["profit_risk_sizing"][key]
         )
+
+
+@pytest.mark.asyncio
+async def test_full_review_roster_routes_training_to_observation_only() -> None:
+    ordinary = _decision()
+    training = deepcopy(ordinary)
+    _use_bounded_training_entry(training)
+    positions = [
+        {"symbol": f"ASSET{index}/USDT", "quantity": 1, "side": "long"}
+        for index in range(PAPER_TRAINING_REVIEW_GROUP_LIMIT)
+    ]
+    policy = EntryProfitRiskSizingPolicy(allocated_order_balance=_balance)
+    await policy.apply(training, "paper", positions)
+    await policy.apply(ordinary, "paper", positions)
+
+    sizing = training.raw_response["profit_risk_sizing"]
+    assert sizing["production_eligible"] is False
+    assert "paper_training_review_capacity_full" in sizing["reason"]
+    assert ordinary.raw_response["profit_risk_sizing"]["production_eligible"] is True
+
+    fresh_training = _decision()
+    _use_bounded_training_entry(fresh_training)
+    await policy.apply(fresh_training, "paper", positions[:-1])
+    assert fresh_training.raw_response["profit_risk_sizing"]["production_eligible"] is True
+
+
+@pytest.mark.asyncio
+async def test_training_tiny_order_is_blocked_but_confirmed_partial_fill_is_reconciled() -> None:
+    training = _decision()
+    _use_bounded_training_entry(training)
+    await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(training, "paper", [])
+    candidate = deepcopy(training)
+    result = reconcile_profit_risk_sizing(
+        candidate,
+        final_notional_usdt=1.0,
+        final_leverage=candidate.suggested_leverage,
+        source="okx_pre_submit_order_shape",
+    )
+    assert result["eligible"] is False
+    assert "paper_training_order_value_below_minimum" in result["reasons"]
+
+    result = reconcile_profit_risk_sizing(
+        training,
+        final_notional_usdt=100.0,
+        final_leverage=training.suggested_leverage,
+        source="okx_pre_submit_order_shape",
+        execution_facts={"okx_symbol": "BTC/USDT:USDT", "order_contracts": 100, "contract_size": 1},
+    )
+    assert result["eligible"] is True
+    result = reconcile_profit_risk_sizing(
+        training,
+        final_notional_usdt=1.0,
+        final_leverage=training.suggested_leverage,
+        source="okx_confirmed_entry_fill",
+        execution_facts={
+            "okx_symbol": "BTC/USDT:USDT", "order_id": "partial-training",
+            "filled_contracts": 1, "contract_size": 1, "execution_price": 1,
+        },
+    )
+    assert result["eligible"] is True
 
 
 def test_okx_leverage_tier_tracks_target_notional_across_contract_size_bounds() -> None:

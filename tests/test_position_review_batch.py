@@ -149,3 +149,18 @@ def test_explicit_hard_risk_precedes_deferred_ordinary_exit_reviews() -> None:
     )
 
     assert result.selected_items == [items[1]]
+
+
+def test_urgent_exit_bypasses_routine_review_cooldown() -> None:
+    items = [_item(symbol) for symbol in ["A/USDT", "B/USDT", "C/USDT"]]
+    fast_scan = {items[1][0]: _scan(0.5, pnl=-1.0)}
+
+    result = _policy().select(
+        items,
+        fast_scan,
+        hard_max_groups_override=3,
+        routine_review_allowed=lambda item, _scan: item == items[2],
+    )
+
+    assert result.selected_items == [items[1], items[2]]
+    assert result.skipped_items == [items[0]]
