@@ -1620,6 +1620,13 @@ class _PriceLimitedExitCcxt(_NativeFullCloseUnconfirmedCcxt):
         self.pending = False
         return {"code": "0", "data": [{"ordId": "pending-close", "sCode": "0"}]}
 
+    async def privateGetTradeOrder(self, params):
+        return {"data": [{
+            "ordId": params["ordId"], "instId": params["instId"], "side": "sell",
+            "posSide": "long", "reduceOnly": "true", "ordType": "market",
+            "state": "live" if self.pending else "canceled", "accFillSz": "0",
+        }]}
+
     async def privatePostTradeClosePosition(self, params):
         result = await super().privatePostTradeClosePosition(params)
         self.pending = True
@@ -1654,6 +1661,25 @@ async def test_pending_exit_does_not_replace_a_market_order_without_legal_liquid
 
 
 @pytest.mark.asyncio
+async def test_pending_exit_keeps_original_order_when_execution_book_has_no_bids():
+    class NoBids(_PriceLimitedExitCcxt):
+        async def executionFetchOrderBook(self, symbol):
+            book = await super().executionFetchOrderBook(symbol)
+            return {**book, "bids": []}
+
+    exchange = NoBids(blocked=False)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    result = await _executor(exchange).place_order(decision)
+
+    assert result.status == OrderStatus.OPEN
+    assert result.exchange_order_id == "pending-close"
+    assert result.raw_response["execution_blocker"] == "okx_exit_price_limit_liquidity"
+    assert result.raw_response["exit_liquidity"]["reason"] == "execution_book_has_no_opposing_orders"
+    assert exchange.cancel_calls == exchange.close_position_calls == exchange.create_calls == []
+
+
+@pytest.mark.asyncio
 async def test_profit_lock_does_not_cancel_an_existing_market_exit():
     exchange = _PriceLimitedExitCcxt(blocked=False)
     executor = _executor(exchange)
@@ -1674,7 +1700,7 @@ async def test_profit_lock_does_not_cancel_an_existing_market_exit():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stale", [False, True])
-async def test_pending_exit_retries_when_liquidity_returns_or_quote_is_stale(monkeypatch, stale):
+async def test_pending_exit_replaces_only_with_fresh_executable_liquidity(monkeypatch, stale):
     exchange = _PriceLimitedExitCcxt(blocked=stale, stale=stale)
     executor = _executor(exchange)
     decision = _exit_decision()
@@ -1685,10 +1711,71 @@ async def test_pending_exit_retries_when_liquidity_returns_or_quote_is_stale(mon
 
     monkeypatch.setattr(okx_module.asyncio, "sleep", no_sleep)
     result = await executor.place_order(decision)
-    assert len(exchange.cancel_calls) == 1
-    assert len(exchange.close_position_calls) == 1
     assert result.status == OrderStatus.OPEN
     assert result.exchange_order_id == "pending-close"
+    if stale:
+        assert exchange.cancel_calls == []
+        assert exchange.close_position_calls == []
+        assert result.raw_response["execution_blocker"] == (
+            "okx_exit_execution_quote_unavailable"
+        )
+    else:
+        assert len(exchange.cancel_calls) == 1
+        assert len(exchange.close_position_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_exit_keeps_original_order_when_execution_book_request_fails(monkeypatch):
+    class UnavailableBook(_PriceLimitedExitCcxt):
+        async def executionFetchOrderBook(self, _symbol):
+            raise TimeoutError("execution book timeout")
+
+    exchange = UnavailableBook(blocked=False)
+    executor = _executor(exchange)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+
+    async def no_sleep(_seconds):
+        pass
+
+    monkeypatch.setattr(okx_module.asyncio, "sleep", no_sleep)
+    result = await executor.place_order(decision)
+
+    assert result.status == OrderStatus.OPEN
+    assert result.exchange_order_id == "pending-close"
+    assert result.raw_response["execution_blocker"] == (
+        "okx_exit_execution_quote_unavailable"
+    )
+    assert exchange.cancel_calls == []
+    assert exchange.close_position_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_detail", [{"state": "live"}, {"accFillSz": "1"}])
+async def test_pending_exit_requires_terminal_cancellation_before_replacing(
+    monkeypatch, terminal_detail,
+):
+    class UnconfirmedCancellation(_PriceLimitedExitCcxt):
+        async def privateGetTradeOrder(self, params):
+            response = await super().privateGetTradeOrder(params)
+            response["data"][0].update(terminal_detail)
+            return response
+
+    async def no_sleep(_seconds):
+        pass
+
+    monkeypatch.setattr(okx_module.asyncio, "sleep", no_sleep)
+    exchange = UnconfirmedCancellation(blocked=False)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+
+    result = await _executor(exchange).place_order(decision)
+
+    assert result.exchange_order_id == "pending-close"
+    assert result.raw_response["cancel_success"] is False
+    assert len(exchange.cancel_calls) == 1
+    assert exchange.close_position_calls == []
+    assert exchange.create_calls == []
 
 
 @pytest.mark.asyncio
@@ -1708,6 +1795,92 @@ async def test_native_full_close_recovers_real_pending_id_and_liquidity_reason(m
     assert result.quantity == 0
     assert result.raw_response["execution_blocker"] == "okx_exit_price_limit_liquidity"
     assert len(exchange.close_position_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("on_retry", [False, True])
+async def test_paper_native_full_close_recognizes_verified_zero_fill_cancellation(
+    monkeypatch, on_retry,
+):
+    class CancelledClose(_NativeFullCloseUnconfirmedCcxt):
+        async def privatePostTradeClosePosition(self, params):
+            self.close_position_calls.append(dict(params))
+            return {"code": "0", "data": [{"ordId": "cancelled-close", "sCode": "0"}]}
+
+        async def privateGetTradeOrder(self, params):
+            assert params == {"instId": "USAR-USDT-SWAP", "ordId": "cancelled-close"}
+            return {"data": [{
+                "instId": "USAR-USDT-SWAP", "ordId": "cancelled-close",
+                "side": "sell", "reduceOnly": "true", "state": "canceled", "accFillSz": "0",
+            }]}
+
+    async def no_sleep(_seconds):
+        pass
+
+    monkeypatch.setattr(okx_module.asyncio, "sleep", no_sleep)
+    exchange = CancelledClose(position_contracts=100.0)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    if on_retry:
+        decision.raw_response = {"pending_native_close_order_id": "cancelled-close"}
+
+    result = await _executor(exchange).place_order(decision)
+
+    assert result.status == OrderStatus.CANCELLED
+    assert result.exchange_order_id == "cancelled-close"
+    assert result.quantity == 0
+    assert result.raw_response["native_close_cancelled_no_fill"] is True
+    assert result.raw_response["remaining_contracts"] == 100
+    assert len(exchange.close_position_calls) == (0 if on_retry else 1)
+    assert not exchange.create_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unproven", [{"accFillSz": "1"}, {"accFillSz": None}, {"state": "live"}])
+async def test_paper_native_full_close_requires_explicit_terminal_zero_fill(unproven):
+    class OrderDetail(_NativeFullCloseUnconfirmedCcxt):
+        async def privateGetTradeOrder(self, params):
+            return {"data": [{
+                "instId": params["instId"], "ordId": params["ordId"],
+                "side": "sell", "reduceOnly": "true", "state": "canceled", "accFillSz": "0",
+                **unproven,
+            }]}
+
+    exchange = OrderDetail(position_contracts=100.0)
+    result = await _executor(exchange)._confirmed_native_close_cancellation(
+        ccxt=exchange, order_id="old-close", symbol="USAR/USDT",
+        side="sell", position_side="long", price=3.0, remaining_contracts=100.0,
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_paper_native_close_recovery_submits_one_bounded_reduce_only_order(monkeypatch):
+    submitted = []
+
+    class CancelledClose(_PriceLimitedExitCcxt):
+        async def privatePostTradeOrder(self, params):
+            submitted.append(params)
+            return {"code": "0", "data": [{"ordId": "recovery-close", "sCode": "0"}]}
+
+    async def no_sleep(_seconds):
+        pass
+
+    monkeypatch.setattr(okx_module.asyncio, "sleep", no_sleep)
+    exchange = CancelledClose(pending=False, blocked=False)
+    decision = _exit_decision()
+    decision.symbol = "USAR/USDT"
+    decision.raw_response = {"pending_native_close_order_id": "cancelled-close"}
+
+    result = await _executor(exchange).place_order(decision)
+
+    assert len(submitted) == 1
+    assert submitted[0]["reduceOnly"] == "true"
+    assert float(submitted[0]["sz"]) == 10.0
+    assert result.status == OrderStatus.CANCELLED
+    assert result.exchange_order_id == "recovery-close"
+    assert result.raw_response["native_close_cancelled_no_fill"] is True
+    assert exchange.close_position_calls == exchange.create_calls == []
 
 
 class _NativeFullCloseAccountWideFillsCcxt(_NativeFullCloseFillsHistoryCcxt):

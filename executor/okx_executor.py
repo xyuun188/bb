@@ -1110,6 +1110,7 @@ class OKXExecutor(AbstractExecutor):
             requested_exit_contracts = 0.0
             requested_exit_fraction = 1.0
             exit_order_replace_note = None
+            cancelled_close: ExecutionResult | None = None
 
             if decision.is_entry:
                 order_quantity, base_quantity = self._entry_order_amount(
@@ -1294,6 +1295,30 @@ class OKXExecutor(AbstractExecutor):
                     )
 
                 existing_exit = await self._find_active_exit_order(ccxt, okx_symbol, side)
+                if not existing_exit and self.executor_mode == "paper":
+                    raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+                    pending_id = str(raw.get("pending_native_close_order_id") or "")
+                    if pending_id:
+                        cancelled_close = await self._confirmed_native_close_cancellation(
+                            ccxt=ccxt,
+                            order_id=pending_id,
+                            symbol=decision.symbol,
+                            side=side,
+                            position_side=position_side,
+                            price=price,
+                            remaining_contracts=pre_exit_contracts,
+                        )
+                        if cancelled_close is None:
+                            return ExecutionResult(
+                                order_id=pending_id, exchange_order_id=pending_id,
+                                symbol=decision.symbol, side=side, order_type="market",
+                                quantity=0.0, price=price, status=OrderStatus.OPEN,
+                                raw_response={
+                                    "exit_tracking": True,
+                                    "do_not_persist_order": True,
+                                    "message": "原平仓单的终态或成交数量仍待确认，本轮未提交新单。",
+                                },
+                            )
                 if existing_exit:
                     info = existing_exit.get("info") or {}
                     order_id = str(existing_exit.get("id") or info.get("ordId") or "")
@@ -1318,18 +1343,29 @@ class OKXExecutor(AbstractExecutor):
                         existing_exit.get("average") or existing_exit.get("price") or price or 0
                     )
                     order_age = self._order_age_seconds(existing_exit)
-                    exit_liquidity: dict[str, Any] = {}
-                    if (
-                        order_age >= EXIT_ORDER_REPLACE_AFTER_SECONDS
-                        and str(info.get("ordType") or existing_exit.get("type") or "").lower()
+                    market_exit_order = (
+                        str(info.get("ordType") or existing_exit.get("type") or "").lower()
                         == "market"
-                    ):
+                    )
+                    stale_market_exit = (
+                        market_exit_order
+                        and order_age >= EXIT_ORDER_REPLACE_AFTER_SECONDS
+                    )
+                    exit_liquidity: dict[str, Any] = {}
+                    if stale_market_exit:
                         exit_liquidity = await self._pending_exit_liquidity(decision.symbol, side)
                     liquidity_blocked = exit_liquidity.get("blocked") is True
+                    executable_liquidity_confirmed = (
+                        exit_liquidity.get("blocked") is False
+                        and exit_liquidity.get("source") == "okx_execution_market"
+                    )
                     if (
                         not (fast_profit_lock or preserve_pending_exit)
                         and order_id and order_age >= EXIT_ORDER_REPLACE_AFTER_SECONDS
-                        and not liquidity_blocked
+                        and (
+                            not stale_market_exit
+                            or executable_liquidity_confirmed
+                        )
                     ):
                         cancel_result = await self._cancel_stale_exit_order(
                             ccxt,
@@ -1338,6 +1374,23 @@ class OKXExecutor(AbstractExecutor):
                             order_id,
                             order_age,
                         )
+                        if cancel_result.get("cancel_success") and market_exit_order:
+                            await asyncio.sleep(0.5)
+                            confirmed_cancellation = await self._verified_exit_cancellation(
+                                ccxt=ccxt,
+                                order_id=order_id,
+                                symbol=decision.symbol,
+                                side=side,
+                                position_side=position_side,
+                                expected_filled_contracts=filled_contracts,
+                            )
+                            if confirmed_cancellation is None or await self._find_active_exit_order(
+                                ccxt, okx_symbol, side,
+                            ):
+                                cancel_result = {
+                                    "cancel_success": False,
+                                    "cancel_error": "OKX exit cancellation or remaining orders not confirmed",
+                                }
                         if not cancel_result.get("cancel_success"):
                             return ExecutionResult(
                                 order_id=order_id or "exit_tracking",
@@ -1375,7 +1428,8 @@ class OKXExecutor(AbstractExecutor):
                                 },
                             )
 
-                        await asyncio.sleep(0.5)
+                        if not market_exit_order:
+                            await asyncio.sleep(0.5)
                         positions = await self.get_positions_strict(decision.symbol)
                         matching = [
                             p
@@ -1461,7 +1515,7 @@ class OKXExecutor(AbstractExecutor):
                         wait_seconds = max(EXIT_ORDER_REPLACE_AFTER_SECONDS - order_age, 0.0)
                         wait_note = (
                             f"OKX 已有平仓订单正在追单或部分成交，已等待约 {order_age:.0f} 秒；"
-                            f"若约 {wait_seconds:.0f} 秒后仍未成交，系统会撤单并按最新仓位重提平仓。"
+                            f"约 {wait_seconds:.0f} 秒后，将重新核对委托和剩余仓位。"
                         )
                         if preserve_pending_exit:
                             wait_note = "OKX 已有平仓委托，盈利减仓不会撤销或替换该委托。"
@@ -1471,6 +1525,8 @@ class OKXExecutor(AbstractExecutor):
                                 "系统保留原 reduce-only 委托并继续检查行情和成交，"
                                 "不再反复撤销同一笔未成交委托。"
                             )
+                        elif stale_market_exit and not executable_liquidity_confirmed:
+                            wait_note = "OKX 执行盘口或价格限制数据暂不可用，继续追踪原只减仓委托。"
                         return ExecutionResult(
                             order_id=order_id or "exit_tracking",
                             symbol=decision.symbol,
@@ -1488,7 +1544,11 @@ class OKXExecutor(AbstractExecutor):
                                 "existing_exit_order": True,
                                 "exit_liquidity": exit_liquidity,
                                 "execution_blocker": (
-                                    "okx_exit_price_limit_liquidity" if liquidity_blocked else None
+                                    "okx_exit_price_limit_liquidity"
+                                    if liquidity_blocked
+                                    else "okx_exit_execution_quote_unavailable"
+                                    if stale_market_exit and not executable_liquidity_confirmed
+                                    else None
                                 ),
                                 "exit_replace_after_seconds": EXIT_ORDER_REPLACE_AFTER_SECONDS,
                                 "exit_order_age_seconds": order_age,
@@ -2207,12 +2267,49 @@ class OKXExecutor(AbstractExecutor):
                             },
                         )
                     params["profit_lock_execution"] = guard
-                # A full close must use OKX's native close-position endpoint.
-                # Sending a reduce-only order for the entire net position first
-                # is rejected by the demo account with 51001 even though the
-                # instrument itself is valid.  Partial exits still use the
-                # reduce-only market-order path below.
-                if requested_exit_fraction >= 0.999 and not guarded_profit_lock:
+                if cancelled_close is not None and not guarded_profit_lock:
+                    exit_liquidity = await self._pending_exit_liquidity(decision.symbol, side)
+                    cancelled_close.raw_response["exit_liquidity"] = exit_liquidity
+                    if (
+                        exit_liquidity.get("blocked") is not False
+                        or exit_liquidity.get("source") != "okx_execution_market"
+                    ):
+                        cancelled_close.raw_response["execution_blocker"] = (
+                            "okx_exit_price_limit_liquidity"
+                            if exit_liquidity.get("blocked") is True
+                            else "okx_exit_execution_quote_unavailable"
+                        )
+                        return cancelled_close
+                    fresh_positions = await self.get_positions_strict(decision.symbol)
+                    fresh_matches = [
+                        position for position in fresh_positions
+                        if self._position_matches_exit_side(
+                            position, target_side, decision_symbol=decision.symbol,
+                        )
+                    ]
+                    if (
+                        len(fresh_matches) != 1
+                        or self._position_contracts(fresh_matches[0]) != pre_exit_contracts
+                        or self._okx_position_side(fresh_matches[0], target_side) != position_side
+                        or await self._find_active_exit_order(ccxt, okx_symbol, side)
+                    ):
+                        return cancelled_close
+                    order_quantity = self._clamp_exit_chunk_contracts(
+                        ccxt, market, min(order_quantity, requested_exit_contracts, pre_exit_contracts),
+                    )
+                    if order_quantity <= 0 or order_quantity < self._amount_min(market):
+                        return cancelled_close
+                    params["native_close_recovery_order"] = True
+                    exit_position_snapshot = fresh_positions
+                    exit_order_replace_note = (
+                        f"OKX 已确认原平仓单 {cancelled_close.exchange_order_id} 撤销且零成交，"
+                        "按最新同向持仓尝试只减仓平仓。"
+                    )
+                if (
+                    requested_exit_fraction >= 0.999
+                    and not guarded_profit_lock
+                    and cancelled_close is None
+                ):
                     full_close_result = await self._place_okx_native_full_close(
                         ccxt=ccxt,
                         decision=decision,
@@ -2277,6 +2374,8 @@ class OKXExecutor(AbstractExecutor):
                     )
                     if native_reduce_result is not None:
                         return native_reduce_result
+                    if cancelled_close is not None and not guarded_profit_lock:
+                        return cancelled_close
                 if guarded_profit_lock:
                     return ExecutionResult(
                         order_id="profit_lock_deferred", symbol=decision.symbol,
@@ -3474,6 +3573,19 @@ class OKXExecutor(AbstractExecutor):
                     raw_response["native_close_pending_order"] = pending
             except Exception as exc:
                 raw_response["pending_order_lookup_error"] = safe_error_text(exc, limit=180)
+            if self.executor_mode == "paper" and not raw_response.get("native_close_pending_order"):
+                cancelled_close = await self._confirmed_native_close_cancellation(
+                    ccxt=ccxt,
+                    order_id=order_id,
+                    symbol=decision.symbol,
+                    side=side,
+                    position_side=position_side,
+                    price=price,
+                    remaining_contracts=after_contracts,
+                )
+                if cancelled_close is not None:
+                    cancelled_close.raw_response = {**raw_response, **cancelled_close.raw_response}
+                    return cancelled_close
             exit_liquidity = await self._pending_exit_liquidity(decision.symbol, side)
             raw_response["exit_liquidity"] = exit_liquidity
             if exit_liquidity.get("blocked") is True:
@@ -3543,6 +3655,85 @@ class OKXExecutor(AbstractExecutor):
             timestamp=(fill_confirmation or {}).get("timestamp") or datetime.now(UTC),
             raw_response=raw_response,
         )
+
+    async def _confirmed_native_close_cancellation(
+        self,
+        *,
+        ccxt: Any,
+        order_id: str,
+        symbol: str,
+        side: str,
+        position_side: str | None,
+        price: float,
+        remaining_contracts: float,
+    ) -> ExecutionResult | None:
+        if remaining_contracts <= 0:
+            return None
+        row = await self._verified_exit_cancellation(
+            ccxt=ccxt,
+            order_id=order_id,
+            symbol=symbol,
+            side=side,
+            position_side=position_side,
+            expected_filled_contracts=0.0,
+        )
+        if row is None:
+            return None
+        return ExecutionResult(
+            order_id=order_id,
+            exchange_order_id=order_id,
+            symbol=symbol,
+            side=side,
+            order_type="market",
+            quantity=0.0,
+            price=price,
+            status=OrderStatus.CANCELLED,
+            timestamp=datetime.now(UTC),
+            raw_response={
+                "exit_tracking": True,
+                "native_close_cancelled_no_fill": True,
+                "info": row,
+                "remaining_contracts": remaining_contracts,
+                "error": "OKX 已确认原平仓单撤单且零成交，剩余仓位等待重新复核。",
+            },
+        )
+
+    async def _verified_exit_cancellation(
+        self,
+        *,
+        ccxt: Any,
+        order_id: str,
+        symbol: str,
+        side: str,
+        position_side: str | None,
+        expected_filled_contracts: float,
+    ) -> dict[str, Any] | None:
+        if not order_id:
+            return None
+        try:
+            detail = await asyncio.wait_for(
+                self._fetch_native_order_detail(ccxt, order_id, symbol),
+                timeout=2.0,
+            )
+        except Exception as exc:
+            logger.debug(
+                "OKX exit cancellation detail unavailable",
+                symbol=symbol,
+                error=safe_error_text(exc, limit=180),
+            )
+            return None
+        row = (detail or {}).get("info") or {}
+        if (
+            row.get("ordId") != order_id
+            or row.get("instId") != okx_inst_id_from_symbol(symbol)
+            or row.get("side") != side
+            or str(row.get("posSide") or "") not in {"", position_side}
+            or str(row.get("reduceOnly")).lower() != "true"
+            or row.get("state") not in {"canceled", "cancelled"}
+            or self._safe_float(row.get("accFillSz"), -1.0) != expected_filled_contracts
+        ):
+            return None
+        return row
 
     async def _native_full_close_fill_confirmation(
         self,
@@ -3918,6 +4109,7 @@ class OKXExecutor(AbstractExecutor):
             request_params["ordType"] = "ioc"
             request_params["px"] = self._format_okx_number(profit_guard["limit_price"])
         execution_order_type = "limit" if request_params["ordType"] == "ioc" else "market"
+        recovery_order = params.get("native_close_recovery_order") is True
         if position_side and position_side != "net":
             request_params["posSide"] = target_side
 
@@ -3960,7 +4152,7 @@ class OKXExecutor(AbstractExecutor):
             response = await self._with_retry(
                 place_order,
                 request_params,
-                _max_attempts=1 if isinstance(profit_guard, dict) else None,
+                _max_attempts=1 if recovery_order or isinstance(profit_guard, dict) else None,
             )
         except ExchangeAPIError as exc:
             submission_error = exc
@@ -4045,13 +4237,14 @@ class OKXExecutor(AbstractExecutor):
         if submission_error is not None:
             exc = submission_error
             error_text = safe_error_text(exc)
-            if execution_order_type == "limit" and (
+            if (recovery_order or execution_order_type == "limit") and (
                 isinstance(exc.__cause__, TimeoutError)
                 or self._is_network_retryable_error(error_text)
             ):
                 return ExecutionResult(
-                    order_id="profit_lock_result_unknown", symbol=decision.symbol,
-                    side=side, order_type="limit", quantity=0.0, price=price,
+                    order_id="native_close_recovery_unknown" if recovery_order else "profit_lock_result_unknown",
+                    symbol=decision.symbol, side=side, order_type=execution_order_type,
+                    quantity=0.0, price=price,
                     status=OrderStatus.PENDING,
                     raw_response={
                         "execution_transport_unknown": True,
@@ -4259,6 +4452,7 @@ class OKXExecutor(AbstractExecutor):
             **(response if isinstance(response, dict) else {"response": response}),
             "exit_tracking": True,
             "okx_native_reduce_market_order": execution_order_type == "market",
+            "native_close_recovery_order": recovery_order,
             "exit_order_replace_note": exit_order_replace_note,
             "profit_lock_execution": profit_guard,
             "request_params": request_params,
@@ -4299,6 +4493,19 @@ class OKXExecutor(AbstractExecutor):
                 raw_response={**raw_response, "do_not_persist_order": True},
             )
         if order_scoped_fill <= 0:
+            if (
+                recovery_order and order_status == OrderStatus.CANCELLED
+                and not position_delta_unattributed
+                and native_order_detail is not None
+                and str(native_order_detail["info"].get("reduceOnly")).lower() == "true"
+                and self._safe_float(native_order_detail["info"].get("accFillSz"), -1.0) == 0.0
+            ):
+                return ExecutionResult(
+                    order_id=order_id, exchange_order_id=order_id, symbol=decision.symbol,
+                    side=side, order_type="market", quantity=0.0, price=price,
+                    status=OrderStatus.CANCELLED, timestamp=datetime.now(UTC),
+                    raw_response={**raw_response, "native_close_cancelled_no_fill": True},
+                )
             if (
                 isinstance(profit_guard, dict)
                 and native_order_detail is not None
@@ -5533,29 +5740,41 @@ class OKXExecutor(AbstractExecutor):
                 return {}
             if (limits.get("price_limit_info") or {}).get("enabled") in (False, "false"):
                 return {}
-            def side_prices(key: str) -> list[float]:
-                return [
-                    self._safe_float(level[0]) for level in book.get(key) or []
-                    if isinstance(level, (list, tuple)) and len(level) >= 2
-                    and self._safe_float(level[0]) > 0 and self._safe_float(level[1]) > 0
-                ]
-
-            bids, asks = side_prices("bids"), side_prices("asks")
-            prices = asks if side == "buy" else bids
-            if not prices:
-                return {}
-            quote = min(prices) if side == "buy" else max(prices)
             bound = self._safe_float(limits.get("buy_price_limit" if side == "buy" else "sell_price_limit"))
-            if quote <= 0 or bound <= 0:
+            if not isfinite(bound) or bound <= 0:
                 return {}
             now_ms = time.time() * 1000
             for stamp in (book.get("timestamp"), limits.get("price_limit_timestamp_ms")):
                 if not 0 <= now_ms - self._safe_float(stamp) <= 10000:
                     return {}
-            blocked = quote > bound if side == "buy" else quote < bound
+
+            def side_prices(levels: list[Any]) -> list[float]:
+                prices = []
+                for level in levels:
+                    if not isinstance(level, (list, tuple)) or len(level) < 2:
+                        continue
+                    price, size = self._safe_float(level[0]), self._safe_float(level[1])
+                    if isfinite(price) and price > 0 and isfinite(size) and size > 0:
+                        prices.append(price)
+                return prices
+
+            if not isinstance(book.get("bids"), list) or not isinstance(book.get("asks"), list):
+                return {}
+            bids, asks = side_prices(book["bids"]), side_prices(book["asks"])
+            opposing_levels = book["asks"] if side == "buy" else book["bids"]
+            prices = asks if side == "buy" else bids
+            if opposing_levels and not prices:
+                return {}
+            quote = (min(prices) if side == "buy" else max(prices)) if prices else None
+            if quote is None:
+                reason = "execution_book_has_no_opposing_orders"
+            elif (quote > bound if side == "buy" else quote < bound):
+                reason = "no_quote_inside_execution_price_limit"
+            else:
+                reason = "quote_inside_execution_price_limit"
             return {
-                "blocked": blocked,
-                "reason": "no_quote_inside_execution_price_limit" if blocked else "quote_inside_execution_price_limit",
+                "blocked": reason != "quote_inside_execution_price_limit",
+                "reason": reason,
                 "side": side,
                 "opposing_quote": quote,
                 "best_bid": max(bids) if bids else 0.0,

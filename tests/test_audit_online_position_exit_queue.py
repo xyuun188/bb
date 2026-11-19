@@ -37,6 +37,9 @@ def test_remote_position_exit_audit_reports_queue_and_execution_reasons() -> Non
     ("status", "quantity", "receipt", "expected"),
     [
         ("cancelled", 0, {"profit_lock_ioc_unfilled": True}, "profit_limit_unfilled"),
+        ("cancelled", 0, {"native_close_cancelled_no_fill": True}, "native_close_cancelled_no_fill"),
+        ("open", 0, {"exit_singleflight_wait": True, "singleflight_state": "native_close_cancelled_no_fill"},
+         "native_close_cancelled_cooldown"),
         ("rejected", 0, {"profit_lock_ioc_unfilled": True}, "close_failed"),
         ("open", 0, {"exit_singleflight_wait": True, "singleflight_state": "profit_lock_no_fill"},
          "profit_limit_cooldown"),

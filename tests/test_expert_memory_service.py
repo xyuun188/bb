@@ -347,6 +347,7 @@ async def test_authoritative_outcome_backfill_runs_when_prompt_memory_is_disable
     assert report["batch_size"] == 25
 
 
+@pytest.mark.usefixtures("initialized_training_epoch")
 @pytest.mark.asyncio
 async def test_backfill_skips_only_committed_matching_feedback(monkeypatch) -> None:
     outcomes = [
@@ -388,6 +389,7 @@ async def test_backfill_skips_only_committed_matching_feedback(monkeypatch) -> N
     assert processed == [2, 3]
 
 
+@pytest.mark.usefixtures("initialized_training_epoch")
 @pytest.mark.asyncio
 async def test_backfill_commits_marker_with_memories_and_applies_settlement_correction(monkeypatch) -> None:
     from sqlalchemy import select

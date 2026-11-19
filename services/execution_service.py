@@ -1513,6 +1513,14 @@ class ExecutionService:
                         },
                     )
                 else:
+                    if decision.is_exit:
+                        raw = dict(_safe_dict(decision.raw_response))
+                        raw.pop("pending_native_close_order_id", None)
+                        if exit_execution_lease and exit_execution_lease.pending_native_close_order_id:
+                            raw["pending_native_close_order_id"] = (
+                                exit_execution_lease.pending_native_close_order_id
+                            )
+                        decision.raw_response = raw
                     execution_timeout = 90.0 if decision.is_exit else 60.0
                     submitted_to_exchange = True
                     execution_result = await await_exchange_place_order(

@@ -33,6 +33,7 @@ async def test_crypto_training_scope_requires_frozen_asset_classification() -> N
     assert "inst_category" in query.params.values()
 
 
+@pytest.mark.usefixtures("initialized_training_epoch")
 @pytest.mark.asyncio
 async def test_training_scope_counts_only_frozen_crypto_asset_class(
     tmp_path, monkeypatch: pytest.MonkeyPatch,

@@ -15,6 +15,7 @@ from core.symbols import normalize_trading_symbol
 from db.repositories.trade_repo import TradeRepository
 from db.session import get_session_ctx
 from executor.base_executor import ExecutionResult, OrderStatus
+from models.decision import AIDecision
 from services.current_position_management import (
     PROFIT_LOCK_LEDGER_KEY,
     PROFIT_LOCK_LEDGER_VERSION,
@@ -37,6 +38,7 @@ PROFIT_LOCK_NO_FILL_RETRY_SECONDS = 300.0
 PROFIT_LOCK_NO_FILL_STATE = "profit_lock_no_fill"
 PROFIT_LOCK_LIQUIDITY_WAIT_STATE = "profit_lock_liquidity_wait"
 PROFIT_LOCK_WAIT_STATES = {PROFIT_LOCK_NO_FILL_STATE, PROFIT_LOCK_LIQUIDITY_WAIT_STATE}
+NATIVE_CLOSE_CANCELLED_STATE = "native_close_cancelled_no_fill"
 
 SessionContextFactory = Callable[[], AbstractAsyncContextManager[Any]]
 TradeRepoFactory = Callable[[Any], TradeRepository]
@@ -52,6 +54,7 @@ class ExitExecutionLease:
     attempt_count: int
     retry_after_seconds: float = 0.0
     reason: str = ""
+    pending_native_close_order_id: str = ""
 
 
 class ExitExecutionSingleFlightService:
@@ -144,6 +147,8 @@ class ExitExecutionSingleFlightService:
                         if cooldown_state == PROFIT_LOCK_NO_FILL_STATE
                         else "盈利减仓正在等待符合限价的模拟盘报价，本轮未提交。"
                         if cooldown_state == PROFIT_LOCK_LIQUIDITY_WAIT_STATE
+                        else "OKX 已确认上一笔平仓撤单且零成交，重新复核前保留剩余仓位。"
+                        if cooldown_state == NATIVE_CLOSE_CANCELLED_STATE
                         else (
                             "A previous exit submission for this position is still awaiting "
                             "exchange confirmation. No duplicate exit was submitted."
@@ -156,6 +161,26 @@ class ExitExecutionSingleFlightService:
             profit_lock_exit = self._is_profit_lock_exit(decision)
             dynamic_exit = raw.get("dynamic_exit_policy")
             dynamic_exit = dynamic_exit if isinstance(dynamic_exit, dict) else {}
+            pending_native_close_order_id = ""
+            if mode == "paper" and current.get("key") == key and cooldown_state in {
+                "submitted_unconfirmed", NATIVE_CLOSE_CANCELLED_STATE,
+            }:
+                order_id = str(current.get("exchange_order_id") or "").strip()
+                if order_id and current.get("native_close_order") is True:
+                    pending_native_close_order_id = order_id
+                elif order_id and current.get("native_close_order") is None:
+                    # Existing leases predate the native-order marker.
+                    previous_id = self._safe_int(current.get("decision_id"), 0)
+                    previous = await session.get(AIDecision, previous_id) if previous_id else None
+                    previous_raw = getattr(previous, "raw_llm_response", None)
+                    receipt = previous_raw.get("execution_result") if isinstance(previous_raw, dict) else None
+                    order_raw = receipt.get("raw_response") if isinstance(receipt, dict) else None
+                    if (
+                        isinstance(order_raw, dict)
+                        and order_raw.get("okx_native_close_position") is True
+                        and receipt.get("exchange_order_id") == order_id
+                    ):
+                        pending_native_close_order_id = order_id
             intent = {
                 "version": EXIT_INTENT_VERSION,
                 "key": key,
@@ -192,6 +217,7 @@ class ExitExecutionSingleFlightService:
                 position_ids=position_ids,
                 state="submitting",
                 attempt_count=attempt_count,
+                pending_native_close_order_id=pending_native_close_order_id,
             )
 
     async def finish(
@@ -238,6 +264,16 @@ class ExitExecutionSingleFlightService:
                     ),
                 }
             )
+            raw_result = result.raw_response if result is not None else None
+            order_id = intent["exchange_order_id"]
+            if state in {"submitted_unconfirmed", NATIVE_CLOSE_CANCELLED_STATE} and order_id:
+                intent["native_close_order"] = bool(
+                    order_id == lease.pending_native_close_order_id
+                    or (isinstance(raw_result, dict) and (
+                        raw_result.get("okx_native_close_position") is True
+                        or raw_result.get("native_close_recovery_order") is True
+                    ))
+                )
             if (
                 intent.get("profit_lock_exit") is True
                 and result is not None
@@ -315,6 +351,8 @@ class ExitExecutionSingleFlightService:
             return "exchange_temporarily_unavailable", TEMPORARY_OUTAGE_RETRY_SECONDS, error
         if raw.get("execution_transport_unknown"):
             return "submitted_result_unknown", UNKNOWN_RESULT_RETRY_SECONDS, error
+        if result.status == OrderStatus.CANCELLED and raw.get("native_close_cancelled_no_fill"):
+            return NATIVE_CLOSE_CANCELLED_STATE, REJECTED_RETRY_SECONDS, error
         if (
             result.status == OrderStatus.REJECTED
             and not result.exchange_order_id

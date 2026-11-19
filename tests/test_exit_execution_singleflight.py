@@ -138,6 +138,7 @@ async def test_persistent_exit_lease_blocks_duplicate_and_survives_service_resta
         quantity=0.0,
         price=0.04381,
         status=OrderStatus.OPEN,
+        exchange_order_id="native-close-123",
         raw_response={"exit_tracking": True, "okx_native_close_position": True},
     )
     await service.finish(first, result)
@@ -164,6 +165,30 @@ async def test_persistent_exit_lease_blocks_duplicate_and_survives_service_resta
     )
     assert retry.acquired is True
     assert retry.attempt_count == 2
+    assert retry.pending_native_close_order_id == "native-close-123"
+
+    result.status = OrderStatus.CANCELLED
+    result.raw_response = {"exit_tracking": True, "native_close_cancelled_no_fill": True}
+    await restarted_service.finish(retry, result)
+    cooldown = await restarted_service.acquire(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        decision=_decision(),
+        decision_id=369553,
+    )
+    assert not cooldown.acquired
+    assert cooldown.state == "native_close_cancelled_no_fill"
+    assert cooldown.retry_after_seconds == pytest.approx(45.0)
+
+    now[0] += timedelta(seconds=46)
+    next_retry = await restarted_service.acquire(
+        model_name="ensemble_trader",
+        execution_mode="paper",
+        decision=_decision(),
+        decision_id=369554,
+    )
+    assert next_retry.acquired
+    assert next_retry.pending_native_close_order_id == "native-close-123"
 
 
 @pytest.mark.asyncio

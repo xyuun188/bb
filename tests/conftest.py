@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,19 @@ os.environ["BB_RUNTIME_ENV_PATH"] = str(
 
 # Add project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+@pytest.fixture
+def initialized_training_epoch(tmp_path, monkeypatch):
+    """Use an isolated training scope instead of a checkout's runtime marker."""
+    from services import training_epoch
+
+    monkeypatch.setattr(training_epoch, "training_epoch_path", lambda: tmp_path / "epoch.json")
+    monkeypatch.setattr(training_epoch, "training_data_migration_path", lambda: tmp_path / "migration.json")
+    training_epoch.write_training_epoch(
+        started_at=datetime.now(UTC) - timedelta(days=1),
+        reset_id="pytest",
+    )
 
 
 def _wait_for_aiosqlite_workers(timeout_seconds: float = 0.5) -> None:

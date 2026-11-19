@@ -65,7 +65,17 @@ def close_category(raw, execution, stage_summary):
             return "profit_limit_liquidity_cooldown"
         if receipt.get("singleflight_state") == "no_local_position":
             return "close_skipped"
+        if receipt.get("singleflight_state") == "native_close_cancelled_no_fill":
+            return "native_close_cancelled_cooldown"
         return "close_pending_confirmation"
+    if (
+        status in {"cancelled", "canceled"}
+        and receipt.get("native_close_cancelled_no_fill") is True
+        and number(execution.get("quantity")) == 0
+        and not execution.get("exchange_confirmed")
+        and not execution.get("exit_progress")
+    ):
+        return "native_close_cancelled_no_fill"
     if (
         status in {"cancelled", "canceled"}
         and receipt.get("profit_lock_ioc_unfilled") is True

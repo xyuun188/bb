@@ -28,8 +28,9 @@ import json
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import Integer, cast, extract, func, select
 
+from core.training_contracts import SHADOW_LABEL_HORIZONS_MINUTES
 from db.session import close_db, get_read_session_ctx
 from models.learning import ShadowBacktest
 from services.shadow_development_split import split_shadow_development_rows
@@ -80,24 +81,34 @@ def _fold(rows):
     }
 
 
-async def main():
-    now = datetime.now(UTC)
-    since = now - timedelta(hours=HOURS)
-    statement = (
+def _sample_statement(since, now):
+    horizons = SHADOW_LABEL_HORIZONS_MINUTES
+    bucket_count = (LIMIT + len(horizons) - 1) // len(horizons)
+    bucket = cast(
+        func.floor(
+            (extract("epoch", ShadowBacktest.created_at) - since.timestamp())
+            * bucket_count / (now - since).total_seconds()
+        ),
+        Integer,
+    )
+    # Bound the read across decision time and horizons before fetching wide snapshots.
+    ranked = (
         select(
             ShadowBacktest.id,
-            ShadowBacktest.decision_id,
-            ShadowBacktest.symbol,
             ShadowBacktest.horizon_minutes,
-            ShadowBacktest.decision_action,
-            ShadowBacktest.updated_at,
-            ShadowBacktest.training_feature_snapshot,
+            bucket.label("time_bucket"),
+            func.row_number().over(
+                partition_by=(ShadowBacktest.horizon_minutes, bucket),
+                order_by=(ShadowBacktest.created_at.desc(), ShadowBacktest.id.desc()),
+            ).label("bucket_rank"),
         )
         .where(
             ShadowBacktest.execution_mode == "paper",
             ShadowBacktest.analysis_type == "market",
             ShadowBacktest.status == "completed",
-            ShadowBacktest.updated_at >= since,
+            ShadowBacktest.horizon_minutes.in_(horizons),
+            ShadowBacktest.created_at >= since,
+            ShadowBacktest.created_at < now,
             ShadowBacktest.updated_at < now,
             ShadowBacktest.training_feature_snapshot[
                 "training_market_fact_contract"
@@ -108,12 +119,31 @@ async def main():
             ]["fee_after_complete"].as_boolean()
             .is_(True),
         )
-        .order_by(ShadowBacktest.updated_at.desc(), ShadowBacktest.id.desc())
+        .subquery()
+    )
+    ids = (
+        select(ranked.c.id)
+        .where(ranked.c.bucket_rank == 1)
+        .order_by(ranked.c.time_bucket, ranked.c.horizon_minutes)
         .limit(LIMIT)
     )
+    return select(
+        ShadowBacktest.id,
+        ShadowBacktest.decision_id,
+        ShadowBacktest.symbol,
+        ShadowBacktest.horizon_minutes,
+        ShadowBacktest.decision_action,
+        ShadowBacktest.updated_at,
+        ShadowBacktest.training_feature_snapshot,
+    ).where(ShadowBacktest.id.in_(ids))
+
+
+async def main():
+    now = datetime.now(UTC)
+    since = now - timedelta(hours=HOURS)
     try:
         async with get_read_session_ctx(statement_timeout_ms=15000) as session:
-            result = await session.execute(statement)
+            result = await session.execute(_sample_statement(since, now))
             raw_rows = list(result.mappings())
     finally:
         await close_db()
@@ -154,7 +184,7 @@ async def main():
                 continue
             by_horizon[row["horizon_minutes"]][fold_number].append(row)
     horizons = {}
-    for horizon in sorted({row["horizon_minutes"] for row in rows}):
+    for horizon in SHADOW_LABEL_HORIZONS_MINUTES:
         development, validation = by_horizon[horizon]
         ordered = development + validation
         horizons[str(horizon)] = {
@@ -182,7 +212,7 @@ async def main():
                     "since": since.isoformat(),
                     "hours": HOURS,
                     "limit": LIMIT,
-                    "selection_policy": "latest_completed_rows_within_window",
+                    "selection_policy": "one_completed_row_per_horizon_and_decision_time_bucket",
                     "source": "native executable 1m path + fee-after-complete labels",
                     "exam_opened": False,
                 },

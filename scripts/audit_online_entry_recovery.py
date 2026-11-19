@@ -69,7 +69,7 @@ def _entry_funnel_reason(row, fields):
         if boundary.get("entry_permission") is False:
             state = boundary.get("execution_candidate_state")
             if state == "analysis_only_execution_unverified":
-                return "execution_capability_pending"
+                return "analysis_only_execution_unverified"
             if state == "execution_unavailable":
                 return "execution_instrument_unavailable"
             return "analysis_only"
@@ -203,6 +203,7 @@ async def main():
         "authoritative_return_candidate", "continuous_model_weights",
         "ml_signal", "local_ml_signal",
         "market_analysis_only_contract", "same_symbol_reentry_guard",
+        "profit_risk_sizing",
     )
     recent_ids = select(AIDecision.id).where(
         AIDecision.is_paper.is_(True), AIDecision.analysis_type == "market",
@@ -267,6 +268,7 @@ async def main():
             selection = _dict(row.get("paper_trade_selection"))
             if len(examples) < 6 or (selection.get("selected") and len(examples) < 12):
                 evidence = _dict(row.get("entry_candidate_evidence"))
+                sizing = _dict(row.get("profit_risk_sizing"))
                 examples.append({
                     key: row.get(key) for key in (
                         "id", "symbol", "action", "created_at", "execution_reason",
@@ -279,6 +281,13 @@ async def main():
                         row.get("analysis_quality_contract")
                     ).get("analysis_complete"),
                     "quality_permissions": evidence.get("quality_permissions"),
+                    "execution_sizing": {
+                        key: sizing[key] for key in (
+                            "reason", "expected_net_return_pct", "return_lcb_pct",
+                            "paper_training_order_economics",
+                        ) if key in sizing
+                    },
+                    "execution_cost_pct": _dict(sizing.get("execution_cost")).get("total_pct"),
                     "model_version": signal.get("model_version"),
                     "derivatives_route_status": snapshot.get("derivatives_route_status"),
                     "derivatives_required_routes": snapshot.get(

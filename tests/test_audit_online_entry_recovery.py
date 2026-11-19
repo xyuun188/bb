@@ -30,7 +30,7 @@ def test_entry_recovery_audit_can_explicitly_include_historical_dry_run() -> Non
 @pytest.mark.parametrize(
     ("state", "reason", "executed", "expected"),
     [
-        ("analysis_only_execution_unverified", None, False, "execution_capability_pending"),
+        ("analysis_only_execution_unverified", None, False, "analysis_only_execution_unverified"),
         ("execution_unavailable", None, False, "execution_instrument_unavailable"),
         (None, "same_symbol_reentry_cooldown_active", False, "same_symbol_reentry_cooldown"),
         ("analysis_only_execution_unverified", None, True, None),
