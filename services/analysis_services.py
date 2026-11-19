@@ -558,7 +558,8 @@ class PositionReviewService(_ScopedAnalysisService):
             results=results,
             round_deadline=round_deadline,
         )
-        if isinstance(sl_tp_results, _PositionReviewStageSkip):
+        protection_interrupted = isinstance(sl_tp_results, _PositionReviewStageSkip)
+        if protection_interrupted:
             if sl_tp_results.kind == "position_review_round_budget_exhausted":
                 return open_positions, review_blocked_keys
             sl_tp_results = []
@@ -577,19 +578,35 @@ class PositionReviewService(_ScopedAnalysisService):
             )
 
         set_loop_stage("review_open_positions")
-        if sl_tp_results:
+        # The exchange may have filled an exit before the protection stage timed out.
+        if sl_tp_results or protection_interrupted or not open_positions:
+            refresh_kwargs: dict[str, Any] = {}
+            if protection_interrupted and self._callable_accepts_keyword(
+                get_open_positions_context, "force_refresh",
+            ):
+                refresh_kwargs["force_refresh"] = True
             refreshed_open_positions = await self._wait_stage(
                 "get_open_positions_context",
-                get_open_positions_context(),
+                get_open_positions_context(**refresh_kwargs),
                 results=results,
                 round_deadline=round_deadline,
             )
             if isinstance(refreshed_open_positions, _PositionReviewStageSkip):
-                if refreshed_open_positions.kind == "position_review_round_budget_exhausted":
+                if (
+                    protection_interrupted
+                    or refreshed_open_positions.kind == "position_review_round_budget_exhausted"
+                ):
                     return open_positions, review_blocked_keys
             elif isinstance(refreshed_open_positions, list):
                 open_positions = refreshed_open_positions
-        elif open_positions:
+                if protection_interrupted:
+                    logger.info(
+                        "position context reloaded after interrupted protection stage",
+                        position_count=len(open_positions),
+                    )
+            elif protection_interrupted:
+                return open_positions, review_blocked_keys
+        else:
             results.setdefault("position_review_diagnostics", []).append(
                 {
                     "stage": "get_open_positions_context",
@@ -601,18 +618,6 @@ class PositionReviewService(_ScopedAnalysisService):
                     "open_position_count": len(open_positions or []),
                 }
             )
-        else:
-            refreshed_open_positions = await self._wait_stage(
-                "get_open_positions_context",
-                get_open_positions_context(),
-                results=results,
-                round_deadline=round_deadline,
-            )
-            if isinstance(refreshed_open_positions, _PositionReviewStageSkip):
-                if refreshed_open_positions.kind == "position_review_round_budget_exhausted":
-                    return open_positions, review_blocked_keys
-            elif isinstance(refreshed_open_positions, list):
-                open_positions = refreshed_open_positions
         review_kwargs = {
             "results": results,
             "round_decision_ids": round_decision_ids,

@@ -75,9 +75,10 @@ async def test_exit_refresh_preserves_quantity_scaled_peak_across_policy_passes(
                 },
             }]
 
+    exchange = Exchange()
     service = OkxSyncService(
         symbol_normalizer=normalize_trading_symbol, float_parser=_float,
-        active_okx_provider=lambda: Exchange(),
+        active_okx_provider=lambda: exchange,
         exchange_position_open_checker=lambda p: bool(p),
         position_profit_peak_recorder=tracker.update,
         position_age_minutes_provider=PositionTimeParser().position_age_minutes,
@@ -113,13 +114,22 @@ async def test_exit_refresh_preserves_quantity_scaled_peak_across_policy_passes(
         model_name="ensemble_trader", symbol="BTC/USDT", action=Action.CLOSE_LONG,
         confidence=0.0, reasoning="profit retrace review", position_size_pct=0.0,
     )
-    for _ in range(2):
-        positions = await service.get_open_positions_context()
+    for force_refresh in (False, True):
+        if force_refresh:
+            exchange.get_positions_strict = AsyncMock(wraps=exchange.get_positions_strict)
+        positions = await service.get_open_positions_context(force_refresh=force_refresh)
+        if force_refresh:
+            exchange.get_positions_strict.assert_awaited_once()
         assert positions[0]["peak_unrealized_pnl"] == pytest.approx(2 * remaining_quantity)
         result = apply_dynamic_exit(decision, positions)
         assert result.eligible is True, result.reason
         assert result.profit_retrace_ratio == pytest.approx(0.5)
         assert result.target_close_fraction >= 0.5
+
+    exchange.get_positions_strict = AsyncMock(side_effect=TimeoutError)
+    with pytest.raises(TimeoutError):
+        await service.get_open_positions_context(force_refresh=True)
+    exchange.get_positions_strict.assert_awaited_once()
 
 
 def test_protection_evidence_accepts_safe_oco_overcoverage_after_partial_close() -> None:

@@ -4592,7 +4592,7 @@ class OkxSyncService:
             )
         return normalized
 
-    async def get_open_positions_context(self) -> list[dict]:
+    async def get_open_positions_context(self, *, force_refresh: bool = False) -> list[dict]:
         """Get open positions from the active OKX account for trading context."""
         normalize_symbol = self._required_symbol_normalizer()
         parse_float = self._required_float_parser()
@@ -4602,15 +4602,19 @@ class OkxSyncService:
 
         active_okx = active_okx_provider()
         if not active_okx:
+            if force_refresh:
+                raise RuntimeError("active OKX executor unavailable for position refresh")
             logger.warning("active OKX executor unavailable; position context is fail-closed")
             return []
 
         active_mode = "live" if mode_manager.mode.value == "live" else "paper"
-        okx_positions = self._cached_authoritative_position_snapshot(
-            active_mode,
-            active_okx,
-            max_age_seconds=AUTHORITATIVE_POSITION_CONTEXT_REUSE_SECONDS,
-        )
+        okx_positions = None
+        if not force_refresh:
+            okx_positions = self._cached_authoritative_position_snapshot(
+                active_mode,
+                active_okx,
+                max_age_seconds=AUTHORITATIVE_POSITION_CONTEXT_REUSE_SECONDS,
+            )
         if okx_positions is None:
             try:
                 okx_positions = await asyncio.wait_for(
@@ -4618,6 +4622,8 @@ class OkxSyncService:
                     timeout=8.0,
                 )
             except Exception as exc:
+                if force_refresh:
+                    raise
                 logger.warning(
                     "failed to fetch authoritative OKX position context; returning no positions",
                     error=safe_error_text(exc),

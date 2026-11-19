@@ -15302,6 +15302,61 @@ async def test_position_review_reuses_round_positions_when_fast_sl_tp_has_no_act
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_fails", [False, True])
+async def test_position_review_refreshes_after_protection_timeout(refresh_fails):
+    initial = [{"symbol": "BTC/USDT", "quantity": 3.0}]
+    remaining = [{"symbol": "BTC/USDT", "quantity": 1.0}]
+    calls = []
+
+    async def enforce_sl_tp(_feature_vectors):
+        calls.append("protection")
+        raise TimeoutError
+
+    async def refresh(*, force_refresh=False):
+        calls.append(("refresh", force_refresh))
+        if refresh_fails:
+            raise RuntimeError("position snapshot unavailable")
+        return remaining
+
+    async def review(positions, _features, **_kwargs):
+        calls.append("review")
+        assert positions is remaining
+        return [], set()
+
+    service = PositionReviewService(
+        loop_stage_setter=lambda _stage: None,
+        sl_tp_enforcer=enforce_sl_tp,
+        open_positions_context_provider=refresh,
+        position_reviewer=review,
+        analysis_symbol_claimer=lambda *_args: asyncio.sleep(0),
+        symbol_normalizer=lambda symbol: symbol,
+        candidate_executor=lambda *_args: asyncio.sleep(0),
+        decision_stage_recorder=lambda *_args: asyncio.sleep(0),
+        decision_reason_marker=lambda *_args: asyncio.sleep(0),
+    )
+    results: dict[str, Any] = {"executions": []}
+    positions, handled = await service.review_open_positions(
+        feature_vectors={},
+        results=results,
+        round_decision_ids=set(),
+        open_positions=initial,
+        position_entry_pause_reason=None,
+        max_groups_override=1,
+        claimed_analysis_symbols=[],
+    )
+
+    assert handled == set()
+    assert results["position_review_diagnostics"][0]["kind"] == "position_review_stage_timeout"
+    if refresh_fails:
+        assert calls == ["protection", ("refresh", True)]
+        assert positions is initial
+        assert results["position_review_diagnostics"][1]["kind"] == "position_review_stage_error"
+    else:
+        assert calls == ["protection", ("refresh", True), "review"]
+        assert positions is remaining
+
+
+@pytest.mark.asyncio
 async def test_execute_position_review_candidate_waits_for_handoff_after_outer_timeout():
     service = TradingService.__new__(TradingService)
     calls: list[tuple[Any, ...]] = []

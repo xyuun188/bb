@@ -4125,9 +4125,13 @@ class TradingService(ModelTrainingCoordinatorMixin):
             return await self._enforce_sl_tp(feature_vectors, open_positions=open_positions)
         return await self._enforce_sl_tp(feature_vectors)
 
-    async def open_positions_context_for_position_review(self) -> list[dict[str, Any]]:
+    async def open_positions_context_for_position_review(
+        self, *, force_refresh: bool = False,
+    ) -> list[dict[str, Any]]:
         """Return open-position context for the position-review service."""
 
+        if force_refresh:
+            return await self.okx_sync_service.get_open_positions_context(force_refresh=True)
         return await self.okx_sync_service.get_open_positions_context()
 
     async def review_open_positions_for_position_service(
