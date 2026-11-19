@@ -88,6 +88,25 @@ def close_category(raw, execution, stage_summary):
         return "close_result_unknown"
     if status == "partial" and execution.get("exit_progress") is True:
         return "close_partial"
+    mismatch = dictionary(execution.get("okx_exit_position_mismatch_summary")) or dictionary(
+        receipt.get("okx_exit_position_mismatch")
+    )
+    if (
+        status == "rejected"
+        and execution.get("order_id") == "no_position"
+        and mismatch.get("source") in {
+            "pre_submit_position_lookup",
+            "exchange_no_position_rejection",
+            "native_reduce_no_position_rejection",
+        }
+        and number(execution.get("quantity")) == 0
+        and not execution.get("exchange_order_id")
+        and not execution.get("exchange_confirmed")
+        and not execution.get("exit_progress")
+        and stage_summary.get("failed") is not True
+        and final_status != "failed"
+    ):
+        return "close_position_absent"
     if stage_summary.get("failed") is True or final_status == "failed" or status == "rejected":
         return "close_failed"
     if stage_summary.get("blocked") is True or final_status == "blocked":

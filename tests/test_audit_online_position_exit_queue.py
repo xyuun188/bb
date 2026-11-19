@@ -66,3 +66,25 @@ def test_exit_audit_does_not_count_unfilled_and_unknown_as_failures(
     assert classify(
         {"local_order_persistence": {"status": "failed"}}, execution, {},
     ) == "close_failed"
+
+
+def test_exit_audit_distinguishes_absent_position_from_order_failure() -> None:
+    namespace = {}
+    script = _render_remote_script(hours=1, limit=10)
+    exec(script.rsplit("\nasyncio.run(main())", 1)[0], namespace)  # noqa: S102
+    classify = namespace["close_category"]
+    execution = {
+        "status": "rejected",
+        "quantity": 0,
+        "order_id": "no_position",
+        "okx_exit_position_mismatch_summary": {"source": "exchange_no_position_rejection"},
+    }
+
+    assert classify({}, execution, {"final_status": "skipped"}) == "close_position_absent"
+    assert classify({}, execution, {"final_status": "failed"}) == "close_failed"
+    assert classify(
+        {}, {**execution, "okx_exit_position_mismatch_summary": {}}, {},
+    ) == "close_failed"
+    assert classify(
+        {}, {**execution, "exchange_order_id": "actual-order"}, {},
+    ) == "close_failed"
