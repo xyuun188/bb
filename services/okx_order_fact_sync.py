@@ -840,9 +840,15 @@ class OkxOrderFactSyncService:
                 key=lambda order_id: -int(order_id) if order_id.isdigit() else 0,
             )
             if fills:
+                # A fill proves execution, but only the order row proves an
+                # explicit repair target has no outstanding remainder.
+                fill_only_ids = {fill.order_id for fill in fills if fill.order_id}
                 missing_order_ids = sorted(
-                    set(missing_order_ids) - {fill.order_id for fill in fills if fill.order_id},
-                    key=lambda order_id: -int(order_id) if order_id.isdigit() else 0,
+                    set(missing_order_ids) - (fill_only_ids - set(self.recovery_order_ids)),
+                    key=lambda order_id: (
+                        order_id not in self.recovery_order_ids,
+                        -int(order_id) if order_id.isdigit() else 0,
+                    ),
                 )
             target_order_rows: list[dict[str, Any]] = []
             for missing_order_id in missing_order_ids[:DEFAULT_MAX_ORDER_GAP_QUERIES]:

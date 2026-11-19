@@ -2660,6 +2660,42 @@ async def test_explicit_recovery_order_uses_historical_fills_for_recent_large_or
 
 
 @pytest.mark.asyncio
+async def test_recovery_checks_order_state_even_after_confirming_target_fill(
+    tmp_path, monkeypatch,
+) -> None:
+    await _init_test_db(tmp_path, monkeypatch, "targeted-recovery-terminal-state.db")
+    now = datetime.now(UTC)
+    order_id = "3785286327831597056"
+
+    class TargetOnlyOrderHistory(_FakeCcxt):
+        async def privateGetTradeOrdersHistory(self, params):
+            if not params.get("ordId"):
+                return {"data": []}
+            return await super().privateGetTradeOrdersHistory(params)
+
+    ccxt = TargetOnlyOrderHistory(
+        fills=[_act_fill_row(now, order_id=order_id)],
+        orders=[{
+            **_act_order_row(now, order_id=order_id),
+            "state": "canceled", "ordType": "ioc", "sz": "10", "accFillSz": "4",
+        }],
+        instruments=[_act_instrument_row()],
+    )
+    try:
+        await OkxOrderFactSyncService(
+            mode="paper", recovery_order_ids=[order_id],
+            executor_factory=_executor_factory(ccxt),
+        ).sync()
+        async with get_session_ctx() as session:
+            order = (await session.execute(select(Order))).scalar_one()
+            assert order.status == "partial"
+            assert order.okx_state == "canceled"
+            assert order.okx_fill_contracts == 4
+    finally:
+        await close_db()
+
+
+@pytest.mark.asyncio
 async def test_recovery_order_id_defers_without_public_contract_size(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
