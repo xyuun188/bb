@@ -329,7 +329,7 @@ async def test_okx_authoritative_sync_excludes_pre_epoch_fills(
 class _LimitBackfillFillCcxt(_FakeCcxt):
     async def privateGetTradeFillsHistory(self, params: dict[str, Any]) -> dict[str, Any]:
         assert params["instType"] == "SWAP"
-        timestamp_ms = int((datetime.now(UTC) - timedelta(minutes=10)).timestamp() * 1000)
+        timestamp_ms = int((datetime.now(UTC) - timedelta(minutes=15)).timestamp() * 1000)
         return {
             "data": [
                 {
@@ -1511,9 +1511,11 @@ async def test_okx_authoritative_sync_uses_context_entry_order_outside_window(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("order_status", ["filled", "partial"])
 async def test_okx_authoritative_sync_does_not_block_lifecycle_covered_fill(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    order_status: str,
 ) -> None:
     await close_db()
     monkeypatch.setattr(
@@ -1522,9 +1524,12 @@ async def test_okx_authoritative_sync_does_not_block_lifecycle_covered_fill(
         f"sqlite+aiosqlite:///{(tmp_path / 'okx-authoritative-lifecycle-covered.db').as_posix()}",
     )
     await init_db()
-    opened_at = datetime(2026, 7, 4, 9, 18, 29, tzinfo=UTC)
-    partial_close_at = datetime(2026, 7, 4, 9, 33, 57, tzinfo=UTC)
-    closed_at = datetime(2026, 7, 4, 9, 39, 37, tzinfo=UTC)
+    closed_at = datetime.now(UTC) - timedelta(minutes=20)
+    partial_close_at = closed_at - timedelta(minutes=6)
+    opened_at = partial_close_at - timedelta(minutes=15)
+    monkeypatch.setattr(
+        _LifecycleCoveredFillExecutor, "timestamp_ms", int(partial_close_at.timestamp() * 1000)
+    )
     try:
         async with get_session_ctx() as session:
             session.add_all(
@@ -1537,7 +1542,8 @@ async def test_okx_authoritative_sync_does_not_block_lifecycle_covered_fill(
                         order_type="market",
                         quantity=19.7,
                         price=8.03,
-                        status="filled",
+                        status=order_status,
+                        okx_state="canceled" if order_status == "partial" else "filled",
                         exchange_order_id="lab-partial-close",
                         filled_at=partial_close_at,
                         created_at=partial_close_at,
@@ -1584,7 +1590,10 @@ async def test_okx_authoritative_sync_does_not_block_lifecycle_covered_fill(
         ).collect()
 
         kinds = {issue["kind"] for issue in report["issues"]}
+        assert report["okx_fill_order_count"] == 1
+        assert report["local_order_count"] == 1
         assert "okx_fill_not_linked_to_position" not in kinds
+        assert "okx_fill_missing_local_order" not in kinds
     finally:
         await close_db()
 
@@ -2268,9 +2277,16 @@ async def test_okx_authoritative_sync_loads_old_open_position_for_recent_entry_o
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("order_status", "fill_contracts", "has_execution"),
+    [("filled", None, True), ("partial", 2.0, True), ("partial", 0.0, False)],
+)
 async def test_okx_authoritative_sync_backfills_local_facts_beyond_primary_limit(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    order_status: str,
+    fill_contracts: float | None,
+    has_execution: bool,
 ) -> None:
     await close_db()
     monkeypatch.setattr(
@@ -2305,10 +2321,12 @@ async def test_okx_authoritative_sync_backfills_local_facts_beyond_primary_limit
                         order_type="market",
                         quantity=0.02,
                         price=100.0,
-                        status="filled",
+                        status=order_status,
+                        okx_fill_contracts=fill_contracts,
+                        okx_state="canceled" if order_status == "partial" else "filled",
                         exchange_order_id="older-matched-order",
-                        filled_at=now - timedelta(minutes=10),
-                        created_at=now - timedelta(minutes=10),
+                        filled_at=now - timedelta(minutes=15),
+                        created_at=now - timedelta(minutes=15),
                     ),
                     Position(
                         model_name="ensemble_trader",
@@ -2348,11 +2366,12 @@ async def test_okx_authoritative_sync_backfills_local_facts_beyond_primary_limit
         ).collect()
 
         kinds = {issue["kind"] for issue in report["issues"]}
-        assert "okx_fill_missing_local_order" not in kinds
+        assert report["okx_fill_order_count"] == 1
+        assert ("okx_fill_missing_local_order" in kinds) is not has_execution
         assert "okx_fill_not_linked_to_position" not in kinds
-        assert report["local_order_count"] == 2
+        assert report["local_order_count"] == 1 + int(has_execution)
         assert report["local_position_count"] == 2
-        assert report["supplemental_local_order_count"] == 1
+        assert report["supplemental_local_order_count"] == int(has_execution)
         assert report["supplemental_local_position_count"] == 1
     finally:
         await close_db()

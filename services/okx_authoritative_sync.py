@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 
 from core.safe_output import safe_error_text
 from core.symbols import (
@@ -54,6 +54,17 @@ MAX_AUTHORITATIVE_FILL_PAGES = 10
 LOCAL_ORDER_SYNC_GRACE_SECONDS = AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS
 QUANTITY_TOLERANCE_RATIO = 0.02
 DECISION_PROJECTION_BATCH_SIZE = 50
+
+
+def _local_order_has_execution():
+    return or_(
+        Order.status == "filled",
+        and_(
+            Order.status.in_(("partial", "partially_filled")),
+            Order.okx_fill_contracts > 0,
+            Order.filled_at.is_not(None),
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,7 +282,7 @@ class OkxAuthoritativeSyncService:
             if str(fill.order_id or "").strip()
         }
         supplemental_orders, supplemental_decisions = (
-            await self._load_filled_local_orders_by_exchange_ids(
+            await self._load_executed_local_orders_by_exchange_ids(
                 exchange_fill_order_ids,
                 known_exchange_order_ids=target_order_ids,
             )
@@ -603,7 +614,7 @@ class OkxAuthoritativeSyncService:
                 select(Order)
                 .where(
                     Order.execution_mode == self.mode,
-                    Order.status == "filled",
+                    _local_order_has_execution(),
                     or_(Order.created_at >= since_naive, Order.filled_at >= since_naive),
                 )
                 .order_by(Order.filled_at.desc(), Order.created_at.desc())
@@ -698,7 +709,7 @@ class OkxAuthoritativeSyncService:
                 )
         return context_orders, context_decisions
 
-    async def _load_filled_local_orders_by_exchange_ids(
+    async def _load_executed_local_orders_by_exchange_ids(
         self,
         exchange_order_ids: set[str],
         *,
@@ -722,7 +733,7 @@ class OkxAuthoritativeSyncService:
                 order_rows = await session.execute(
                     select(Order).where(
                         Order.execution_mode == self.mode,
-                        Order.status == "filled",
+                        _local_order_has_execution(),
                         or_(*clauses),
                     )
                 )
@@ -1398,7 +1409,7 @@ class OkxAuthoritativeSyncService:
                     classification="manual_review",
                     severity="critical",
                     reason=(
-                        "OKX has a recent fill that is not represented by a local filled order."
+                            "OKX has a recent fill without a corresponding local execution record."
                     ),
                     symbol=fill.symbol,
                     side=fill.side,
