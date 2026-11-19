@@ -178,7 +178,9 @@ def classify_entry_funnel_reason(
         or capacity.get("passed") is False
     ):
         return "shadow_training"
-    if economics.get("passed") is False:
+    if economics.get("passed") is False or (
+        "paper_training_conservative_return_not_positive" in _text(sizing.get("reason")).split(",")
+    ):
         return "profit_gate_blocked"
     quality_complete = bool(
         quality.get("analysis_complete") is True

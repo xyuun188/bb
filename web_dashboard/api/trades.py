@@ -40,6 +40,7 @@ from services.okx_order_fact_sync import (
     OKX_SYNC_OKX_ONLY,
 )
 from services.okx_position_ledger_view import build_okx_position_ledger_groups
+from services.okx_protection_position_recovery import confirmed_protection_lifecycle
 from services.position_open_time import parse_position_time
 from services.position_settlement import is_final_settlement_status
 from web_dashboard.api import dashboard as dashboard_api
@@ -953,6 +954,9 @@ async def get_trades(
         history_side = str(getattr(history, "side", "") or "").lower()
         if history_side in {"long", "short"}:
             return "close_long" if history_side == "long" else "close_short"
+        protection = confirmed_protection_lifecycle(order)
+        if protection:
+            return f"close_{protection['position_side'].lower()}"
 
         action = (decision_meta.get(order.decision_id) or {}).get("action")
         if action and action != "hold":
@@ -1029,20 +1033,23 @@ async def get_trades(
         if action not in {"close_long", "close_short"}:
             return None, None
 
+        history = authoritative_closed_history(order)
+        if history is not None:
+            close_status = _authoritative_order_close_status(history, order)
+            if close_status == "partial":
+                return "partial", "部分平仓"
+            if close_status == "full":
+                return "full", "全部平仓"
+
         meta = decision_meta.get(order.decision_id) or {}
-        by_pct = close_status_from_pct(meta.get("position_size_pct"))
+        by_pct = close_status_from_pct(
+            meta.get("position_size_pct") if meta.get("action") == action else None
+        )
         if by_pct[0]:
             return by_pct
 
         p = matching_closed_position(order)
         if not p:
-            history = authoritative_closed_history(order)
-            if history is not None:
-                close_status = _authoritative_order_close_status(history, order)
-                if close_status == "partial":
-                    return "partial", "部分平仓"
-                if close_status == "full":
-                    return "full", "全部平仓"
             return None, None
         if closed_position_looks_partial(p):
             return "partial", "部分平仓"
@@ -1351,6 +1358,10 @@ async def get_trade_detail(trade_id: int):
         str(getattr(order, "exchange_order_id", "") or "").strip()
     )
     authoritative_side = str(getattr(authoritative_history, "side", "") or "").lower()
+    if authoritative_side not in {"long", "short"}:
+        protection = confirmed_protection_lifecycle(order)
+        if protection:
+            authoritative_side = protection["position_side"].lower()
     execution_reason = sanitize_text(
         localize_execution_reason(getattr(decision, "execution_reason", None))
     )

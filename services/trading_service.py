@@ -10765,12 +10765,20 @@ class TradingService(ModelTrainingCoordinatorMixin):
         sizing = self._safe_dict(self._safe_dict(decision.raw_response).get("profit_risk_sizing"))
         training_capacity = self._safe_dict(sizing.get("paper_training_review_capacity"))
         training_economics = self._safe_dict(sizing.get("paper_training_order_economics"))
+        training_return_blocked = "paper_training_conservative_return_not_positive" in str(
+            sizing.get("reason") or ""
+        ).split(",")
         if model_mode == "paper" and (
-            training_capacity.get("passed") is False or training_economics.get("passed") is False
+            training_capacity.get("passed") is False
+            or training_return_blocked
+            or training_economics.get("passed") is False
         ):
             if training_capacity.get("passed") is False:
                 skip_kind = "paper_training_review_capacity_full"
                 reason = "持仓复盘名额已满，本次模拟训练信号继续用于观察。"
+            elif training_return_blocked:
+                skip_kind = "paper_training_conservative_return_not_positive"
+                reason = "模拟训练单扣除执行成本后的保守收益未转正，本次信号保留为观察。"
             else:
                 skip_kind = "paper_training_order_value_below_minimum"
                 reason = "模拟训练单的预计费后收益未达到最低价值，本次信号保留为观察。"

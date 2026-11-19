@@ -105,6 +105,52 @@ async def _settled_profit_cohorts(session: Any, *, since: datetime, now: datetim
     return {"source": "okx_position_history", "entry_cohort_since": since.isoformat(), **results}
 
 
+async def _confirmed_entry_orders(session: Any, *, since: datetime, now: datetime) -> int:
+    from sqlalchemy import and_, or_, select
+
+    from models.decision import AIDecision
+    from models.trade import Order
+    from services.okx_order_fact_sync import (
+        OKX_SYNC_CONFIRMED,
+        OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+        OKX_SYNC_OKX_ONLY,
+        OKX_SYNC_ORDER_DETAIL_CONFIRMED,
+    )
+    from services.okx_protection_position_recovery import confirmed_protection_lifecycle
+
+    # Protective exits can carry the original opening decision as lineage.
+    rows = await session.scalars(
+        select(Order)
+        .join(AIDecision, AIDecision.id == Order.decision_id)
+        .where(
+            Order.execution_mode == "paper",
+            AIDecision.is_paper.is_(True),
+            Order.status == "filled",
+            Order.exchange_order_id.is_not(None),
+            Order.quantity > 0,
+            Order.filled_at >= since,
+            Order.filled_at <= now,
+            Order.okx_sync_status.in_(
+                (
+                    OKX_SYNC_CONFIRMED,
+                    OKX_SYNC_EXECUTION_RESULT_CONFIRMED,
+                    OKX_SYNC_OKX_ONLY,
+                    OKX_SYNC_ORDER_DETAIL_CONFIRMED,
+                )
+            ),
+            or_(
+                and_(AIDecision.action == "long", Order.side == "buy"),
+                and_(AIDecision.action == "short", Order.side == "sell"),
+            ),
+        )
+    )
+    return len({
+        order.exchange_order_id
+        for order in rows
+        if order.exchange_order_id.strip() and not confirmed_protection_lifecycle(order)
+    })
+
+
 async def build_briefing(
     *,
     window_hours: int = DEFAULT_WINDOW_HOURS,
@@ -112,7 +158,7 @@ async def build_briefing(
 ) -> dict[str, Any]:
     # Imported lazily so the render helpers stay importable without a
     # database URL (tests, and any offline operator tooling).
-    from sqlalchemy import case, func, or_, select
+    from sqlalchemy import case, func, select
 
     from db.session import get_read_session_ctx
     from models.decision import AIDecision
@@ -129,9 +175,6 @@ async def build_briefing(
         AIDecision.created_at >= since,
         AIDecision.created_at <= now,
     )
-    executed_condition = or_(
-        AIDecision.was_executed.is_(True), AIDecision.executed_at.is_not(None)
-    )
     blocked_entry_condition = (
         (AIDecision.analysis_type == "market")
         & AIDecision.was_executed.is_not(True)
@@ -145,7 +188,6 @@ async def build_briefing(
                 select(
                     AIDecision.action,
                     func.count().label("count"),
-                    func.sum(case((executed_condition, 1), else_=0)).label("executed"),
                     func.sum(case((blocked_entry_condition, 1), else_=0)).label("blocked"),
                 )
                 .where(*window_filters)
@@ -178,16 +220,14 @@ async def build_briefing(
                 )
             )
         ).scalar()
+        executed = await _confirmed_entry_orders(session, since=since, now=now)
         report["settled_profit"] = await _settled_profit_cohorts(session, since=since, now=now)
 
     actions: Counter[str] = Counter()
-    executed = 0
     blocked = 0
     for row in totals:
         action = str(row.action or "").lower()
         actions[action] += int(row.count or 0)
-        if action in {"long", "short"}:
-            executed += int(row.executed or 0)
         blocked += int(row.blocked or 0)
     reasons: Counter[str] = Counter()
     for row in rows:
@@ -221,8 +261,8 @@ def render_text(report: dict[str, Any]) -> str:
 
     lines.append("【交易】")
     lines.append(
-        f"决策 {decisions.get('in_window', 0)} 次，实际开仓 "
-        f"{decisions.get('executed', 0)} 次"
+        f"决策 {decisions.get('in_window', 0)} 次，OKX 确认开仓订单 "
+        f"{decisions.get('executed', 0)} 笔"
     )
     actions = decisions.get("actions") or {}
     if actions:

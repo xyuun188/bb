@@ -348,6 +348,22 @@ async def test_training_and_validated_entry_share_the_same_risk_sizing() -> None
 
 
 @pytest.mark.asyncio
+async def test_training_with_positive_mean_and_negative_downside_does_not_submit() -> None:
+    training = _decision()
+    _use_bounded_training_entry(training)
+    opportunity = training.raw_response["opportunity_score"]
+    opportunity["return_lcb_pct"] = -0.1
+    opportunity["return_distribution_contract"]["objective_expected_return_pct"] = -0.1
+    await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(training, "paper", [])
+
+    sizing = training.raw_response["profit_risk_sizing"]
+    assert sizing["paper_training_order_economics"]["passed"] is True
+    assert sizing["production_eligible"] is False
+    assert "paper_training_conservative_return_not_positive" in sizing["reason"]
+    assert sizing["final_notional_usdt"] == 0
+
+
+@pytest.mark.asyncio
 async def test_full_review_roster_routes_training_to_observation_only() -> None:
     ordinary = _decision()
     training = deepcopy(ordinary)
@@ -385,6 +401,17 @@ async def test_training_tiny_order_is_blocked_but_confirmed_partial_fill_is_reco
     )
     assert result["eligible"] is False
     assert "paper_training_order_value_below_minimum" in result["reasons"]
+
+    candidate = deepcopy(training)
+    candidate.raw_response["profit_risk_sizing"]["return_lcb_pct"] = -0.1
+    result = reconcile_profit_risk_sizing(
+        candidate,
+        final_notional_usdt=100.0,
+        final_leverage=candidate.suggested_leverage,
+        source="okx_pre_submit_order_shape",
+    )
+    assert result["eligible"] is False
+    assert "paper_training_conservative_return_not_positive" in result["reasons"]
 
     result = reconcile_profit_risk_sizing(
         training,
@@ -887,9 +914,8 @@ async def test_normal_paper_rejects_when_native_tier_has_no_remaining_capacity()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("return_lcb", [0.3, 0.0, -0.22, -3.0])
-async def test_training_entry_uses_normal_paper_risk_budget(return_lcb) -> None:
-    decision = _quality_observation_decision(return_lcb_pct=return_lcb)
+async def test_training_entry_uses_normal_paper_risk_budget() -> None:
+    decision = _quality_observation_decision(return_lcb_pct=0.3)
     _use_bounded_training_entry(decision)
     decision.raw_response["opportunity_score"]["return_distribution_contract"][
         "raw_expected_return_pct"
@@ -914,7 +940,7 @@ async def test_training_entry_uses_normal_paper_risk_budget(return_lcb) -> None:
     assert sizing["production_permission"] is False
     assert dynamic["policy_provenance"]["effective_return_pct"] > 0.0
     assert sizing["final_leverage"] >= 1.0
-    assert sizing["stressed_loss_fraction"] >= max(-return_lcb / 100.0, 0.0)
+    assert sizing["stressed_loss_fraction"] > 0.0
     assert sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"] + 1e-8
     assert RiskEngine().assess(decision, [], 1000.0).approved is True
 

@@ -1728,6 +1728,12 @@ def validate_normal_paper_entry_contract(
         and not isfinite(_safe_float(sizing.get("return_lcb_pct"), float("nan")))
     ):
         reasons.append("normal_paper_size_aware_downside_return_missing")
+    if (
+        training_entry
+        and not executed
+        and _safe_float(sizing.get("return_lcb_pct"), 0.0) <= 0.0
+    ):
+        reasons.append("paper_training_conservative_return_not_positive")
     if not (
         _provenance_complete(sizing.get("policy_provenance"))
         or (

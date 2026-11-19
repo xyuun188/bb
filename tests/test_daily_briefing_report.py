@@ -103,7 +103,7 @@ def test_render_text_reports_blockers_and_model_state() -> None:
     text = module.render_text(report)
 
     assert "决策 300 次" in text
-    assert "实际开仓 0 次" in text
+    assert "OKX 确认开仓订单 0 笔" in text
     assert "direction_support_expected_net_not_positive" in text
     assert "canary" in text
     assert "模型纸盘调用资格：True" in text
@@ -137,7 +137,7 @@ async def test_build_briefing_counts_full_paper_window_and_only_entry_executions
     from models.base import Base
     from models.decision import AIDecision
     from models.learning import ShadowBacktest
-    from models.trade import OkxPositionHistory
+    from models.trade import OkxPositionHistory, Order
 
     module = _load_module()
     now = datetime.now(UTC)
@@ -166,7 +166,10 @@ async def test_build_briefing_counts_full_paper_window_and_only_entry_executions
             await connection.run_sync(
                 lambda sync_connection: Base.metadata.create_all(
                     sync_connection,
-                    tables=[AIDecision.__table__, ShadowBacktest.__table__, OkxPositionHistory.__table__],
+                    tables=[
+                        AIDecision.__table__, ShadowBacktest.__table__,
+                        OkxPositionHistory.__table__, Order.__table__,
+                    ],
                 )
             )
             await connection.execute(AIDecision.__table__.insert(), [
@@ -180,6 +183,22 @@ async def test_build_briefing_counts_full_paper_window_and_only_entry_executions
                 decision(8, "short", minutes=120, executed=True),
                 decision(9, "short", minutes=-60, executed=True),
             ])
+            for order_id, decision_id, side, mode, status, sync_status in (
+                ("entry", 1, "sell", "paper", "filled", "okx_confirmed"),
+                ("entry", 1, "sell", "paper", "filled", "okx_confirmed"),
+                ("cross-window", 8, "sell", "paper", "filled", "okx_only_backfilled"),
+                ("protective-exit", 8, "buy", "paper", "filled", "okx_only_backfilled"),
+                ("close-decision", 3, "buy", "paper", "filled", "okx_confirmed"),
+                ("live", 7, "sell", "live", "filled", "okx_confirmed"),
+                ("unconfirmed", 2, "buy", "paper", "filled", "unverified"),
+                ("working", 2, "buy", "paper", "open", "okx_confirmed"),
+            ):
+                await connection.execute(Order.__table__.insert().values(
+                    model_name="test", symbol="BTC/USDT", execution_mode=mode,
+                    side=side, order_type="limit", quantity=2.0, status=status,
+                    okx_sync_status=sync_status, decision_id=decision_id,
+                    exchange_order_id=order_id, filled_at=now,
+                ))
             await connection.execute(ShadowBacktest.__table__.insert(), [
                 {
                     "model_name": "test", "symbol": "BTC/USDT",
@@ -209,7 +228,7 @@ async def test_build_briefing_counts_full_paper_window_and_only_entry_executions
         )
         assert report["shadow"]["completed_in_window"] == 1
         text = module.render_text(report)
-        assert "决策 6 次，实际开仓 2 次" in text
+        assert "决策 6 次，OKX 确认开仓订单 2 笔" in text
         assert ("最近 1 条未开仓决策" in text) is (decision_limit == 1)
     finally:
         await engine.dispose()

@@ -608,9 +608,11 @@ async def test_trade_history_accepts_okx_execution_result_confirmed_order(
 
 
 @pytest.mark.asyncio
-async def test_trade_history_uses_okx_history_close_when_local_position_is_missing(
+@pytest.mark.parametrize("close_status", ["full", "partial"])
+async def test_trade_history_uses_okx_history_close_status(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    close_status: str,
 ) -> None:
     await close_db()
     monkeypatch.setattr(
@@ -630,7 +632,7 @@ async def test_trade_history_uses_okx_history_close_when_local_position_is_missi
                     symbol="STRK/USDT",
                     pos_id="strk-pos-1",
                     side="short",
-                    close_status="full",
+                    close_status=close_status,
                     opened_at=filled_at - timedelta(days=2),
                     updated_at_okx=filled_at,
                     open_avg_px=375.9524,
@@ -644,6 +646,13 @@ async def test_trade_history_uses_okx_history_close_when_local_position_is_missi
             )
             await session.flush()
             repo = TradeRepository(session)
+            if close_status == "partial":
+                await repo.open_position({
+                    "model_name": "okx_authoritative_sync", "execution_mode": "paper",
+                    "symbol": "STRK/USDT", "side": "short", "quantity": 39.49,
+                    "entry_price": 375.9524, "current_price": 377.9507, "is_open": False,
+                    "created_at": filled_at - timedelta(days=2), "closed_at": filled_at,
+                })
             order = await repo.create_order(
                 {
                     "model_name": "okx_authoritative_sync",
@@ -675,12 +684,12 @@ async def test_trade_history_uses_okx_history_close_when_local_position_is_missi
 
     row = next(item for item in trades["trades"] if item["id"] == order.id)
     assert row["action"] == "close_short"
-    assert row["close_status"] == "full"
+    assert row["close_status"] == close_status
     assert row["execution_source"] == "okx"
     assert "OKX" in row["reason"]
     assert detail["action"] == "close_short"
     assert detail["execution_source"] == "okx"
-    assert "已确认平仓" in detail["reason"]
+    assert "平仓" in detail["reason"]
 
 
 @pytest.mark.asyncio
