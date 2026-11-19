@@ -3000,7 +3000,7 @@ function analysisTimingStatusLabel(status) {
 function analysisExpertStatusLine(record, missingCount) {
     const preExpertSkip = analysisPreExpertSkip(record);
     if (preExpertSkip.skipped) {
-        return `${preExpertSkip.label}；没有消耗大模型专家`;
+        return '本轮未调用专家';
     }
     const statusCounts = record?.expert_status_counts || {};
     const deferredCircuit = Number(statusCounts.circuit_breaker_deferred || 0);
@@ -3992,7 +3992,7 @@ function renderAnalysisPage() {
         const automaticCross = Number(cross.automatic || 0);
         const unavailableCross = Number(cross.unavailable || 0);
         const crossText = preExpertSkip.skipped
-            ? '预检阶段未发起交叉验证'
+            ? '未发起交叉验证'
             : `计划 ${expectedCross}，完成 ${completedCross}（专家请求 ${expertRequestedCross} / 自动 ${automaticCross}），无法验证 ${unavailableCross}，分歧 ${Number(cross.divergent || 0)}`;
         const expertStatusLine = analysisExpertStatusLine(r, missingCount);
         const expertStatusColor = missingCount ? 'var(--yellow)' : 'var(--text-muted)';
@@ -4012,7 +4012,7 @@ function renderAnalysisPage() {
             <td style="font-size:11px;color:${hasMajorConflict ? 'var(--red)' : 'var(--text-muted)'};">${crossText}</td> 
             <td style="font-size:11px;color:var(--text-muted);">${analysisConsultationLabel(r.consultation_status, hasMajorConflict)}</td>
             <td><span class="badge badge-${analysisDisplayAction(r.final_action, r)}">${analysisActionLabel(r.final_action, r)}</span></td>
-            <td style="color:${conf >= 0.65 ? 'var(--green)' : 'var(--text-muted)'};font-weight:600;">${(conf * 100).toFixed(0)}%</td>
+            <td style="color:${conf >= 0.65 ? 'var(--green)' : 'var(--text-muted)'};font-weight:600;">${preExpertSkip.skipped ? '-' : `${(conf * 100).toFixed(0)}%`}</td>
             <td title="${escHtml(analysisWeightedScoreTitle(r))}">${escHtml(score)}</td>
             <td>
                 <button
@@ -4225,10 +4225,10 @@ function renderAnalysisReasonModal(record) {
         : renderMarketFundingAnalysis(record.direction_competition);
  
     const expertsHtml = preExpertSkip.skipped ? `
-        <div class="analysis-card analysis-card-warning">
+        <div class="analysis-card">
             <div class="analysis-card-head">
                 <div class="analysis-card-title">${escHtml(preExpertSkip.label)}</div>
-                ${analysisPill('预检跳过专家', 'muted')}
+                ${analysisPill('本轮未调用专家', 'muted')}
             </div>
             <div class="analysis-card-text">
                 ${analysisText(preExpertSkip.reason || record.flow_summary || '预检阶段已确定本轮暂不需要进入大模型专家。')}
@@ -4560,13 +4560,13 @@ function renderAnalysisReasonModal(record) {
     document.getElementById('decision-reason-body').innerHTML = ` 
         <div class="analysis-flow">
             <div class="analysis-summary">
-                ${analysisMetric('专家返回', preExpertSkip.skipped ? preExpertSkip.label : `${expertCount}/${expectedCount}`, preExpertSkip.skipped || expertCount === expectedCount ? 'good' : 'warn')}
+                ${analysisMetric('专家返回', preExpertSkip.skipped ? '不适用' : `${expertCount}/${expectedCount}`, preExpertSkip.skipped ? 'muted' : expertCount === expectedCount ? 'good' : 'warn')}
                 ${mlSignal?.available ? analysisMetric('ML目标期望', distributionPctLabel(mlSignalDistribution?.objective_expected_return_pct), mlSignalDistribution && Number(mlSignalDistribution.objective_expected_return_pct) > 0 ? 'good' : 'warn') : ''}
-                ${analysisMetric('交叉验证', `${completedCross}/${expectedCross}`, unavailableCross || completedCross < expectedCross ? 'warn' : 'good')}
+                ${preExpertSkip.skipped ? '' : analysisMetric('交叉验证', `${completedCross}/${expectedCross}`, unavailableCross || completedCross < expectedCross ? 'warn' : 'good')}
                 ${analysisMetric('分析耗时', analysisDurationLabel(totalDuration), totalDuration > 60 ? 'warn' : 'muted')}
                 ${analysisMetric('最终方向', analysisActionLabel(record.final_action, record), analysisTone(record.final_action))}
                 ${lifecycleLabel ? analysisMetric('持仓状态', lifecycleLabel, analysisPositionLifecycleTone(record)) : ''}
-                ${analysisMetric('分析信心 / 仓位', `${finalConfidence} / ${positionSize}`, Number(record.final_confidence || 0) >= 0.6 ? 'good' : 'muted')}
+                ${preExpertSkip.skipped ? '' : analysisMetric('分析信心 / 仓位', `${finalConfidence} / ${positionSize}`, Number(record.final_confidence || 0) >= 0.6 ? 'good' : 'muted')}
             </div>
 
             ${attributionHtml ? analysisSection('决策归因面板', `${paperTradeDiagnosticHtml(attribution)}${attributionHtml}`) : paperTradeDiagnosticHtml(attribution)}
@@ -4578,7 +4578,7 @@ function renderAnalysisReasonModal(record) {
             ${analysisSection('三期相似样本记忆', renderAnalysisVectorMemory(vectorMemory))}
             ${analysisSection(preExpertSkip.skipped ? preExpertSkip.label : '专家初诊', `<div class="analysis-grid">${expertsHtml || '<div class="analysis-empty">无返回结果</div>'}</div>`, expertSectionSubtitle)}
             ${missingHtml ? analysisSection('未返回专家', `<div class="analysis-grid">${missingHtml}</div>`) : ''}
-            ${analysisSection('交叉验证', `<div class="analysis-grid">${pairValidations || '<div class="analysis-empty">没有触发交叉验证</div>'}</div>`, `计划 ${expectedCross} 个，完成 ${completedCross} 个（专家请求 ${expertRequestedCross} 个，自动核验 ${automaticCross} 个），无法验证 ${unavailableCross} 个，重大矛盾 ${majorConflicts} 个`)}
+            ${preExpertSkip.skipped ? '' : analysisSection('交叉验证', `<div class="analysis-grid">${pairValidations || '<div class="analysis-empty">没有触发交叉验证</div>'}</div>`, `计划 ${expectedCross} 个，完成 ${completedCross} 个（专家请求 ${expertRequestedCross} 个，自动核验 ${automaticCross} 个），无法验证 ${unavailableCross} 个，重大矛盾 ${majorConflicts} 个`)}
             ${analysisSection('深度会诊', consultation)}
             ${analysisSection('分歧处理', resolutionHtml)}
             ${analysisSection('最终交易员', decisionMakerHtml)}
@@ -4588,8 +4588,8 @@ function renderAnalysisReasonModal(record) {
                     <div class="analysis-card-head">
                         <div class="analysis-card-title">${analysisActionLabel(record.final_action, record)}</div>
                         <div class="analysis-card-tags">
-                            ${analysisPill(`分析信心 ${finalConfidence}`, Number(record.final_confidence || 0) >= 0.6 ? 'good' : 'muted')}
-                            ${analysisPill(`下单信心 ${tradeConfidence}`, Number(record.trade_confidence || 0) >= 0.6 ? 'good' : 'muted')}
+                            ${preExpertSkip.skipped ? '' : analysisPill(`分析信心 ${finalConfidence}`, Number(record.final_confidence || 0) >= 0.6 ? 'good' : 'muted')}
+                            ${preExpertSkip.skipped ? '' : analysisPill(`下单信心 ${tradeConfidence}`, Number(record.trade_confidence || 0) >= 0.6 ? 'good' : 'muted')}
                             ${analysisPill(`仓位 ${positionSize}`, Number(record.position_size_pct || 0) > 0 ? 'good' : 'muted')}
                             ${analysisPill(record.execution_outcome_label || (record.was_executed ? '已执行' : '未执行'), record.was_executed && !record.execution_outcome_label ? 'good' : 'warn')}
                         </div>
@@ -4601,7 +4601,7 @@ function renderAnalysisReasonModal(record) {
                         </div>
                         ${analysisOpportunityScoreHtml(record.opportunity_score, record)}
                         ${record.execution_reason ? `<div class="analysis-note"><span>${record.execution_outcome_label || record.was_executed ? '执行说明' : '未执行原因'}</span>${analysisText(record.execution_reason)}</div>` : ''}
-                        ${record.confidence_note ? `<div class="analysis-note analysis-note-muted"><span>信心说明</span>${analysisText(record.confidence_note)}</div>` : ''}
+                        ${!preExpertSkip.skipped && record.confidence_note ? `<div class="analysis-note analysis-note-muted"><span>信心说明</span>${analysisText(record.confidence_note)}</div>` : ''}
                         <div class="analysis-note analysis-note-muted"><span>裁决理由</span>${analysisText(record.final_reasoning || '-')}</div>
                     </div>
                 </div>

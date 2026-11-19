@@ -1385,7 +1385,7 @@ def _analysis_pre_expert_skip(raw: dict[str, Any]) -> dict[str, Any]:
             "kind": "position_fast_scan",
             "label": "持仓快速扫描未进入专家",
             "reason": sanitize_text(
-                position_fast_scan.get("reason")
+                localize_execution_reason(position_fast_scan.get("reason"))
                 or "本轮是持仓快速扫描；只有出现强平仓、强加仓或高风险信号时才进入专家深度复盘。"
             ),
         }
@@ -1405,6 +1405,24 @@ def _analysis_pre_expert_skip(raw: dict[str, Any]) -> dict[str, Any]:
                     "结果未能完整返回并落库。"
                 )
             ),
+        }
+    phase = _safe_dict(raw.get("analysis_idempotency")).get("phase")
+    has_expert_evidence = any(
+        raw.get(key)
+        for key in (
+            "attempted_experts",
+            "expert_failures",
+            "model_timings",
+            "opinions",
+            "analysis_quality_contract",
+        )
+    )
+    if phase == "fast_risk_exit" and not has_expert_evidence:
+        return {
+            "skipped": True,
+            "kind": "position_rule_exit",
+            "label": "规则触发平仓",
+            "reason": "持仓快扫按退出规则生成平仓建议，本轮未调用专家。实际结果以执行回执为准。",
         }
     return {"skipped": False, "kind": "", "label": "", "reason": ""}
 
@@ -11951,11 +11969,14 @@ async def _get_analysis_records_uncached(
             continue
         analysis_type, analysis_type_label = infer_analysis_type(d, raw)
         analysis_quality = _safe_dict(raw.get("analysis_quality_contract"))
+        pre_expert_skip = _analysis_pre_expert_skip(raw)
         expected_expert_names = (
             POSITION_ANALYSIS_EXPERT_NAMES
             if analysis_type == "position"
             else MARKET_ANALYSIS_EXPERT_NAMES
         )
+        if pre_expert_skip.get("kind") == "position_rule_exit":
+            expected_expert_names = ()
         expected_expert_name_set = set(expected_expert_names)
         opinions = raw.get("opinions") or []
         if not isinstance(opinions, list):
@@ -12102,7 +12123,6 @@ async def _get_analysis_records_uncached(
             name for name in expected_expert_names if name in attempted_names
         ]
         fast_scan_payload = _safe_dict(raw.get("position_fast_scan"))
-        pre_expert_skip = _analysis_pre_expert_skip(raw)
         ensemble_timed_out = pre_expert_skip.get("kind") == "ensemble_timeout"
         quality_attempted_count_present = "attempted_expert_count" in analysis_quality
         contract_attempted_count = _safe_int_value(

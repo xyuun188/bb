@@ -2023,9 +2023,8 @@ def test_analysis_pre_expert_skip_contract_is_not_reported_as_model_config_error
     assert "function analysisPreExpertSkip" in script
     assert "expert_call_status" in script
     assert "行情预检未进入专家" in script
-    assert "预检跳过专家" in script
+    assert "本轮未调用专家" in script
     assert "不是模型故障" in script
-    assert "没有消耗大模型专家" in script
     assert "pre_expert_skipped" in script
     assert "position_fast_scan.phase" in script
     assert "未配置 API Key" in script
@@ -2147,6 +2146,17 @@ def test_dashboard_api_normalizes_position_fast_scan_expert_status() -> None:
     assert status["kind"] == "position_fast_scan"
     assert status["label"] == "持仓快速扫描未进入专家"
     assert "强平仓" in status["reason"]
+
+
+def test_rule_exit_marker_does_not_hide_actual_model_failure() -> None:
+    status = dashboard._analysis_pre_expert_skip(
+        {
+            "analysis_idempotency": {"phase": "fast_risk_exit"},
+            "expert_failures": [{"expert_name": "position_expert", "reason": "timeout"}],
+        }
+    )
+
+    assert status["skipped"] is False
 
 
 def test_dashboard_api_normalizes_position_fast_scan_phase_without_skip_flag() -> None:

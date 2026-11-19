@@ -424,10 +424,14 @@ async def test_analysis_detail_shows_proven_no_fill_without_an_order_row(
     try:
         async with get_session_ctx() as session:
             raw = append_decision_stage(
-                {"execution_result": {
-                    "status": "cancelled",
-                    "raw_response": {"profit_lock_ioc_unfilled": True},
-                }},
+                {
+                    "analysis_idempotency": {"phase": "fast_risk_exit"},
+                    "fast_risk_trigger": "profit_drawdown_dynamic_position_scan",
+                    "execution_result": {
+                        "status": "cancelled",
+                        "raw_response": {"profit_lock_ioc_unfilled": True},
+                    },
+                },
                 DecisionStage.EXCHANGE_CONFIRM, DecisionStageStatus.SKIPPED, "Profit lock cancelled",
             )
             decision = AIDecision(
@@ -443,6 +447,13 @@ async def test_analysis_detail_shows_proven_no_fill_without_an_order_row(
             decision_id=decision_id, include_detail=True, is_paper=True,
         )
         record = response["records"][0]
+        assert record["expert_call_status"]["kind"] == "position_rule_exit"
+        assert record["expert_call_status"]["skipped"] is True
+        assert record["attempt_evidence_status"] == "complete"
+        assert record["expected_expert_count"] == record["attempted_expert_count"] == 0
+        assert record["missing_experts"] == []
+        assert record["cross_summary"]["expected"] == 0
+        assert record["final_action"] == "close_short"
         assert record["execution_outcome_label"] == "未成交"
         assert "零成交" in record["execution_reason"]
         assert record["was_executed"] is False
