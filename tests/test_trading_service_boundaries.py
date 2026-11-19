@@ -6641,6 +6641,36 @@ async def test_fast_dynamic_position_scan_allows_only_hard_risk_or_profit_lock(
     assert {key[1] for key in service._paper_profit_lock_attempts} == {"LTC/USDT"}
 
 
+def test_low_risk_paper_residual_requires_a_completed_profit_lock_target() -> None:
+    service = TradingService.__new__(TradingService)
+    service._get_model_execution_mode = lambda _model: "paper"
+    positions = [{"notional": 0.59, "entry_exchange_order_id": "entry-1", "side": "short"}]
+    policy = {
+        "current_management_contract_complete": True,
+        "economic_exit_evidence_complete": True,
+        "execution_cost_complete": True,
+        "eligible": False,
+        "hard_risk": False,
+        "lifecycle_closed_fraction": 0.92,
+        "stop_risk_usage": 0.01,
+        "profit_lock_pressure": 0.27,
+        "profit_lock_target_gap": 0.0,
+    }
+    model = "ensemble_trader"
+    scan = {"dynamic_exit_policy": policy}
+    assert service._paper_residual_review_identity(model, positions, scan) == ("entry-1", "short")
+    for field, value in (
+        ("profit_lock_target_gap", 0.01),
+        ("profit_lock_target_gap", None),
+        ("execution_cost_complete", False),
+        ("hard_risk", True),
+        ("eligible", True),
+        ("stop_risk_usage", 0.5),
+    ):
+        scan = {"dynamic_exit_policy": {**policy, field: value}}
+        assert service._paper_residual_review_identity(model, positions, scan) is None
+
+
 @pytest.mark.asyncio
 async def test_expired_canary_does_not_force_exit_with_incomplete_takeover_contract() -> None:
     service = TradingService.__new__(TradingService)

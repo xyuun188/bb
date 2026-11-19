@@ -1502,6 +1502,8 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                             'return_lcb_pct',
                             'risk_budget_usdt',
                             'selected_contract_spec',
+                            'paper_training_order_economics',
+                            'paper_training_review_capacity',
                             'stressed_loss_fraction',
                             'single_trade_risk_budget_usdt',
                             'target_inst_id',

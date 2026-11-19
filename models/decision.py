@@ -100,6 +100,8 @@ _PROFIT_RISK_SIZING_SNAPSHOT_KEYS = {
     "model_can_influence",
     "model_leverage_is_explicit",
     "model_requested_leverage",
+    "paper_training_order_economics",
+    "paper_training_review_capacity",
     "planned_stressed_loss_usdt",
     "policy_provenance",
     "portfolio_risk_budget_usdt",

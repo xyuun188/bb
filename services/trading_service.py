@@ -15097,11 +15097,12 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if (
             dynamic.get("current_management_contract_complete") is not True
             or dynamic.get("economic_exit_evidence_complete") is not True
+            or dynamic.get("execution_cost_complete") is not True
             or dynamic.get("hard_risk")
             or dynamic.get("eligible")
             or self._safe_float(dynamic.get("lifecycle_closed_fraction"), 0.0) < 0.8
             or not 0 <= self._safe_float(dynamic.get("stop_risk_usage"), 1.0) < 0.5
-            or self._safe_float(dynamic.get("profit_lock_pressure"), 0.0) > 0.0
+            or not 0 <= self._safe_float(dynamic.get("profit_lock_target_gap"), 1.0) <= 1e-8
         ):
             return None
         notional = abs(self._safe_float(position.get("notional"), 0.0))
