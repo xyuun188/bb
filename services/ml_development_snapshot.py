@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from core.symbols import normalize_trading_symbol
+from services.execution_cost_model import FUNDING_PROJECTION_VERSION
 from services.ml_development_baselines import _development_input_sha256
 from services.ml_signal_service import FEATURE_KEYS, _decision_group_availability
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
@@ -127,6 +128,7 @@ def make_development_snapshot(
         "created_at": datetime.now(UTC).isoformat(),
         "development_cutoff": boundary.isoformat(),
         "profit_supervision_version": PROFIT_SUPERVISION_VERSION,
+        "funding_projection_version": FUNDING_PROJECTION_VERSION,
         "cutoff_policy": "all_group_labels_strictly_before_earliest_exam_start",
         "source_frame_row_count": len(frame),
         "row_count": len(development),

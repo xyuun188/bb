@@ -25,6 +25,7 @@ EXECUTION_COST_FACT_FIELDS = (
     "post_only_fill_probability",
 )
 SHADOW_SETTLEMENT_COST_VERSION = "2026-11-11.observed-shadow-exit-cost.v2"
+FUNDING_PROJECTION_VERSION = "2026-11-20.decision-clock-funding-settlements.v3"
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -249,7 +250,7 @@ def funding_cost_estimate(
             "observation_window": "current_prediction_horizon",
             "sample_count": int(eligible),
             "generated_at": datetime.now(UTC).isoformat(),
-            "strategy_version": "2026-11-20.decision-clock-funding-settlements.v3",
+            "strategy_version": FUNDING_PROJECTION_VERSION,
             "fallback_reason": "" if eligible else reason,
             "funding_rate_observed_at": observed_raw,
             "income_credit_policy": "signed_cashflow_positive_income_negative_cost",

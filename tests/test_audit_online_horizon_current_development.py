@@ -283,6 +283,7 @@ def test_replay_weight_audit_reuses_sealed_inputs_and_checks_identity_before_fit
     from config import settings as settings_module
     from db import session as db_session
     from services import ml_replay_weight_development as research
+    from services.execution_cost_model import FUNDING_PROJECTION_VERSION
     from services.ml_development_baselines import _development_input_sha256
     from services.ml_development_snapshot import (
         REPLAY_METADATA_COLUMNS,
@@ -292,10 +293,15 @@ def test_replay_weight_audit_reuses_sealed_inputs_and_checks_identity_before_fit
 
     development, snapshot = _snapshot(_source())
     cutoff = datetime.fromisoformat(CUTOFF)
+    import hashlib
+
     from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 
+    cost_identity = hashlib.sha256(
+        f"{PROFIT_SUPERVISION_VERSION}:{FUNDING_PROJECTION_VERSION}".encode()
+    ).hexdigest()[:16]
     path = tmp_path / "strategy_replay" / (
-        f"replay-weight-input-{PROFIT_SUPERVISION_VERSION}-v3-20260810T000000Z-2500-672.json"
+        f"replay-weight-input-{cost_identity}-v3-20260810T000000Z-2500-672.json"
     )
     save_development_snapshot(snapshot, path=path)
     original_bytes = path.read_bytes()
@@ -327,6 +333,7 @@ def test_replay_weight_audit_reuses_sealed_inputs_and_checks_identity_before_fit
         exec(rendered, {})  # noqa: S102 - Exercise sealed-input reuse in the actual payload.
         report = json.loads(capsys.readouterr().out)
         assert report["input"]["source_rows_reloaded"] is False
+        assert report["input"]["funding_projection_version"] == FUNDING_PROJECTION_VERSION
         assert calls == [snapshot]
     else:
         with pytest.raises(RuntimeError, match="fingerprint changed"):

@@ -152,6 +152,7 @@ from pathlib import Path
 from config.settings import settings
 from db.session import close_db, get_read_session_ctx
 from scripts.audit_online_horizon_current_development import _build_development_statement
+from services.execution_cost_model import FUNDING_PROJECTION_VERSION
 from services.ml_development_snapshot import (
     REPLAY_METADATA_COLUMNS, load_development_snapshot, make_development_snapshot,
     save_development_snapshot, snapshot_frame,
@@ -281,8 +282,11 @@ async def main():
         limit=GROUP_LIMIT, since=since, cutoff=CUTOFF, revision=REVISION,
     )
     try:
+        cost_identity = hashlib.sha256(
+            f"{PROFIT_SUPERVISION_VERSION}:{FUNDING_PROJECTION_VERSION}".encode()
+        ).hexdigest()[:16]
         snapshot_path = settings.data_dir / "strategy_replay" / (
-            f"replay-weight-input-{PROFIT_SUPERVISION_VERSION}-{REVISION}-{CUTOFF.strftime('%Y%m%dT%H%M%SZ')}-"
+            f"replay-weight-input-{cost_identity}-{REVISION}-{CUTOFF.strftime('%Y%m%dT%H%M%SZ')}-"
             f"{GROUP_LIMIT}-{HOURS}.json"
         )
         reuse_snapshot = FAMILY == "replay_weights" and snapshot_path.exists()
@@ -292,7 +296,10 @@ async def main():
                 development, snapshot = load_development_snapshot(
                     snapshot_path, cutoff=CUTOFF.isoformat(),
                 )
-                if snapshot.get("profit_supervision_version") != PROFIT_SUPERVISION_VERSION:
+                if (
+                    snapshot.get("profit_supervision_version") != PROFIT_SUPERVISION_VERSION
+                    or snapshot.get("funding_projection_version") != FUNDING_PROJECTION_VERSION
+                ):
                     raise RuntimeError("frozen development costs use an obsolete supervision policy")
                 frame = development
             else:
@@ -362,6 +369,7 @@ async def main():
             "input": {
                 "source_row_count": len(rows),
                 "source_rows_reloaded": not reuse_snapshot,
+                "funding_projection_version": snapshot.get("funding_projection_version"),
                 "training_frame_row_count": int(len(frame)),
                 "development_row_count": int(len(development)),
                 "decision_group_count": int(
