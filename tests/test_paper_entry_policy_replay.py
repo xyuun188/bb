@@ -90,3 +90,12 @@ def test_replay_reports_guard_saved_with_support_when_full_context_was_not_persi
     assert report["counts"]["side_loss_guard_snapshots_losing"] == 1
     assert report["counts"].get("side_loss_guard_context_missing", 0) == 0
     assert report["counts"]["still_blocked"] == 1
+
+
+def test_replay_keeps_frozen_cohort_block_when_symbol_context_is_present():
+    row = _row()
+    row["strategy_mode"] = {}
+    row["selection"]["by_side"]["short"]["recent_side_loss_guard"] = {
+        "training_cohort": {"blocked": True, "reason": "cross_symbol_training_loss"},
+    }
+    assert replay_policy([row])["counts"]["still_blocked"] == 1

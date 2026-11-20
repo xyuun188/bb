@@ -736,6 +736,7 @@ class EntryDirectionCompetitionPolicy:
             evidence[side].append(
                 {
                     "source": "local_ml",
+                    "model_version": signal.get("model_version"),
                     "side": side,
                     "available": bool(primary),
                     "decision_eligible": eligible,

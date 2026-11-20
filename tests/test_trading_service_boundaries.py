@@ -10279,6 +10279,8 @@ async def test_strategy_mode_uses_cached_learning_without_waiting(
             "created_at": datetime.now(UTC),
             "context": {
                 "strategy": "cached_strategy",
+                "symbol_side_performance": {"obsolete": True},
+                "strategy_context_performance": {"status": "expired"},
                 "current_production_strategy": {"id": "cached_production_strategy"},
                 "account_equity": 200.0,
             },
@@ -10312,7 +10314,7 @@ async def test_strategy_mode_uses_cached_learning_without_waiting(
     service._strategy_context_account_equity = lambda _mode: _async_value(200.0)  # type: ignore[method-assign]
     calibration = {"execution_mode": "paper", "data_fingerprint": "fresh-fill-costs"}
     service._recent_strategy_context_performance_snapshot = lambda _mode: (
-        {"execution_trade_calibration": calibration},
+        {"execution_trade_calibration": calibration, "symbol_side_perf": {"current": True}},
         {"status": "fresh"},
     )
 
@@ -10351,6 +10353,8 @@ async def test_strategy_mode_uses_cached_learning_without_waiting(
     assert result["strategy_learning_cache_status"] == "stale_background_refresh"
     assert result["execution_mode"] == "paper"
     assert result["execution_trade_calibration"] == calibration
+    assert result["symbol_side_performance"] == {"current": True}
+    assert result["strategy_context_performance"]["status"] == "fresh"
     assert "paper_training_mode" not in result
     task = service._strategy_learning_context_refresh_tasks.get("paper")
     assert task is not None and not task.done()

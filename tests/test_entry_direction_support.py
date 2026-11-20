@@ -175,6 +175,30 @@ def test_direct_training_contract_cannot_bypass_recent_side_loss_guard() -> None
     ) == {}
 
 
+@pytest.mark.parametrize("validated", [False, True])
+def test_versioned_cross_symbol_feedback_only_restricts_training(validated):
+    from tests.normal_paper_test_fixtures import paper_quality_permissions
+
+    entry = {**_row("local_ml"), "model_version": "a",
+             "paper_return_quality_governance": paper_quality_permissions()["local_ml"],
+             "paper_training_only": not validated}
+    strategy = {"paper_training_settlements": {"status": "complete", "profiles": {
+        "a|long|30": {"sample_count": 5, "symbol_count": 4, "losing_symbols": 3, "net_usdt": -4},
+    }}}
+    support = assess_paper_model_trade_support(
+        {"long": {"evidence": [entry]}, "short": {"evidence": [_row("local_ml", raw=-1, objective=-1)]}},
+        [], "long", execution_cost_pct=0.1, strategy_mode=strategy, symbol="NEW/USDT",
+    )
+    assert support["recent_side_loss_guard"]["training_cohort"]["blocked"]
+    selection = select_normal_paper_trade_side({"long": support})
+    assert selection["selected"] is validated
+    if not validated:
+        assert build_normal_paper_trade_contract(
+            symbol="NEW/USDT", side="long", selection_reason="paper_training_entry",
+            direction_support=support,
+        ) == {}
+
+
 @pytest.mark.parametrize("qualified_source", ["local_ml", "server_profit"])
 def test_qualified_model_keeps_normal_entry_with_unqualified_observation_tools(
     qualified_source: str,

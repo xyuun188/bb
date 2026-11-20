@@ -193,6 +193,7 @@ from services.okx_settlement_fact_sync import OkxSettlementFactSyncService
 from services.open_positions_execution_applier import OpenPositionsExecutionApplier
 from services.paper_bootstrap_canary import assess_paper_canary_position_horizon
 from services.paper_training import assess_paper_training_position_horizon
+from services.paper_training_settlements import load_paper_training_profiles
 from services.pending_exit_recovery import PendingExitDecisionRecoveryProcessor
 from services.portfolio_profit_protection import PortfolioProfitProtectionPolicy
 from services.position_execution_persistence import PositionExecutionPersistenceService
@@ -3677,6 +3678,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     selected_mode
                 ),
             }
+            if selected_mode == "paper":
+                loaders["paper_training_settlements"] = load_paper_training_profiles
             if (
                 selected_mode == "paper"
                 and getattr(self, "continuous_model_weight_evidence_service", None) is not None
@@ -7773,6 +7776,19 @@ class TradingService(ModelTrainingCoordinatorMixin):
         context["execution_trade_calibration"] = self._safe_dict(
             performance_values.get("execution_trade_calibration")
         )
+        # Keep risk evidence and its freshness together even on learning-cache hits.
+        current_evidence = {
+            "strategy_context_performance": performance_snapshot,
+            "symbol_side_performance": symbol_side_perf,
+            "execution_trade_calibration": context["execution_trade_calibration"],
+        }
+        if selected_mode == "paper":
+            current_evidence["paper_training_settlements"] = (
+                performance_values.get("paper_training_settlements")
+                if "paper_training_settlements" not in (performance_snapshot.get("failed_labels") or [])
+                else None
+            )
+        context.update(current_evidence)
         if continuous_weight_report:
             context["continuous_model_weights"] = continuous_weight_report
         if _analysis_scope_context.get() == "market":
@@ -7814,13 +7830,12 @@ class TradingService(ModelTrainingCoordinatorMixin):
                             **(
                                 {
                                     "continuous_model_weights": continuous_weight_report,
-                                    "strategy_context_performance": performance_snapshot,
                                 }
                                 if continuous_weight_report
                                 else {}
                             ),
                             "strategy_learning_cache_status": "stale_background_refresh",
-                            "execution_trade_calibration": context["execution_trade_calibration"],
+                            **current_evidence,
                             "strategy_learning_error": (
                                 "市场扫描轮使用最近一次策略学习上下文，后台刷新学习结果，"
                                 "不让慢学习查询阻塞开仓候选发现。"
@@ -7845,7 +7860,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     else:
                         refreshed_context = self._refresh_dynamic_capacity(
                             open_positions=open_positions or [],
-                            strategy_context=dict(learned_context),
+                            strategy_context={**learned_context, **current_evidence},
                             market_regime=market_regime,
                             account_equity=account_equity,
                         )
@@ -7885,7 +7900,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             learned_context = next(iter(done)).result()
             refreshed_context = self._refresh_dynamic_capacity(
                 open_positions=open_positions or [],
-                strategy_context=dict(learned_context),
+                strategy_context={**learned_context, **current_evidence},
                 market_regime=market_regime,
                 account_equity=account_equity,
             )
@@ -7905,13 +7920,12 @@ class TradingService(ModelTrainingCoordinatorMixin):
                         **(
                             {
                                 "continuous_model_weights": continuous_weight_report,
-                                "strategy_context_performance": performance_snapshot,
                             }
                             if continuous_weight_report
                             else {}
                         ),
                         "strategy_learning_cache_status": "stale_timeout",
-                        "execution_trade_calibration": context["execution_trade_calibration"],
+                        **current_evidence,
                         "strategy_learning_error": (
                             "策略学习上下文超过交易轮次预算，已使用最近一次可用学习上下文，"
                             "后台继续刷新，不阻塞开仓决策。"

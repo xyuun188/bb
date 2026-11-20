@@ -79,6 +79,11 @@ def replay_policy(rows: list[dict[str, Any]]) -> dict[str, Any]:
             ]
             if isinstance(row.get("strategy_mode"), dict):
                 guard = _recent_side_loss_guard(row["strategy_mode"], side, row["symbol"])
+                frozen = (support.get("recent_side_loss_guard") or {}).get("training_cohort")
+                if isinstance(frozen, dict):
+                    guard["training_cohort"] = frozen
+                    if frozen.get("blocked") is True:
+                        guard.update(blocked=True, reason=frozen["reason"])
                 support["recent_side_loss_guard"] = guard
                 counts["side_loss_guard_snapshots_available"] += guard["enabled"]
                 counts["side_loss_guard_snapshots_losing"] += guard["blocked"]

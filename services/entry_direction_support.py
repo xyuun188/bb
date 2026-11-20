@@ -14,6 +14,7 @@ from services.normal_paper_trade import (
     normal_paper_current_return_ready,
     normal_paper_entry_return_ready,
 )
+from services.paper_training_settlements import training_feedback
 
 INDEPENDENT_DIRECTION_SUPPORT_VERSION = "2026-11-17.scoped-paper-model-direction.v21"
 PAPER_MODEL_TRADE_SCOPE = "paper_model_trade"
@@ -618,6 +619,24 @@ def assess_directional_entry_support(
             for source in item.get("sources") or []
         }
     )
+    strategy = _dict(strategy_mode)
+    if paper_scope and quantitative_sources == ["local_ml"] and (
+        "paper_training_settlements" in strategy
+        or any(_dict(row).get("model_version") for row in selected_evidence)
+    ):
+        versions = {
+            row.get("model_version") for row in selected_evidence if isinstance(row, dict)
+            and row.get("source") == "local_ml"
+            and _float(row.get("horizon_minutes")) == prediction_horizon_minutes
+        }
+        feedback = training_feedback(
+            strategy.get("paper_training_settlements"),
+            version=next(iter(versions)) if len(versions) == 1 else None,
+            side=side, horizon=prediction_horizon_minutes,
+        )
+        recent_side_loss_guard["training_cohort"] = feedback
+        if feedback["blocked"]:
+            recent_side_loss_guard.update(blocked=True, reason=feedback["reason"])
     quant_quality_permissions = {
         source: permission
         for source, permission in quant_quality_permissions.items()
