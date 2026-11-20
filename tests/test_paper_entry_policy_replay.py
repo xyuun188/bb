@@ -32,11 +32,10 @@ def test_replay_uses_new_training_policy_without_mutating_historical_evidence() 
     row = _row()
     original = deepcopy(row)
     report = replay_policy([row])
-    assert report["counts"]["newly_selection_contract_ready"] == 1
+    assert report["counts"]["still_blocked"] == 1
     assert report["counts"].get("contract_rejected", 0) == 0
-    assert report["ready_sides"] == {"short": 1}
-    assert report["examples"][0]["selection_reason"] == "paper_training_entry"
-    assert report["examples"][0]["production_permission"] is False
+    assert report["ready_sides"] == {}
+    assert report["blocking_reasons"]["direction_support_risk_adjusted_return_not_positive"] == 1
     assert report["submits_orders"] is False
     assert report["counts"]["side_loss_guard_context_missing"] == 1
     assert row == original
@@ -55,6 +54,9 @@ def test_replay_preserves_upstream_blockers() -> None:
 
 def test_replay_uses_settled_side_loss_guard_without_changing_source_evidence() -> None:
     row = _row()
+    row["selection"]["by_side"]["short"].update(
+        objective_net_return_pct=0.1, blocking_reasons=[], paper_training_only=True,
+    )
     row["strategy_mode"] = {
         "strategy_context_performance": {
             "available": True, "status": "fresh",

@@ -70,13 +70,7 @@ def replay_policy(rows: list[dict[str, Any]]) -> dict[str, Any]:
             counts["missing_support"] += 1
             continue
         by_side = deepcopy(selection["by_side"])
-        # This reason was added by the old selector, after direction support.
-        # Re-run selection from that stage without erasing any upstream guard.
         for side, support in by_side.items():
-            support["blocking_reasons"] = [
-                reason for reason in support.get("blocking_reasons") or []
-                if reason != "direction_support_risk_adjusted_return_not_positive"
-            ]
             if isinstance(row.get("strategy_mode"), dict):
                 guard = _recent_side_loss_guard(row["strategy_mode"], side, row["symbol"])
                 frozen = (support.get("recent_side_loss_guard") or {}).get("training_cohort")

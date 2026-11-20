@@ -341,6 +341,7 @@ async def test_local_context_recovers_training_scope_from_exact_entry_snapshot(
         "prediction_horizon_minutes": 30.0,
         "expected_net_return_pct": 0.8,
         "current_raw_expected_return_pct": 0.9,
+        "direction_objective_net_return_pct": 0.3,
         "objective_net_return_pct": 0.3,
             "authorized": True,
             "execution_scope": "paper_only",

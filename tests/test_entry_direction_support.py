@@ -251,7 +251,7 @@ def test_qualified_model_keeps_normal_entry_with_unqualified_observation_tools(
     )
 
 
-def test_negative_objective_with_unproven_history_only_selects_bounded_training() -> None:
+def test_negative_objective_with_unproven_history_stays_observation_only() -> None:
     row = _row("local_ml", raw=0.6, objective=-0.2)
     row["paper_return_quality_governance"] = {"paper_execution_permission": True}
     support = assess_paper_model_trade_support(
@@ -264,9 +264,8 @@ def test_negative_objective_with_unproven_history_only_selects_bounded_training(
 
     selection = select_normal_paper_trade_side({"long": support})
 
-    assert selection["selected"] is True
-    assert selection["selection_reason"] == "paper_training_entry"
-    assert selection["selected_support"]["paper_training_only"] is True
+    assert selection["selected"] is False
+    assert "direction_support_risk_adjusted_return_not_positive" in selection["blocking_reasons"]
     assert selection["production_permission"] is False
 
 
@@ -324,7 +323,7 @@ def test_training_direction_never_inherits_ordinary_quality_permission(
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_negative_qualified_tool_cannot_hide_positive_training_direction(side) -> None:
     opposite = "short" if side == "long" else "long"
-    training = _row("local_ml", raw=0.6, objective=-0.2)
+    training = _row("local_ml", raw=0.6, objective=0.2)
     training["paper_training_only"] = True
     training["paper_return_quality_governance"] = {"paper_execution_permission": True}
     tool = _row("server_profit", raw=-0.6, objective=-0.8)

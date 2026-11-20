@@ -11,7 +11,7 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-11-17.normal-paper-strategy-trade.v24"
+NORMAL_PAPER_TRADE_VERSION = "2026-11-21.normal-paper-strategy-trade.v25"
 NORMAL_PAPER_SIDE_SELECTION_POLICY = "2026-11-17.quality-first-side-selection.v2"
 NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-11-20.normal-paper-dynamic-risk.v15"
 HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS = frozenset(
@@ -32,6 +32,7 @@ NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
 HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS = frozenset(
     {
+        "2026-11-17.normal-paper-strategy-trade.v24",
         "2026-11-14.normal-paper-strategy-trade.v23",
         "2026-10-31.normal-paper-strategy-trade.v22",
         "2026-10-30.normal-paper-strategy-trade.v21",
@@ -71,7 +72,7 @@ NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION = 0.005
 HISTORICAL_PAPER_TRAINING_SINGLE_TRADE_RISK_FRACTION = 0.0001
 HISTORICAL_PAPER_TRAINING_PORTFOLIO_RISK_FRACTION = 0.0003
 HISTORICAL_SHARED_RISK_PAPER_TRAINING_VERSIONS = frozenset(
-    {"2026-11-14.normal-paper-strategy-trade.v23"}
+    {"2026-11-14.normal-paper-strategy-trade.v23", "2026-11-17.normal-paper-strategy-trade.v24"}
 )
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
 NORMAL_PAPER_TRADE_DIRECTION_CONCENTRATION_ALERT_THRESHOLD = 0.80
@@ -460,6 +461,7 @@ def _contract_fingerprint_payload(contract: dict[str, Any]) -> dict[str, Any]:
             "valid_for_seconds",
             "expected_net_return_pct",
             "current_raw_expected_return_pct",
+            "direction_objective_net_return_pct",
             "objective_net_return_pct",
             "current_edge_validated",
             "loss_probability",
@@ -510,6 +512,8 @@ def select_normal_paper_trade_side(
         objective_net = _float(support.get("objective_net_return_pct"), None)
         if objective_net is None:
             reasons.append("direction_support_objective_net_missing")
+        elif objective_net <= 0:
+            reasons.append("direction_support_risk_adjusted_return_not_positive")
         if not support.get("quant_evidence_families"):
             if not support.get("quant_family_summaries"):
                 reasons.append("direction_support_quant_evidence_missing")
@@ -571,7 +575,6 @@ def select_normal_paper_trade_side(
             and (
                 observation_only
                 or quality_permission_denied
-                or not ordinary_return_ready
                 or support.get("paper_training_only") is True
             )
         )
@@ -612,10 +615,6 @@ def select_normal_paper_trade_side(
                                 ["historical_quality_gate_is_observation_only"]
                                 if observation_only or quality_permission_denied else []
                             ),
-                            *(
-                                ["positive_mean_with_non_positive_risk_adjusted_return"]
-                                if not ordinary_return_ready else []
-                            ),
                             "current_directional_evidence_is_training_eligible",
                         ],
                     }
@@ -631,10 +630,6 @@ def select_normal_paper_trade_side(
                     "selection_reason": selection_reason,
                     "quality_permission_ready": quality_permission_ready,
                 }
-            )
-        elif current_edge and not ordinary_return_ready:
-            support["blocking_reasons"].append(
-                "direction_support_risk_adjusted_return_not_positive"
             )
 
     candidates.sort(
@@ -829,7 +824,6 @@ def build_normal_paper_trade_contract(
             and not normal_paper_entry_return_ready(
                 expected_net,
                 objective_net,
-                paper_training_only=paper_training_only,
             )
         )
         or (
@@ -896,6 +890,9 @@ def build_normal_paper_trade_contract(
         "valid_for_seconds": horizon * 60.0,
         "expected_net_return_pct": expected_net,
         "current_raw_expected_return_pct": current_raw_expected,
+        # Immutable selection evidence. The legacy objective field is used as
+        # the executable downside by sizing once a quote has been reconciled.
+        "direction_objective_net_return_pct": objective_net,
         "objective_net_return_pct": objective_net,
         "loss_probability": loss_probability,
         "quant_evidence_families": list(support.get("quant_evidence_families") or []),
@@ -941,11 +938,15 @@ def reconcile_normal_paper_trade_contract(
     contract = dict(_dict(value))
     if contract.get("version") != NORMAL_PAPER_TRADE_VERSION:
         return contract
+    original_valid = not normal_paper_entry_contract_reasons(contract)
     scored = _dict(opportunity)
     expected_net = _float(scored.get("expected_net_return_pct"), None)
     return_lcb = _float(scored.get("return_lcb_pct"), None)
 
     distribution = _dict(scored.get("return_distribution_contract"))
+    training_entry = contract.get("selection_reason") == "paper_training_entry"
+    quote_objective = _float(distribution.get("objective_expected_return_pct"), None)
+    quote_lower = _float(distribution.get("lower_quantile_return_pct"), None)
     gross_distribution = _dict(distribution.get("gross_market_distribution"))
     gross_expected = _float(gross_distribution.get("raw_expected_return_pct"), None)
     previous = {
@@ -984,13 +985,14 @@ def reconcile_normal_paper_trade_contract(
         )
     )
     contract["loss_probability"] = current_loss_probability
-    training_entry = selection_reason == "paper_training_entry"
     training_entry_eligible = bool(
         training_entry
         and contract.get("paper_training_only") is True
         and contract["current_edge_validated"]
         and current_raw is not None
         and current_raw > 0.0
+        and quote_objective is not None and quote_objective > 0.0
+        and quote_lower is not None
         and normal_paper_entry_return_ready(
             expected_net, return_lcb, paper_training_only=True,
         )
@@ -1009,7 +1011,7 @@ def reconcile_normal_paper_trade_contract(
             NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
         )
     )
-    entry_eligible = training_entry_eligible or validated_entry_eligible
+    entry_eligible = original_valid and (training_entry_eligible or validated_entry_eligible)
     reconciliation_reason = (
         "current_execution_expected_return_missing"
         if expected_net is None
@@ -1019,12 +1021,18 @@ def reconcile_normal_paper_trade_contract(
         if return_lcb is None
         else "current_execution_return_lcb_not_positive"
         if return_lcb <= 0.0 and not training_entry
+        else "current_execution_direction_objective_not_positive"
+        if training_entry and (quote_objective is None or quote_objective <= 0)
+        else "current_execution_lower_quantile_missing"
+        if training_entry and quote_lower is None
         else "current_execution_loss_probability_missing"
         if current_loss_probability is None
         else "current_execution_loss_probability_invalid"
         if not 0.0 <= current_loss_probability <= (
             NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
         )
+        else "original_direction_contract_not_authorized"
+        if not original_valid
         else None
     )
     contract["reconciliation"] = {
@@ -1045,10 +1053,15 @@ def reconcile_normal_paper_trade_contract(
                 round(expected_net, 8) if expected_net is not None else None
             ),
             "return_lcb_pct": round(return_lcb, 8) if return_lcb is not None else None,
+            "risk_adjusted_net_return_pct": quote_objective,
+            "lower_quantile_net_return_pct": quote_lower,
             "new_entry_return_ready": (
                 normal_paper_entry_return_ready(
                     expected_net, return_lcb, paper_training_only=training_entry,
                 )
+                and (not training_entry or (
+                    quote_objective is not None and quote_objective > 0 and quote_lower is not None
+                ))
             ),
             "positive_return_lcb_required": not training_entry,
             "gross_expected_return_pct": (
@@ -1198,6 +1211,10 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_quality_observation_shadow_only")
     if require_new_entry_permission and contract.get("current_edge_validated") is not True:
         reasons.append("normal_paper_trade_current_edge_not_validated")
+    if require_new_entry_permission and (
+        _float(contract.get("direction_objective_net_return_pct"), 0.0) <= 0.0
+    ):
+        reasons.append("normal_paper_trade_direction_objective_not_positive")
     if str(contract.get("side") or "").lower() not in {"long", "short"}:
         reasons.append("normal_paper_trade_side_missing")
     if not str(contract.get("symbol") or "").strip():

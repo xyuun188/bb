@@ -114,6 +114,7 @@ def _decision() -> DecisionOutput:
                 "return_distribution_contract": {
                     "raw_expected_return_pct": 0.9,
                     "objective_expected_return_pct": 0.6,
+                    "lower_quantile_return_pct": 0.2,
                     "uncertainty_penalty_pct": 0.1,
                     "tail_loss_penalty_pct": 0.2,
                     "tail_loss_probability": 0.25,
@@ -221,6 +222,8 @@ def _use_bounded_training_entry(
     normal_trade.update(
         {
             "selection_reason": "paper_training_entry",
+            "direction_objective_net_return_pct": 0.52,
+            "current_edge_validated": True,
             "paper_quality_observation_only": False,
             "paper_training_only": True,
             "paper_quality_mode": "training",
@@ -235,7 +238,7 @@ def _use_bounded_training_entry(
             ),
         }
     )
-    normal_trade["contract_fingerprint"] = _fingerprint(
+    normal_trade["contract_fingerprint"] = normal_paper_fingerprint(
         _contract_fingerprint_payload(normal_trade)
     )
     return normal_trade
@@ -354,8 +357,7 @@ async def test_bounded_training_with_negative_downside_passes_execution_contract
     training = _decision()
     _use_bounded_training_entry(training)
     opportunity = training.raw_response["opportunity_score"]
-    opportunity["return_lcb_pct"] = -3.0
-    opportunity["return_distribution_contract"]["objective_expected_return_pct"] = -3.0
+    opportunity["return_distribution_contract"]["lower_quantile_return_pct"] = -3.0
     opportunity["execution_cost"].update(order_size_complete=True, order_notional_usdt=800.0)
     training.raw_response.update(
         pre_order_execution_facts={"production_eligible": True, "input_fingerprint": "test"},
@@ -366,8 +368,9 @@ async def test_bounded_training_with_negative_downside_passes_execution_contract
     sizing = training.raw_response["profit_risk_sizing"]
     assert sizing["paper_training_order_economics"]["passed"] is True
     assert sizing["production_eligible"] is True
-    assert sizing["return_lcb_pct"] < 0.0
-    assert sizing["stressed_loss_fraction"] >= -sizing["return_lcb_pct"] / 100.0
+    assert sizing["return_lcb_pct"] > 0.0
+    assert sizing["stressed_loss_fraction"] >= 0.03
+    assert training.stop_loss_pct == pytest.approx(0.02)
     assert 0.0 < sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
     assert RiskEngine().assess(training, [], 1000.0).approved is True
     assert reconcile_profit_risk_sizing(
@@ -1055,7 +1058,7 @@ async def test_native_price_band_blocks_unaffordable_training_minimum_during_siz
     decision.action = Action.LONG if side == "long" else Action.SHORT
     normal = decision.raw_response["normal_paper_trade"]
     normal["side"] = side
-    normal["contract_fingerprint"] = _fingerprint(_contract_fingerprint_payload(normal))
+    normal["contract_fingerprint"] = normal_paper_fingerprint(_contract_fingerprint_payload(normal))
     decision.feature_snapshot.update(buy_price_limit=102.0, sell_price_limit=98.0)
     decision.raw_response["exchange_risk_facts"]["contract_specs"]["BTC-USDT-SWAP"].update(
         minSz="2", lotSz="2", tickSz="0.01",
@@ -1110,7 +1113,7 @@ async def test_daily_extremes_do_not_expand_entry_protection_risk(side: str) -> 
     decision.action = Action.LONG if side == "long" else Action.SHORT
     normal = decision.raw_response["normal_paper_trade"]
     normal["side"] = side
-    normal["contract_fingerprint"] = _fingerprint(_contract_fingerprint_payload(normal))
+    normal["contract_fingerprint"] = normal_paper_fingerprint(_contract_fingerprint_payload(normal))
     decision.feature_snapshot.update(
         last=100.0, bid=99.9, ask=100.1, buy_price_limit=102.0, sell_price_limit=98.0,
     )

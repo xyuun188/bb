@@ -1185,7 +1185,7 @@ def test_current_bounded_training_entry_is_attributed_as_v21_training_fill() -> 
             "prediction_horizon_minutes": 30.0,
             "expected_net_return_pct": 0.35,
             "raw_expected_return_pct": 0.5,
-            "objective_net_return_pct": -0.2,
+            "objective_net_return_pct": 0.2,
             "loss_probability": 0.3,
             "quant_evidence_families": ["local_ml"],
             "quant_quality_permissions": permissions,

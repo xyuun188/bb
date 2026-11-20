@@ -287,11 +287,12 @@ def test_reconcile_allows_bounded_training_entry_with_non_positive_lcb() -> None
         contract,
         {
             "expected_net_return_pct": 0.08,
-            "return_lcb_pct": -0.22,
+            "return_lcb_pct": 0.02,
             "server_profit_loss_probability": 0.4,
             "execution_cost": {"total_pct": 0.19},
             "return_distribution_contract": {
-                "gross_market_distribution": {"raw_expected_return_pct": 0.27}
+                "gross_market_distribution": {"raw_expected_return_pct": 0.27},
+                "objective_expected_return_pct": 0.02, "lower_quantile_return_pct": -0.22,
             },
         },
     )
@@ -301,6 +302,7 @@ def test_reconcile_allows_bounded_training_entry_with_non_positive_lcb() -> None
     assert reconciled["reconciliation"]["reason"] is None
     assert reconciled["reconciliation"]["current"]["new_entry_return_ready"] is True
     assert reconciled["reconciliation"]["current"]["positive_return_lcb_required"] is False
+    assert reconciled["reconciliation"]["current"]["lower_quantile_net_return_pct"] == -0.22
     assert normal_paper_entry_contract_reasons(reconciled) == []
 
 
@@ -680,7 +682,7 @@ def test_unpromoted_quality_model_stays_shadow_only() -> None:
     assert selection["selection_reason"] == "no_direction"
 
 
-def test_current_positive_fee_after_mean_with_negative_downside_selects_training() -> None:
+def test_current_positive_mean_with_negative_direction_score_stays_shadow() -> None:
     support = _quality_observation_support(
         "short",
         expected_net=0.08,
@@ -691,12 +693,11 @@ def test_current_positive_fee_after_mean_with_negative_downside_selects_training
 
     selection = select_normal_paper_trade_side({"short": support})
 
-    assert selection["selected"] is True
-    assert selection["selected_side"] == "short"
-    assert selection["selection_reason"] == "paper_training_entry"
+    assert selection["selected_side"] == "neutral"
+    assert "direction_support_risk_adjusted_return_not_positive" in selection["blocking_reasons"]
 
 
-def test_current_positive_signal_with_negative_downside_and_denied_history_selects_training() -> None:
+def test_denied_history_does_not_override_negative_direction_score() -> None:
     support = _support(
         "short",
         expected_net=0.08,
@@ -710,9 +711,7 @@ def test_current_positive_signal_with_negative_downside_and_denied_history_selec
 
     selection = select_normal_paper_trade_side({"short": support})
 
-    assert selection["selected"] is True
-    assert selection["selected_side"] == "short"
-    assert selection["selection_reason"] == "paper_training_entry"
+    assert selection["selected_side"] == "neutral"
 
 
 def test_current_positive_edge_does_not_override_denied_quality_permission() -> None:
@@ -927,10 +926,11 @@ def test_training_same_quality_tier_preserves_return_ranking(
 ) -> None:
     other_side = "short" if preferred_side == "long" else "long"
     supports = {
-        preferred_side: _support(preferred_side, expected_net=0.5, objective_net=-1.0),
-        other_side: _support(other_side, expected_net=0.2, objective_net=-1.0),
+        preferred_side: _support(preferred_side, expected_net=0.5, objective_net=0.1),
+        other_side: _support(other_side, expected_net=0.2, objective_net=0.1),
     }
     for support in supports.values():
+        support["paper_training_only"] = True
         support["quant_quality_permissions"]["local_ml"][
             "paper_execution_permission"
         ] = quality_ready
@@ -943,11 +943,11 @@ def test_quality_permission_flag_alone_cannot_gain_training_priority(
     preferred_side: str,
 ) -> None:
     other_side = "short" if preferred_side == "long" else "long"
-    unverified = _support(other_side, expected_net=0.2, objective_net=-1.0)
+    unverified = _support(other_side, expected_net=0.2, objective_net=0.1)
     unverified["quant_quality_permissions"]["local_ml"][
         "paper_execution_evidence"
     ] = {"sample_count": 0}
-    other = _support(preferred_side, expected_net=0.5, objective_net=-1.0)
+    other = _support(preferred_side, expected_net=0.5, objective_net=0.1)
     other["quant_quality_permissions"]["local_ml"][
         "paper_execution_permission"
     ] = False
@@ -959,7 +959,7 @@ def test_quality_permission_flag_alone_cannot_gain_training_priority(
 
 def test_equal_training_returns_and_quality_remain_neutral() -> None:
     selection = select_normal_paper_trade_side({
-        side: _support(side, expected_net=0.35, objective_net=-1.7)
+        side: {**_support(side, expected_net=0.35, objective_net=0.1), "paper_training_only": True}
         for side in ("long", "short")
     })
 
@@ -995,7 +995,7 @@ def test_quality_observation_rejects_excessive_loss_probability() -> None:
 
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("objective", [0.0, -0.8251118651])
-def test_positive_mean_negative_objective_uses_bounded_training(
+def test_positive_mean_nonpositive_direction_score_cannot_create_training_order(
     side: str, objective: float,
 ) -> None:
     support = _quality_observation_support(
@@ -1005,21 +1005,13 @@ def test_positive_mean_negative_objective_uses_bounded_training(
     support["loss_probability"] = 0.549535456
     selection = select_normal_paper_trade_side({side: support})
 
-    assert selection["selected_side"] == side
-    assert selection["selection_reason"] == "paper_training_entry"
-    assert "positive_mean_with_non_positive_risk_adjusted_return" in (
-        selection["selected_support"]["paper_training_reasons"]
-    )
+    assert selection["selected_side"] == "neutral"
     contract = build_normal_paper_trade_contract(
         symbol="ALGO/USDT", side=side,
-        selection_reason=selection["selection_reason"],
-        direction_support=selection["selected_support"],
+        selection_reason="paper_training_entry",
+        direction_support={**support, "paper_training_only": True},
     )
-    assert normal_paper_entry_contract_reasons(contract) == []
-    assert contract["single_trade_risk_fraction_cap"] == 0.005
-    assert "portfolio_risk_fraction_cap" not in contract
-    assert contract["production_permission"] is False
-    assert contract["execution_scope"] == "paper_only"
+    assert contract == {}
     assert support.get("paper_training_only") is None
 
 
@@ -1042,7 +1034,7 @@ def test_positive_mean_negative_objective_uses_bounded_training(
     ],
 )
 def test_relaxed_training_policy_keeps_other_entry_guards(field: str, value: object) -> None:
-    support = _support("short", expected_net=0.2, objective_net=-0.8)
+    support = {**_support("short", expected_net=0.2, objective_net=0.1), "paper_training_only": True}
     support[field] = value
     assert select_normal_paper_trade_side({"short": support})["selected"] is False
 
@@ -1051,7 +1043,7 @@ def test_relaxed_training_policy_keeps_other_entry_guards(field: str, value: obj
 @pytest.mark.parametrize("value", [None, float("nan"), float("inf")])
 def test_relaxed_training_rechecks_current_execution_evidence(field: str, value: object) -> None:
     selection = select_normal_paper_trade_side(
-        {"short": _support("short", expected_net=0.2, objective_net=-0.8)},
+        {"short": {**_support("short", expected_net=0.2, objective_net=0.1), "paper_training_only": True}},
     )
     contract = build_normal_paper_trade_contract(
         symbol="ALGO/USDT", side="short",
@@ -1069,6 +1061,34 @@ def test_relaxed_training_rechecks_current_execution_evidence(field: str, value:
     reconciled = reconcile_normal_paper_trade_contract(contract, opportunity)
     assert reconciled["authorized"] is False
     assert normal_paper_entry_contract_reasons(reconciled)
+
+
+def test_quote_cannot_replace_frozen_direction_or_resign_invalid_permission() -> None:
+    support = {**_support("long", expected_net=0.3, objective_net=0.15), "paper_training_only": True}
+    contract = build_normal_paper_trade_contract(
+        symbol="BTC/USDT", side="long", selection_reason="paper_training_entry", direction_support=support,
+    )
+    quote = {
+        "expected_net_return_pct": 0.22, "return_lcb_pct": -0.1, "loss_probability": 0.3,
+        "return_distribution_contract": {"gross_market_distribution": {"raw_expected_return_pct": 0.35},
+                                         "objective_expected_return_pct": 0.04, "lower_quantile_return_pct": -0.1},
+    }
+    first = reconcile_normal_paper_trade_contract(contract, quote)
+    second = reconcile_normal_paper_trade_contract(first, quote)
+    assert second["authorized"] and second["direction_objective_net_return_pct"] == 0.15
+    for score in (None, 0, -0.01, float("nan")):
+        bad_quote = {**quote, "return_distribution_contract": {
+            **quote["return_distribution_contract"], "objective_expected_return_pct": score,
+        }}
+        denied = reconcile_normal_paper_trade_contract(first, bad_quote)
+        assert not denied["authorized"] and not reconcile_normal_paper_trade_contract(denied, quote)["authorized"]
+    for score in (-0.01, None, 0.9):
+        assert not reconcile_normal_paper_trade_contract(
+            {**first, "direction_objective_net_return_pct": score}, quote,
+        )["authorized"]
+    historical = {**contract, "version": "2026-11-17.normal-paper-strategy-trade.v24"}
+    assert normal_paper_entry_contract_reasons(historical)
+    assert not normal_paper_settlement_contract_reasons(historical)
 
 
 def test_existing_signed_contract_can_be_attached_to_paper_decision() -> None:

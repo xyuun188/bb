@@ -2165,6 +2165,12 @@ class EntryProfitRiskSizingPolicy:
             0.01,
         )
         protection_stop_fraction = stress_fraction
+        # A lower forecast quantile can reduce size, never widen the stop.
+        negative_lcb_stress_fraction = max(
+            negative_lcb_stress_fraction,
+            -_safe_float(distribution.get("lower_quantile_return_pct"), 0.0) / 100.0,
+        )
+        stress_fraction = max(stress_fraction, negative_lcb_stress_fraction)
         stop_slippage_distribution = _same_mode_stop_slippage_distribution(
             opportunity,
             model_mode,
@@ -2369,7 +2375,9 @@ class EntryProfitRiskSizingPolicy:
             # slippage floor. Reuse it while repricing size so its delta is
             # applied once, not once in scoring and again in sizing.
             execution_slippage_floor_pct=execution_slippage_floor_pct,
-            paper_training_only=training_mode,
+            # This input is the repriced objective, not the loss quantile.
+            # Both entry types must find a size with a positive objective.
+            paper_training_only=False,
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (
@@ -2460,7 +2468,8 @@ class EntryProfitRiskSizingPolicy:
         decision.raw_response = raw
         training_shadow_only = False
         negative_lcb_stress_fraction = max(
-            negative_lcb_stress_fraction, -return_lcb / 100.0, 0.0
+            negative_lcb_stress_fraction, -return_lcb / 100.0,
+            -_safe_float(distribution.get("lower_quantile_return_pct"), 0.0) / 100.0, 0.0,
         )
         stress_fraction = max(stress_fraction, negative_lcb_stress_fraction)
         risk_limited_notional = risk_budget / stress_fraction

@@ -128,6 +128,14 @@ def _governed_payload(long_return: float, short_return: float) -> dict:
 
 def _paper_payload(long_return: float, short_return: float) -> dict:
     payload = _governed_payload(long_return, short_return)
+    payload["predictions"] = [{
+        "horizon_minutes": 30,
+        "fee_after_side_selection": {
+            "return_semantics": "risk_adjusted_net_after_counterfactual_execution_cost",
+            "long": {"objective_net_return_pct": long_return},
+            "short": {"objective_net_return_pct": short_return},
+        },
+    }]
     payload.update(
         {
             "route_mode": "paper_analysis",
@@ -158,6 +166,12 @@ def _governed_ml(long_return: float, short_return: float) -> dict:
         },
         "predictions": [
             {
+                "horizon_minutes": 30,
+                "fee_after_side_selection": {
+                    "return_semantics": "risk_adjusted_net_after_counterfactual_execution_cost",
+                    "long": {"objective_net_return_pct": long_return},
+                    "short": {"objective_net_return_pct": short_return},
+                },
                 "best_side": "long" if long_return >= short_return else "short",
                 "return_distribution_contract_version": (
                     RETURN_DISTRIBUTION_CONTRACT_VERSION
@@ -182,6 +196,28 @@ def _context(*, ml=None, tools=None, feature=None, market=None, strategy=None) -
         market,
         strategy,
     )
+
+
+@pytest.mark.parametrize("selected", ["long", "short"])
+@pytest.mark.parametrize("score", [-0.8, 0.0, None, float("nan"), 0.15])
+def test_paper_ml_requires_a_positive_frozen_fee_after_score(selected, score):
+    signal = _governed_ml(0.8, 0.6)
+    primary = signal["predictions"][0]
+    primary["horizon_minutes"] = 30
+    primary["fee_after_side_selection"] = {
+        "return_semantics": "risk_adjusted_net_after_counterfactual_execution_cost",
+        **{side: {"objective_net_return_pct": score if side == selected else -1.2}
+           for side in ("long", "short")},
+    }
+    context = _context(ml=signal, strategy={"execution_mode": "paper"})
+    for side in ("long", "short"):
+        row = next(i for i in context[side]["evidence"] if i["source"] == "local_ml")
+        allowed = side == selected and score == 0.15
+        assert row["paper_eligible"] is allowed
+        if not allowed:
+            assert row["decision_eligible"] is False
+            assert row["direction_comparison_eligible"] is True
+            assert row["eligibility_reason"].startswith("model_fee_after_objective_")
 
 
 def test_only_governed_return_models_choose_observed_side() -> None:
@@ -516,7 +552,7 @@ def test_paper_mixed_horizons_select_highest_weight_native_cohort() -> None:
     assert context["enabled"] is True
     assert context["preferred_side"] == "long"
     assert context["selected_horizon_minutes"] == 30
-    assert context["decision_source_count"] == 2
+    assert context["decision_source_count"] == 1
     assert context["aggregate_blockers"] == []
     assert context["horizon_cohort_selection"]["selection_reason"] == (
         "authorized_prediction_horizon"
@@ -541,7 +577,7 @@ def test_high_weight_tool_horizon_cannot_displace_authorized_model_horizon() -> 
         server["return_distribution_contract"][side]["horizon_minutes"] = 60
 
     context = _context(
-        ml=_governed_ml(0.8, -0.2),
+        ml=_governed_ml(0.8, 0.2),
         tools={"profit_prediction": server},
         feature={
             "timestamp": "2026-08-17T00:00:00+00:00",
@@ -745,9 +781,7 @@ def test_missing_opposite_loss_probability_keeps_only_return_comparison(
     )
     payload.pop(f"{opposite}_loss_probability")
     if source == "local_ml":
-        payload["predictions"] = [{
-            "return_distribution_contract": deepcopy(payload["return_distribution_contract"]),
-        }]
+        payload["predictions"][0]["return_distribution_contract"] = deepcopy(payload["return_distribution_contract"])
     signal = payload if source == "local_ml" else None
     if blueprint_blocks_opposite:
         signal = signal or {}

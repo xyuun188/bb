@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any
 
 from services.entry_signal_extraction import (
@@ -437,6 +438,7 @@ class EntryDirectionCompetitionPolicy:
                 # validated return distribution still provides its baseline.
                 item["direction_comparison_eligible"] = bool(
                     item.get("decision_eligible") is True
+                    or item.get("direction_comparison_eligible") is True
                 )
                 item.update(
                     decision_eligible=False,
@@ -708,10 +710,8 @@ class EntryDirectionCompetitionPolicy:
     ) -> None:
         signal = _safe_dict(ml_signal_context)
         predictions = _safe_list(signal.get("predictions"))
-        primary = _safe_dict(predictions[0] if predictions else {})
         influence = _safe_dict(signal.get("influence_policy"))
         production = signal_production_eligibility(signal)
-        multitask = _safe_dict(primary.get("multitask_prediction"))
         for side in ("long", "short"):
             side_policy = _safe_dict(influence.get(side))
             distribution_eligibility = signal_return_distribution_eligibility(
@@ -719,8 +719,13 @@ class EntryDirectionCompetitionPolicy:
                 side,
             )
             contract = signal_return_distribution(signal, side)
+            primary = next(
+                (_safe_dict(p) for p in predictions if _safe_dict(p).get("horizon_minutes")
+                 == contract.get("horizon_minutes")),
+                {},
+            )
             paper = signal_paper_eligibility(signal, side)
-            side_multitask = _safe_dict(multitask.get(side))
+            side_multitask = _safe_dict(_safe_dict(primary.get("multitask_prediction")).get(side))
             production_eligible = bool(
                 production.get("eligible") is True
                 and side_policy.get("enabled") is True
@@ -730,6 +735,22 @@ class EntryDirectionCompetitionPolicy:
                 paper.get("eligible") is True
                 and distribution_eligibility.get("eligible") is True
             )
+            fee_after = _safe_dict(primary.get("fee_after_side_selection"))
+            model_score = _safe_float(_safe_dict(fee_after.get(side)).get("objective_net_return_pct"))
+            score_reason = None
+            comparison_eligible = False
+            if execution_scope == "paper" and paper_eligible:
+                if (
+                    fee_after.get("return_semantics") != "risk_adjusted_net_after_counterfactual_execution_cost"
+                    or primary.get("horizon_minutes") != contract.get("horizon_minutes")
+                    or model_score is None or not isfinite(model_score)
+                ):
+                    score_reason = "model_fee_after_objective_missing"
+                elif model_score <= 0:
+                    score_reason = "model_fee_after_objective_not_positive"
+                if score_reason:
+                    comparison_eligible = True
+                    paper_eligible = False
             eligible = (
                 paper_eligible if execution_scope == "paper" else production_eligible
             )
@@ -740,13 +761,17 @@ class EntryDirectionCompetitionPolicy:
                     "side": side,
                     "available": bool(primary),
                     "decision_eligible": eligible,
+                    "direction_comparison_eligible": comparison_eligible,
+                    "model_fee_after_objective_pct": (
+                        model_score if model_score is not None and isfinite(model_score) else None
+                    ),
                     "paper_eligible": paper_eligible,
                     "production_eligible": production_eligible,
                     "observation_only": bool(contract and not eligible),
                     "eligibility_reason": (
                         "live_influence_and_side_readiness_confirmed"
                         if eligible
-                        else str(
+                        else score_reason or str(
                             (
                                 paper.get("reason")
                                 if execution_scope == "paper"
