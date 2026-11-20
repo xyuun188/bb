@@ -111,15 +111,16 @@ def summarize_forward_predictions(
         if side not in {"long", "short"}:
             raise ValueError("common-window model side missing")
         contract = (primary.get("return_distribution_contract") or {}).get(side) or {}
-        expected = _finite(contract.get("objective_expected_return_pct"))
-        lower = _finite(contract.get("lower_quantile_return_pct"))
-        cost = _finite(row.get("execution_cost_pct"))
-        funding = _finite(row.get(f"{side}_funding_return_pct"))
+        fee_after = primary.get("fee_after_side_selection") or {}
+        if fee_after.get("return_semantics") != "risk_adjusted_net_after_counterfactual_execution_cost":
+            raise ValueError("common-window fee-after prediction contract missing")
+        selected_net = fee_after.get(side) or {}
+        net_expected = _finite(selected_net.get("expected_net_return_pct"))
+        net_objective = _finite(selected_net.get("objective_net_return_pct"))
+        net_lower = _finite(selected_net.get("lower_quantile_net_return_pct"))
         realized = _finite(row.get(f"{side}_net_return_after_all_cost_pct"))
-        if None in (expected, lower, cost, funding, realized):
+        if None in (net_expected, net_objective, net_lower, realized):
             raise ValueError("common-window fee-after evidence incomplete")
-        net_expected = float(expected) - float(cost) + float(funding)
-        net_lower = float(lower) - float(cost) + float(funding)
         cost_ready = (
             (primary.get("counterfactual_execution_cost_distribution") or {}).get(side) or {}
         ).get("distribution_ready") is True
@@ -127,7 +128,7 @@ def summarize_forward_predictions(
             reason for reason, passed in (
                 ("return_contract_ineligible", contract.get("production_eligible") is True),
                 ("cost_distribution_not_ready", cost_ready),
-                ("fee_after_expected_not_positive", net_expected > 0),
+                ("fee_after_objective_not_positive", net_objective > 0),
                 ("fee_after_lower_quantile_not_positive", net_lower > 0),
             ) if not passed
         ]
@@ -143,6 +144,8 @@ def summarize_forward_predictions(
             "timestamp": row["decision_timestamp"],
             "net_return_after_all_cost_pct": realized,
             "model_expected_net_return_pct": net_expected,
+            "model_objective_net_return_pct": net_objective,
+            "model_lower_quantile_net_return_pct": net_lower,
             "return_gate_passed": gate_passed,
         }
         samples.append(sample)
@@ -265,6 +268,7 @@ async def run_model_forward_comparison(*, limit: int = 500) -> dict[str, Any]:
         "status": "complete" if observations else "insufficient_forward_evidence",
         "generated_at": evaluated_at.isoformat(),
         "comparison_scope": "same_cost_complete_post_training_decisions",
+        "prediction_metric_version": "model_fee_after_forecast_and_objective_v2",
         "diagnostic_only": True,
         "promotion_authorized": False,
         "submits_orders": False,
@@ -282,8 +286,8 @@ async def run_model_forward_comparison(*, limit: int = 500) -> dict[str, Any]:
         "no_trade_baseline_return_pct": 0.0,
         "metric_limitations": (
             "Shadow opportunities, not executed portfolio PnL. "
-            "The return gate uses captured decision execution costs and realized funding for "
-            "diagnostics only; it does not reproduce or authorize a live entry."
+            "Prediction bias uses the model fee-after mean; the gate uses its risk-adjusted "
+            "objective and lower quantile. Shadow labels are not inputs to these predictions."
         ),
         "models": models,
     }

@@ -109,6 +109,14 @@ def _prediction(version="challenger", side="long", horizon_minutes=5):
             {
                 "horizon_minutes": horizon_minutes,
                 "best_side": side,
+                "fee_after_side_selection": {
+                    "return_semantics": "risk_adjusted_net_after_counterfactual_execution_cost",
+                    side: {
+                        "expected_net_return_pct": 0.35,
+                        "objective_net_return_pct": 0.2,
+                        "lower_quantile_net_return_pct": 0.1,
+                    },
+                },
                 "return_distribution_contract": {
                     side: {
                         "production_eligible": True,
@@ -163,7 +171,7 @@ def test_forward_report_preserves_losing_signals_and_compares_same_rows():
     assert winning["all_model_selected_directions"]["average_net_return_pct"] == 0.1
     assert losing["fee_after_return_gate"]["sample_count"] == 1
     assert losing["gate_pass_count"] == 1
-    assert losing["observed_prediction_bias_pct"] == pytest.approx(0.4)
+    assert losing["observed_prediction_bias_pct"] == pytest.approx(0.55)
     assert losing["prediction_count"] == winning["prediction_count"] == 1
 
 
@@ -174,10 +182,12 @@ def test_forward_report_attributes_overlapping_blockers_to_the_selected_side():
         production_eligible=False, objective_expected_return_pct=0.1
     )
     long_primary["counterfactual_execution_cost_distribution"]["long"]["distribution_ready"] = False
+    long_primary["fee_after_side_selection"]["long"]["objective_net_return_pct"] = 0.0
     short = _prediction(side="short")
     short["predictions"][0]["return_distribution_contract"]["short"][
         "lower_quantile_return_pct"
     ] = 0.05
+    short["predictions"][0]["fee_after_side_selection"]["short"]["lower_quantile_net_return_pct"] = -0.05
     report = summarize_forward_predictions(
         [_observation(source_id=1), _observation(source_id=2)],
         [long, short],
@@ -190,10 +200,38 @@ def test_forward_report_attributes_overlapping_blockers_to_the_selected_side():
         "long": {
             "return_contract_ineligible": 1,
             "cost_distribution_not_ready": 1,
-            "fee_after_expected_not_positive": 1,
+            "fee_after_objective_not_positive": 1,
         },
         "short": {"fee_after_lower_quantile_not_positive": 1},
     }
+
+
+def test_forward_gate_uses_frozen_model_net_fields_not_outcome_costs():
+    prediction = _prediction()
+    p = prediction["predictions"][0]["fee_after_side_selection"]["long"]
+    p.update(expected_net_return_pct=0.6, objective_net_return_pct=-0.2)
+    results = [
+        summarize_forward_predictions(
+            [{**_observation(), "execution_cost_pct": cost, "long_funding_return_pct": funding}],
+            [prediction], expected_version="challenger", horizon_minutes=5,
+        )
+        for cost, funding in ((0.1, 4.0), (7.0, -2.0))
+    ]
+    assert results[0] == results[1]
+    assert results[0]["gate_blockers_by_side"]["long"] == {"fee_after_objective_not_positive": 1}
+    assert results[0]["observed_prediction_bias_pct"] == pytest.approx(0.8)
+
+
+@pytest.mark.parametrize("missing", ["return_semantics", "expected_net_return_pct",
+                                     "objective_net_return_pct", "lower_quantile_net_return_pct"])
+def test_forward_report_rejects_missing_net_prediction_contract(missing):
+    prediction = _prediction()
+    fee_after = prediction["predictions"][0]["fee_after_side_selection"]
+    del (fee_after if missing == "return_semantics" else fee_after["long"])[missing]
+    with pytest.raises(ValueError, match="fee-after"):
+        summarize_forward_predictions(
+            [_observation()], [prediction], expected_version="challenger", horizon_minutes=5
+        )
 
 
 def test_forward_report_refuses_silent_model_fallback():
