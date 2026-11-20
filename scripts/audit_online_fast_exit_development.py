@@ -53,7 +53,7 @@ NATIVE_SOURCE = "shadow_entry_result_and_okx_native_1m_path"
 
 def dependency_hashes():
     return {
-        name: hashlib.sha256(Path(name).read_bytes()).hexdigest()
+        name: hashlib.sha256(Path(name).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
         for name in DEPENDENCIES
     }
 
@@ -212,7 +212,7 @@ def _render_remote_script(*, hours: int, limit: int, cutoff: datetime) -> str:
 
 def _local_dependency_hashes() -> dict[str, str]:
     return {
-        name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+        name: hashlib.sha256((ROOT / name).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
         for name in DEPENDENCIES
     }
 

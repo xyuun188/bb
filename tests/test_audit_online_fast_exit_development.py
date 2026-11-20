@@ -51,3 +51,15 @@ def test_remote_query_is_keyset_paginated_and_bounded() -> None:
     )
     assert ".limit(min(SCAN_BATCH_SIZE, scan_limit - scanned))" in audit.REMOTE_SCRIPT
     assert "updated_at_index_keyset_pages_with_sql_contract_filters" in audit.REMOTE_SCRIPT
+
+
+def test_dependency_check_ignores_only_platform_line_endings(tmp_path, monkeypatch):
+    monkeypatch.setattr(audit, "ROOT", tmp_path)
+    monkeypatch.setattr(audit, "DEPENDENCIES", ("model.py",))
+    path = tmp_path / "model.py"
+    path.write_bytes(b"x = 1\n")
+    expected = audit._local_dependency_hashes()
+    path.write_bytes(b"x = 1\r\n")
+    assert audit._local_dependency_hashes() == expected
+    path.write_bytes(b"x = 2\r\n")
+    assert audit._local_dependency_hashes() != expected
