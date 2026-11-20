@@ -9,7 +9,7 @@ from typing import Any
 
 ENTRY_ENVIRONMENT_PRICE_MAX_DRIFT_FRACTION = 0.01
 ENTRY_ENVIRONMENT_COMPATIBILITY_VERSION = (
-    "2026-08-24.okx-entry-environment-compatibility.v2"
+    "2026-11-20.okx-entry-environment-compatibility.v3"
 )
 ENTRY_INSTRUMENT_UNAVAILABLE_CACHE_SECONDS = 6 * 60 * 60
 ENTRY_ENVIRONMENT_PRICE_DRIFT_RETRY_SECONDS = 10 * 60
@@ -47,7 +47,10 @@ def entry_instrument_unavailable_cache_ttl(facts: Mapping[str, Any] | None) -> f
     blockers = set(compatibility.get("blockers") or ())
     if not blockers:
         return None
-    if blockers == {"environment_price_drift_exceeded"}:
+    if "environment_price_drift_exceeded" in blockers and blockers <= {
+        "environment_price_drift_exceeded",
+        "environment_executable_quote_drift_exceeded",
+    }:
         return ENTRY_ENVIRONMENT_PRICE_DRIFT_RETRY_SECONDS
     return ENTRY_ENVIRONMENT_COMPATIBILITY_RETRY_SECONDS
 
@@ -85,19 +88,37 @@ def _decimal(value: Any, *, default: str = "0") -> Decimal:
         return Decimal(default)
 
 
-def _ticker_price(value: Any) -> float:
+def _ticker_row(value: Any) -> dict[str, Any]:
     row = _row(value)
     rows = row.get("data")
     if isinstance(rows, list) and rows:
-        row = _row(rows[0])
+        return _row(rows[0])
+    return row
+
+
+def _positive_number(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if isfinite(parsed) and parsed > 0 else 0.0
+
+
+def _ticker_price(row: dict[str, Any]) -> float:
     for key in ("markPx", "last", "lastPx", "bidPx", "askPx"):
-        try:
-            parsed = float(row.get(key))
-        except (TypeError, ValueError):
-            continue
-        if isfinite(parsed) and parsed > 0:
+        if parsed := _positive_number(row.get(key)):
             return parsed
     return 0.0
+
+
+def _ticker_quote(row: dict[str, Any]) -> tuple[float, float] | None:
+    bid = _positive_number(row.get("bidPx"))
+    ask = _positive_number(row.get("askPx"))
+    if not 0 < bid <= ask or any(
+        key in row and not _positive_number(row[key]) for key in ("bidSz", "askSz")
+    ):
+        return None
+    return bid, ask
 
 
 def assess_okx_entry_environment_compatibility(
@@ -149,15 +170,33 @@ def assess_okx_entry_environment_compatibility(
             if _decimal(execution.get(field)) <= 0:
                 blockers.append(f"execution_{field}_missing_or_invalid")
 
-    live_price = _ticker_price(live_ticker)
-    execution_price = _ticker_price(execution_ticker)
+    live_quote_row = _ticker_row(live_ticker)
+    execution_quote_row = _ticker_row(execution_ticker)
+    live_price = _ticker_price(live_quote_row)
+    execution_price = _ticker_price(execution_quote_row)
+    max_drift = max(float(max_price_drift_fraction), 0.0)
     price_drift = None
     if live_price <= 0 or execution_price <= 0:
         blockers.append("environment_price_missing")
     else:
         price_drift = abs(execution_price - live_price) / max(live_price, execution_price)
-        if price_drift > max(float(max_price_drift_fraction), 0.0):
+        if price_drift > max_drift:
             blockers.append("environment_price_drift_exceeded")
+
+    live_quote = _ticker_quote(live_quote_row)
+    execution_quote = _ticker_quote(execution_quote_row)
+    quote_drift: dict[str, float] = {}
+    if execution_quote_row and execution_quote is None:
+        blockers.append("execution_ticker_quote_incomplete")
+    if live_quote is not None and execution_quote is not None:
+        quote_drift = {
+            side: abs(execution_px - live_px) / max(live_px, execution_px)
+            for side, live_px, execution_px in zip(
+                ("bid", "ask"), live_quote, execution_quote, strict=True
+            )
+        }
+        if max(quote_drift.values()) > max_drift:
+            blockers.append("environment_executable_quote_drift_exceeded")
 
     # Keep one blocker per category in diagnostics while preserving the exact
     # list for operators and tests.
@@ -183,9 +222,12 @@ def assess_okx_entry_environment_compatibility(
         "blockers": deduped_blockers,
         "warnings": list(dict.fromkeys(warnings)),
         "price_drift_fraction": price_drift,
-        "max_price_drift_fraction": max(float(max_price_drift_fraction), 0.0),
+        "max_price_drift_fraction": max_drift,
         "live_price": live_price,
         "execution_price": execution_price,
+        "quote_drift_fraction": quote_drift,
+        "live_ticker_timestamp_ms": live_quote_row.get("ts"),
+        "execution_ticker_timestamp_ms": execution_quote_row.get("ts"),
         "live_inst_id": _text(live.get("instId")),
         "execution_inst_id": _text(execution.get("instId")),
         "live_uly": _text(live.get("uly")),

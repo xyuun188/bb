@@ -167,6 +167,35 @@ def test_forward_report_preserves_losing_signals_and_compares_same_rows():
     assert losing["prediction_count"] == winning["prediction_count"] == 1
 
 
+def test_forward_report_attributes_overlapping_blockers_to_the_selected_side():
+    long = _prediction()
+    long_primary = long["predictions"][0]
+    long_primary["return_distribution_contract"]["long"].update(
+        production_eligible=False, objective_expected_return_pct=0.1
+    )
+    long_primary["counterfactual_execution_cost_distribution"]["long"]["distribution_ready"] = False
+    short = _prediction(side="short")
+    short["predictions"][0]["return_distribution_contract"]["short"][
+        "lower_quantile_return_pct"
+    ] = 0.05
+    report = summarize_forward_predictions(
+        [_observation(source_id=1), _observation(source_id=2)],
+        [long, short],
+        expected_version="challenger",
+        horizon_minutes=5,
+    )
+    assert report["gate_pass_count"] == 0
+    assert report["gate_failures"] == {"fee_after_distribution_gate_failed": 2}
+    assert report["gate_blockers_by_side"] == {
+        "long": {
+            "return_contract_ineligible": 1,
+            "cost_distribution_not_ready": 1,
+            "fee_after_expected_not_positive": 1,
+        },
+        "short": {"fee_after_lower_quantile_not_positive": 1},
+    }
+
+
 def test_forward_report_refuses_silent_model_fallback():
     with pytest.raises(ValueError, match="version mismatch"):
         summarize_forward_predictions(

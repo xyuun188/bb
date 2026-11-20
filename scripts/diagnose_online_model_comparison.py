@@ -10,7 +10,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.remote_ssh import connect_remote_ssh, run_remote_text  # noqa: E402
+from core.remote_ssh import (  # noqa: E402
+    MAX_REMOTE_OUTPUT_TEXT_LIMIT,
+    connect_remote_ssh,
+    run_remote_text,
+)
 
 REMOTE_CODE = """
 import asyncio
@@ -58,7 +62,13 @@ def main() -> int:
     ]
     ssh = connect_remote_ssh(ROOT, timeout=25)
     try:
-        output = run_remote_text(ssh, shlex.join(command), timeout=360, max_output_chars=20000)
+        output = run_remote_text(
+            ssh,
+            shlex.join(command),
+            timeout=360,
+            check=True,
+            max_output_chars=MAX_REMOTE_OUTPUT_TEXT_LIMIT,
+        )
     finally:
         ssh.close()
     print(output)

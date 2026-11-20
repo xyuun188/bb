@@ -24,8 +24,14 @@ def _instrument(**overrides: str) -> dict[str, str]:
     return row
 
 
-def _ticker(price: str) -> dict:
-    return {"data": [{"instId": "BTC-USDT-SWAP", "last": price}]}
+def _ticker(price: str, **overrides: str) -> dict:
+    return {"data": [{
+        "instId": "BTC-USDT-SWAP",
+        "last": price,
+        "bidPx": price,
+        "askPx": price,
+        **overrides,
+    }]}
 
 
 def test_matching_live_and_execution_contract_is_compatible() -> None:
@@ -77,6 +83,41 @@ def test_material_live_demo_price_divergence_is_blocked() -> None:
 
     assert result["compatible"] is False
     assert "environment_price_drift_exceeded" in result["blockers"]
+
+
+@pytest.mark.parametrize("quote", [{"bidPx": ""}, {"bidSz": "0"}, {"askPx": "99"}])
+def test_matching_last_trade_does_not_verify_an_incomplete_demo_quote(quote):
+    result = assess_okx_entry_environment_compatibility(
+        live_instrument=_instrument(),
+        execution_instrument=_instrument(),
+        live_ticker=_ticker("100"),
+        execution_ticker=_ticker("100", **quote),
+    )
+    assert result["compatible"] is False
+    assert result["blockers"] == ["execution_ticker_quote_incomplete"]
+    assert entry_instrument_unavailable_cache_ttl({
+        "reason": "okx_entry_live_execution_environment_incompatible",
+        "environment_compatibility": result,
+    }) == 60
+
+
+def test_matching_last_trade_does_not_hide_a_divergent_executable_quote():
+    result = assess_okx_entry_environment_compatibility(
+        live_instrument=_instrument(),
+        execution_instrument=_instrument(),
+        live_ticker=_ticker("100", bidPx="99.99", askPx="100.01", ts="1795151372776"),
+        execution_ticker=_ticker("100", bidPx="99.99", askPx="104", ts="1795151373366"),
+    )
+    assert result["compatible"] is False
+    assert result["blockers"] == ["environment_executable_quote_drift_exceeded"]
+    assert result["price_drift_fraction"] == 0
+    assert result["quote_drift_fraction"]["ask"] > 0.01
+    assert result["live_ticker_timestamp_ms"] == "1795151372776"
+    assert result["execution_ticker_timestamp_ms"] == "1795151373366"
+    assert entry_instrument_unavailable_cache_ttl({
+        "reason": "okx_entry_live_execution_environment_incompatible",
+        "environment_compatibility": result,
+    }) == 60
 
 
 def test_execution_step_differences_are_diagnostic_not_identity_blockers() -> None:

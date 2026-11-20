@@ -91,6 +91,7 @@ def summarize_forward_predictions(
         raise ValueError("common-window prediction count mismatch")
     samples: list[dict[str, Any]] = []
     failures: Counter[str] = Counter()
+    failures_by_side: dict[str, Counter[str]] = {"long": Counter(), "short": Counter()}
     prediction_digest = hashlib.sha256()
     for row, prediction in zip(observations, predictions, strict=True):
         if (
@@ -122,14 +123,18 @@ def summarize_forward_predictions(
         cost_ready = (
             (primary.get("counterfactual_execution_cost_distribution") or {}).get(side) or {}
         ).get("distribution_ready") is True
-        gate_passed = (
-            contract.get("production_eligible") is True
-            and cost_ready
-            and net_expected > 0
-            and net_lower > 0
-        )
+        blockers = [
+            reason for reason, passed in (
+                ("return_contract_ineligible", contract.get("production_eligible") is True),
+                ("cost_distribution_not_ready", cost_ready),
+                ("fee_after_expected_not_positive", net_expected > 0),
+                ("fee_after_lower_quantile_not_positive", net_lower > 0),
+            ) if not passed
+        ]
+        gate_passed = not blockers
         if not gate_passed:
             failures["fee_after_distribution_gate_failed"] += 1
+            failures_by_side[side].update(blockers)
         sample = {
             "source_id": row["source_id"],
             "decision_id": row.get("decision_id"),
@@ -155,6 +160,9 @@ def summarize_forward_predictions(
         "gate_pass_count": len(selected),
         "gate_pass_share": len(selected) / len(samples) if samples else 0.0,
         "gate_failures": dict(failures),
+        "gate_blockers_by_side": {
+            side: dict(blockers) for side, blockers in failures_by_side.items()
+        },
         "sides": {
             side: _return_metrics([row for row in samples if row["side"] == side])
             for side in ("long", "short")
@@ -272,6 +280,10 @@ async def run_model_forward_comparison(*, limit: int = 500) -> dict[str, Any]:
         "cost_exclusions": cost_exclusions,
         "exclusions": exclusions,
         "no_trade_baseline_return_pct": 0.0,
-        "metric_limitations": "shadow opportunities, not executed portfolio PnL; block lower bounds are diagnostics",
+        "metric_limitations": (
+            "Shadow opportunities, not executed portfolio PnL. "
+            "The return gate uses captured decision execution costs and realized funding for "
+            "diagnostics only; it does not reproduce or authorize a live entry."
+        ),
         "models": models,
     }

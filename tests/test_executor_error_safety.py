@@ -476,10 +476,10 @@ class _IncompatibleEntryEnvironmentCcxt(_EntryInstrumentAvailabilityCcxt):
         return {"data": [self._instrument("TEST-USDT")]}
 
     async def publicGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
-        return {"data": [{"last": "60000"}]}
+        return {"data": [{"last": "60000", "bidPx": "59999", "askPx": "60000"}]}
 
     async def executionGetMarketTicker(self, _params: dict[str, Any]) -> dict[str, Any]:
-        return {"data": [{"last": "60000"}]}
+        return await self.publicGetMarketTicker(_params)
 
 
 class _MissingMarketCacheCcxt:
@@ -3509,7 +3509,9 @@ async def test_okx_pre_order_execution_facts_share_native_instrument_and_units(
 
         async def executionGetMarketTicker(self, params: dict[str, Any]) -> dict[str, Any]:
             assert params["instId"] == "BTC-USDT-SWAP"
-            return {"data": [{"instId": "BTC-USDT-SWAP", "last": "100"}]}
+            return {"data": [{
+                "instId": "BTC-USDT-SWAP", "last": "100", "bidPx": "99.8", "askPx": "100.2",
+            }]}
 
         async def fetch_order_book(self, symbol: str) -> dict[str, Any]:
             assert symbol == "BTC/USDT:USDT"
