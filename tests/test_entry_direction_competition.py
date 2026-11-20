@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from models.decision import _compact_decision_learning_snapshot, compact_runtime_decision_payload
 from services.entry_direction_competition import (
     EntryDirectionCompetitionPolicy,
     _enforce_aggregate_contract_consistency,
@@ -11,6 +12,7 @@ from services.entry_direction_competition import (
 from services.entry_direction_support import assess_paper_model_trade_support
 from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.model_strategy_blueprint import build_model_strategy_blueprint
+from services.normal_paper_trade import select_normal_paper_trade_side
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
     COST_MODEL_VERSION,
@@ -218,6 +220,35 @@ def test_paper_ml_requires_a_positive_frozen_fee_after_score(selected, score):
             assert row["decision_eligible"] is False
             assert row["direction_comparison_eligible"] is True
             assert row["eligibility_reason"].startswith("model_fee_after_objective_")
+
+
+@pytest.mark.parametrize("key", ["ml_signal", "local_ml_signal"])
+def test_primary_prediction_survives_persistence_and_replay(key):
+    signal = _governed_ml(-0.8, -0.6)
+    primary = signal["predictions"][0]
+    primary["multitask_prediction"] = {
+        "long": {"loss_probability": 0.4}, "short": {"loss_probability": 0.7},
+    }
+    other = {"horizon_minutes": 5, "multitask_prediction": {"long": {"loss_probability": 0.99}}}
+    signal["predictions"].insert(0, other)
+    signal["diagnostics"] = {"large": "x" * 20000}
+    stored = compact_runtime_decision_payload({key: signal})
+    assert _compact_decision_learning_snapshot(stored) == stored
+    assert "diagnostics" not in stored[key]
+    frozen = stored[key]["predictions"][1]
+    for field in ("fee_after_side_selection", "return_distribution_contract", "multitask_prediction"):
+        assert frozen[field] == primary[field]
+    support = {}
+    competition = _context(ml=stored[key], strategy={"execution_mode": "paper"})
+    for side in ("long", "short"):
+        row = competition[side]["evidence"][0]
+        assert row["model_fee_after_objective_pct"] < 0
+        assert row["loss_probability"] == primary["multitask_prediction"][side]["loss_probability"]
+        support[side] = assess_paper_model_trade_support(competition, [], side, execution_cost_pct=0.1)
+    selection = select_normal_paper_trade_side(support)
+    assert not selection["selected"]
+    assert selection["diagnostic_status"] == "profit_gate_blocked"
+    assert selection["by_side"]["long"]["reason"] == "model_fee_after_objective_not_positive"
 
 
 def test_only_governed_return_models_choose_observed_side() -> None:

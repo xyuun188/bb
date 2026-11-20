@@ -258,6 +258,15 @@ def signal_loss_probability(payload: dict[str, Any] | None, side: str) -> float 
             ):
                 return probability
             return None
+        if predictions:
+            horizon = signal_return_distribution(payload, side).get("horizon_minutes")
+            if horizon is not None and (
+                len(predictions) > 1 or "horizon_minutes" in primary
+            ):
+                matches = [p for p in predictions if safe_dict(p).get("horizon_minutes") == horizon]
+                # A server signal can publish the active distribution's risk
+                # directly even when its optional prediction list is auxiliary.
+                primary = safe_dict(matches[0]) if len(matches) == 1 else {}
         task = safe_dict(safe_dict(primary.get("multitask_prediction")).get(side))
         # Older tool bundles exposed a gross-tail event under ordinary-loss names.
         legacy_tail_alias = node.get("model") == "local-profit-trained-v2"

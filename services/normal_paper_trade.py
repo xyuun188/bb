@@ -681,6 +681,7 @@ def select_normal_paper_trade_side(
         )
     )
     quality_gate_reasons = {
+        "model_fee_after_objective_not_positive",
         "direction_support_expected_net_not_positive",
         "direction_support_risk_adjusted_return_not_positive",
         "direction_support_objective_net_not_positive",
@@ -691,6 +692,8 @@ def select_normal_paper_trade_side(
         "direction_support_recent_side_loss",
     }
     evidence_reasons = {
+        "model_fee_after_objective_missing",
+        "direction_support_loss_probability_missing",
         "direction_support_execution_cost_incomplete",
         "direction_support_quant_evidence_missing",
         "direction_support_prediction_horizon_missing",
@@ -698,6 +701,12 @@ def select_normal_paper_trade_side(
     if selected:
         diagnostic_status = "selected"
         blocking_category = "none"
+    elif all(
+        support.get("reason") == "model_fee_after_objective_not_positive"
+        for support in by_side.values()
+    ):
+        diagnostic_status = "profit_gate_blocked"
+        blocking_category = "profit_gate"
     elif blocking_reasons and set(blocking_reasons).issubset(quality_gate_reasons):
         diagnostic_status = "profit_gate_blocked"
         blocking_category = "profit_gate"

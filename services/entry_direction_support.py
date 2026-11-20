@@ -731,6 +731,15 @@ def assess_directional_entry_support(
         quality_permission_missing and not current_edge_validated and not training_scope
     )
     blockers: list[str] = []
+    if paper_scope and not family_summaries:
+        # Report why the model was excluded before aggregation. Its rejected
+        # score must never become an input to the entry decision.
+        for row in selected_evidence:
+            reason = _dict(row).get("eligibility_reason")
+            if _dict(row).get("source") == "local_ml" and reason in (
+                "model_fee_after_objective_not_positive", "model_fee_after_objective_missing",
+            ):
+                blockers.append(reason)
     if side not in {"long", "short"}:
         blockers.append("direction_support_side_missing")
     if paper_scope and not execution_cost_complete:
@@ -749,9 +758,8 @@ def assess_directional_entry_support(
             or loss_probability > MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY
         )
     ):
-        blockers.append(
-            "direction_support_quality_observation_loss_probability_too_high"
-        )
+        blockers.append("direction_support_loss_probability_missing" if loss_probability is None
+                        else "direction_support_quality_observation_loss_probability_too_high")
     if not quant_families:
         if not family_summaries:
             blockers.append("direction_support_quant_evidence_missing")
@@ -931,9 +939,8 @@ def directional_entry_support_reasons(value: Any, selected_side: str) -> list[st
             or loss_probability > MAX_PAPER_QUALITY_OBSERVATION_LOSS_PROBABILITY
             )
         ):
-            reasons.append(
-                "direction_support_quality_observation_loss_probability_too_high"
-            )
+            reasons.append("direction_support_loss_probability_missing" if loss_probability is None
+                           else "direction_support_quality_observation_loss_probability_too_high")
     if support.get("blocking_reasons"):
         reasons.append("direction_support_contains_blockers")
     if support.get("contract_fingerprint") != _fingerprint(

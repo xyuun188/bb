@@ -1578,6 +1578,10 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                                              AND jsonb_typeof(item.value) = 'object'
                                              AND pg_column_size(item.value) <= 16384
                                         THEN item.value
+                                        WHEN item.key IN ('ml_signal', 'local_ml_signal')
+                                             AND jsonb_typeof(item.value) = 'object'
+                                             AND pg_column_size(item.value) <= 32768
+                                        THEN item.value
                                         WHEN jsonb_typeof(item.value) IN ('object', 'array')
                                              AND pg_column_size(item.value) <= 16384
                                         THEN item.value
@@ -1591,7 +1595,9 @@ async def _ensure_ai_decision_model_health_columns(conn: Any) -> None:
                                 FROM jsonb_each(raw) AS item(key, value)
                             ) AS projected
                             WHERE projected.value IS NOT NULL
-                              AND pg_column_size(projected.value) <= 16384
+                              AND pg_column_size(projected.value) <= CASE
+                                  WHEN projected.key IN ('ml_signal', 'local_ml_signal')
+                                  THEN 32768 ELSE 16384 END
                         ),
                         '{}'::JSONB
                     );

@@ -1,3 +1,5 @@
+import json
+from argparse import Namespace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -61,3 +63,27 @@ def test_fitting_purges_late_labels_and_rejects_overlap(monkeypatch):
     assert result["not_selected"]["sample_count"] == 1
     assert result["promotable"] is False
     assert research.evaluate(model, [])["kept"]["realized_net_pnl_usdt"] is None
+
+
+@pytest.mark.asyncio
+async def test_evaluation_only_uses_settlements_known_before_end(tmp_path, monkeypatch):
+    start = datetime(2025, 1, 1, tzinfo=UTC)
+    split = start + timedelta(days=1)
+    end = split + timedelta(days=1)
+    path = tmp_path / "frozen.json"
+    path.write_text(json.dumps({
+        "version": research.VERSION, "features": research.INPUTS, "start": start.isoformat(),
+        "split": split.isoformat(), "frozen_at": split.isoformat(), "available_training_count": 32,
+        "training_exclusions": {}, "excluded_after_cutoff": 0,
+    }))
+
+    async def load(lower, upper):
+        assert (lower, upper) == (split, end)
+        return [{"known": (end + timedelta(seconds=offset)).isoformat(), "offset": offset}
+                for offset in (-1, 0, 1)], {}
+
+    monkeypatch.setattr(research, "load", load)
+    monkeypatch.setattr(research, "evaluate", lambda model, rows: {"offsets": [r["offset"] for r in rows]})
+    report = await research.run(Namespace(start=start, split=split, end=end, forward=True, artifact=path))
+    assert report["offsets"] == [-1]
+    assert report["evaluation_exclusions"]["mirror_at_or_after_cutoff"] == 2

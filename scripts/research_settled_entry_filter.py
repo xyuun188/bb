@@ -191,13 +191,17 @@ async def run(args):
     if end <= evaluation_start:
         raise ValueError("empty evaluation time window")
     rows, exclusions = await load(evaluation_start, end)
+    known_rows = [row for row in rows if datetime.fromisoformat(row["known"]) < end]
     return {
         "artifact_sha256": digest(model), "frozen_at": model["frozen_at"],
         "evaluation_from": evaluation_start.isoformat(), "evaluation_until": end.isoformat(),
         "prospective": args.forward, "trained": model["available_training_count"],
         "training_exclusions": model["training_exclusions"],
         "training_mirror_after_cutoff": model["excluded_after_cutoff"],
-        "evaluation_exclusions": exclusions, **evaluate(model, rows),
+        "evaluation_exclusions": {
+            **exclusions, "mirror_at_or_after_cutoff": len(rows) - len(known_rows),
+        },
+        **evaluate(model, known_rows),
     }
 
 

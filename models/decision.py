@@ -209,6 +209,38 @@ def _exact_bounded_learning_contract(value: object) -> object:
     return copy.deepcopy(value)
 
 
+def _compact_ml_signal(value: object) -> object:
+    compact = _compact_learning_value(value)
+    if not isinstance(value, dict) or not isinstance(compact, dict):
+        return compact
+    rows = value.get("predictions")
+    projected = compact.get("predictions")
+    if not isinstance(rows, list) or not isinstance(projected, list):
+        return compact
+    horizon = value.get("primary_horizon_minutes")
+    if horizon is None and len(rows) == 1 and isinstance(rows[0], dict):
+        horizon = rows[0].get("horizon_minutes")
+    if horizon is None:
+        return compact
+    matches = [p for p in rows if isinstance(p, dict) and p.get("horizon_minutes") == horizon]
+    if len(matches) != 1:
+        return compact
+    # Freeze the primary prediction used at selection. Keep other horizons
+    # and heavy model-readiness diagnostics under the existing depth limit.
+    primary = matches[0]
+    evidence = _exact_bounded_learning_contract({
+        key: primary[key] for key in (
+            "fee_after_side_selection", "return_distribution_contract", "multitask_prediction",
+        ) if key in primary
+    })
+    if isinstance(evidence, dict):
+        for row in projected:
+            if isinstance(row, dict) and row.get("horizon_minutes") == horizon:
+                row.update(evidence)
+                break
+    return compact
+
+
 def _compact_decision_learning_snapshot(raw: object) -> dict[str, object]:
     if not isinstance(raw, dict):
         return {}
@@ -221,6 +253,8 @@ def _compact_decision_learning_snapshot(raw: object) -> dict[str, object]:
             if key == "profit_risk_sizing"
             else _exact_bounded_learning_contract(value)
             if key == "normal_paper_trade"
+            else _compact_ml_signal(value)
+            if key in {"ml_signal", "local_ml_signal"}
             else _compact_learning_value(value)
         )
         if compact_value is not _MISSING_LEARNING_VALUE:
