@@ -31,8 +31,8 @@ def _cards() -> list[dict]:
                     "paper_training_entry_is_bounded_paper_only": True,
                     "paper_training_entry_authorizes_normal_entry": True,
                     "paper_training_entry_requires_positive_size_aware_net_return": True,
-                    "paper_training_entry_requires_positive_return_lcb": True,
-                    "paper_training_entry_allows_non_positive_return_lcb": False,
+                    "paper_training_entry_requires_positive_return_lcb": False,
+                    "paper_training_entry_allows_non_positive_return_lcb": True,
                     "paper_training_entry_requires_finite_downside_stress": True,
                     "paper_training_entry_allows_non_positive_fee_after_return": False,
                     "paper_training_entry_is_shadow_only": False,
@@ -199,8 +199,8 @@ def test_phase3_go_no_go_requires_positive_lcb_for_ordinary_paper_entries() -> N
 
 def test_phase3_go_no_go_requires_bounded_training_downside_policy() -> None:
     for key, value in (
-        ("paper_training_entry_requires_positive_return_lcb", False),
-        ("paper_training_entry_allows_non_positive_return_lcb", True),
+        ("paper_training_entry_requires_positive_return_lcb", True),
+        ("paper_training_entry_allows_non_positive_return_lcb", False),
         ("paper_training_entry_requires_finite_downside_stress", False),
     ):
         cards = deepcopy(_cards())

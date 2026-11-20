@@ -15,6 +15,7 @@ from services.entry_profit_risk_sizing import (
     uplift_profit_risk_sizing_to_exchange_minimum,
 )
 from services.execution_cost_model import execution_cost_estimate
+from services.execution_service import _return_entry_contract_result
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     PAPER_TRAINING_REVIEW_GROUP_LIMIT,
@@ -27,6 +28,7 @@ from services.normal_paper_trade import (
 from services.okx_native_facts import OKX_STOP_LOSS_SLIPPAGE_SOURCE
 from services.production_trade_gate import PRODUCTION_TRADE_GATE_VERSION
 from services.return_objective import execution_cost_with_slippage_floor
+from services.trade_execution_contract import validate_entry_execution_contract
 from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
@@ -348,19 +350,52 @@ async def test_training_and_validated_entry_share_the_same_risk_sizing() -> None
 
 
 @pytest.mark.asyncio
-async def test_training_with_positive_mean_and_negative_downside_does_not_submit() -> None:
+async def test_bounded_training_with_negative_downside_passes_execution_contract() -> None:
     training = _decision()
     _use_bounded_training_entry(training)
     opportunity = training.raw_response["opportunity_score"]
-    opportunity["return_lcb_pct"] = -0.1
-    opportunity["return_distribution_contract"]["objective_expected_return_pct"] = -0.1
+    opportunity["return_lcb_pct"] = -3.0
+    opportunity["return_distribution_contract"]["objective_expected_return_pct"] = -3.0
+    opportunity["execution_cost"].update(order_size_complete=True, order_notional_usdt=800.0)
+    training.raw_response.update(
+        pre_order_execution_facts={"production_eligible": True, "input_fingerprint": "test"},
+        execution_cost_sizing_pass={"order_size_complete": True},
+    )
     await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(training, "paper", [])
 
     sizing = training.raw_response["profit_risk_sizing"]
     assert sizing["paper_training_order_economics"]["passed"] is True
-    assert sizing["production_eligible"] is False
-    assert "paper_training_conservative_return_not_positive" in sizing["reason"]
-    assert sizing["final_notional_usdt"] == 0
+    assert sizing["production_eligible"] is True
+    assert sizing["return_lcb_pct"] < 0.0
+    assert sizing["stressed_loss_fraction"] >= -sizing["return_lcb_pct"] / 100.0
+    assert 0.0 < sizing["planned_stressed_loss_usdt"] <= sizing["risk_budget_usdt"]
+    assert RiskEngine().assess(training, [], 1000.0).approved is True
+    assert reconcile_profit_risk_sizing(
+        training,
+        final_notional_usdt=sizing["final_notional_usdt"],
+        final_leverage=training.suggested_leverage,
+        source="okx_pre_submit_order_shape",
+    )["eligible"] is True
+    raw = training.raw_response
+    contract, reasons = validate_entry_execution_contract(raw)
+    assert reasons == []
+    assert contract["execution_scope"] == "paper_only"
+    assert contract["production_permission"] is False
+    assert _return_entry_contract_result(training, "paper").passed is True
+    assert _return_entry_contract_result(training, "live").passed is False
+
+    for change, expected_reason in (
+        ({"return_lcb_pct": None}, "normal_paper_size_aware_downside_return_missing"),
+        ({"return_lcb_pct": -50.0}, "paper_training_downside_stress_understated"),
+        ({"expected_net_return_pct": 0.001}, "paper_training_order_value_below_minimum"),
+        ({"risk_budget_usdt": 0.01}, "normal_paper_planned_loss_invalid"),
+    ):
+        invalid = deepcopy(raw)
+        invalid["profit_risk_sizing"].update(change)
+        assert expected_reason in validate_entry_execution_contract(invalid)[1]
+    invalid = deepcopy(raw)
+    invalid["opportunity_score"]["execution_cost"]["order_size_complete"] = False
+    assert "normal_paper_order_size_cost_incomplete" in validate_entry_execution_contract(invalid)[1]
 
 
 @pytest.mark.asyncio
@@ -402,16 +437,21 @@ async def test_training_tiny_order_is_blocked_but_confirmed_partial_fill_is_reco
     assert result["eligible"] is False
     assert "paper_training_order_value_below_minimum" in result["reasons"]
 
-    candidate = deepcopy(training)
-    candidate.raw_response["profit_risk_sizing"]["return_lcb_pct"] = -0.1
-    result = reconcile_profit_risk_sizing(
-        candidate,
-        final_notional_usdt=100.0,
-        final_leverage=candidate.suggested_leverage,
-        source="okx_pre_submit_order_shape",
-    )
-    assert result["eligible"] is False
-    assert "paper_training_conservative_return_not_positive" in result["reasons"]
+    for downside, expected_reason in (
+        (None, "normal_paper_size_aware_downside_return_missing"),
+        (float("inf"), "normal_paper_size_aware_downside_return_missing"),
+        (-50.0, "paper_training_downside_stress_understated"),
+    ):
+        candidate = deepcopy(training)
+        candidate.raw_response["profit_risk_sizing"]["return_lcb_pct"] = downside
+        result = reconcile_profit_risk_sizing(
+            candidate,
+            final_notional_usdt=100.0,
+            final_leverage=candidate.suggested_leverage,
+            source="okx_pre_submit_order_shape",
+        )
+        assert result["eligible"] is False
+        assert expected_reason in result["reasons"]
 
     result = reconcile_profit_risk_sizing(
         training,

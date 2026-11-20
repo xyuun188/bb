@@ -26,6 +26,7 @@ from services.normal_paper_trade import (
     normal_paper_entry_contract_reasons,
     normal_paper_trade_observation_contract_reasons,
     normalize_normal_paper_contract,
+    paper_training_order_economics,
 )
 from services.okx_native_facts import (
     OKX_PROTECTION_EXECUTION_VERSION,
@@ -589,8 +590,8 @@ def trade_execution_policy() -> dict[str, Any]:
         "paper_quality_observation_max_loss_probability": 0.60,
         "paper_training_entry_requires_current_raw_return": True,
         "paper_training_entry_requires_positive_size_aware_net_return": True,
-        "paper_training_entry_requires_positive_return_lcb": True,
-        "paper_training_entry_allows_non_positive_return_lcb": False,
+        "paper_training_entry_requires_positive_return_lcb": False,
+        "paper_training_entry_allows_non_positive_return_lcb": True,
         "paper_training_entry_requires_finite_downside_stress": True,
         "paper_validated_entry_requires_positive_fee_after_return": True,
         "paper_training_entry_allows_non_positive_fee_after_return": False,
@@ -1719,19 +1720,33 @@ def validate_normal_paper_entry_contract(
         and _safe_float(sizing.get("expected_net_return_pct"), 0.0) <= 0.0
     ):
         reasons.append("normal_paper_size_aware_expected_net_not_positive")
+    sizing_return_lcb = _finite_value(sizing.get("return_lcb_pct"))
     if (
         not historical_normal_trade
         and not confirmed_observation_settlement
         and not (allow_historical_settlement and executed and filled_order_present is True)
-        and not isfinite(_safe_float(sizing.get("return_lcb_pct"), float("nan")))
+        and sizing_return_lcb is None
     ):
         reasons.append("normal_paper_size_aware_downside_return_missing")
     if (
-        training_entry
-        and not executed
-        and _safe_float(sizing.get("return_lcb_pct"), 0.0) <= 0.0
+        not executed
+        and not training_entry
+        and sizing_return_lcb is not None
+        and sizing_return_lcb <= 0.0
     ):
-        reasons.append("paper_training_conservative_return_not_positive")
+        reasons.append("normal_paper_size_aware_return_lcb_not_positive")
+    if training_entry and not historical_normal_trade:
+        if (not executed or not historical_sizing_settlement) and (
+            sizing_return_lcb is not None
+            and stress + 1e-8 < -sizing_return_lcb / 100.0
+        ):
+            reasons.append("paper_training_downside_stress_understated")
+        if executed and not historical_sizing_settlement and sizing_return_lcb is None:
+            reasons.append("normal_paper_size_aware_downside_return_missing")
+        if not executed and not paper_training_order_economics(
+            final_notional, _safe_float(sizing.get("expected_net_return_pct")), stress,
+        )["passed"]:
+            reasons.append("paper_training_order_value_below_minimum")
     if not (
         _provenance_complete(sizing.get("policy_provenance"))
         or (
