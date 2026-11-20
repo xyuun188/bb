@@ -122,7 +122,7 @@ async def load(start, end):
     return sorted(result, key=lambda r: (r["at"], r["id"])), dict(excluded)
 
 
-async def evaluate(model, rows):
+async def evaluate(model, rows, *, until):
     from services.authoritative_trade_outcome import load_authoritative_trade_outcomes
     from services.ml_signal_service import ML_SIGNAL_ARTIFACT_REGISTRY, MLSignalService
     from services.strategy_learning import _return_metrics
@@ -150,9 +150,11 @@ async def evaluate(model, rows):
                 side = p["best_side"]
                 calls[r["id"]] = side
     outcomes = await load_authoritative_trade_outcomes(
-        mode="paper", since=datetime.fromisoformat(rows[0]["at"]), limit=500, compact=True,
+        mode="paper", since=datetime.fromisoformat(rows[0]["at"]), until=until, limit=501, compact=True,
         include_decision_evidence=True,
     ) if rows else []
+    if len(outcomes) > 500:
+        raise ValueError("settlement window exceeds research budget; narrow the evaluation window")
     for name in ("candidate", "incumbent_direction", "no_trade"):
         samples, decisions, counts = [], {}, Counter()
         for r in rows:
@@ -170,6 +172,8 @@ async def evaluate(model, rows):
         matched = {
             o["outcome_id"]: o["realized_pnl"] for o in outcomes
             if o.get("trade_fact_trusted") is True and o.get("outcome_complete") is True
+            and o.get("close_status") == "full" and o.get("entry_decision_ids") == [o.get("decision_id")]
+            and o.get("label_timestamp") and datetime.fromisoformat(o["label_timestamp"]) < until
             and decisions.get(o.get("decision_id")) == (o.get("symbol"), o.get("side"))
         }
         lifecycle_pnl[name] = {"matching_settlements": len(matched), "observed_net_usdt": sum(matched.values()) if matched else None}
@@ -201,7 +205,7 @@ async def run(args):
     rows, excluded = await load(eval_start, end)
     return {"artifact_sha256": digest(model), "trained": model["train_count"], "classes": model["classes"],
             "frozen_at": model["frozen_at"], "evaluation_start": eval_start.isoformat(), "end": end.isoformat(),
-            "prospective": args.forward, "excluded": excluded, **await evaluate(model, rows)}
+            "prospective": args.forward, "excluded": excluded, **await evaluate(model, rows, until=end)}
 
 
 if __name__ == "__main__":

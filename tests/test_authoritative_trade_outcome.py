@@ -651,6 +651,15 @@ async def test_position_history_loader_filters_evaluation_window_in_sql(
             "recent-update",
             "recent-open-no-update",
         }
+        async with get_session_ctx() as session:
+            through = await load_okx_position_history_records(
+                session, mode="paper", since=cutoff, until=cutoff + timedelta(hours=2), limit=1,
+            )
+            empty = await load_okx_position_history_records(
+                session, mode="paper", since=cutoff, until=cutoff + timedelta(hours=1),
+            )
+        assert [record.pos_id for record in through] == ["recent-update"]
+        assert empty == []
     finally:
         await close_db()
 

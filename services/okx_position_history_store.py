@@ -142,6 +142,7 @@ async def load_okx_position_history_records(
     *,
     mode: str | None,
     since: datetime | None = None,
+    until: datetime | None = None,
     limit: int | None = 5000,
 ) -> list[OkxPositionHistory]:
     stmt = select(OkxPositionHistory).order_by(
@@ -164,6 +165,12 @@ async def load_okx_position_history_records(
                 ),
             )
         )
+    if until is not None:
+        end = _as_utc(until)
+        stmt = stmt.where(or_(
+            OkxPositionHistory.updated_at_okx < end,
+            OkxPositionHistory.updated_at_okx.is_(None) & (OkxPositionHistory.opened_at < end),
+        ))
     safe_limit = max(1, int(limit or 1)) if limit is not None else None
     if safe_limit is not None:
         stmt = stmt.limit(min(safe_limit * 4, 20000))

@@ -694,6 +694,7 @@ async def load_authoritative_trade_outcomes(
     *,
     mode: str | None = None,
     since: datetime | None = None,
+    until: datetime | None = None,
     limit: int | None = None,
     compact: bool = False,
     include_training_features: bool = False,
@@ -710,6 +711,7 @@ async def load_authoritative_trade_outcomes(
     global _compact_outcome_cache, _compact_outcome_refresh_task
     cache_enabled = bool(
         compact
+        and until is None
         and not include_training_features
         and not include_decision_evidence
         and session_factory is get_read_session_ctx
@@ -803,6 +805,7 @@ async def load_authoritative_trade_outcomes(
             session,
             mode=requested_mode,
             since=requested_since,
+            until=until,
             limit=requested_limit,
         )
         since_utc = _as_utc(requested_since)

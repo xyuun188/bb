@@ -443,7 +443,7 @@ async def audit(
 
     since = until - timedelta(hours=hours)
     outcomes = await load_authoritative_trade_outcomes(
-        mode="paper", since=since, limit=limit + 1, compact=True,
+        mode="paper", since=since, until=until, limit=limit + 1, compact=True,
         session_factory=partial(
             get_read_session_ctx, statement_timeout_ms=15_000,
             transaction_isolation="REPEATABLE READ READ ONLY",
@@ -451,7 +451,7 @@ async def audit(
     )
     canonical_rows_loaded = len(outcomes)
     lifecycle_limit_reached = canonical_rows_loaded > limit
-    # The canonical loader has a lower boundary only. Enforce our frozen upper boundary.
+    # Keep only dated settlement labels, even if history lookup fell back to open time.
     outcomes = [
         row for row in outcomes
         if row.get("label_timestamp") and since <= _utc(row["label_timestamp"]) < until
