@@ -120,6 +120,7 @@ class OkxPositionHistory(Base, TimestampMixin):
     sync_status: Mapped[str] = mapped_column(String(40), default="synced")
     last_sync_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
     synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    settlement_facts_known_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         UniqueConstraint("mode", "row_identity", name="uq_okx_position_history_mode_row"),

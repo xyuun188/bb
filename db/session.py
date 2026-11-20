@@ -456,6 +456,7 @@ async def init_db(*, migrate_schema: bool = True) -> None:
         await _ensure_trade_fact_indexes(conn)
         await _ensure_okx_account_bill_indexes(conn)
         await _ensure_okx_position_history_column_widths(conn)
+        await _ensure_okx_history_evidence_clock(conn)
         await _ensure_okx_position_history_indexes(conn)
         if "sqlite" in settings.database_url:
             for ddl in [
@@ -2024,6 +2025,68 @@ async def _ensure_okx_position_history_column_widths(conn: Any) -> None:
             "ALTER COLUMN match_status TYPE VARCHAR(160)"
         )
     )
+
+
+async def _ensure_okx_history_evidence_clock(conn: Any) -> None:
+    """Timestamp material mirror revisions independently of sync heartbeats."""
+    if "postgresql" in settings.database_url:
+        if "settlement_facts_known_at" not in await _postgres_table_columns(conn, "okx_position_history"):
+            await conn.execute(text(
+                "ALTER TABLE okx_position_history ADD COLUMN IF NOT EXISTS "
+                "settlement_facts_known_at TIMESTAMPTZ"
+            ))
+        await conn.execute(text("""
+            CREATE OR REPLACE FUNCTION bb_stamp_history_settlement() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            DECLARE ignored text[] := ARRAY['synced_at','updated_at','sync_status',
+                'last_sync_error','source','settlement_facts_known_at'];
+            BEGIN
+                IF TG_OP = 'INSERT' THEN
+                    NEW.settlement_facts_known_at := clock_timestamp();
+                ELSIF (to_jsonb(NEW) - ignored) IS DISTINCT FROM (to_jsonb(OLD) - ignored) THEN
+                    NEW.settlement_facts_known_at := clock_timestamp();
+                ELSE
+                    NEW.settlement_facts_known_at := COALESCE(OLD.settlement_facts_known_at,
+                        GREATEST(OLD.synced_at, OLD.updated_at, OLD.created_at), clock_timestamp());
+                END IF;
+                RETURN NEW;
+            END; $$
+        """))
+        await conn.execute(text("""
+            CREATE OR REPLACE TRIGGER bb_history_settlement_clock
+            BEFORE INSERT OR UPDATE ON okx_position_history
+            FOR EACH ROW EXECUTE FUNCTION bb_stamp_history_settlement()
+        """))
+        return
+    cols = await conn.execute(text("PRAGMA table_info(okx_position_history)"))
+    names = {row[1] for row in cols.fetchall()}
+    if "settlement_facts_known_at" not in names:
+        await conn.execute(text(
+            "ALTER TABLE okx_position_history ADD COLUMN settlement_facts_known_at DATETIME"
+        ))
+    from models.trade import OkxPositionHistory
+
+    ignored = {"settlement_facts_known_at", "updated_at", "synced_at", "sync_status",
+               "last_sync_error", "source"}
+    fields = [col.name for col in OkxPositionHistory.__table__.columns if col.name not in ignored]
+    changed = " OR ".join(f'NEW."{field}" IS NOT OLD."{field}"' for field in fields)
+    now = "strftime('%Y-%m-%d %H:%M:%f','now')"
+    # The only interpolated identifiers below come from the ORM table definition.
+    insert_sql = """
+        CREATE TRIGGER IF NOT EXISTS bb_history_clock_insert AFTER INSERT ON okx_position_history
+        BEGIN UPDATE okx_position_history SET settlement_facts_known_at=strftime('%Y-%m-%d %H:%M:%f','now')
+        WHERE id=NEW.id; END
+    """
+    update_sql = f"""
+        CREATE TRIGGER IF NOT EXISTS bb_history_clock_update AFTER UPDATE OF
+        {','.join([*fields, 'synced_at'])} ON okx_position_history
+        WHEN OLD.settlement_facts_known_at IS NULL OR {changed}
+        BEGIN UPDATE okx_position_history SET settlement_facts_known_at=CASE
+            WHEN {changed} THEN {now} ELSE COALESCE(max(ifnull(OLD.updated_at,OLD.created_at),
+                ifnull(OLD.synced_at,OLD.created_at), OLD.created_at),{now}) END WHERE id=NEW.id; END
+    """  # noqa: S608
+    await conn.execute(text(insert_sql))
+    await conn.execute(text(update_sql))
 
 
 async def _ensure_okx_position_history_indexes(conn: Any) -> None:

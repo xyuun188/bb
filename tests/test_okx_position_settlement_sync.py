@@ -4,7 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from config.settings import settings
 from db.session import close_db, get_session_ctx, init_db
@@ -48,6 +48,34 @@ def test_net_position_history_uses_authoritative_direction_for_side_matching() -
     assert _position_history_side(
         {"posSide": "net", "direction": "long"}
     ) == "long"
+
+
+@pytest.mark.asyncio
+async def test_settlement_version_clock_survives_poll_but_moves_on_correction(tmp_path, monkeypatch):
+    await _init_test_db(tmp_path, monkeypatch, "settlement-clock.db")
+    try:
+        async with get_session_ctx() as session:
+            row = await upsert_okx_position_history_row(
+                session, {"instId": "BTC-USDT-SWAP", "posId": "test", "realizedPnl": "1"},
+                mode="paper", source="test",
+            )
+            await session.flush()
+            await session.refresh(row)
+            assert row.settlement_facts_known_at is not None
+            # Seed an older known revision so the test does not depend on timer resolution.
+            await session.execute(text(
+                "UPDATE okx_position_history SET settlement_facts_known_at='2020-01-01 00:00:00'"
+            ))
+            row.synced_at = datetime.now(UTC)
+            await session.flush()
+            await session.refresh(row)
+            assert row.settlement_facts_known_at.year == 2020
+            row.fee = -0.2
+            await session.flush()
+            await session.refresh(row)
+            assert row.settlement_facts_known_at.year > 2020
+    finally:
+        await close_db()
 
 
 @pytest.mark.asyncio

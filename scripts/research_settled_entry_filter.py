@@ -84,9 +84,15 @@ async def load(start, end):
         if len(page) >= 161:
             raise ValueError("settlement page budget exceeded; refusing incomplete research")
         async with db() as session:
-            clocks = dict((await session.execute(select(H.row_identity, H.synced_at).where(
+            receipts = (await session.execute(select(
+                H.row_identity, H.settlement_facts_known_at, H.synced_at, H.updated_at, H.created_at,
+            ).where(
                 H.mode == "paper", H.row_identity.in_([r["lifecycle_key"] for r in page]),
-            ))).all())
+            ))).all()
+            clocks = {
+                key: known or max((t for t in (sync, updated, created) if t), default=None)
+                for key, known, sync, updated, created in receipts
+            }
         for row in page:
             key = row["lifecycle_key"]
             if key in seen:
