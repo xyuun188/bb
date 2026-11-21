@@ -994,7 +994,7 @@ async def test_normal_paper_rejects_when_native_tier_has_no_remaining_capacity()
 
 @pytest.mark.asyncio
 async def test_training_entry_uses_normal_paper_risk_budget() -> None:
-    decision = _quality_observation_decision(return_lcb_pct=0.3)
+    decision = _quality_observation_decision(return_lcb_pct=-0.3)
     _use_bounded_training_entry(decision)
     decision.raw_response["opportunity_score"]["return_distribution_contract"][
         "raw_expected_return_pct"
@@ -1009,6 +1009,7 @@ async def test_training_entry_uses_normal_paper_risk_budget() -> None:
     assert sizing["final_notional_usdt"] > 0.0
     assert dynamic["policy_provenance"]["policy_scope"] == "paper"
     assert sizing["paper_training_entry_mode"] is True
+    assert sizing["return_lcb_pct"] < 0.0
     assert sizing["single_trade_risk_fraction_cap"] == pytest.approx(
         NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )

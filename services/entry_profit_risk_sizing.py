@@ -2375,9 +2375,9 @@ class EntryProfitRiskSizingPolicy:
             # slippage floor. Reuse it while repricing size so its delta is
             # applied once, not once in scoring and again in sizing.
             execution_slippage_floor_pct=execution_slippage_floor_pct,
-            # This input is the repriced objective, not the loss quantile.
-            # Both entry types must find a size with a positive objective.
-            paper_training_only=False,
+            # Training accepts a finite negative lower bound, but the solver
+            # still requires positive size-aware fee-after expected return.
+            paper_training_only=training_mode,
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (
