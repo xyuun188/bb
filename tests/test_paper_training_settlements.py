@@ -2,7 +2,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from services.paper_training_settlements import build_training_profiles, training_feedback
+from services.paper_training_settlements import (
+    _settled_model_versions,
+    build_training_profiles,
+    training_feedback,
+)
 
 NOW = datetime(2026, 11, 20, 18, tzinfo=UTC)
 
@@ -36,6 +40,23 @@ def test_training_guard_recovers_and_does_not_use_future_or_expired_settlements(
         assert not _feedback([*rows, _row(4, closed=closed)])["blocked"]
     assert not _feedback([*rows, _row(4), _row(5, pnl=9.0)])["blocked"]
     assert not _feedback([*rows, _row(4), *[_row(i, pnl=0.1) for i in range(5, 9)]])["blocked"]
+
+
+def test_server_settlements_do_not_contaminate_the_local_model_cohort():
+    rows = [_row(i, family="local_ai_tools") for i in range(4)]
+    assert _feedback(rows, family="local_ai_tools")["blocked"]
+    assert not _feedback(rows)["blocked"]
+    assert not _feedback(rows, family="local_ai_tools", version="model2")["blocked"]
+
+
+def test_settlement_uses_frozen_family_version_before_legacy_route_metadata():
+    families = ["local_ai_tools"]
+    assert _settled_model_versions(families, {"local_ai_tools": "v2"}, "ml", "v1", "v1") == {
+        "local_ai_tools": "v2",
+    }
+    assert _settled_model_versions(families, None, "ml", "v1", "v1") == {"local_ai_tools": "v1"}
+    assert _settled_model_versions(families, None, "ml", "v1", "v2") == {}
+    assert _settled_model_versions(families, {"local_ai_tools": None}, "ml", "v1", "v1") == {}
 
 
 @pytest.mark.parametrize("profiles", [None, {"status": "incomplete"}])

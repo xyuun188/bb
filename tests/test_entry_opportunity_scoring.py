@@ -706,6 +706,34 @@ def test_shadow_server_models_participate_in_normal_paper_scoring() -> None:
     assert all(component["included_in_return_distribution"] is True for component in components[1:])
 
 
+@pytest.mark.parametrize(("series_version", "opposite_return", "count"), [
+    ("server-v1", -0.4, 1), ("server-v2", -0.4, 2), ("server-v1", -0.5, 2),
+])
+def test_paper_scoring_counts_a_shared_server_forecast_once(
+    series_version, opposite_return, count,
+) -> None:
+    decision = _decision()
+    decision.raw_response["ml_signal"] = {}
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": {
+            **_paper_payload(side="long", long_return=1.0, short_return=-0.4),
+            "artifact_version": "server-v1",
+        },
+        "time_series_prediction": {
+            **_paper_payload(side="long", long_return=1.0, short_return=opposite_return),
+            "artifact_version": series_version,
+        },
+    }
+    _scorer().score_candidate(decision, {"execution_mode": "paper"})
+
+    opportunity = decision.raw_response["opportunity_score"]
+    assert opportunity["paper_eligible"] is True
+    assert opportunity["policy_provenance"]["sample_count"] == count
+    series = opportunity["expected_net_breakdown"]["components"][2]
+    assert series["available"] is True
+    assert series["included_in_return_distribution"] is (count == 2)
+
+
 def test_paper_scoring_keeps_only_direction_support_selected_quant_families() -> None:
     decision = _decision()
     decision.action = Action.SHORT

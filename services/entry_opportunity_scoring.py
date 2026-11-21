@@ -17,10 +17,12 @@ from typing import Any
 from ai_brain.base_model import Action, DecisionOutput
 from services.entry_signal_extraction import (
     first_tool_payload,
+    mark_duplicate_paper_server_prediction,
     payload_side,
     safe_dict,
     safe_float,
     safe_list,
+    server_model_artifact_version,
     signal_available,
     signal_loss_probability,
     signal_paper_eligibility,
@@ -349,6 +351,13 @@ class EntryOpportunityScoringPolicy:
         )
         return {
             "key": key,
+            "model_version": server_model_artifact_version(payload),
+            "opposite_return_distribution": signal_return_distribution(
+                payload, "short" if side == "long" else "long",
+            ) if execution_scope == "paper" else {},
+            "opposite_loss_probability": signal_loss_probability(
+                payload, "short" if side == "long" else "long",
+            ) if execution_scope == "paper" else None,
             "available": signal_available(payload),
             "decision_claimed": decision_claimed,
             "decision_eligible": decision_eligible,
@@ -523,6 +532,18 @@ class EntryOpportunityScoringPolicy:
                 component["eligibility_reason"] = (
                     "direction_support_quant_family_not_selected"
                 )
+        if execution_scope == "paper":
+            profit, series = components[1:]
+            if (
+                profit["opposite_return_distribution"]
+                and profit["opposite_return_distribution"] == series["opposite_return_distribution"]
+                and profit["opposite_loss_probability"] is not None
+                and profit["opposite_loss_probability"] == series["opposite_loss_probability"]
+            ):
+                mark_duplicate_paper_server_prediction(profit, series)
+        for component in components[1:]:
+            component.pop("opposite_return_distribution")
+            component.pop("opposite_loss_probability")
         selected_components = [
             component for component in components if component["decision_eligible"]
         ]

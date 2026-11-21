@@ -620,23 +620,39 @@ def assess_directional_entry_support(
         }
     )
     strategy = _dict(strategy_mode)
-    if paper_scope and quantitative_sources == ["local_ml"] and (
-        "paper_training_settlements" in strategy
-        or any(_dict(row).get("model_version") for row in selected_evidence)
-    ):
-        versions = {
-            row.get("model_version") for row in selected_evidence if isinstance(row, dict)
-            and row.get("source") == "local_ml"
+    if paper_scope and quantitative_sources:
+        cohort_rows = [
+            row for row in selected_evidence if isinstance(row, dict)
+            and row.get("source") in quantitative_sources
+            and row.get("decision_eligible") is True
             and _float(row.get("horizon_minutes")) == prediction_horizon_minutes
-        }
-        feedback = training_feedback(
-            strategy.get("paper_training_settlements"),
-            version=next(iter(versions)) if len(versions) == 1 else None,
-            side=side, horizon=prediction_horizon_minutes,
-        )
-        recent_side_loss_guard["training_cohort"] = feedback
-        if feedback["blocked"]:
-            recent_side_loss_guard.update(blocked=True, reason=feedback["reason"])
+        ]
+        if "paper_training_settlements" in strategy or any(row.get("model_version") for row in cohort_rows):
+            versions_by_family: dict[str, set[str | None]] = {}
+            for source in quantitative_sources:
+                family = _quant_family(source)
+                versions_by_family.setdefault(family, set()).update(
+                    str(row["model_version"]) if row.get("model_version") else None
+                    for row in cohort_rows if row["source"] == source
+                )
+            model_versions = {
+                family: next(iter(versions)) if len(versions) == 1 else None
+                for family, versions in versions_by_family.items()
+            }
+            feedback_by_family = {
+                family: training_feedback(
+                    strategy.get("paper_training_settlements"),
+                    version=version, side=side, horizon=prediction_horizon_minutes, family=family,
+                )
+                for family, version in model_versions.items()
+            }
+            recent_side_loss_guard["training_model_versions"] = model_versions
+            if len(feedback_by_family) == 1:
+                recent_side_loss_guard["training_cohort"] = next(iter(feedback_by_family.values()))
+            else:
+                recent_side_loss_guard["training_cohorts"] = feedback_by_family
+            if blocked := next((row for row in feedback_by_family.values() if row["blocked"]), None):
+                recent_side_loss_guard.update(blocked=True, reason=blocked["reason"])
     quant_quality_permissions = {
         source: permission
         for source, permission in quant_quality_permissions.items()

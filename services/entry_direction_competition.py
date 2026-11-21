@@ -8,6 +8,9 @@ from typing import Any
 
 from services.entry_signal_extraction import (
     first_tool_payload,
+    mark_duplicate_paper_server_prediction,
+    same_paper_server_prediction,
+    server_model_artifact_version,
     signal_available,
     signal_loss_probability,
     signal_paper_eligibility,
@@ -495,6 +498,16 @@ class EntryDirectionCompetitionPolicy:
                 item["aggregate_eligible"] = False
                 item["observation_only"] = True
                 item["eligibility_reason"] = authorization.get("reason")
+        if execution_scope == "paper":
+            # Compare both directions before discarding a route, so the remaining
+            # forecast can still provide a consistent opposite-side baseline.
+            pairs = [
+                tuple(item for item in evidence[side] if item["source"] in {"server_profit", "timeseries"})
+                for side in ("long", "short")
+            ]
+            if all(same_paper_server_prediction(profit, series) for profit, series in pairs):
+                for profit, series in pairs:
+                    mark_duplicate_paper_server_prediction(profit, series)
         quant_weights = _paper_quant_weights(strategy_mode)
         quant_quality_permissions = _paper_quant_quality_permissions(
             strategy_mode, ml_signal_context,
@@ -843,6 +856,7 @@ class EntryDirectionCompetitionPolicy:
             evidence[side].append(
                 {
                     "source": key,
+                    "model_version": server_model_artifact_version(payload),
                     "side": side,
                     "available": signal_available(payload),
                     "decision_eligible": eligible,

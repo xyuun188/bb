@@ -52,6 +52,7 @@ _WRAPPER_METADATA_KEYS = (
     "primary_model",
     "challenger_model",
     "model_version",
+    "artifact_version",
     "horizon_minutes",
     "route_mode",
     "live_ml_ready",
@@ -161,6 +162,43 @@ def first_tool_payload(raw: dict[str, Any], *keys: str) -> dict[str, Any]:
             if payload:
                 return enrich_signal_payload(key, payload)
     return {}
+
+
+def server_model_artifact_version(payload: dict[str, Any]) -> str | None:
+    version = str(payload.get("artifact_version") or "").strip()
+    model_version = str(payload.get("model_version") or "").strip()
+    if version and model_version and version != model_version:
+        return None
+    return version or model_version or None
+
+
+def same_paper_server_prediction(profit: dict[str, Any], series: dict[str, Any]) -> bool:
+    return bool(
+        profit.get("model_version")
+        and profit["model_version"] == series.get("model_version")
+        and profit.get("return_distribution_contract")
+        and profit["return_distribution_contract"] == series.get("return_distribution_contract")
+        and profit.get("loss_probability") is not None
+        and profit["loss_probability"] == series.get("loss_probability")
+    )
+
+
+def mark_duplicate_paper_server_prediction(profit: dict[str, Any], series: dict[str, Any]) -> None:
+    """Keep identical forecasts from the same artifact from receiving two weights."""
+    if (
+        same_paper_server_prediction(profit, series)
+        and profit.get("decision_eligible") is True
+        and series.get("decision_eligible") is True
+    ):
+        series.update(
+            decision_eligible=False,
+            decision_claimed=False,
+            paper_eligible=False,
+            aggregate_eligible=False,
+            direction_comparison_eligible=False,
+            observation_only=True,
+            eligibility_reason="duplicate_same_artifact_server_prediction",
+        )
 
 
 def signal_available(payload: dict[str, Any]) -> bool:

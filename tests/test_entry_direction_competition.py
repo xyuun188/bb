@@ -415,6 +415,21 @@ def test_shadow_models_choose_direction_in_paper_scope_without_live_permission()
     )
 
 
+def test_identical_server_forecasts_only_count_once_in_paper_direction() -> None:
+    payload = {**_paper_payload(0.7, -0.2), "model_version": "server-v1"}
+    context = _context(
+        tools={"profit_prediction": payload, "time_series_prediction": payload},
+        strategy={"execution_mode": "paper"},
+    )
+
+    assert context["preferred_side"] == "long"
+    assert context["decision_source_count"] == 2
+    for side in ("long", "short"):
+        series = next(row for row in context[side]["evidence"] if row["source"] == "timeseries")
+        assert series["decision_eligible"] is False
+        assert series["eligibility_reason"] == "duplicate_same_artifact_server_prediction"
+
+
 def test_structurally_invalid_shadow_model_cannot_choose_paper_direction() -> None:
     payload = _paper_payload(0.7, -0.2)
     payload["return_distribution_contract"]["long"][
