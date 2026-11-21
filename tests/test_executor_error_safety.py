@@ -4222,6 +4222,66 @@ async def test_final_paper_entry_rechecks_signal_after_executor_quote_refresh(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", [Action.LONG, Action.SHORT])
+async def test_bounded_paper_entry_sizes_stop_risk_at_the_actual_order_limit(
+    action: Action, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(okx_module.settings, "okx_entry_post_only_enabled", False)
+
+    class Exchange(_EntryExitLiquidityCcxt):
+        def market(self, symbol):
+            result = super().market(symbol)
+            result["info"]["tickSz"] = "0.001"
+            return result
+
+        async def executionGetPublicPriceLimit(self, params):
+            response = await super().executionGetPublicPriceLimit(params)
+            response["data"][0].update(buyLmt="4.0", sellLmt="0.015")
+            return response
+
+    exchange = Exchange()
+    executor = _executor(exchange)
+    decision = _entry_decision()
+    decision.action = action
+    decision.feature_snapshot = {"current_price": 1.0}
+    decision.raw_response.update({
+        "normal_paper_trade": {"authorized": True},
+        "pre_execution_analysis_basis": {
+            "version": "2026-08-19.entry-analysis-basis.v1",
+            "validated": True, "symbol": decision.symbol,
+            "action": action.value, "snapshot_price": 1.0,
+        },
+        "pre_execution_price_check": {
+            "snapshot_price": 1.0, "latest_price": 1.0, "return_budget_verified": True,
+        },
+    })
+    decision.raw_response["profit_risk_sizing"].update(
+        expected_net_return_pct=2.0, risk_budget_usdt=0.9, target_notional_usdt=50.0,
+    )
+
+    result = await executor.place_order(decision, override_balance=100.0)
+
+    assert result.status == OrderStatus.FILLED
+    assert len(exchange.create_calls) == 1
+    _, kind, side, quantity, limit, params = exchange.create_calls[0]
+    assert kind == "ioc"
+    assert side == ("buy" if action == Action.LONG else "sell")
+    assert limit == pytest.approx(1.019 if action == Action.LONG else 0.981)
+    sizing = decision.raw_response["profit_risk_sizing"]
+    evidence = next(
+        item for item in sizing["execution_reconciliations"]
+        if item["source"] == "okx_pre_submit_protection_risk"
+    )
+    risk = evidence["facts"]["protection_risk"]
+    assert risk["worst_entry_price"] == limit
+    assert risk["bounded_entry_limit"] == limit
+    assert risk["venue_worst_entry_price"] == (4.0 if action == Action.LONG else 0.015)
+    stop = float(params["attachAlgoOrds"][0]["slTriggerPx"])
+    assert quantity * 4.0 * abs(stop - limit) / limit <= 0.9
+    assert result.raw_response["okx_order_rules"]["fill_risk_price"] == 4.0
+
+
+@pytest.mark.asyncio
 async def test_entry_cancellation_runs_exchange_cleanup_before_propagating(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

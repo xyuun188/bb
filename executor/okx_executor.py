@@ -1838,6 +1838,31 @@ class OKXExecutor(AbstractExecutor):
                         status=OrderStatus.REJECTED,
                         raw_response=protection,
                     )
+                execution_price_guard = paper_entry_execution_price_limit(
+                    decision, self.executor_mode,
+                    latest_price=price,
+                    tick_size=self._market_info_float(market, "tickSz", "price_tick"),
+                    protection=protection,
+                    price_limit=submit_price_limit,
+                )
+                if execution_price_guard is not None:
+                    if execution_price_guard.get("eligible") is not True:
+                        return ExecutionResult(
+                            order_id="entry_return_budget_consumed", symbol=decision.symbol,
+                            side=side, order_type="limit", quantity=0.0, price=price,
+                            status=OrderStatus.REJECTED,
+                            raw_response={
+                                "execution_blocker": "entry_execution_return_budget",
+                                "system_pre_submit_rejection": True,
+                                "okx_rejection": False,
+                                "entry_execution_price_check": execution_price_guard,
+                                "error": "最终执行报价不满足收益预算或止盈止损价格关系，或价格证据不完整，未提交订单。",
+                            },
+                        )
+                    params["entry_execution_price_check"] = execution_price_guard
+                bounded_entry_limit = (
+                    execution_price_guard["limit_price"] if execution_price_guard else None
+                )
                 protection_risk = self._entry_protection_risk(
                     decision=decision,
                     side=side,
@@ -1845,6 +1870,7 @@ class OKXExecutor(AbstractExecutor):
                     price_limit=submit_price_limit,
                     stop_loss_price=self._safe_float(protection["stop_loss_price"]),
                     planned_notional_usdt=position_value,
+                    bounded_entry_limit=bounded_entry_limit,
                 )
                 position_value = protection_risk["maximum_notional_usdt"]
                 minimum_contracts = self._amount_min(market)
@@ -1879,6 +1905,7 @@ class OKXExecutor(AbstractExecutor):
                         planned_notional_usdt=self._safe_float(
                             minimum_refresh["sizing"].get("final_notional_usdt"), 0.0,
                         ),
+                        bounded_entry_limit=bounded_entry_limit,
                     )
                     position_value = protection_risk["maximum_notional_usdt"]
                 protection_reconciliation = reconcile_profit_risk_sizing(
@@ -2180,28 +2207,6 @@ class OKXExecutor(AbstractExecutor):
                             "okx_order_rules": okx_order_rules,
                         },
                     )
-                execution_price_guard = paper_entry_execution_price_limit(
-                    decision, self.executor_mode,
-                    latest_price=price,
-                    tick_size=self._market_info_float(market, "tickSz", "price_tick"),
-                    protection=protection,
-                    price_limit=submit_price_limit,
-                )
-                if execution_price_guard is not None:
-                    if execution_price_guard.get("eligible") is not True:
-                        return ExecutionResult(
-                            order_id="entry_return_budget_consumed", symbol=decision.symbol,
-                            side=side, order_type="limit", quantity=0.0, price=price,
-                            status=OrderStatus.REJECTED,
-                            raw_response={
-                                "execution_blocker": "entry_execution_return_budget",
-                                "system_pre_submit_rejection": True,
-                                "okx_rejection": False,
-                                "entry_execution_price_check": execution_price_guard,
-                                "error": "最终执行报价不满足收益预算或止盈止损价格关系，或价格证据不完整，未提交订单。",
-                            },
-                        )
-                    params["entry_execution_price_check"] = execution_price_guard
                 params["attachAlgoOrds"] = [
                     {
                         "tpTriggerPx": protection["take_profit_price"],
@@ -6357,6 +6362,7 @@ class OKXExecutor(AbstractExecutor):
         price_limit: dict[str, Any],
         stop_loss_price: float,
         planned_notional_usdt: float,
+        bounded_entry_limit: float | None = None,
     ) -> dict[str, Any]:
         """Keep widened native stops inside the already approved loss budget."""
 
@@ -6366,7 +6372,14 @@ class OKXExecutor(AbstractExecutor):
         upper = max(price, self._safe_float(price_limit.get("buy_price_limit")))
         lower_limit = self._safe_float(price_limit.get("sell_price_limit"))
         lower = min(price, lower_limit) if lower_limit > 0 else price
-        worst_entry = upper if side == "buy" else lower
+        venue_worst_entry = upper if side == "buy" else lower
+        worst_entry = venue_worst_entry
+        if bounded_entry_limit is not None:
+            # Both the passive leg and its IOC fallback enforce this adverse bound.
+            worst_entry = (
+                min(worst_entry, bounded_entry_limit)
+                if side == "buy" else max(worst_entry, bounded_entry_limit)
+            )
         stop = max(self._safe_float(stop_loss_price), 0.0)
         declared_stress = self._safe_float(sizing.get("stressed_loss_fraction"))
         stop_ratio = stop / worst_entry if worst_entry > 0 else 0.0
@@ -6400,10 +6413,16 @@ class OKXExecutor(AbstractExecutor):
             else 0.0
         )
         return {
-            "source": "formatted_native_stop_and_pre_submit_price_band",
+            "source": (
+                "formatted_native_stop_and_bounded_entry_limit"
+                if bounded_entry_limit is not None
+                else "formatted_native_stop_and_pre_submit_price_band"
+            ),
             "side": side,
             "stop_loss_price": stop,
             "worst_entry_price": worst_entry,
+            "venue_worst_entry_price": venue_worst_entry,
+            "bounded_entry_limit": bounded_entry_limit,
             "stop_price_same_scale": stop_is_same_scale,
             "stop_direction_valid": stop_direction_valid,
             "stop_distance_fraction": stop_distance_fraction,
