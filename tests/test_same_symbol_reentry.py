@@ -4,11 +4,17 @@ from types import SimpleNamespace
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from services.normal_paper_trade import (
+    build_normal_paper_trade_contract,
+    normal_paper_entry_contract_reasons,
+    reconcile_normal_paper_trade_contract,
+)
 from services.same_symbol_reentry import (
     ClosedLifecycleFact,
     SameSymbolReentryGuard,
 )
 from services.trading_policies import EntryPolicy
+from tests.normal_paper_test_fixtures import paper_quality_permissions
 
 
 def _decision(
@@ -61,6 +67,62 @@ def _closed(
     )
 
 
+def _validated_paper_decision(
+    now: datetime,
+    *,
+    selection_reason: str = "strategy_edge_selected",
+    horizon_minutes: float = 240.0,
+    evidence_at: datetime | None = None,
+    reconciled: bool = True,
+) -> DecisionOutput:
+    training = selection_reason == "paper_training_entry"
+    contract = build_normal_paper_trade_contract(
+        symbol="PEPE/USDT",
+        side="short",
+        selection_reason=selection_reason,
+        direction_support={
+            "eligible": True,
+            "selected_side": "short",
+            "prediction_horizon_minutes": horizon_minutes,
+            "expected_net_return_pct": 0.3,
+            "raw_expected_return_pct": 0.4,
+            "objective_net_return_pct": 0.1,
+            "loss_probability": 0.4,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": paper_quality_permissions(),
+            "strong_expert_opposition": False,
+            "current_edge_validated": True,
+            "paper_training_only": training,
+            "paper_training_reasons": ["bounded_training_candidate"] if training else [],
+            "aligned_expert_count": 2 if training else 0,
+        },
+    )
+    if reconciled:
+        contract = reconcile_normal_paper_trade_contract(
+            contract,
+            {
+                "expected_net_return_pct": 0.3,
+                "return_lcb_pct": 0.1,
+                "loss_probability": 0.4,
+                "return_distribution_contract": {
+                    "objective_expected_return_pct": 0.2,
+                    "lower_quantile_return_pct": 0.1,
+                    "gross_market_distribution": {"raw_expected_return_pct": 0.4},
+                },
+            },
+        )
+    assert normal_paper_entry_contract_reasons(contract) == []
+    decision = _decision(
+        now,
+        selection_reason=selection_reason,
+        expected_net=0.3,
+        downside_return=0.1,
+        evidence_at=evidence_at,
+    )
+    decision.raw_response["normal_paper_trade"] = contract
+    return decision
+
+
 def test_profitable_symbol_reentry_waits_ten_minutes() -> None:
     closed_at = datetime(2026, 9, 22, 4, 50, tzinfo=UTC)
     now = closed_at + timedelta(minutes=5)
@@ -102,6 +164,109 @@ def test_non_profitable_symbol_reentry_waits_twenty_minutes() -> None:
     assert blocked.remaining_cooldown_seconds == 480.0
 
 
+def test_validated_paper_edge_can_reenter_after_loss_floor_before_horizon() -> None:
+    closed_at = datetime(2026, 9, 22, 4, 6, tzinfo=UTC)
+    now = closed_at + timedelta(minutes=30)
+    result = SameSymbolReentryGuard.assess(
+        _validated_paper_decision(now),
+        execution_mode="paper",
+        latest_closed_lifecycle=_closed(closed_at, pnl=-3.0),
+        now=now,
+    )
+
+    assert result.allowed is True
+    assert result.reason == "same_symbol_reentry_cooldown_elapsed"
+    assert result.required_cooldown_seconds == 1200.0
+    assert result.remaining_cooldown_seconds == 0.0
+    assert result.policy_provenance["prediction_horizon_cooldown_bypassed"] is True
+    assert result.policy_provenance["cooldown_basis"] == (
+        "paper_validated_edge_outcome_floor"
+    )
+
+
+def test_validated_paper_edge_still_waits_loss_floor() -> None:
+    closed_at = datetime(2026, 9, 22, 4, 6, tzinfo=UTC)
+    now = closed_at + timedelta(minutes=15)
+    result = SameSymbolReentryGuard.assess(
+        _validated_paper_decision(now),
+        execution_mode="paper",
+        latest_closed_lifecycle=_closed(closed_at, pnl=-3.0),
+        now=now,
+    )
+
+    assert result.allowed is False
+    assert result.reason == "same_symbol_reentry_cooldown_active"
+    assert result.required_cooldown_seconds == 1200.0
+    assert result.remaining_cooldown_seconds == 300.0
+
+
+def test_unvalidated_paper_candidate_keeps_prediction_horizon_cooldown() -> None:
+    closed_at = datetime(2026, 9, 22, 4, 6, tzinfo=UTC)
+    now = closed_at + timedelta(minutes=30)
+    decision = _decision(now)
+    decision.raw_response["normal_paper_trade"]["prediction_horizon_minutes"] = 240.0
+    result = SameSymbolReentryGuard.assess(
+        decision,
+        execution_mode="paper",
+        latest_closed_lifecycle=_closed(closed_at, pnl=-3.0),
+        now=now,
+    )
+
+    assert result.allowed is False
+    assert result.reason == "same_symbol_reentry_cooldown_active"
+    assert result.required_cooldown_seconds == 14_400.0
+    assert result.policy_provenance["prediction_horizon_cooldown_bypassed"] is False
+
+
+def test_unreconciled_invalid_or_mismatched_paper_contract_cannot_bypass_horizon() -> None:
+    closed_at = datetime(2026, 9, 22, 4, 6, tzinfo=UTC)
+    now = closed_at + timedelta(minutes=30)
+    invalid_contract = _validated_paper_decision(now)
+    invalid_contract.raw_response["normal_paper_trade"][
+        "objective_net_return_pct"
+    ] = -0.1
+    wrong_side = _validated_paper_decision(now)
+    wrong_side.action = Action.LONG
+    unreconciled = _validated_paper_decision(now, reconciled=False)
+
+    for decision in (invalid_contract, wrong_side, unreconciled):
+        result = SameSymbolReentryGuard.assess(
+            decision,
+            execution_mode="paper",
+            latest_closed_lifecycle=_closed(closed_at, pnl=-3.0),
+            now=now,
+        )
+        assert result.allowed is False
+        assert result.reason == "same_symbol_reentry_cooldown_active"
+        assert result.required_cooldown_seconds == 14_400.0
+        assert result.policy_provenance["prediction_horizon_cooldown_bypassed"] is False
+
+
+def test_training_and_live_candidates_keep_prediction_horizon_cooldown() -> None:
+    closed_at = datetime(2026, 9, 22, 4, 6, tzinfo=UTC)
+    now = closed_at + timedelta(minutes=30)
+
+    training = SameSymbolReentryGuard.assess(
+        _validated_paper_decision(now, selection_reason="paper_training_entry"),
+        execution_mode="paper",
+        latest_closed_lifecycle=_closed(closed_at, pnl=-3.0),
+        now=now,
+    )
+    live = SameSymbolReentryGuard.assess(
+        _validated_paper_decision(now),
+        execution_mode="live",
+        latest_closed_lifecycle=_closed(closed_at, pnl=-3.0),
+        now=now,
+    )
+
+    assert training.allowed is False
+    assert training.required_cooldown_seconds == 14_400.0
+    assert training.policy_provenance["prediction_horizon_cooldown_bypassed"] is False
+    assert live.allowed is False
+    assert live.required_cooldown_seconds == 14_400.0
+    assert live.policy_provenance["prediction_horizon_cooldown_bypassed"] is False
+
+
 def test_reentry_requires_market_evidence_newer_than_the_close() -> None:
     closed_at = datetime(2026, 9, 22, 4, 6, tzinfo=UTC)
     now = closed_at + timedelta(minutes=30)
@@ -110,6 +275,23 @@ def test_reentry_requires_market_evidence_newer_than_the_close() -> None:
         _decision(now, evidence_at=closed_at - timedelta(seconds=1)),
         execution_mode="paper",
         latest_closed_lifecycle=_closed(closed_at, pnl=4.0),
+        now=now,
+    )
+
+    assert result.allowed is False
+    assert result.reason == "same_symbol_reentry_market_evidence_not_newer_than_close"
+
+
+def test_validated_paper_edge_still_requires_fresh_market_evidence() -> None:
+    closed_at = datetime(2026, 9, 22, 4, 6, tzinfo=UTC)
+    now = closed_at + timedelta(minutes=30)
+    result = SameSymbolReentryGuard.assess(
+        _validated_paper_decision(
+            now,
+            evidence_at=closed_at - timedelta(seconds=1),
+        ),
+        execution_mode="paper",
+        latest_closed_lifecycle=_closed(closed_at, pnl=-3.0),
         now=now,
     )
 

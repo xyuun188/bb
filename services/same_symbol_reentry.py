@@ -15,9 +15,12 @@ from ai_brain.base_model import DecisionOutput
 from core.symbols import normalize_trading_symbol, trading_symbol_variants
 from db.session import get_read_session_ctx
 from models.trade import OkxPositionHistory, Position
-from services.normal_paper_trade import normal_paper_current_return_ready
+from services.normal_paper_trade import (
+    normal_paper_current_return_ready,
+    normal_paper_entry_contract_reasons,
+)
 
-SAME_SYMBOL_REENTRY_CONTRACT_VERSION = "2026-10-10.same-symbol-reentry.v2"
+SAME_SYMBOL_REENTRY_CONTRACT_VERSION = "2026-11-21.same-symbol-reentry.v3"
 MIN_PROFITABLE_REENTRY_SECONDS = 10 * 60
 MIN_NON_PROFITABLE_REENTRY_SECONDS = 20 * 60
 
@@ -154,6 +157,22 @@ class SameSymbolReentryGuard:
             )
         )
         paper_scope = str(execution_mode or "").lower() == "paper"
+        decision_side = str(getattr(decision.action, "value", decision.action) or "").lower()
+        reconciliation = _safe_dict(normal_trade.get("reconciliation"))
+        reconciled_current = _safe_dict(reconciliation.get("current"))
+        validated_paper_edge = bool(
+            paper_scope
+            and selection_reason == "strategy_edge_selected"
+            and normal_trade.get("selection_reason") == selection_reason
+            and normalize_trading_symbol(normal_trade.get("symbol")) == symbol
+            and str(normal_trade.get("side") or "").lower() == decision_side
+            and reconciliation.get("source") == "opportunity_score"
+            and reconciliation.get("status") == "authorized"
+            and reconciled_current.get("new_entry_return_ready") is True
+            and (_safe_float(reconciled_current.get("expected_net_return_pct")) or 0.0) > 0.0
+            and (_safe_float(reconciled_current.get("return_lcb_pct")) or 0.0) > 0.0
+            and not normal_paper_entry_contract_reasons(normal_trade)
+        )
         downside_return = _safe_float(
             opportunity.get("realized_net_lcb_pct", opportunity.get("return_lcb_pct"))
         )
@@ -282,7 +301,12 @@ class SameSymbolReentryGuard:
             else MIN_NON_PROFITABLE_REENTRY_SECONDS
         )
         horizon_seconds = max(horizon_minutes, 0.0) * 60.0
-        required_seconds = max(float(minimum_seconds), horizon_seconds)
+        horizon_cooldown_bypassed = validated_paper_edge
+        required_seconds = (
+            float(minimum_seconds)
+            if horizon_cooldown_bypassed
+            else max(float(minimum_seconds), horizon_seconds)
+        )
         elapsed_seconds = max(
             (current - latest_closed_lifecycle.closed_at).total_seconds(),
             0.0,
@@ -317,6 +341,12 @@ class SameSymbolReentryGuard:
             expected_net=expected_net,
             opportunity_consistent=True,
             now=current,
+            cooldown_basis=(
+                "paper_validated_edge_outcome_floor"
+                if horizon_cooldown_bypassed
+                else "max_outcome_floor_and_prediction_horizon"
+            ),
+            prediction_horizon_cooldown_bypassed=horizon_cooldown_bypassed,
         )
 
     async def _latest_closed_lifecycle(
@@ -444,6 +474,8 @@ class SameSymbolReentryGuard:
         expected_net: float | None,
         opportunity_consistent: bool,
         now: datetime,
+        cooldown_basis: str = "max_outcome_floor_and_prediction_horizon",
+        prediction_horizon_cooldown_bypassed: bool = False,
     ) -> SameSymbolReentryAssessment:
         holding_minutes = None
         if latest is not None and latest.opened_at is not None:
@@ -496,7 +528,10 @@ class SameSymbolReentryGuard:
                 "non_profitable_reentry_floor_seconds": (
                     MIN_NON_PROFITABLE_REENTRY_SECONDS
                 ),
-                "cooldown_basis": "max_outcome_floor_and_prediction_horizon",
+                "cooldown_basis": cooldown_basis,
+                "prediction_horizon_cooldown_bypassed": (
+                    prediction_horizon_cooldown_bypassed
+                ),
                 "production_permission": False,
             },
         )
