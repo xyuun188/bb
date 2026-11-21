@@ -2781,6 +2781,73 @@ async def test_okx_authoritative_sync_accepts_identity_complete_persisted_order_
         await close_db()
 
 
+@pytest.mark.parametrize(
+    "case", ["settled", "unsettled", "partial_page", "ambiguous", "two_receipts"]
+)
+def test_native_close_receipt_requires_unique_settled_exchange_fill(case: str) -> None:
+    now = datetime.now(UTC)
+    pending_status = "okx_native_full_close_pending_backfill"
+    receipt = Order(
+        id=1, execution_mode="paper", symbol="LINK/USDT", side="sell",
+        status="partial", quantity=96.8, filled_at=now + timedelta(seconds=1),
+        okx_sync_status=pending_status, okx_inst_id="LINK-USDT-SWAP",
+        okx_raw_fills={
+            "source": pending_status,
+            "requires_okx_fill_backfill": True,
+            "inst_id": "LINK-USDT-SWAP",
+            "position_contracts_before": 96.8,
+            "position_contracts_after": 0.0,
+        },
+    )
+    canonical = Order(
+        id=2, execution_mode="paper", symbol="LINK/USDT", side="sell",
+        status="filled", quantity=96.8, filled_at=now, exchange_order_id="100",
+        okx_inst_id="LINK-USDT-SWAP", okx_sync_status="okx_confirmed",
+        okx_fill_contracts=96.8, price=8.4,
+    )
+    position = Position(
+        id=3, execution_mode="paper", symbol="LINK/USDT", side="long",
+        is_open=False, quantity=96.8, closed_at=now, close_exchange_order_id="100",
+        settlement_status="pending" if case == "unsettled" else "reconciled",
+        settlement_source="okx_position_history_settlement",
+    )
+
+    def make_fill(order_id: str) -> OkxFillGroup:
+        return OkxFillGroup(
+            order_id=order_id, trade_ids=(f"trade-{order_id}",), inst_id="LINK-USDT-SWAP",
+            symbol="LINK/USDT", side="sell", pos_side="net", contracts=96.8,
+            avg_price=8.4, fee_abs=0.1, fill_pnl=-1.0, timestamp=now,
+            timestamp_ms=now.timestamp() * 1000, raw_count=1,
+            pagination_complete=case != "partial_page",
+        )
+
+    orders = [receipt, canonical]
+    if case == "two_receipts":
+        orders.append(Order(
+            id=4, execution_mode="paper", symbol=receipt.symbol, side=receipt.side,
+            status=receipt.status, quantity=receipt.quantity, filled_at=receipt.filled_at,
+            okx_sync_status=pending_status, okx_inst_id=receipt.okx_inst_id,
+            okx_raw_fills=dict(receipt.okx_raw_fills),
+        ))
+    fills = [make_fill("100")]
+    if case == "ambiguous":
+        fills.append(make_fill("101"))
+    findings = OkxAuthoritativeSyncService(mode="paper")._diff_facts(
+        local_orders=orders, local_positions=[position], local_decisions={},
+        exchange_positions=[], exchange_fills=fills,
+        instrument_contract_sizes={"LINK-USDT-SWAP": 1.0}, observed_at=now,
+    )
+    [finding] = [item for item in findings if item.local_order_id == receipt.id]
+    if case == "settled":
+        assert finding.kind == "native_close_receipt_covered_by_settled_okx_fill"
+        assert finding.classification == "observation"
+        assert finding.linked_local_order_id == canonical.id
+    else:
+        assert finding.kind == "local_filled_order_missing_exchange_id"
+        assert finding.classification == "manual_review"
+    assert receipt.exchange_order_id is None
+
+
 def test_okx_authoritative_diff_uses_complete_order_history_when_fills_are_empty() -> None:
     now = datetime.now(UTC)
     order = Order(

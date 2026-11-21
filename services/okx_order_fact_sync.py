@@ -9,6 +9,7 @@ local rows from OKX native fills (`instId`, `ordId`, `tradeId`, `fillSz`,
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -1083,6 +1084,11 @@ class OkxOrderFactSyncService:
             order_history_backfilled_count = 0
             contract_size_deferred_count = priority_contract_size_deferred_count
             if okx_pull_available:
+                # The refresh cohort skips locked rows. Their exchange IDs are
+                # still owned and cannot be claimed by a pending close.
+                occupied_fill_ids = await _existing_order_ids(
+                    session, self.mode, set(fills_by_order_id)
+                )
                 (
                     local_confirmed_count,
                     unverified_count,
@@ -1115,6 +1121,7 @@ class OkxOrderFactSyncService:
                         }
                     ),
                     canonical_orders_by_exchange_id=canonical_orders_by_exchange_id,
+                    occupied_fill_ids=occupied_fill_ids,
                 )
                 confirmed_count += local_confirmed_count
                 samples.extend(local_samples)
@@ -2012,12 +2019,28 @@ class OkxOrderFactSyncService:
         since: datetime,
         authoritative_absence_order_ids: set[str],
         canonical_orders_by_exchange_id: dict[str, Order] | None = None,
+        occupied_fill_ids: set[str] | None = None,
     ) -> tuple[int, int, int, int, list[dict[str, Any]]]:
         confirmed_count = 0
         unverified_count = 0
         skipped_old_count = 0
         contract_size_deferred_count = 0
         samples: list[dict[str, Any]] = []
+        claimed_fill_ids = set(occupied_fill_ids or ())
+        claimed_fill_ids.update(canonical_orders_by_exchange_id or {})
+        claimed_fill_ids.update(
+            exchange_id
+            for order in orders
+            for exchange_id in _split_exchange_order_ids(order.exchange_order_id)
+        )
+        pending_fills = {
+            order: fill
+            for order in orders
+            if (fill := _matching_native_full_close_pending_fill(
+                order, fills=fills, contract_sizes=contract_sizes
+            )) is not None
+        }
+        pending_claim_counts = Counter(fill.order_id for fill in pending_fills.values())
         for order in orders:
             order_time = _order_time(order)
             if order_time is not None and order_time < since:
@@ -2099,6 +2122,7 @@ class OkxOrderFactSyncService:
                         ),
                         now=now,
                     )
+                    claimed_fill_ids.add(order_detail_fill.order_id)
                     confirmed_count += 1
                     samples.append(
                         _sample(
@@ -2114,12 +2138,14 @@ class OkxOrderFactSyncService:
                 samples.append(_sample(order, kind="local_order_fill_pagination_unverified"))
                 continue
             if fill is None:
-                pending_fill = _matching_native_full_close_pending_fill(
-                    order,
-                    fills=fills,
-                    contract_sizes=contract_sizes,
-                )
+                pending_fill = pending_fills.get(order)
                 if pending_fill is not None:
+                    if pending_fill.order_id in claimed_fill_ids:
+                        samples.append(_sample(order, kind="native_full_close_fill_already_owned"))
+                        continue
+                    if pending_claim_counts[pending_fill.order_id] != 1:
+                        samples.append(_sample(order, kind="native_full_close_fill_pending_ambiguous"))
+                        continue
                     contract_size, contract_size_source = _contract_size_for_fill_with_source(
                         pending_fill,
                         contract_sizes,
@@ -2145,6 +2171,7 @@ class OkxOrderFactSyncService:
                             str(pending_fill.order_id or "").strip()
                         ),
                     )
+                    claimed_fill_ids.add(pending_fill.order_id)
                     confirmed_count += 1
                     samples.append(_sample(order, kind="native_full_close_backfill_confirmed"))
                     continue
@@ -2356,6 +2383,7 @@ class OkxOrderFactSyncService:
                 order_row=order_row,
                 protection_execution=protection_execution_by_order_id.get(fill.order_id),
             )
+            claimed_fill_ids.add(fill.order_id)
             recovered_from_submit_stage = bool(
                 decision is not None
                 and fill.order_id in _decision_completed_submit_exchange_order_ids(decision)
@@ -3413,7 +3441,7 @@ def _matching_native_full_close_pending_fill(
         or getattr(order, "quantity", None),
         0.0,
     )
-    candidates: list[tuple[float, OkxNativeFillGroup]] = []
+    candidates: dict[str, OkxNativeFillGroup] = {}
     for fill in fills:
         order_id = str(getattr(fill, "order_id", "") or "").strip()
         if not order_id:
@@ -3442,11 +3470,8 @@ def _matching_native_full_close_pending_fill(
             )
         if not quantity_matches:
             continue
-        candidates.append((delta, fill))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item[0])
-    return candidates[0][1]
+        candidates[order_id] = fill
+    return next(iter(candidates.values())) if len(candidates) == 1 else None
 
 
 def _order_needs_okx_fact_refresh(order: Order) -> bool:

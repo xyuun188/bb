@@ -3421,6 +3421,57 @@ def test_already_verified_stored_fill_is_not_counted_as_missing_contract_size() 
     assert samples[0]["kind"] == "local_order_stored_fill_already_verified"
 
 
+@pytest.mark.parametrize("case", ["available", "owned", "two_receipts", "ambiguous"])
+def test_native_close_sync_does_not_claim_same_exchange_id_twice(case: str) -> None:
+    now = datetime.now(UTC)
+    pending_status = "okx_native_full_close_pending_backfill"
+
+    def make_receipt(order_id: int) -> Order:
+        return Order(
+            id=order_id, execution_mode="paper", symbol="ACT/USDT", side="sell",
+            status="partial", quantity=4.0, filled_at=now, okx_inst_id="ACT-USDT-SWAP",
+            okx_sync_status=pending_status, okx_raw_fills={
+                "source": pending_status, "contracts": 4.0, "base_quantity": 4.0,
+            },
+        )
+
+    def make_fill(order_id: str) -> OkxNativeFillGroup:
+        return OkxNativeFillGroup(
+            order_id=order_id, trade_ids=(f"trade-{order_id}",), inst_id="ACT-USDT-SWAP",
+            symbol="ACT/USDT", side="sell", pos_side="net", contracts=4.0, avg_price=0.01,
+            fee_abs=0.001, fill_pnl=-0.01, timestamp=now,
+            timestamp_ms=now.timestamp() * 1000, raw_count=1,
+        )
+
+    receipts = [make_receipt(1)]
+    if case == "two_receipts":
+        receipts.append(make_receipt(2))
+    fills = [make_fill("100")]
+    if case == "ambiguous":
+        fills.append(make_fill("101"))
+
+    confirmed, _, _, _, samples = OkxOrderFactSyncService(
+        mode="paper"
+    )._apply_local_order_facts(
+        receipts, fills=fills, fills_by_order_id={fill.order_id: fill for fill in fills},
+        order_rows_by_id={}, protection_execution_by_order_id={},
+        contract_sizes={"ACT-USDT-SWAP": 1.0}, now=now, since=now - timedelta(minutes=1),
+        authoritative_absence_order_ids=set(),
+        occupied_fill_ids={"100"} if case == "owned" else set(),
+    )
+
+    if case == "available":
+        assert confirmed == 1
+        assert [order.exchange_order_id for order in receipts].count("100") == 1
+    else:
+        assert confirmed == 0
+        assert all(order.exchange_order_id is None for order in receipts)
+    if case == "owned":
+        assert samples[-1]["kind"] == "native_full_close_fill_already_owned"
+    if case == "two_receipts":
+        assert samples[-1]["kind"] == "native_full_close_fill_pending_ambiguous"
+
+
 def test_matching_native_fill_still_refreshes_missing_slippage_fact() -> None:
     now = datetime.now(UTC)
     order_id = "act-matching-fill"

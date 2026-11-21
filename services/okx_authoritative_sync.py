@@ -52,6 +52,7 @@ DEFAULT_TIMEOUT_SECONDS = 6.0
 DEFAULT_MAX_PULL_ATTEMPTS = 2
 MAX_AUTHORITATIVE_FILL_PAGES = 10
 LOCAL_ORDER_SYNC_GRACE_SECONDS = AUTHORITATIVE_FILL_SYNC_GRACE_SECONDS
+NATIVE_CLOSE_RECEIPT_MATCH_SECONDS = 5
 QUANTITY_TOLERANCE_RATIO = 0.02
 DECISION_PROJECTION_BATCH_SIZE = 50
 
@@ -83,6 +84,7 @@ class OkxFillGroup:
     timestamp: datetime | None
     raw_count: int
     rows: tuple[dict[str, Any], ...] = ()
+    pagination_complete: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -876,6 +878,7 @@ class OkxAuthoritativeSyncService:
                 timestamp=group.timestamp,
                 raw_count=group.raw_count,
                 rows=group.rows,
+                pagination_complete=group.pagination_complete,
             )
             for group in groups
         ]
@@ -990,6 +993,12 @@ class OkxAuthoritativeSyncService:
             **local_decisions,
         }
         local_orders_by_exchange_id = _local_orders_by_exchange_id(all_context_orders)
+        settled_native_closes = _settled_native_close_receipts(
+            local_orders,
+            local_positions=local_positions,
+            orders_by_exchange_id=local_orders_by_exchange_id,
+            exchange_fills=exchange_fills,
+        )
         local_exchange_order_ids = {
             token
             for order in local_orders
@@ -1135,6 +1144,26 @@ class OkxAuthoritativeSyncService:
             )
             exchange_ids = _split_exchange_order_ids(order.exchange_order_id)
             if not exchange_ids:
+                match = settled_native_closes.get(order.id)
+                if match is not None:
+                    fill, canonical, position = match
+                    issues.append(
+                        OkxAuthoritativeIssue(
+                            kind="native_close_receipt_covered_by_settled_okx_fill",
+                            classification="observation",
+                            severity="info",
+                            reason="The pending receipt is covered by one verified and settled OKX close.",
+                            symbol=order_symbol,
+                            side=fill.side,
+                            local_order_id=order.id,
+                            local_position_id=position.id,
+                            linked_local_order_id=canonical.id,
+                            linked_exchange_order_id=fill.order_id,
+                            okx_contracts=fill.contracts,
+                            okx_timestamp=fill.timestamp,
+                        )
+                    )
+                    continue
                 issues.append(
                     OkxAuthoritativeIssue(
                         kind="local_filled_order_missing_exchange_id",
@@ -1485,6 +1514,101 @@ def _local_orders_by_exchange_id(local_orders: list[Order]) -> dict[str, Order]:
         for exchange_order_id in _split_exchange_order_ids(order.exchange_order_id):
             result.setdefault(exchange_order_id, order)
     return result
+
+
+def _settled_native_close_receipts(
+    local_orders: list[Order],
+    *,
+    local_positions: list[Position],
+    orders_by_exchange_id: dict[str, Order],
+    exchange_fills: list[OkxFillGroup],
+) -> dict[int, tuple[OkxFillGroup, Order, Position]]:
+    """Resolve historical placeholders without attributing or rewriting a fill."""
+    positions_by_close_id: dict[str, list[Position]] = {}
+    for position in local_positions:
+        if (
+            position.is_open is False
+            and getattr(position, "settlement_status", None) == "reconciled"
+            and getattr(position, "settlement_source", None) == "okx_position_history_settlement"
+        ):
+            close_ids = _split_exchange_order_ids(position.close_exchange_order_id)
+            if len(close_ids) == 1:
+                positions_by_close_id.setdefault(next(iter(close_ids)), []).append(position)
+
+    matches: dict[int, tuple[OkxFillGroup, Order, Position]] = {}
+    claims: Counter[str] = Counter()
+    for order in local_orders:
+        raw = _safe_dict(getattr(order, "okx_raw_fills", None))
+        if (
+            order.exchange_order_id
+            or getattr(order, "okx_sync_status", None) != "okx_native_full_close_pending_backfill"
+            or raw.get("source") != "okx_native_full_close_pending_backfill"
+            or raw.get("requires_okx_fill_backfill") is not True
+            or _safe_float(raw.get("position_contracts_after"), -1.0) != 0
+        ):
+            continue
+        receipt_time = _parse_datetime(order.filled_at)
+        contracts = _safe_float(raw.get("position_contracts_before"))
+        quantity = _safe_float(order.quantity)
+        side = str(order.side or "").lower()
+        position_side = {"sell": "long", "buy": "short"}.get(side)
+        inst_id = str(raw.get("inst_id") or "").upper()
+        if receipt_time is None or min(contracts, quantity) <= 0 or not position_side or not inst_id:
+            continue
+
+        candidates: list[tuple[OkxFillGroup, Order, Position]] = []
+        matching_ids: set[str] = set()
+        for fill in exchange_fills:
+            fill_time = _parse_datetime(fill.timestamp)
+            if (
+                fill.inst_id != inst_id
+                or fill.side != side
+                or fill.pos_side not in ("net", position_side)
+                or not fill.order_id
+                or not fill.trade_ids
+                or fill_time is None
+                or abs((fill_time - receipt_time).total_seconds()) > NATIVE_CLOSE_RECEIPT_MATCH_SECONDS
+                or not _relative_close_enough(fill.contracts, contracts, 0.000001)
+            ):
+                continue
+            matching_ids.add(fill.order_id)
+            claims[fill.order_id] += 1
+            canonical = orders_by_exchange_id.get(fill.order_id)
+            if (
+                not fill.pagination_complete
+                or canonical is None
+                or canonical.execution_mode != order.execution_mode
+                or canonical.side != side
+                or canonical.okx_inst_id != inst_id
+                or canonical.okx_sync_status != "okx_confirmed"
+                or not _relative_close_enough(
+                    _safe_float(canonical.okx_fill_contracts), contracts, 0.000001
+                )
+                or not _relative_close_enough(
+                    _safe_float(canonical.quantity), quantity, 0.000001
+                )
+            ):
+                continue
+            for position in positions_by_close_id.get(fill.order_id, ()):
+                closed_at = _parse_datetime(position.closed_at)
+                if (
+                    position.execution_mode == order.execution_mode
+                    and _local_position_key(position) == (fill.symbol, position_side)
+                    and closed_at is not None
+                    and abs((closed_at - fill_time).total_seconds()) <= NATIVE_CLOSE_RECEIPT_MATCH_SECONDS
+                    and _relative_close_enough(
+                        _safe_float(position.quantity), quantity, 0.000001
+                    )
+                ):
+                    candidates.append((fill, canonical, position))
+        if len(matching_ids) == len(candidates) == 1:
+            matches[order.id] = candidates[0]
+
+    return {
+        order_id: match
+        for order_id, match in matches.items()
+        if claims[match[0].order_id] == 1
+    }
 
 
 def _order_ids_from_order_history_contexts(
