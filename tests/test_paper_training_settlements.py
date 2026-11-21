@@ -39,7 +39,21 @@ def test_training_guard_recovers_and_does_not_use_future_or_expired_settlements(
     for closed in (NOW + timedelta(seconds=1), NOW - timedelta(days=1, seconds=1)):
         assert not _feedback([*rows, _row(4, closed=closed)])["blocked"]
     assert not _feedback([*rows, _row(4), _row(5, pnl=9.0)])["blocked"]
-    assert not _feedback([*rows, _row(4), *[_row(i, pnl=0.1) for i in range(5, 9)]])["blocked"]
+
+
+def test_training_guard_uses_net_pnl_across_symbols_instead_of_majority_vote():
+    losses = [-6.0, -5.0, -4.5, -3.0, -2.67485666]
+    wins = [1.8, 1.8, 1.8, 1.8, 1.8]
+    rows = [_row(i, pnl=pnl) for i, pnl in enumerate(losses + wins)]
+    result = _feedback(rows)
+    assert result["net_usdt"] == pytest.approx(-12.17485666)
+    assert result["losing_symbols"] == 5
+    assert result["symbol_count"] == 10
+    assert result["blocked"] is True
+    assert result["reason"] == "cross_symbol_training_loss"
+    assert _feedback([*rows, _row(10, pnl=1.0)])["blocked"] is True
+    assert _feedback([*rows, _row(10, pnl=15.0)])["blocked"] is False
+    assert _feedback([_row(0, pnl=-50), *[_row(i, pnl=1) for i in range(1, 4)]])["blocked"] is False
 
 
 def test_server_settlements_do_not_contaminate_the_local_model_cohort():

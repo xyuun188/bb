@@ -99,6 +99,7 @@ def test_entry_signal_economics_does_not_attribute_aggregate_or_mismatched_entri
         "strategy_selection_reason": "paper_training_entry",
         "normal_paper_trade_evidence": {"objective_net_return_pct": -0.2},
         "net_return_after_all_cost_pct": -0.15,
+        "notional": 500,
         "label_timestamp": SINCE.isoformat(),
     }
     exact = outcome(decision_id=1, entry_decision_ids=[1], **entry)
@@ -109,23 +110,59 @@ def test_entry_signal_economics_does_not_attribute_aggregate_or_mismatched_entri
         since=SINCE,
         entry_evidence={
             1: {"side": "long", "selection_reason": "paper_training_entry",
-                "families": ["local_ai_tools", "local_ai_tools"]},
+                "families": ["local_ai_tools", "local_ai_tools"],
+                "versions": {"local_ai_tools": "tools-v2"}, "local_version": "other",
+                "horizon": 240, "direction_objective": 0.3, "quote_objective": 0.1,
+                "quote_lower_bound": -0.2, "quote_expected_net": 0.4},
             3: {"side": "short", "selection_reason": "paper_training_entry",
-                "families": ["local_ml"]},
+                "families": ["local_ml"], "direction_objective": 0.1},
         },
     )["entry_signal_economics"]
 
     assert {
-        (row["objective_at_entry"], tuple(row["quant_evidence_families"])): row["count"]
+        (row["direction_objective_sign"], row["quote_objective_sign"],
+         row["quote_lower_bound_sign"], tuple(row["quant_evidence_families"])): row["count"]
         for row in report["rows"]
     } == {
-        ("non_positive_objective", ("local_ai_tools",)): 1,
-        ("non_positive_objective", ()): 1,
-        ("unattributed", ()): 1,
+        ("positive", "positive", "non_positive", ("local_ai_tools",)): 1,
+        ("missing", "missing", "missing", ()): 2,
     }
-    assert report["rows"][1]["mean_fee_after_return_pct"] == -0.15
-    assert report["rows"][1]["settled_pnl_drawdown_usdt"] == 0.75
+    attributed = next(row for row in report["rows"] if row["driving_model_versions"])
+    assert attributed["driving_model_versions"] == {"local_ai_tools": "tools-v2"}
+    assert attributed["prediction_horizon_minutes"] == 240
+    assert attributed["mean_fee_after_return_pct"] == -0.15
+    assert attributed["settled_pnl_drawdown_usdt"] == 0.75
+    assert attributed["forecast_comparison"]["net"]["mean_forecast_minus_realized_pct"] == 0.55
     assert report["return_confidence_bound"] is None
+
+
+def test_observed_entry_filters_use_only_trusted_fills_with_settlement_known_before_cutoff():
+    closed = SINCE + timedelta(hours=1)
+    until = SINCE + timedelta(hours=3)
+    rows = [
+        outcome(str(i), decision_id=i, entry_decision_ids=[i], side="long",
+                strategy_selection_reason="paper_training_entry", trade_fact_trusted=True,
+                net_return_after_all_cost_pct=-0.15, decision_timestamp=SINCE.isoformat(),
+                label_timestamp=closed.isoformat())
+        for i in range(1, 5)
+    ]
+    rows[2]["trade_fact_trusted"] = False
+    evidence = {
+        i: {"side": "long", "selection_reason": "paper_training_entry",
+            "direction_objective": 0.3, "quote_objective": 0.1, "quote_lower_bound": -0.2}
+        for i in range(1, 5)
+    }
+    report = audit_profitability_economics._observed_entry_filters(
+        rows, evidence, {"1": closed, "2": until, "3": closed, "4": closed - timedelta(seconds=1)},
+        start=SINCE, until=until,
+    )
+    assert report["exclusions"]["settlement_version_unavailable_at_cutoff"] == 2
+    assert report["exclusions"]["not_trusted_exactly_attributed_training"] == 1
+    assert report["policies"]["observed_policy"]["realized_net_pnl_usdt"] == -0.75
+    assert report["policies"]["positive_direction_objective"]["coverage"] == 1
+    assert report["policies"]["positive_quote_objective"]["coverage"] == 1
+    assert report["policies"]["positive_quote_lower_bound"]["coverage"] == 0
+    assert report["policies"]["no_trade"]["realized_net_pnl_usdt"] == 0
 
 
 def test_slippage_is_measured_but_never_deducted_twice_and_horizon_is_diagnostic():

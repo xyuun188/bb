@@ -47,9 +47,12 @@ def training_feedback(snapshot, *, version, side, horizon, family="local_ml"):
     available = bool(key and snapshot and snapshot.get("status") == "complete"
                      and isinstance(snapshot.get("profiles"), dict))
     row = snapshot["profiles"].get(key, {}) if available else {}
-    loss = (row.get("sample_count", 0) >= MIN_LIFECYCLES and row["net_usdt"] < 0
-            and row["losing_symbols"] >= 2
-            and 2 * row["losing_symbols"] > row["symbol_count"])
+    # A majority vote can hide losses when a few losers outweigh more small wins.
+    loss = (
+        row.get("sample_count", 0) >= MIN_LIFECYCLES
+        and row["net_usdt"] < 0
+        and row["losing_symbols"] >= 2
+    )
     return {
         "cohort": key, "available": available, **row, "blocked": not available or loss,
         "reason": "training_settlements_unavailable" if not available else

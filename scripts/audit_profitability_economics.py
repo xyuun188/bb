@@ -15,7 +15,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -24,11 +24,14 @@ if str(ROOT) not in sys.path:
 from core.exceptions import ExchangeAPIError  # noqa: E402
 from db.session import close_db, get_read_session_ctx  # noqa: E402
 from models.decision import AIDecision  # noqa: E402
+from models.trade import OkxPositionHistory  # noqa: E402
 from services.authoritative_trade_outcome import load_authoritative_trade_outcomes  # noqa: E402
 from services.okx_native_facts import (  # noqa: E402
     _account_bill_from_row,
     _oldest_account_bill_pagination_cursor,
 )
+from services.paper_training_settlements import _settled_model_versions  # noqa: E402
+from services.strategy_learning import _return_metrics  # noqa: E402
 
 BILL_PAGE_INTERVAL_SECONDS = 0.5
 BILL_RATE_LIMIT_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
@@ -72,7 +75,17 @@ async def _load_entry_evidence(
         and (decision_id := _single_entry_decision_id(row)) is not None
     })
     result = {}
-    contract = AIDecision.decision_learning_snapshot["normal_paper_trade"]
+    snapshot = AIDecision.decision_learning_snapshot
+    raw = AIDecision.raw_llm_response
+    contract = snapshot["normal_paper_trade"]
+    current = contract["reconciliation"]["current"]
+
+    def tool_version(route):
+        return func.coalesce(
+            snapshot["local_ai_tools"][route]["model_version"].as_string(),
+            raw["local_ai_tools"][route]["model_version"].as_string(),
+        )
+
     async with get_read_session_ctx(
         statement_timeout_ms=15_000, transaction_isolation="REPEATABLE READ READ ONLY",
     ) as session:
@@ -82,6 +95,17 @@ async def _load_entry_evidence(
                 contract["quant_evidence_families"].label("families"),
                 contract["selection_reason"].as_string().label("selection_reason"),
                 contract["side"].as_string().label("side"),
+                contract["prediction_horizon_minutes"].label("horizon"),
+                contract["recent_side_loss_guard"]["training_model_versions"].label("versions"),
+                snapshot["ml_signal"]["model_version"].as_string().label("local_version"),
+                tool_version("profit_prediction").label("profit_version"),
+                tool_version("time_series_prediction").label("timeseries_version"),
+                contract["direction_objective_net_return_pct"].label("direction_objective"),
+                current["risk_adjusted_net_return_pct"].label("quote_objective"),
+                current["return_lcb_pct"].label("quote_lower_bound"),
+                current["expected_net_return_pct"].label("quote_expected_net"),
+                current["gross_expected_return_pct"].label("quote_expected_gross"),
+                current["execution_cost_pct"].label("quote_cost"),
             ).where(AIDecision.id.in_(ids[offset : offset + 50]))
             rows = (await session.execute(statement)).mappings()
             result.update({row["id"]: dict(row) for row in rows})
@@ -91,31 +115,42 @@ async def _load_entry_evidence(
 def _entry_signal_economics(
     rows: list[dict[str, Any]], evidence: dict[int, dict[str, Any]],
 ) -> dict[str, Any]:
-    cohorts: dict[tuple[str, str, str, tuple[str, ...]], list[dict[str, Any]]] = defaultdict(list)
+    cohorts = defaultdict(list)
     for row in rows:
         decision_id = _single_entry_decision_id(row)
         side = str(row.get("side") or "unknown")
         route = str(row.get("strategy_selection_reason") or "unknown")
         entry = evidence.get(decision_id) if decision_id else None
-        objective = None
+        direction_objective = quote_objective = quote_lower_bound = None
         families: tuple[str, ...] = ()
-        if decision_id:
-            frozen = row.get("normal_paper_trade_evidence") or {}
-            objective = _finite(frozen.get("objective_net_return_pct"))
-            if (
-                entry and entry["selection_reason"] == route and entry["side"] == side
-                and isinstance(entry["families"], list)
-            ):
+        versions: tuple[tuple[str, str], ...] = ()
+        horizon = None
+        if entry and entry["selection_reason"] == route and entry["side"] == side:
+            direction_objective = _finite(entry.get("direction_objective"))
+            quote_objective = _finite(entry.get("quote_objective"))
+            quote_lower_bound = _finite(entry.get("quote_lower_bound"))
+            horizon = _finite(entry.get("horizon"))
+            if isinstance(entry["families"], list):
                 families = tuple(sorted({
                     family for family in entry["families"] if isinstance(family, str) and family
                 }))
-        quality = (
-            "unattributed" if objective is None else "positive_objective" if objective > 0
-            else "non_positive_objective"
-        )
-        cohorts[side, route, quality, families].append(row)
+                versions = tuple(sorted(
+                    (family, version)
+                    for family, version in _settled_model_versions(
+                        list(families), entry.get("versions"), entry.get("local_version"),
+                        entry.get("profit_version"), entry.get("timeseries_version"),
+                    ).items() if isinstance(version, str) and version
+                ))
+        else:
+            entry = {}
+        cohorts[
+            side, route, _sign(direction_objective), _sign(quote_objective),
+            _sign(quote_lower_bound), families, versions, horizon,
+        ].append((row, entry))
     summaries = []
-    for (side, route, quality, families), cohort in sorted(cohorts.items()):
+    for key, pairs in sorted(cohorts.items(), key=lambda item: str(item[0])):
+        side, route, direction_sign, quote_sign, lower_sign, families, versions, horizon = key
+        cohort = [row for row, _ in pairs]
         pnl = [
             row["realized_net_pnl_components"]["reported_realized_net_pnl_usdt"] for row in cohort
         ]
@@ -149,8 +184,12 @@ def _entry_signal_economics(
         summaries.append({
             "side": side,
             "entry_selection_reason": route,
-            "objective_at_entry": quality,
+            "direction_objective_sign": direction_sign,
+            "quote_objective_sign": quote_sign,
+            "quote_lower_bound_sign": lower_sign,
             "quant_evidence_families": list(families),
+            "driving_model_versions": dict(versions),
+            "prediction_horizon_minutes": horizon,
             "count": len(cohort),
             "realized_net_pnl_usdt": math.fsum(pnl),
             "fee_after_return_count": len(returns),
@@ -169,12 +208,139 @@ def _entry_signal_economics(
             "realized_loss_over_budget_count": sum(item[2] > 0 for item in risk),
             "realized_loss_over_budget_usdt": math.fsum(item[2] for item in risk)
             if risk else None,
+            "forecast_comparison": _forecast_comparison(pairs),
         })
     return {
         "rows": summaries,
         "scope": "observed_closed_lifecycles_only",
         "return_confidence_bound": None,
         "counterfactual_execution_or_portfolio_equity_evaluated": False,
+    }
+
+
+def _sign(value: float | None) -> str:
+    return "missing" if value is None else "positive" if value > 0 else "non_positive"
+
+
+def _forecast_comparison(pairs: list[tuple[dict, dict]]) -> dict[str, Any]:
+    forecasts = defaultdict(list)
+    for row, entry in pairs:
+        notional = _finite(row.get("notional"))
+        net = _finite(row.get("net_return_after_all_cost_pct"))
+        if not notional or notional <= 0 or net is None:
+            continue
+        price = row["realized_net_pnl_components"]["gross_pnl_usdt"] * 100 / notional
+        for component, expected_key, actual in (
+            ("net", "quote_expected_net", net),
+            ("gross", "quote_expected_gross", price),
+            ("cost", "quote_cost", price - net),
+        ):
+            expected = _finite(entry.get(expected_key))
+            if expected is not None:
+                forecasts[component].append((expected, actual))
+    return {
+        name: {
+            "paired_count": len(values),
+            "mean_forecast_pct": math.fsum(expected for expected, _ in values) / len(values),
+            "mean_realized_pct": math.fsum(actual for _, actual in values) / len(values),
+            "mean_forecast_minus_realized_pct": (
+                math.fsum(expected - actual for expected, actual in values) / len(values)
+            ),
+        }
+        for name, values in forecasts.items()
+    }
+
+
+async def _load_settlement_clocks(outcomes: list[dict[str, Any]]) -> dict[str, datetime]:
+    history = OkxPositionHistory
+    async with get_read_session_ctx(
+        statement_timeout_ms=15_000, transaction_isolation="REPEATABLE READ READ ONLY",
+    ) as session:
+        rows = (await session.execute(select(
+            history.row_identity, history.settlement_facts_known_at,
+        ).where(
+            history.mode == "paper",
+            history.row_identity.in_([row["lifecycle_key"] for row in outcomes]),
+        ))).all()
+    return {key: known for key, known in rows if known is not None}
+
+
+def _observed_entry_filters(
+    rows: list[dict[str, Any]], evidence: dict[int, dict[str, Any]],
+    settlement_clocks: dict[str, datetime], *, start: datetime, until: datetime,
+) -> dict[str, Any]:
+    groups = defaultdict(list)
+    exclusions = Counter()
+    for row in rows:
+        opened = row.get("decision_timestamp")
+        closed = row.get("label_timestamp")
+        known = settlement_clocks.get(row["lifecycle_key"])
+        if not opened or not closed or not start <= _utc(opened) <= _utc(closed) < until:
+            continue
+        entry = evidence.get(_single_entry_decision_id(row)) or {}
+        if (
+            row.get("close_status") != "full"
+            or row.get("trade_fact_trusted") is not True
+            or row.get("outcome_complete") is not True
+            or entry.get("selection_reason") != "paper_training_entry"
+            or entry["selection_reason"] != row.get("strategy_selection_reason")
+            or entry.get("side") != row.get("side")
+            or (row.get("realized_net_pnl_components") or {}).get("formula_consistent") is not True
+        ):
+            exclusions["not_trusted_exactly_attributed_training"] += 1
+            continue
+        if known is None or not _utc(closed) <= known < until:
+            exclusions["settlement_version_unavailable_at_cutoff"] += 1
+            continue
+        keys = ("direction_objective", "quote_objective", "quote_lower_bound")
+        scores = {key: _finite(entry.get(key)) for key in keys}
+        net = _finite(row.get("net_return_after_all_cost_pct"))
+        pnl = _finite(row["realized_net_pnl_components"]["reported_realized_net_pnl_usdt"])
+        if net is None or pnl is None:
+            exclusions["missing_net_settlement"] += 1
+            continue
+        groups[_single_entry_decision_id(row)].append((
+            closed, row["lifecycle_key"], {
+                "timestamp": closed,
+                "net_return_after_all_cost_pct": net,
+                "net_pnl_after_all_costs_usdt": pnl,
+            }, scores,
+        ))
+    exclusions["repeated_entry_decision"] = sum(len(group) for group in groups.values() if len(group) > 1)
+    cases = sorted(group[0] for group in groups.values() if len(group) == 1)
+    evaluated = {}
+    for name, selected in (
+        ("observed_policy", [case[2] for case in cases]),
+        ("positive_direction_objective", [
+            case[2] for case in cases if _sign(case[3]["direction_objective"]) == "positive"
+        ]),
+        ("positive_quote_objective", [
+            case[2] for case in cases if _sign(case[3]["quote_objective"]) == "positive"
+        ]),
+        ("positive_quote_lower_bound", [
+            case[2] for case in cases if _sign(case[3]["quote_lower_bound"]) == "positive"
+        ]),
+        ("no_trade", []),
+    ):
+        evaluated[name] = {
+            **_return_metrics(selected),
+            "coverage": len(selected) / len(cases) if cases else None,
+            "realized_net_pnl_usdt": (
+                math.fsum(row["net_pnl_after_all_costs_usdt"] for row in selected)
+            ),
+        }
+    return {
+        "scope": "retrospective_abstention_on_observed_training_fills_only",
+        "counterfactual_portfolio_replay": False,
+        "return_uncertainty_method": "minimum_contiguous_block_mean",
+        "entry_window_start": start.isoformat(),
+        "settlement_availability_cutoff": until.isoformat(),
+        "exclusions": dict(exclusions),
+        "missing_prediction_counts": {
+            key: sum(case[3][key] is None for case in cases)
+            for key in ("direction_objective", "quote_objective", "quote_lower_bound")
+        },
+        "policies": evaluated,
     }
 
 
@@ -467,7 +633,7 @@ async def audit(
     finally:
         await executor.shutdown()
     report = {
-        "audit_version": "profitability-economics.v2",
+        "audit_version": "profitability-economics.v3",
         "generated_at": datetime.now(UTC).isoformat(),
         "window_start_utc": since.isoformat(),
         "window_end_utc_exclusive": until.isoformat(),
@@ -490,6 +656,11 @@ async def audit(
             "lifecycle_window_complete": not lifecycle_limit_reached,
             **summarize_lifecycles(cohort, since=opened_since, entry_evidence=entry_evidence),
         }
+        if not lifecycle_limit_reached:
+            report["observed_entry_filters"] = _observed_entry_filters(
+                cohort, entry_evidence, await _load_settlement_clocks(cohort),
+                start=opened_since, until=until,
+            )
     return report
 
 
