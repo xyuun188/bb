@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -386,6 +389,123 @@ def test_unverified_market_candidate_with_full_paper_contract_is_not_promoted(
     assert not decision.raw_response["market_analysis_only_contract"].get(
         "promoted_for_execution", False
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    ["verified", "compacted", "unverified", "wrong_symbol", "timeout", "revoked_during_probe",
+     "known_unavailable", "live", "unprofitable", "expired"],
+)
+async def test_deferred_market_instrument_recheck_at_entry_handoff(case: str) -> None:
+    service = object.__new__(TradingService)
+    service._verified_entry_symbols_by_mode = {"paper": set()}
+    symbol = "ARB/USDT"
+    decision = _decision(symbol, Action.SHORT)
+    contract = build_normal_paper_trade_contract(
+        symbol=symbol,
+        side="short",
+        selection_reason="paper_training_entry",
+        direction_support={
+            "eligible": True,
+            "selected_side": "short",
+            "prediction_horizon_minutes": 240.0,
+            "expected_net_return_pct": 2.425,
+            "raw_expected_return_pct": 2.537,
+            "paper_training_only": True,
+            "objective_net_return_pct": -0.01 if case == "unprofitable" else 0.088,
+            "loss_probability": 0.236,
+            "quant_evidence_families": ["local_ml"],
+            "quant_quality_permissions": {
+                "local_ml": {"paper_execution_permission": False},
+            },
+            "strong_expert_opposition": False,
+        },
+    )
+    if case == "expired":
+        contract["generated_at"] = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
+    decision.raw_response = {
+        "entry_permission": {"granted": True},
+        "normal_paper_trade": contract,
+    }
+    service._attach_market_candidate_funnel(decision, {
+        "execution_availability": {
+            "analysis_only_execution_unverified": [
+                {"symbol": symbol, "reason": "okx_private_entry_instrument_probe_deferred"},
+            ],
+        },
+    })
+    if case == "compacted":
+        decision.raw_response["market_candidate_funnel"] = {
+            "analysis_only_selected_symbols": [symbol],
+        }
+
+    async def probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        if case == "timeout":
+            raise TimeoutError
+        if case == "revoked_during_probe":
+            service._remember_unavailable_entry_symbol(
+                "paper", symbol, {"error_code": "51001"}, persist=False,
+            )
+        return {
+            "available": None if case == "unverified" else True,
+            "symbol": "BTC/USDT" if case == "wrong_symbol" else symbol,
+            "demo": True,
+            "mode": "paper",
+        }
+
+    if case == "known_unavailable":
+        service._remember_unavailable_entry_symbol(
+            "paper", symbol, {"error_code": "51001"}, persist=False,
+        )
+    availability = AsyncMock(side_effect=probe)
+    service._get_okx_executor_for_mode = AsyncMock(
+        return_value=SimpleNamespace(entry_instrument_availability=availability)
+    )
+    record_skip = AsyncMock()
+    service.market_auto_entry_processor = SimpleNamespace(record_skip=record_skip)
+    # Cancel at the risk preparation boundary so no execution can occur.
+    prepared = False
+
+    async def prepare(*_args: Any) -> None:
+        nonlocal prepared
+        prepared = True
+        raise StopBeforeExecution
+
+    class StopBeforeExecution(BaseException):
+        pass
+
+    service._prepare_entry_for_hard_risk = prepare
+    kwargs = {
+        "symbol": symbol,
+        "model_name": decision.model_name,
+        "decision": decision,
+        "decision_db_id": None,
+        "model_mode": "live" if case == "live" else "paper",
+        "feature_vector": object(),
+        "results": {},
+        "open_positions": [],
+        "staged_entry_counts": {},
+        "strategy_mode_context": None,
+        "market_regime_context": None,
+        "new_pair_pause_reason": None,
+    }
+    if case in {"verified", "compacted"}:
+        with pytest.raises(StopBeforeExecution):
+            await service._run_market_entry_pipeline(**kwargs)
+        assert prepared
+        assert service._market_analysis_only_entry_reason(decision, model_mode="paper") is None
+        assert decision.raw_response["market_analysis_only_contract"]["promoted_for_execution"]
+        assert decision.raw_response["normal_paper_trade"] == contract
+        record_skip.assert_not_awaited()
+    else:
+        await service._run_market_entry_pipeline(**kwargs)
+        assert not prepared
+        assert record_skip.await_args.kwargs["skip_kind"] == "market_analysis_only"
+    if case in {"known_unavailable", "live", "unprofitable", "expired"}:
+        availability.assert_not_awaited()
+    else:
+        availability.assert_awaited_once_with(symbol, force=True)
 
 
 def test_market_analysis_only_training_contract_is_not_promoted() -> None:

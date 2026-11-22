@@ -390,6 +390,7 @@ MARKET_ANALYSIS_ONLY_FALLBACK_LIMIT = 8
 # progress concurrently.
 MARKET_ENTRY_PIPELINE_MAX_CONCURRENCY = 4
 MARKET_ENTRY_PIPELINE_QUEUE_TIMEOUT_SECONDS = 45.0
+MARKET_ENTRY_INSTRUMENT_RECHECK_TIMEOUT_SECONDS = 5.0
 MARKET_FINAL_FEATURE_REFRESH_TIMEOUT_SECONDS = 12.0
 PAPER_PROFIT_LOCK_SECOND_ATTEMPT_MIN_SECONDS = 40.0
 TRAINING_PROCESS_NICE_LEVEL = 10
@@ -8418,11 +8419,12 @@ class TradingService(ModelTrainingCoordinatorMixin):
             else None
         )
         marker_state = str((marker or {}).get("state") or "").strip()
-        if marker_state in {
-            "analysis_only_execution_unverified",
-            "execution_unavailable",
-        }:
+        if marker_state == "execution_unavailable":
             return False
+        if marker_state == "analysis_only_execution_unverified":
+            recheck = self._safe_dict(raw.get("market_entry_instrument_recheck"))
+            if recheck.get("available") is not True or recheck.get("symbol") != symbol:
+                return False
         verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
         verified_symbols = (
             verified_by_mode.get(selected_mode, set())
@@ -8446,6 +8448,102 @@ class TradingService(ModelTrainingCoordinatorMixin):
             and permission.get("granted") is True
             and not normal_paper_entry_contract_reasons(contract)
         )
+
+    async def _recheck_deferred_paper_entry_instrument(
+        self,
+        decision: DecisionOutput,
+        model_mode: str,
+    ) -> None:
+        """Verify a deferred instrument on the execution queue for a valid paper entry."""
+
+        if model_mode != "paper" or not decision.is_entry:
+            return
+        raw = self._safe_dict(decision.raw_response)
+        symbol = self._normalize_position_symbol(decision.symbol)
+        funnel = self._safe_dict(raw.get("market_candidate_funnel"))
+        marker = self._market_analysis_only_marker(funnel, symbol) or {}
+        persisted = self._safe_dict(raw.get("market_analysis_only_contract"))
+        if (
+            marker.get("state") == "execution_unavailable"
+            or persisted.get("execution_candidate_state") == "execution_unavailable"
+        ):
+            return
+        deferred = (
+            marker.get("state") == "analysis_only_execution_unverified"
+            and marker.get("reason") == "okx_private_entry_instrument_probe_deferred"
+        ) or (
+            persisted.get("selected_for_market_analysis") is True
+            and persisted.get("entry_permission") is False
+            and persisted.get("execution_candidate_state") == "analysis_only_execution_unverified"
+            and persisted.get("reason") == "okx_private_entry_instrument_probe_deferred"
+        )
+        if (
+            not deferred
+            or symbol in self._entry_unavailable_cache_for_mode(model_mode)
+        ):
+            return
+        contract = self._safe_dict(raw.get("normal_paper_trade"))
+        if (
+            self._safe_dict(raw.get("entry_permission")).get("granted") is not True
+            or normal_paper_entry_contract_reasons(contract)
+            or self._normalize_position_symbol(contract.get("symbol")) != symbol
+            or contract.get("side") != decision.action.value
+        ):
+            return
+        generated_at = self._parse_datetime(contract.get("generated_at"))
+        if generated_at is None or not 0 <= (
+            datetime.now(UTC) - generated_at
+        ).total_seconds() <= float(contract["valid_for_seconds"]):
+            return
+
+        try:
+            async with asyncio.timeout(MARKET_ENTRY_INSTRUMENT_RECHECK_TIMEOUT_SECONDS):
+                executor = await self._get_okx_executor_for_mode(model_mode)
+                facts = self._safe_dict(
+                    await executor.entry_instrument_availability(symbol, force=True)
+                )
+        except Exception as exc:
+            facts = {
+                "reason": (
+                    "okx_entry_instrument_recheck_timeout"
+                    if isinstance(exc, TimeoutError)
+                    else "okx_entry_instrument_recheck_failed"
+                ),
+                "error": safe_error_text(exc, limit=160),
+            }
+
+        # Do not overwrite an exchange restriction recorded while the probe was in flight.
+        blocked = symbol in self._entry_unavailable_cache_for_mode(model_mode)
+        verified = (
+            not blocked
+            and facts.get("available") is True
+            and facts.get("demo") is True
+            and facts.get("mode") == model_mode
+            and self._normalize_position_symbol(facts.get("symbol")) == symbol
+        )
+        if verified:
+            self._verified_entry_symbols_by_mode.setdefault(model_mode, set()).add(symbol)
+        elif not blocked:
+            ttl = entry_instrument_unavailable_cache_ttl(facts)
+            if ttl is not None:
+                self._remember_unavailable_entry_symbol(
+                    model_mode, symbol, facts, ttl_seconds=ttl,
+                )
+        raw["market_entry_instrument_recheck"] = {
+            "symbol": symbol,
+            "available": verified,
+            "reason": (
+                "okx_entry_instrument_recheck_superseded"
+                if blocked
+                else "okx_entry_instrument_recheck_fact_mismatch"
+                if facts.get("available") is True and not verified
+                else facts.get("reason") or "okx_entry_instrument_recheck_unverified"
+            ),
+            "error_code": facts.get("error_code"),
+            "source": facts.get("source"),
+            "checked_at": datetime.now(UTC).isoformat(),
+        }
+        decision.raw_response = raw
 
     def _entry_gate_reason_with_market_boundary(
         self,
@@ -10726,6 +10824,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         """Finish risk preparation and execution outside the market analysis clock."""
 
         try:
+            await self._recheck_deferred_paper_entry_instrument(decision, model_mode)
             market_analysis_reason = self._market_analysis_only_entry_reason(
                 decision,
                 model_mode=model_mode,
