@@ -90,7 +90,7 @@ from services.dynamic_exit_policy import (
 from services.dynamic_position_capacity import DynamicPositionCapacityPolicy
 from services.entry_candidate_evidence import EntryCandidateEvidencePolicy
 from services.entry_candidate_filter import EntryCandidateFilterPolicy
-from services.entry_candidate_queue import EntryCandidateQueuePolicy
+from services.entry_candidate_queue import EntryCandidate, EntryCandidateQueuePolicy
 from services.entry_capacity import EntryCapacityPolicy
 from services.entry_direction_competition import EntryDirectionCompetitionPolicy
 from services.entry_execution_handoff import (
@@ -303,6 +303,7 @@ MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS = 30.0
 MARKET_INSTRUMENT_SHORTLIST_WAIT_SECONDS = 8.0
 MARKET_INSTRUMENT_REFRESH_BATCH_SIZE = 24
 MARKET_INSTRUMENT_REFRESH_QUEUE_LIMIT = 96
+MARKET_ENTRY_INSTRUMENT_RECHECK_CONCURRENCY = 2
 AUTHORITATIVE_OUTCOME_FEEDBACK_TIMEOUT_SECONDS = 120.0
 AUTHORITATIVE_OUTCOME_FEEDBACK_MAX_ATTEMPTS = 3
 AUTHORITATIVE_OUTCOME_FEEDBACK_RETRY_DELAY_SECONDS = 15.0
@@ -8496,6 +8497,21 @@ class TradingService(ModelTrainingCoordinatorMixin):
         ).total_seconds() <= float(contract["valid_for_seconds"]):
             return
 
+        previous_recheck = self._safe_dict(raw.get("market_entry_instrument_recheck"))
+        previous_checked_at = self._parse_datetime(previous_recheck.get("checked_at"))
+        verified_symbols = self._verified_entry_symbols_by_mode.get(model_mode, set())
+        if (
+            previous_recheck.get("available") is True
+            and previous_recheck.get("symbol") == symbol
+            and previous_recheck.get("mode") == model_mode
+            and symbol in verified_symbols
+            and previous_checked_at is not None
+            and 0
+            <= (datetime.now(UTC) - previous_checked_at).total_seconds()
+            <= MARKET_ENTRY_INSTRUMENT_RECHECK_TIMEOUT_SECONDS * 2
+        ):
+            return
+
         try:
             async with asyncio.timeout(MARKET_ENTRY_INSTRUMENT_RECHECK_TIMEOUT_SECONDS):
                 executor = await self._get_okx_executor_for_mode(model_mode)
@@ -8531,6 +8547,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 )
         raw["market_entry_instrument_recheck"] = {
             "symbol": symbol,
+            "mode": model_mode,
             "available": verified,
             "reason": (
                 "okx_entry_instrument_recheck_superseded"
@@ -8544,6 +8561,38 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "checked_at": datetime.now(UTC).isoformat(),
         }
         decision.raw_response = raw
+
+    async def _recheck_deferred_paper_entry_candidates_before_filter(
+        self,
+        candidates: list[EntryCandidate],
+    ) -> None:
+        """Resolve eligible deferred paper instruments before the synchronous entry gate."""
+
+        semaphore = asyncio.Semaphore(MARKET_ENTRY_INSTRUMENT_RECHECK_CONCURRENCY)
+
+        async def recheck(candidate: EntryCandidate) -> None:
+            _symbol, model_name, decision, _assessment, _decision_db_id = candidate
+            if not decision.is_entry:
+                return
+            model_mode = self._get_model_execution_mode(model_name)
+            if model_mode != "paper":
+                return
+            entry_policy = getattr(self, "entry_policy", None)
+            if entry_policy is not None and entry_policy.gate_reason(decision):
+                return
+            async with semaphore:
+                try:
+                    await self._recheck_deferred_paper_entry_instrument(decision, model_mode)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "deferred paper entry pre-filter recheck failed closed",
+                        symbol=decision.symbol,
+                        error=safe_error_text(exc, limit=160),
+                    )
+
+        await asyncio.gather(*(recheck(candidate) for candidate in candidates))
 
     def _entry_gate_reason_with_market_boundary(
         self,
@@ -13117,6 +13166,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     )
                     await self._mark_decision_reason(decision_db_id, ranked.wait_reason)
 
+            await self._recheck_deferred_paper_entry_candidates_before_filter(all_candidates)
             filtered_entry_candidates = self._entry_candidate_filter_policy().filter(
                 all_candidates,
                 strategy_context=strategy_mode_context,

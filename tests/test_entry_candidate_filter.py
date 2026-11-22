@@ -508,6 +508,103 @@ async def test_deferred_market_instrument_recheck_at_entry_handoff(case: str) ->
         availability.assert_awaited_once_with(symbol, force=True)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("instrument_available", "expected_accepted"),
+    [(True, True), (False, False)],
+)
+async def test_deferred_instrument_is_rechecked_before_synchronous_candidate_filter(
+    instrument_available: bool,
+    expected_accepted: bool,
+) -> None:
+    service = object.__new__(TradingService)
+    symbol = "ARB/USDT"
+    service._market_analysis_only_symbols = {symbol}
+    service._verified_entry_symbols_by_mode = {"paper": set(), "live": set()}
+    service._unavailable_entry_symbols_by_mode = {"paper": {}, "live": {}}
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    service.entry_policy = SimpleNamespace(gate_reason=lambda _decision: None)
+
+    decision = _decision(symbol, Action.SHORT)
+    decision.raw_response = {
+        "paper_trade_selection": {"selected": True},
+        "entry_permission": {"granted": True},
+        "normal_paper_trade": build_normal_paper_trade_contract(
+            symbol=symbol,
+            side="short",
+            selection_reason="paper_training_entry",
+            direction_support={
+                "eligible": True,
+                "selected_side": "short",
+                "prediction_horizon_minutes": 240.0,
+                "expected_net_return_pct": 2.425,
+                "raw_expected_return_pct": 2.537,
+                "paper_training_only": True,
+                "objective_net_return_pct": 0.088,
+                "loss_probability": 0.236,
+                "quant_evidence_families": ["local_ml"],
+                "quant_quality_permissions": {
+                    "local_ml": {"paper_execution_permission": False},
+                },
+                "strong_expert_opposition": False,
+            },
+        ),
+        "market_candidate_funnel": {
+            "execution_availability": {
+                "analysis_only_execution_unverified": [
+                    {
+                        "symbol": symbol,
+                        "reason": "okx_private_entry_instrument_probe_deferred",
+                    },
+                ],
+            },
+        },
+    }
+    availability = AsyncMock(
+        return_value={
+            "available": instrument_available,
+            "symbol": symbol,
+            "demo": True,
+            "mode": "paper",
+            "reason": None if instrument_available else "okx_entry_instrument_unavailable",
+        }
+    )
+    service._get_okx_executor_for_mode = AsyncMock(
+        return_value=SimpleNamespace(entry_instrument_availability=availability)
+    )
+    candidate = (symbol, decision.model_name, decision, object(), None)
+
+    await service._recheck_deferred_paper_entry_candidates_before_filter([candidate])
+    if instrument_available:
+        # Only a passing candidate reaches the execution handoff.
+        await service._recheck_deferred_paper_entry_candidates_before_filter([candidate])
+
+    policy = EntryCandidateFilterPolicy(
+        gate_reason=lambda item: service._entry_gate_reason_with_market_boundary(item),
+        market_regime_reason=lambda _decision, _context: None,
+        capacity_reason=lambda *_args: None,
+        reserve_capacity=lambda *_args: None,
+    )
+    result = policy.filter(
+        [candidate],
+        strategy_context=None,
+        market_regime_context=None,
+        open_positions=[],
+        staged_entry_counts={},
+    )
+
+    assert bool(result.accepted_candidates) is expected_accepted
+    assert availability.await_count == 1
+    if expected_accepted:
+        assert result.rejected_candidates == []
+        assert decision.raw_response["market_analysis_only_contract"][
+            "promoted_for_execution"
+        ]
+    else:
+        assert result.rejected_candidates[0].blocker == "entry_gate"
+        assert decision.raw_response["market_entry_instrument_recheck"]["available"] is False
+
+
 def test_market_analysis_only_training_contract_is_not_promoted() -> None:
     service = object.__new__(TradingService)
     service._market_analysis_only_symbols = {"BTC/USDT"}
