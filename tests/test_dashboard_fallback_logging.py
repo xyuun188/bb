@@ -1025,7 +1025,7 @@ async def test_dashboard_okx_positions_stale_cache_returns_on_refresh_timeout(
     await refresh_task
 
 
-async def test_dashboard_okx_position_lock_timeout_returns_stale_cache(
+async def test_dashboard_okx_position_lock_timeout_does_not_return_expired_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     executor = object()
@@ -1054,14 +1054,14 @@ async def test_dashboard_okx_position_lock_timeout_returns_stale_cache(
     monkeypatch.setattr(dashboard, "_DASHBOARD_OKX_LOCK_TIMEOUT_SECONDS", 0.01)
 
     try:
-        result = await asyncio.wait_for(
-            dashboard._fetch_dashboard_okx_positions("paper"),
-            timeout=0.2,
-        )
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                dashboard._fetch_dashboard_okx_positions("paper"),
+                timeout=0.2,
+            )
     finally:
         locked.release()
 
-    assert result == [{"symbol": "STALE/USDT:USDT", "side": "short", "contracts": 2}]
     assert "paper" in dashboard._dashboard_okx_position_error_cache
 
 

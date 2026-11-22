@@ -356,11 +356,8 @@ const DASHBOARD_BALANCE_FIELDS = [
     'okx_equity_balance',
     'equity',
     'wallet_balance',
-    'used_margin',
     'okx_used_balance',
-    'position_margin_used',
     'paper_execution_available_balance',
-    'paper_execution_used_margin',
 ];
 
 async function fetchJSON(url) {
@@ -555,17 +552,17 @@ async function fetchDashboardSummary() {
 function preserveLastGoodAccountBalance(rawAccount, fallbackMode = 'paper') {
     if (!rawAccount || !Object.keys(rawAccount).length) return rawAccount || {};
     const account = { ...rawAccount };
-    const mode = account.mode === 'live' || fallbackMode === 'live' ? 'live' : 'paper';
-    const hasBalanceValue = DASHBOARD_BALANCE_FIELDS.some(field => (
-        valueNumber(account[field]) !== null
-    ));
+    const mode = (account.mode || fallbackMode) === 'live' ? 'live' : 'paper';
+    const hasBalanceValue = valueNumber(account.account_equity) !== null
+        && valueNumber(account.available_balance) !== null;
     const isFresh = hasBalanceValue
+        && account.account_pnl_source === 'okx_authoritative'
         && !account.balance_error
         && account.balance_snapshot_stale !== true;
 
     if (isFresh) {
         state.lastFreshAccountBalances[mode] = {
-            capturedAtMs: Date.now(),
+            capturedAtMs: Date.parse(account.balance_as_of) || Date.now(),
             values: Object.fromEntries(
                 DASHBOARD_BALANCE_FIELDS
                     .filter(field => valueNumber(account[field]) !== null)
@@ -576,26 +573,15 @@ function preserveLastGoodAccountBalance(rawAccount, fallbackMode = 'paper') {
     }
 
     const cached = state.lastFreshAccountBalances[mode];
-    const needsClientFallback = Boolean(account.balance_error)
-        && account.balance_snapshot_stale !== true;
-    let usedClientFallback = false;
-    if (cached && (!hasBalanceValue || needsClientFallback)) {
-        for (const [field, value] of Object.entries(cached.values)) {
-            if (needsClientFallback || valueNumber(account[field]) === null) account[field] = value;
-        }
-        usedClientFallback = true;
-    }
-    if ((account.balance_error || usedClientFallback) && (hasBalanceValue || usedClientFallback)) {
+    const cacheAge = cached ? Math.max((Date.now() - cached.capturedAtMs) / 1000, 0) : null;
+    if (!hasBalanceValue && cached && cacheAge <= 300 && isTemporaryBalanceError(account.balance_error)) {
+        Object.assign(account, cached.values);
         account.balance_snapshot_stale = true;
-        if (usedClientFallback) {
-            account.balance_snapshot_age_seconds = Math.max(
-                (Date.now() - cached.capturedAtMs) / 1000,
-                Number(account.balance_snapshot_age_seconds || 0),
-            );
-            account.balance_source = mode === 'live'
-                ? 'OKX 实盘最近成功快照'
-                : 'OKX 模拟盘最近成功快照';
-        }
+        account.balance_as_of = new Date(cached.capturedAtMs).toISOString();
+        account.balance_snapshot_age_seconds = cacheAge;
+        account.balance_source = mode === 'live'
+            ? 'OKX 实盘最近成功快照'
+            : 'OKX 模拟盘最近成功快照';
     }
     downgradeTemporaryBalanceError(account);
     return account;
@@ -916,6 +902,8 @@ function updateTickers(tickers, options = {}) {
 }
 
 function valueNumber(value) {
+    if (value == null || typeof value === 'boolean'
+        || (typeof value === 'string' && !value.trim())) return null;
     const n = Number(value);
     return Number.isFinite(n) ? n : null;
 }
@@ -1030,7 +1018,9 @@ function updateExecutionAccountPanel(account) {
     }
 
     const modeLabel = account.mode === 'live' ? '实盘' : '模拟盘';
-    const unrealizedPnl = valueNumber(account.unrealized_pnl) || 0;
+    const openPositionCount = Math.max(valueNumber(account.open_positions) || 0, 0);
+    const unrealizedPnl = account.positions_read_unavailable && openPositionCount === 0
+        ? null : valueNumber(account.unrealized_pnl);
     const phase3TotalPnl = valueNumber(account.phase3_equity_pnl);
     const phase3ObservedStart = account.phase3_equity_observed_start_date || '';
     const phase3EquityLabel = account.phase3_equity_series_complete
@@ -1046,13 +1036,23 @@ function updateExecutionAccountPanel(account) {
         : '累计交易总盈亏';
     const remainingAllocation = valueNumber(account.available_balance ?? account.okx_available_balance ?? account.remaining_allocation);
     const accountEquity = valueNumber(account.account_equity ?? account.okx_equity_balance ?? account.equity ?? account.wallet_balance);
-    const openPositionCount = Math.max(valueNumber(account.open_positions) || 0, 0);
     const positionMarginUsed = openPositionCount > 0
-        ? (valueNumber(
+        ? valueNumber(
             account.position_margin_used ?? account.paper_execution_used_margin ?? account.used_margin
-        ) || 0)
-        : 0;
+        )
+        : (account.positions_read_unavailable ? null : 0);
     const balanceSource = account.balance_source || (account.balance_snapshot_stale ? 'OKX 缓存快照' : 'OKX 权威账户');
+    const balanceCacheAge = valueNumber(account.balance_snapshot_age_seconds);
+    const balanceCacheText = account.balance_snapshot_stale
+        ? ` · 缓存${balanceCacheAge === null ? '' : ` ${monitorNumber(balanceCacheAge, 1)} 秒`}`
+        : '';
+    const positionStatus = account.positions_read_unavailable && openPositionCount === 0
+        ? 'OKX 持仓读取暂不可用'
+        : (account.positions_snapshot_stale && account.positions_as_of
+            ? `持仓快照 ${shortBeijingTime(account.positions_as_of)}` : '');
+    const accountStatus = account.risk_paused
+        ? (account.market_analysis_paused ? '暂停分析/开仓' : '分析中·暂停开仓')
+        : (account.balance_error || account.balance_snapshot_stale ? '余额待确认' : '运行中');
     const accountBalanceLabel = account.mode === 'live' ? 'OKX 实盘' : 'OKX 模拟盘';
     const pauseNote = account.risk_paused
         ? `<div class="exec-risk-note paused">${account.market_analysis_paused ? '市场分析已暂停；' : '市场分析继续运行；'}已暂停新开仓：${escHtml(translatePauseReason(account.entry_pause_reason || account.risk_pause_reason || '账户触发风险限制'))}</div>`
@@ -1063,15 +1063,15 @@ function updateExecutionAccountPanel(account) {
             <div class="exec-account-head">
                 <div>
                     <div class="exec-account-name">${escHtml(account.account_name || '多专家执行账户')}</div>
-                    <div class="exec-account-mode">${modeLabel} · ${escHtml(balanceSource)}${account.balance_snapshot_stale ? ` · 缓存 ${monitorNumber(account.balance_snapshot_age_seconds, 1)}秒` : ''}${account.trade_pnl_as_of ? ` · 盈亏更新 ${shortBeijingTime(account.trade_pnl_as_of)}` : ''}</div>
+                    <div class="exec-account-mode">${modeLabel} · ${escHtml(balanceSource)}${balanceCacheText}${account.trade_pnl_as_of ? ` · 盈亏更新 ${shortBeijingTime(account.trade_pnl_as_of)}` : ''}${positionStatus ? ` · ${escHtml(positionStatus)}` : ''}</div>
                 </div>
-                <span class="badge ${account.risk_paused ? 'badge-short' : 'badge-long'}">${account.risk_paused ? (account.market_analysis_paused ? '暂停分析/开仓' : '分析中·暂停开仓') : '可分析可开仓'}</span>
+                <span class="badge ${account.risk_paused || account.balance_error ? 'badge-short' : 'badge-long'}">${accountStatus}</span>
             </div>
             <div class="exec-status-grid">
                 <div class="exec-status-cell"><span>${accountBalanceLabel}可交易余额</span><strong>${accountMoneyText(remainingAllocation, account)} USDT</strong></div>
                 <div class="exec-status-cell"><span>${accountBalanceLabel}当前账户权益</span><strong>${accountMoneyText(accountEquity, account)} USDT</strong></div>
-                <div class="exec-status-cell"><span>持仓保证金占用</span><strong>${accountMoneyText(positionMarginUsed, account)} USDT</strong></div>
-                <div class="exec-status-cell"><span>浮动盈亏</span><strong style="color:${unrealizedPnl >= 0 ? 'var(--green)' : 'var(--red)'};">${signedMoney(unrealizedPnl)} USDT</strong></div>
+                <div class="exec-status-cell"><span>持仓保证金占用</span><strong>${positionMarginUsed === null ? '--' : `${fmtMoney(positionMarginUsed)} USDT`}</strong></div>
+                <div class="exec-status-cell"><span>浮动盈亏</span><strong style="color:${signedMoneyColor(unrealizedPnl)};">${signedMoneyWithUnit(unrealizedPnl)}</strong></div>
                 <div class="exec-status-cell"><span>今日交易总盈亏</span><strong style="color:${signedMoneyColor(todayTradePnl)};">${signedMoneyWithUnit(todayTradePnl)}</strong></div>
                 <div class="exec-status-cell"><span>${tradeScope}</span><strong style="color:${signedMoneyColor(cumulativeTradePnl)};">${signedMoneyWithUnit(cumulativeTradePnl)}</strong></div>
                 <div class="exec-status-cell"><span>今日OKX权益变化</span><strong style="color:${signedMoneyColor(todayTotalPnl)};">${signedMoneyWithUnit(todayTotalPnl)}</strong></div>

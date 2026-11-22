@@ -375,14 +375,51 @@ def test_dashboard_execution_account_refuses_synthetic_balance_when_okx_missing(
         pnl_summary={"total_pnl": 9.22, "today_total_pnl": 9.22},
     )
 
-    assert payload["account_equity"] == 0.0
+    assert payload["account_equity"] is None
     assert payload["allocated_balance"] is None
     assert payload["available_balance"] is None
     assert payload["total_pnl"] is None
     assert payload["cumulative_total_pnl"] is None
     assert payload["local_trade_total_pnl"] == 9.22
     assert payload["account_pnl_source"] == "okx_unavailable"
-    assert payload["risk_paused"] is True
+    assert payload["risk_paused"] is False
+
+
+@pytest.mark.parametrize("mode", ["paper", "live"])
+def test_dashboard_execution_account_distinguishes_verified_zero_from_unavailable(
+    monkeypatch, mode,
+) -> None:
+    monkeypatch.setattr(dashboard, "_trading_service", None)
+    snapshot = {"free": 0.0, "equity": 0.0, "total": 40.0, "verified": True}
+    pnl_summary = {"today_equity_baseline": 40.0}
+
+    zero = dashboard._build_execution_account_status(
+        mode, okx_account=snapshot, pnl_summary=pnl_summary,
+    )
+    assert zero["account_equity"] == 0.0
+    assert zero["available_balance"] == 0.0
+    assert zero["today_equity_pnl"] == -40.0
+    assert zero["balance_error"] is None
+
+    stale = dashboard._build_execution_account_status(
+        mode, okx_account={**snapshot, "stale": True, "stale_age_seconds": 12, "error": "timeout"},
+        pnl_summary=pnl_summary,
+    )
+    assert stale["account_equity"] == 0.0
+    assert stale["balance_snapshot_stale"] is True
+    assert stale["balance_snapshot_age_seconds"] == 12
+    assert stale["balance_error"] is None
+
+    unavailable = dashboard._build_execution_account_status(
+        mode, okx_account={"free": 0.0, "equity": 0.0, "verified": False, "error": "timeout"},
+        pnl_summary={**pnl_summary, "phase3_equity_pnl": -40.0},
+    )
+    assert unavailable["available_balance"] is None
+    assert unavailable["account_equity"] is None
+    assert unavailable["today_equity_pnl"] is None
+    assert unavailable["phase3_equity_pnl"] is None
+    assert unavailable["balance_snapshot_stale"] is False
+    assert unavailable["balance_error"]
 
 
 def test_dashboard_execution_account_does_not_promote_local_trade_pnl_to_account_pnl(

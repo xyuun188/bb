@@ -39,7 +39,6 @@ from data_feed.okx_ticker_volume import okx_swap_volume_fields
 from executor.okx_executor import OKXExecutor
 from services.account_accounting_service import (
     allocatable_balance_from_snapshot,
-    balance_from_snapshot,
     tradeable_balance_from_snapshot,
 )
 from services.continuous_observation import (
@@ -94,6 +93,7 @@ from services.model_training_state import (
     training_timeline,
 )
 from services.observability_contract import build_snapshot, status_from_sections
+from services.okx_balance_snapshot import balance_snapshot_verified, finite_balance_value
 from services.okx_error_classifier import is_okx_temporary_service_error
 from services.okx_lifecycle_order_allocations import lifecycle_order_allocation
 from services.phase3_boundary import PHASE3_CLEAN_START_UTC, PHASE3_FIRST_CLEAN_DAY
@@ -758,12 +758,9 @@ def _dashboard_okx_error_text(exc: Exception, *, resource: str) -> str:
     error = safe_error_text(exc)
     lower = error.lower()
     if is_okx_temporary_service_error(error):
-        return (
-            f"OKX 返回错误码 50001：{resource}接口临时不可用，"
-            "当前优先显示最近一次成功快照，系统会自动重试。"
-        )
+        return f"OKX 返回错误码 50001：{resource}接口临时不可用，系统会自动重试。"
     if isinstance(exc, TimeoutError) or error in ("TimeoutError", "") or "timed out" in lower:
-        return f"OKX {resource}响应超时，已优先返回缓存数据"
+        return f"OKX {resource}响应超时，系统会自动重试"
     if "authorization" in lower or "api key" in lower or "signature" in lower:
         return f"OKX {resource}鉴权失败：{error}"
     return f"OKX {resource}读取失败：{error}"
@@ -969,10 +966,9 @@ async def _fetch_dashboard_okx_balance_uncached(selected_mode: str) -> dict[str,
         fallback_executor.get_balance_snapshot("USDT"),
         timeout=_DASHBOARD_OKX_BALANCE_READ_TIMEOUT_SECONDS,
     )
-    if not snapshot:
-        raise RuntimeError("empty OKX balance snapshot")
-    if snapshot.get("error"):
-        raise RuntimeError(safe_error_text(snapshot.get("error")))
+    if not balance_snapshot_verified(snapshot):
+        error = snapshot.get("error") if isinstance(snapshot, dict) else None
+        raise RuntimeError(safe_error_text(error or "unverified OKX balance snapshot"))
     return dict(snapshot)
 
 
@@ -1084,6 +1080,12 @@ def _dashboard_okx_position_error_state(mode: str | None = None) -> dict[str, An
 
 def _dashboard_okx_positions_temporarily_unavailable(mode: str | None = None) -> bool:
     return _dashboard_okx_position_error_state(mode) is not None
+
+
+def _usable_dashboard_position_cache(cached_at: datetime) -> bool:
+    return (datetime.now(UTC) - cached_at).total_seconds() <= (
+        _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS
+    )
 
 
 def _as_utc_datetime(value: Any) -> datetime | None:
@@ -1991,26 +1993,6 @@ def _extract_local_tools(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _execution_tradeable_balance(
-    *,
-    okx_available: float | None,
-    okx_allocatable: float | None,
-    okx_equity: float | None,
-    okx_total: float | None,
-    fallback_available: float | None,
-) -> float | None:
-    snapshot = {
-        "free": okx_available,
-        "allocatable": okx_allocatable,
-        "equity": okx_equity,
-        "total": okx_total,
-    }
-    tradeable = tradeable_balance_from_snapshot(snapshot)
-    if tradeable > 0:
-        return tradeable
-    return _safe_float(fallback_available, None)
-
-
 def _build_decision_attribution(
     decision: Any, raw: dict[str, Any], experts: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -2348,7 +2330,7 @@ def _okx_equity_pnl_from_snapshot(
     summary = pnl_summary or {}
     equity = _safe_float(current_equity, None)
     baseline = _safe_float(summary.get("today_equity_baseline"), None)
-    if equity is None or equity <= 0 or baseline is None or baseline <= 0:
+    if equity is None or baseline is None or baseline <= 0:
         return {
             "today_total_pnl": None,
             "today_equity_pnl": None,
@@ -2497,7 +2479,9 @@ async def _execution_open_position_metrics(mode: str) -> tuple[list[Any], dict[s
     }
 
 
-async def _get_execution_pnl_summary(mode: str) -> dict:
+async def _get_execution_pnl_summary(
+    mode: str, *, balance_snapshot: dict[str, Any] | None = None,
+) -> dict:
     """Return official trading PnL and separate account-equity movement."""
     from db.repositories.trade_repo import TradeRepository
     from db.session import get_read_session_ctx, get_session_ctx
@@ -2506,22 +2490,21 @@ async def _get_execution_pnl_summary(mode: str) -> dict:
     today_local = datetime.now(BEIJING_TZ).date()
     closed_ledger_rows = []
     trade_pnl_available = False
-    balance_result, metrics_result = await asyncio.gather(
-        _dashboard_okx_balance_snapshot_for_mode(selected_mode),
-        _execution_open_position_metrics(selected_mode),
-        return_exceptions=True,
+    if balance_snapshot is None:
+        try:
+            balance_snapshot = await _dashboard_okx_balance_snapshot_for_mode(selected_mode)
+        except Exception as exc:
+            _log_dashboard_fallback("dashboard balance snapshot fallback", exc, mode=selected_mode)
+    snapshot = balance_snapshot or {}
+    position_rows, position_metrics = await _execution_open_position_metrics(selected_mode)
+    validation_snapshot = (
+        {**snapshot, "stale": False, "error": None} if snapshot.get("stale") else snapshot
     )
-    if isinstance(balance_result, Exception):
-        _log_dashboard_fallback(
-            "dashboard balance snapshot fallback", balance_result, mode=selected_mode
-        )
-        snapshot = {}
-    else:
-        snapshot = balance_result or {}
-    if isinstance(metrics_result, Exception):
-        raise metrics_result
-    position_rows, position_metrics = metrics_result
-    okx_current_equity = _safe_float(snapshot.get("equity") or snapshot.get("total"), None)
+    okx_current_equity = (
+        finite_balance_value(snapshot.get("equity"))
+        if balance_snapshot_verified(validation_snapshot)
+        else None
+    )
     allocated = (
         _safe_float(
             snapshot.get("allocatable")
@@ -2735,56 +2718,30 @@ def _build_execution_account_status(
     okx_error = str(okx_error_value) if okx_error_value else None
     if okx_error and is_okx_temporary_service_error(okx_error):
         okx_error = _dashboard_okx_error_text(RuntimeError(okx_error), resource="余额")
-    raw_okx_available = _safe_float(okx_account.get("free"), None) if okx_account else None
-    raw_okx_used = _safe_float(okx_account.get("used"), 0.0) if okx_account else None
-    raw_okx_total = (
-        _safe_float(okx_account.get("total"), raw_okx_available) if okx_account else None
+    snapshot = dict(okx_account or {})
+    stale = snapshot.get("stale") is True
+    # Errors attached to a last-good snapshot describe the refresh, not the snapshot.
+    validation_snapshot = {**snapshot, "stale": False, "error": None} if stale else snapshot
+    okx_balance_available = balance_snapshot_verified(validation_snapshot) and (
+        stale or not okx_error
     )
-    raw_okx_cash = _safe_float(okx_account.get("cash"), raw_okx_total) if okx_account else None
-    raw_okx_equity = _safe_float(okx_account.get("equity"), raw_okx_total) if okx_account else None
-    raw_okx_allocatable = (
-        _safe_float(
-            okx_account.get("allocatable"), raw_okx_equity or raw_okx_total or raw_okx_available
-        )
-        if okx_account
-        else None
+    if not okx_balance_available:
+        snapshot = {}
+    okx_available = finite_balance_value(snapshot.get("free"))
+    okx_used = finite_balance_value(snapshot.get("used"))
+    okx_total = finite_balance_value(snapshot.get("total"))
+    okx_cash = finite_balance_value(snapshot.get("cash"))
+    account_equity = finite_balance_value(snapshot.get("equity"))
+    parsed_allocatable = (
+        allocatable_balance_from_snapshot(snapshot) if okx_balance_available else None
     )
-    okx_error_blocks_balance = bool(
-        okx_error
-        and max(
-            _safe_float(raw_okx_available, 0.0),
-            _safe_float(raw_okx_total, 0.0),
-            _safe_float(raw_okx_cash, 0.0),
-            _safe_float(raw_okx_equity, 0.0),
-            _safe_float(raw_okx_allocatable, 0.0),
-        )
-        <= 0
-    )
-    okx_available = None if okx_error_blocks_balance else raw_okx_available
-    okx_used = None if okx_error_blocks_balance else raw_okx_used
-    okx_total = None if okx_error_blocks_balance else raw_okx_total
-    okx_cash = None if okx_error_blocks_balance else raw_okx_cash
-    okx_equity = None if okx_error_blocks_balance else raw_okx_equity
-    okx_allocatable = None if okx_error_blocks_balance else raw_okx_allocatable
-    okx_snapshot_for_balance = (
-        {
-            "free": okx_available,
-            "used": okx_used,
-            "total": okx_total,
-            "cash": okx_cash,
-            "equity": okx_equity,
-            "allocatable": okx_allocatable,
-        }
-        if okx_account and not okx_error_blocks_balance
-        else None
-    )
-    parsed_account_equity = balance_from_snapshot(okx_snapshot_for_balance)
-    parsed_allocatable = allocatable_balance_from_snapshot(okx_snapshot_for_balance)
-    parsed_tradeable = tradeable_balance_from_snapshot(okx_snapshot_for_balance)
-    okx_balance_available = bool(okx_snapshot_for_balance and parsed_account_equity > 0)
-    account_equity = parsed_account_equity if okx_balance_available else 0.0
+    available = tradeable_balance_from_snapshot(snapshot) if okx_balance_available else None
+    stale_age = finite_balance_value(snapshot.get("stale_age_seconds"))
+    balance_as_of = snapshot.get("balance_as_of")
+    if stale and stale_age is not None and not balance_as_of:
+        balance_as_of = (datetime.now(UTC) - timedelta(seconds=stale_age)).isoformat()
     okx_pnl = _okx_equity_pnl_from_snapshot(
-        current_equity=account_equity if okx_balance_available else None,
+        current_equity=account_equity,
         pnl_summary=pnl_summary,
     )
     pause_reason = None
@@ -2806,15 +2763,20 @@ def _build_execution_account_status(
     pause_reason = _translate_pause_reason(pause_reason)
     entry_pause_reason = _translate_pause_reason(entry_pause_reason)
     market_analysis_pause_reason = _translate_pause_reason(market_analysis_pause_reason)
-    if not okx_error and not okx_balance_available:
-        okx_error = "OKX balance unavailable"
-    if okx_error and not pause_reason and not okx_balance_available:
-        source = "OKX 实盘账户" if mode == "live" else "OKX 模拟盘账户"
-        pause_reason = f"{source} 余额同步失败，系统不会分析新的交易对。原因：{okx_error}"
-        market_analysis_pause_reason = market_analysis_pause_reason or pause_reason
-        entry_pause_reason = entry_pause_reason or pause_reason
+    if not okx_balance_available and not okx_error:
+        okx_error = (
+            "OKX 余额同步中"
+            if (okx_account or {}).get("refresh_in_progress")
+            else "OKX 余额暂无可用快照"
+        )
     blocking_balance_error = okx_error if not okx_balance_available else None
     balance_warning = okx_error if okx_balance_available else None
+    position_cache = _dashboard_okx_position_cache.get(mode)
+    position_as_of = position_cache[0] if position_cache else None
+    positions_stale = bool(
+        position_as_of and (datetime.now(UTC) - position_as_of).total_seconds()
+        > _DASHBOARD_OKX_POSITION_CACHE_TTL_SECONDS
+    )
     payload = {
         **cfg,
         "model_name": ENSEMBLE_TRADER_NAME,
@@ -2833,7 +2795,14 @@ def _build_execution_account_status(
         "okx_used_balance": okx_used,
         "okx_total_balance": okx_total,
         "okx_cash_balance": okx_cash,
-        "okx_equity_balance": okx_equity,
+        "okx_equity_balance": account_equity,
+        "balance_snapshot_stale": bool(okx_balance_available and stale),
+        "balance_snapshot_age_seconds": stale_age if stale else None,
+        "balance_as_of": balance_as_of,
+        "balance_source": _dashboard_okx_account_label(mode),
+        "positions_as_of": position_as_of.isoformat() if position_as_of else None,
+        "positions_snapshot_stale": positions_stale,
+        "positions_read_unavailable": _dashboard_okx_positions_temporarily_unavailable(mode),
         "max_allocatable_balance": parsed_allocatable,
         "allocation_exceeds_balance": False,
         "account_pnl_source": "okx_authoritative" if okx_balance_available else "okx_unavailable",
@@ -2867,8 +2836,13 @@ def _build_execution_account_status(
         "today_equity_baseline_at": pnl_summary.get("today_equity_baseline_at"),
         "today_equity_baseline_source": pnl_summary.get("today_equity_baseline_source"),
         "today_snapshot_date": pnl_summary.get("today_snapshot_date"),
-        "phase3_equity_pnl": _safe_float(pnl_summary.get("phase3_equity_pnl"), None),
-        "phase3_equity_pnl_pct": _safe_float(pnl_summary.get("phase3_equity_pnl_pct"), None),
+        "phase3_equity_pnl": (
+            _safe_float(pnl_summary.get("phase3_equity_pnl"), None) if okx_balance_available else None
+        ),
+        "phase3_equity_pnl_pct": (
+            _safe_float(pnl_summary.get("phase3_equity_pnl_pct"), None)
+            if okx_balance_available else None
+        ),
         "phase3_equity_baseline": _safe_float(pnl_summary.get("phase3_equity_baseline"), None),
         "phase3_equity_baseline_at": pnl_summary.get("phase3_equity_baseline_at"),
         "phase3_equity_baseline_source": pnl_summary.get("phase3_equity_baseline_source"),
@@ -2886,33 +2860,15 @@ def _build_execution_account_status(
         "cumulative_total_pnl": okx_pnl["cumulative_total_pnl"],
         "total_pnl": okx_pnl["total_pnl"],
         "total_pnl_pct": okx_pnl["total_pnl_pct"],
-        "remaining_allocation": _execution_tradeable_balance(
-            okx_available=okx_available,
-            okx_allocatable=okx_allocatable,
-            okx_equity=okx_equity,
-            okx_total=okx_total,
-            fallback_available=None,
-        )
-        or parsed_tradeable
-        or 0.0,
+        "remaining_allocation": available,
     }
 
     if mode == "paper":
         summary = paper_summary or {}
         unrealized = _safe_float(pnl_summary.get("unrealized_pnl"), 0.0) or 0.0
-        available = _execution_tradeable_balance(
-            okx_available=okx_available,
-            okx_allocatable=okx_allocatable,
-            okx_equity=okx_equity,
-            okx_total=okx_total,
-            fallback_available=None,
-        )
         used_margin = position_margin_used
         wallet = (
             okx_cash if okx_cash is not None else (okx_total if okx_total is not None else None)
-        )
-        equity = (
-            okx_equity if okx_equity is not None else (okx_total if okx_total is not None else None)
         )
         payload.update(
             {
@@ -2921,7 +2877,7 @@ def _build_execution_account_status(
                 "tradeable_balance": available,
                 "remaining_allocation": available,
                 "wallet_balance": wallet,
-                "equity": equity,
+                "equity": account_equity,
                 "used_margin": used_margin,
                 "position_margin_used": used_margin,
                 "unrealized_pnl": unrealized,
@@ -2936,23 +2892,11 @@ def _build_execution_account_status(
                 "paper_execution_used_margin": used_margin,
                 "positions": summary.get("positions", []),
                 "open_positions": open_positions,
-                "balance_snapshot_stale": bool(okx_account and okx_account.get("stale") is True),
-                "balance_snapshot_age_seconds": (
-                    _safe_float(okx_account.get("stale_age_seconds"), None) if okx_account else None
-                ),
-                "balance_source": "OKX 模拟盘账户" if okx_account else "模拟盘执行账户",
             }
         )
         return payload
 
-    if okx_account and not okx_error:
-        available = _execution_tradeable_balance(
-            okx_available=okx_available,
-            okx_allocatable=okx_allocatable,
-            okx_equity=okx_equity,
-            okx_total=okx_total,
-            fallback_available=None,
-        ) or (okx_available if okx_available is not None else okx_allocatable)
+    if okx_balance_available:
         used_margin = position_margin_used
         total = okx_total
         unrealized = _safe_float(pnl_summary.get("unrealized_pnl"), 0.0)
@@ -2963,7 +2907,7 @@ def _build_execution_account_status(
                 "tradeable_balance": available,
                 "remaining_allocation": available,
                 "wallet_balance": okx_cash if okx_cash is not None else total,
-                "equity": okx_equity if okx_equity is not None else total,
+                "equity": account_equity,
                 "used_margin": used_margin,
                 "position_margin_used": used_margin,
                 "unrealized_pnl": unrealized,
@@ -2971,11 +2915,6 @@ def _build_execution_account_status(
                 "cumulative_total_pnl": okx_pnl["cumulative_total_pnl"],
                 "total_pnl_pct": okx_pnl["total_pnl_pct"],
                 "initial_balance": None,
-                "balance_source": "OKX 实盘账户",
-                "balance_snapshot_stale": bool(okx_account.get("stale")),
-                "balance_snapshot_age_seconds": _safe_float(
-                    okx_account.get("stale_age_seconds"), None
-                ),
             }
         )
     else:
@@ -2995,10 +2934,6 @@ def _build_execution_account_status(
                 "total_pnl": None,
                 "total_pnl_pct": None,
                 "initial_balance": None,
-                "balance_source": "OKX 实盘账户",
-                "balance_error": okx_error or "实盘账户未连接或余额查询失败",
-                "balance_snapshot_stale": False,
-                "balance_snapshot_age_seconds": None,
             }
         )
     return payload
@@ -4198,7 +4133,7 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
             and (now - cached_at).total_seconds()
             <= _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS
         ):
-            if cached:
+            if cached and cached[2] is executor_identity and _usable_dashboard_position_cache(cached[0]):
                 return copy.deepcopy(cached[1])
             raise RuntimeError(cached_text)
     if cached:
@@ -4233,7 +4168,7 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
             _dashboard_okx_error_text(exc, resource="positions"),
             executor_identity,
         )
-        if cached:
+        if cached and cached[2] is executor_identity and _usable_dashboard_position_cache(cached[0]):
             return copy.deepcopy(cached[1])
         raise
     try:
@@ -4255,7 +4190,7 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
                 and (now - cached_at).total_seconds()
                 <= _DASHBOARD_OKX_POSITION_ERROR_CACHE_TTL_SECONDS
             ):
-                if cached:
+                if cached and cached[2] is executor_identity and _usable_dashboard_position_cache(cached[0]):
                     return copy.deepcopy(cached[1])
                 raise RuntimeError(cached_text)
 
@@ -4270,7 +4205,7 @@ async def _fetch_dashboard_okx_positions(selected_mode: str) -> list[dict[str, A
                 _dashboard_okx_error_text(exc, resource="持仓"),
                 executor_identity,
             )
-            if cached and cached[2] is executor_identity:
+            if cached and cached[2] is executor_identity and _usable_dashboard_position_cache(cached[0]):
                 return copy.deepcopy(cached[1])
             raise
 
@@ -7454,14 +7389,13 @@ async def _get_exchange_open_position_symbols(mode: str | None = None) -> set[st
             mode=selected_mode,
             has_cached=bool(cached),
         )
-        return set(cached[1]) if cached else None
+        return set(cached[1]) if cached and _usable_dashboard_position_cache(cached[0]) else None
 
     symbols: set[str] = set()
     for position in positions or []:
         if _is_live_position_open(position):
             symbols.add(_normalize_dashboard_symbol(position.get("symbol")))
     result = {s for s in symbols if s}
-    _exchange_open_symbol_cache[selected_mode] = (now, result)
     return set(result)
 
 
@@ -7486,7 +7420,7 @@ async def _get_exchange_position_mark_map(
             mode=selected_mode,
             has_cached=bool(cached),
         )
-        return cached[1] if cached else {}
+        return cached[1] if cached and _usable_dashboard_position_cache(cached[0]) else {}
 
     snapshots: dict[tuple[str, str], dict[str, Any]] = {}
     for position in positions or []:
@@ -7499,7 +7433,6 @@ async def _get_exchange_position_mark_map(
         symbol = str(snapshot["symbol"])
         side = str(snapshot["side"])
         snapshots[(symbol, side)] = dict(snapshot)
-    _exchange_mark_cache[selected_mode] = (now, snapshots)
     return snapshots
 
 
@@ -7520,6 +7453,7 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
         if not fresh_only and age_seconds > _DASHBOARD_OKX_BALANCE_STALE_CACHE_TTL_SECONDS:
             return None
         snapshot = copy.deepcopy(cached_value)
+        snapshot.setdefault("balance_as_of", cached_at.isoformat())
         if not fresh_only:
             snapshot["stale"] = True
             snapshot["stale_age_seconds"] = round(age_seconds, 3)
@@ -7651,12 +7585,13 @@ async def _get_dashboard_okx_account_snapshot(selected_mode: str) -> dict[str, A
             # leaving the dashboard without an authoritative balance until a
             # later background poll happened to succeed.
             snapshot = await _fetch_dashboard_okx_balance_uncached_with_total_budget(selected_mode)
+            captured_at = datetime.now(UTC)
             _dashboard_okx_balance_cache[selected_mode] = (
-                datetime.now(UTC),
+                captured_at,
                 copy.deepcopy(snapshot),
             )
             _dashboard_okx_balance_error_cache.pop(selected_mode, None)
-            return snapshot
+            return cached_success(captured_at, fresh_only=True)
         except Exception as exc:
             _log_dashboard_fallback(
                 "dashboard summary okx balance fallback",
@@ -7844,6 +7779,10 @@ async def _build_open_position_market_snapshot(mode: str | None = None) -> dict[
         selected_mode,
         ticker_overrides=tickers,
     )
+    open_positions = [
+        position for position in open_positions
+        if _normalize_dashboard_symbol(position.get("symbol")) in open_symbols
+    ]
     if open_positions:
         position_tickers = _build_tickers_from_position_snapshot(
             open_positions,
@@ -10078,7 +10017,9 @@ async def _build_dashboard_summary() -> dict[str, Any]:
 
     market_state = await _build_open_position_market_snapshot(selected_mode)
 
-    pnl_summary = await _get_execution_pnl_summary(selected_mode)
+    pnl_summary = await _get_execution_pnl_summary(
+        selected_mode, balance_snapshot=okx_account or {},
+    )
     execution_account = _build_execution_account_status(
         selected_mode,
         paper_summary=None,
@@ -10180,6 +10121,8 @@ async def get_dashboard_summary(request: Request = None):
             refreshed_entry = _dashboard_heavy_cache.get(key)
             if refreshed_entry is not None and refreshed_entry[0] > cached_at:
                 return sanitize_payload(refreshed_entry[1])
+        if age > _DASHBOARD_OKX_POSITION_STALE_CACHE_TTL_SECONDS:
+            return sanitize_payload(_dashboard_summary_warming_payload())
         stale_payload = copy.deepcopy(cached_payload)
         stale_payload["cache"] = {
             "hit": True,

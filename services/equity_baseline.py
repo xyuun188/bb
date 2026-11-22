@@ -53,7 +53,7 @@ async def apply_daily_equity_baseline(
     )
     baseline_equity = _safe_float(baseline.get("equity"), None)
     okx_equity = _safe_float(current_equity, None)
-    if baseline_equity is None or baseline_equity <= 0 or okx_equity is None or okx_equity <= 0:
+    if baseline_equity is None or baseline_equity <= 0 or okx_equity is None:
         return _unavailable_baseline(snapshot_date)
     today_equity_pnl = okx_equity - baseline_equity
     return {
@@ -81,7 +81,7 @@ async def phase3_equity_change_from_snapshots(
     series_complete = observed_start_date == PHASE3_FIRST_CLEAN_DAY
     baseline_equity = _safe_float(getattr(row, "equity", None), None) if row else None
     okx_equity = _safe_float(current_equity, None)
-    if baseline_equity is None or baseline_equity <= 0 or okx_equity is None or okx_equity <= 0:
+    if baseline_equity is None or baseline_equity <= 0 or okx_equity is None:
         return {
             "phase3_equity_pnl": None,
             "phase3_equity_pnl_pct": None,

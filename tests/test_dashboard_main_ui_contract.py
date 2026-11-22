@@ -1344,7 +1344,8 @@ def test_dashboard_balance_error_keeps_last_successful_numeric_snapshot() -> Non
 
     assert "lastFreshAccountBalances: {}" in script
     assert "function preserveLastGoodAccountBalance" in script
-    assert "const needsClientFallback = Boolean(account.balance_error)" in script
+    assert "account.account_pnl_source === 'okx_authoritative'" in script
+    assert "cacheAge <= 300 && isTemporaryBalanceError(account.balance_error)" in script
     assert "account.balance_snapshot_stale = true;" in script
     assert "account.balance_snapshot_age_seconds" in script
     assert "if (account && account.balance_error) return '--';" not in script
@@ -1745,6 +1746,7 @@ async def test_open_position_market_snapshot_returns_positions_and_tickers(
         assert mode == "paper"
         assert ticker_overrides == {"ETH/USDT": {"price": 2500.0}}
         return [
+            {"symbol": "TRX/USDT", "current_price": 0.3, "is_open": True},
             {
                 "symbol": "ETH/USDT",
                 "side": "long",
@@ -1762,7 +1764,8 @@ async def test_open_position_market_snapshot_returns_positions_and_tickers(
 
     assert payload["position_symbols"] == ["ETH/USDT"]
     assert payload["tickers"]["ETH/USDT"]["price"] == 2500.0
-    assert payload["open_positions"][0]["symbol"] == "ETH/USDT"
+    assert [position["symbol"] for position in payload["open_positions"]] == ["ETH/USDT"]
+    assert set(payload["tickers"]) == {"ETH/USDT"}
     assert payload["open_position_count"] == 1
 
 
