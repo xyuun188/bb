@@ -12,9 +12,9 @@ import json
 import math
 import os
 import sys
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -86,6 +86,8 @@ _ERROR_EXCERPT_LIMIT = 700
 _REMOTE_TRAINING_TRANSPORT_VERSION = LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION
 _REMOTE_TRAINING_MAX_SHADOW_SAMPLES = 512
 _REMOTE_COMPARISON_MAX_SHADOW_SAMPLES = 512
+_COVERAGE_TRAINING_DAYS = 14
+_COVERAGE_SHADOW_SAMPLES_PER_DAY = 128
 _EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER = 8
 _SHADOW_IDENTITY_MODULUS = 2_000_000_011
 _SHADOW_IDENTITY_MULTIPLIER = 1_000_003
@@ -258,6 +260,21 @@ def _as_utc(value: Any) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _coverage_timestamp(value: Any) -> datetime | None:
+    try:
+        result = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return result.astimezone(UTC) if result.tzinfo is not None else None
+
+
+def _parse_coverage_cutoff(value: str) -> datetime:
+    cutoff = _coverage_timestamp(value)
+    if cutoff is None:
+        raise argparse.ArgumentTypeError("expected an ISO timestamp with timezone")
+    return cutoff
 
 
 def _snapshot(value: Any) -> dict[str, Any]:
@@ -550,6 +567,8 @@ def _transport_sample(sample: dict[str, Any], *, kind: str) -> dict[str, Any]:
 
 def _build_training_transport_views(
     training_payload: dict[str, Any],
+    *,
+    shadow_limit: int = _REMOTE_TRAINING_MAX_SHADOW_SAMPLES,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     """Build bounded, audit-linked views for the remote training request."""
 
@@ -563,7 +582,7 @@ def _build_training_transport_views(
         "shadow": [
             _transport_sample(row, kind="shadow")
             for row in _evenly_spaced_rows(
-                source_rows["shadow"], _REMOTE_TRAINING_MAX_SHADOW_SAMPLES
+                source_rows["shadow"], shadow_limit
             )
         ],
         "trade": [
@@ -608,7 +627,7 @@ def _build_training_transport_views(
         "source_sample_counts": {key: len(value) for key, value in source_rows.items()},
         "sent_sample_counts": {key: len(value) for key, value in selected.items()},
         "limits": {
-            "shadow_samples": _REMOTE_TRAINING_MAX_SHADOW_SAMPLES,
+            "shadow_samples": shadow_limit,
             "trade_samples": _REMOTE_TRAINING_MAX_TRADE_SAMPLES,
             "sequence_samples": _REMOTE_TRAINING_MAX_SEQUENCE_SAMPLES,
             "sequence_length": _REMOTE_TRAINING_MAX_SEQUENCE_LENGTH,
@@ -932,6 +951,9 @@ async def _load_shadow_samples(
     sample_budget: int | None = None,
     executable_only: bool = True,
     recent_only: bool = False,
+    created_from: datetime | None = None,
+    created_before: datetime | None = None,
+    due_before: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Separate executable training from explicitly requested historical research.
 
@@ -964,6 +986,12 @@ async def _load_shadow_samples(
         ShadowBacktest.long_return_pct.is_not(None),
         ShadowBacktest.short_return_pct.is_not(None),
     )
+    if created_from is not None:
+        filters += (ShadowBacktest.created_at >= created_from,)
+    if created_before is not None:
+        filters += (ShadowBacktest.created_at < created_before,)
+    if due_before is not None:
+        filters += (ShadowBacktest.due_at < due_before,)
     if executable_only:
         filters += (
             ShadowBacktest.horizon_minutes == PRIMARY_PREDICTION_HORIZON_MINUTES,
@@ -1046,13 +1074,60 @@ async def _load_shadow_samples(
     return _evenly_spaced_rows(samples, requested_limit) if requested_limit else samples
 
 
-async def _load_comparison_shadow_view() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _coverage_shadow_clocks(row: dict[str, Any]) -> tuple[datetime | None, datetime | None]:
+    features = _snapshot(row.get("features"))
+    label = _snapshot(features.get("training_label_contract"))
+    label = _snapshot(label.get("labels")) or label
+    return (
+        _coverage_timestamp(features.get("original_decision_timestamp")),
+        _coverage_timestamp(label.get("label_timestamp")),
+    )
+
+
+async def _load_coverage_shadow_samples(cutoff: datetime) -> list[dict[str, Any]]:
+    """Take the same bounded quota per day before inspecting outcomes."""
+    rows = []
+    for offset in range(_COVERAGE_TRAINING_DAYS, 0, -1):
+        start = cutoff - timedelta(days=offset)
+        end = start + timedelta(days=1)
+        batch = await _load_shadow_samples(
+            sample_budget=_COVERAGE_SHADOW_SAMPLES_PER_DAY,
+            created_from=start,
+            created_before=end,
+            due_before=cutoff,
+        )
+        for row in batch:
+            decision_at, label_at = _coverage_shadow_clocks(row)
+            if decision_at and label_at and start <= decision_at < end and decision_at < label_at < cutoff:
+                rows.append(row)
+    return rows
+
+
+async def _load_comparison_shadow_view(
+    *,
+    coverage_cutoff: datetime | None = None,
+    frozen_at: datetime | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Keep recent settled facts out of fitting and training quality statistics."""
 
-    samples = await _load_shadow_samples(
-        sample_budget=_REMOTE_COMPARISON_MAX_SHADOW_SAMPLES,
-        recent_only=True,
-    )
+    if coverage_cutoff is None:
+        samples = await _load_shadow_samples(
+            sample_budget=_REMOTE_COMPARISON_MAX_SHADOW_SAMPLES,
+            recent_only=True,
+        )
+    else:
+        assert frozen_at is not None
+        available = await _load_shadow_samples(
+            sample_budget=_REMOTE_COMPARISON_MAX_SHADOW_SAMPLES,
+            created_from=coverage_cutoff,
+            created_before=frozen_at,
+            due_before=frozen_at,
+        )
+        samples = []
+        for row in available:
+            decision_at, label_at = _coverage_shadow_clocks(row)
+            if decision_at and label_at and coverage_cutoff <= decision_at < label_at < frozen_at:
+                samples.append(row)
     payload = annotate_training_payload(
         shadow_samples=samples,
         trade_samples=[],
@@ -1064,7 +1139,10 @@ async def _load_comparison_shadow_view() -> tuple[list[dict[str, Any]], dict[str
         for row in payload["shadow_samples"]
     ]
     return rows, {
-        "selection_policy": "latest_bounded_primary_horizon_raw_identities",
+        "selection_policy": (
+            "frozen_primary_horizon_comparison"
+            if coverage_cutoff is not None else "latest_bounded_primary_horizon_raw_identities"
+        ),
         "sample_count": len(rows),
         "sample_limit": _REMOTE_COMPARISON_MAX_SHADOW_SAMPLES,
         "used_for_fitting": False,
@@ -1369,7 +1447,20 @@ async def _main() -> None:
         action="store_true",
         help="Required together with --persist-artifact for a Phase 3 bundle rebuild.",
     )
+    parser.add_argument(
+        "--coverage-cutoff",
+        type=_parse_coverage_cutoff,
+        metavar="ISO8601",
+        help="Run a non-persisting 14-day coverage experiment with a frozen post-cutoff holdout.",
+    )
     args = parser.parse_args()
+    frozen_at = datetime.now(UTC)
+    coverage_cutoff = args.coverage_cutoff
+    if coverage_cutoff is not None and (
+        args.persist_artifact or args.confirm_phase3_rebuild or args.training_mode not in {"shadow", "walk_forward"}
+        or coverage_cutoff >= frozen_at
+    ):
+        parser.error("--coverage-cutoff requires a past cutoff and a non-persisting shadow run")
     if args.persist_artifact and not args.confirm_phase3_rebuild:
         raise SystemExit("--persist-artifact requires --confirm-phase3-rebuild")
     okx_gate = okx_training_refresh_gate()
@@ -1391,21 +1482,34 @@ async def _main() -> None:
     elif not args.skip_quarantine:
         quarantine_result = await quarantine_dirty_shadow_samples()
 
-    shadow_loader = _load_shadow_samples
-    shadow_samples = (
-        await shadow_loader(sample_budget=_REMOTE_TRAINING_MAX_SHADOW_SAMPLES)
-        if "sample_budget" in inspect.signature(shadow_loader).parameters
-        else await shadow_loader()
-    )
-    comparison_samples, comparison_report = await _load_comparison_shadow_view()
+    if coverage_cutoff is None:
+        shadow_loader = _load_shadow_samples
+        shadow_samples = (
+            await shadow_loader(sample_budget=_REMOTE_TRAINING_MAX_SHADOW_SAMPLES)
+            if "sample_budget" in inspect.signature(shadow_loader).parameters
+            else await shadow_loader()
+        )
+        comparison_samples, comparison_report = await _load_comparison_shadow_view()
+        shadow_limit = _REMOTE_TRAINING_MAX_SHADOW_SAMPLES
+    else:
+        shadow_samples = await _load_coverage_shadow_samples(coverage_cutoff)
+        comparison_samples, comparison_report = await _load_comparison_shadow_view(
+            coverage_cutoff=coverage_cutoff, frozen_at=frozen_at,
+        )
+        shadow_limit = _COVERAGE_TRAINING_DAYS * _COVERAGE_SHADOW_SAMPLES_PER_DAY
     trade_loader = _load_trade_samples
     trade_samples = (
         await trade_loader(compact=True)
         if "compact" in inspect.signature(trade_loader).parameters
         else await trade_loader()
     )
-    sequence_samples = await _load_sequence_samples()
-    text_sentiment_samples = await _load_text_sentiment_samples()
+    if coverage_cutoff is not None:
+        trade_samples = [
+            row for row in trade_samples
+            if (label_at := _coverage_timestamp(row.get("label_timestamp"))) and label_at < coverage_cutoff
+        ]
+    sequence_samples = await _load_sequence_samples() if coverage_cutoff is None else []
+    text_sentiment_samples = await _load_text_sentiment_samples() if coverage_cutoff is None else []
     training_payload = annotate_training_payload(
         shadow_samples=shadow_samples,
         trade_samples=trade_samples,
@@ -1413,7 +1517,7 @@ async def _main() -> None:
         text_sentiment_samples=text_sentiment_samples,
     )
     transport_views, training_transport_report = _build_training_transport_views(
-        training_payload
+        training_payload, shadow_limit=shadow_limit,
     )
     training_transport_report["comparison_view"] = comparison_report
     training_transport_report["shadow_sampling"] = {
@@ -1427,6 +1531,20 @@ async def _main() -> None:
         ),
         "raw_identity_candidate_refill_allowed": False,
     }
+    if coverage_cutoff is not None:
+        coverage = Counter(
+            decision_at.date().isoformat()
+            for row in transport_views["shadow"]
+            if (decision_at := _coverage_timestamp(row.get("decision_timestamp")))
+        )
+        training_transport_report["shadow_sampling"].update({
+            "policy": "bounded_daily_primary_horizon_coverage",
+            "candidate_limit": shadow_limit * _EXECUTABLE_SHADOW_CANDIDATE_MULTIPLIER,
+            "training_window_start": (coverage_cutoff - timedelta(days=_COVERAGE_TRAINING_DAYS)).isoformat(),
+            "training_cutoff": coverage_cutoff.isoformat(),
+            "comparison_frozen_at": frozen_at.isoformat(),
+            "sent_rows_by_utc_date": dict(sorted(coverage.items())),
+        })
     quality_report = training_payload["quality_report"]
     training_payload["governance_report"] = artifact_bound_governance_report(
         quality_report,
@@ -1443,7 +1561,9 @@ async def _main() -> None:
         )
     completed_shadow_count = await _completed_shadow_sample_count()
     completed_trade_count = len(training_payload["trade_samples"])
-    paper_observation_report = await _refresh_paper_observation_report_for_training()
+    paper_observation_report = (
+        await _refresh_paper_observation_report_for_training() if coverage_cutoff is None else {}
+    )
     return_objective_report = build_return_objective_report(
         trade_samples=training_payload["trade_samples"],
         shadow_samples=training_payload["shadow_samples"],
@@ -1484,6 +1604,8 @@ async def _main() -> None:
             {},
         ),
     }
+    if coverage_cutoff is not None:
+        payload["compare_preflight"] = True
     payload["promotion_recommendation"] = build_phase3_promotion_recommendation(
         training_mode=args.training_mode,
         quality_report=quality_report,

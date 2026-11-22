@@ -1527,6 +1527,42 @@ async def test_train_local_ai_tools_cli_defaults_to_phase3_preflight(
 
 
 @pytest.mark.asyncio
+async def test_daily_coverage_keeps_only_mature_rows_in_their_decision_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cutoff = PHASE3_CLEAN_START_UTC + timedelta(days=3)
+    windows = []
+
+    def sample(decision_at, label_at):
+        return {"features": {
+            "original_decision_timestamp": decision_at.isoformat(),
+            "training_label_contract": {"labels": {"label_timestamp": label_at.isoformat()}},
+        }}
+
+    async def load(**kwargs):
+        start = kwargs["created_from"]
+        end = kwargs["created_before"]
+        windows.append((start, end, kwargs["due_before"]))
+        assert kwargs["sample_budget"] == train_script._COVERAGE_SHADOW_SAMPLES_PER_DAY
+        return [
+            sample(start, start + timedelta(hours=4)),
+            sample(start - timedelta(minutes=1), start + timedelta(hours=4)),
+            sample(start, cutoff),
+        ]
+
+    monkeypatch.setattr(train_script, "_COVERAGE_TRAINING_DAYS", 2)
+    monkeypatch.setattr(train_script, "_load_shadow_samples", load)
+    rows = await train_script._load_coverage_shadow_samples(cutoff)
+    assert windows == [
+        (cutoff - timedelta(days=2), cutoff - timedelta(days=1), cutoff),
+        (cutoff - timedelta(days=1), cutoff, cutoff),
+    ]
+    assert [train_script._coverage_shadow_clocks(row)[0] for row in rows] == [
+        start for start, _, _ in windows
+    ]
+
+
+@pytest.mark.asyncio
 async def test_train_local_ai_tools_cli_rejects_unconfirmed_artifact_persist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

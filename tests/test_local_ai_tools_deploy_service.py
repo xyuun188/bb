@@ -3975,6 +3975,35 @@ def test_local_ai_tools_generated_service_train_defaults_to_preflight_only(
     assert not module.CURRENT_POINTER_PATH.exists()
 
 
+def test_coverage_preflight_compares_without_writing_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _local_ai_tools_training_module(tmp_path)
+    monkeypatch.setattr(
+        module, "_resolve_artifact_pointer", lambda *_args, **_kwargs: {"version": "champion"}
+    )
+    monkeypatch.setattr(
+        module, "_paired_artifact_return_evaluation",
+        lambda _bundle, _current, rows, *, include_baselines: {
+            "ready": True, "sample_count": len(rows), "baselines": include_baselines,
+        },
+    )
+    request = _training_request(
+        module, shadow_samples=_training_shadow_samples(count=20),
+        comparison_shadow_samples=_training_shadow_samples(count=4), compare_preflight=True,
+    )
+    rejected = module._train_impl_inner(request.model_copy(update={"persist_artifact": True}))
+    assert rejected["reason"] == "coverage_comparison_requires_non_persisting_preflight"
+    result = module._train_impl_inner(request)
+    assert result["coverage_comparison"] == {
+        "ready": True, "sample_count": 4, "baselines": True, "champion_version": "champion",
+    }
+    assert result["fit_coverage"]["symbols"] == 1
+    assert result["artifact_persisted"] is False
+    assert not module.CANDIDATE_POINTER_PATH.exists()
+    assert not module.CURRENT_POINTER_PATH.exists()
+
+
 def test_local_ai_tools_training_does_not_require_shadow_execution_cost(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

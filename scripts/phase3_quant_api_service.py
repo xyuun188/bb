@@ -621,6 +621,7 @@ class TrainRequest(BaseModel):
     promotion_recommendation: dict[str, Any] = {}
     persist_artifact: bool = False
     confirm_phase3_rebuild: bool = False
+    compare_preflight: bool = False
 
 
 _RESOURCE_RECOVERY_FRACTIONS = (0.25, 0.125)
@@ -2320,6 +2321,8 @@ def _paired_artifact_return_evaluation(
     candidate_bundle: dict[str, Any],
     champion: dict[str, Any],
     holdout_rows: list[dict[str, Any]],
+    *,
+    include_baselines: bool = False,
 ) -> dict[str, Any]:
     report = {
         "version": "2026-11-13.positive-entry-common-holdout.v3",
@@ -2377,6 +2380,21 @@ def _paired_artifact_return_evaluation(
             "evaluation_label_end": rows[-1]["label_timestamp"],
             "chronological_label_disjoint": True,
         })
+        if include_baselines:
+            report["fixed_direction_baselines"] = {
+                side: {
+                    **_return_evidence([
+                        {
+                            "return_pct": float(row[f"{side}_net_return"]),
+                            "label_timestamp": row["label_timestamp"],
+                            "decision_group": row["decision_group"],
+                        }
+                        for row in rows
+                    ]),
+                    "return_semantics": "shadow_net_return_after_all_cost",
+                }
+                for side in ("long", "short")
+            }
         x = [row["x"] for row in rows]
         for role, bundle in bundles.items():
             scored_by_side = {}
@@ -2457,6 +2475,10 @@ def _paired_artifact_return_evaluation(
                         if np.isfinite(ordinary_probability).all() else None
                     ),
                 }
+                if include_baselines:
+                    forecast_evidence["sides"][side]["mean_net_forecast_error_pct"] = float(
+                        np.mean(market - cost - net_labels)
+                    )
             report[f"{role}_forecast_evaluation"] = forecast_evidence
             selected_by_side = positive_objective_entry_rows(scored_by_side)
             sides = {}
@@ -6270,6 +6292,12 @@ def _with_post_training_inference_warmup(payload: dict[str, Any]) -> dict[str, A
 
 
 def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
+    if req.compare_preflight and (req.persist_artifact or req.confirm_phase3_rebuild):
+        return {
+            "trained": False,
+            "reason": "coverage_comparison_requires_non_persisting_preflight",
+            "artifact_persisted": False,
+        }
     transport_version = (req.training_transport_report or {}).get("version")
     if transport_version != LOCAL_AI_TOOLS_TRAINING_TRANSPORT_VERSION:
         return {
@@ -6994,10 +7022,43 @@ def _train_impl_inner(req: TrainRequest) -> dict[str, Any]:
         "profiles": profiles,
     }
     if not req.persist_artifact:
+        comparison = {}
+        if req.compare_preflight:
+            try:
+                current = _resolve_artifact_pointer(
+                    CURRENT_POINTER_PATH, role="current", deserialize_bundle=False,
+                )
+            except ValueError as exc:
+                current = None
+                evaluation = {"ready": False, "reason": "current_artifact_unverified", "error": safe_error(exc)}
+            else:
+                evaluation = (
+                    _paired_artifact_return_evaluation(
+                        bundle, current, _market_training_rows(req.comparison_shadow_samples),
+                        include_baselines=True,
+                    )
+                    if current else {"ready": False, "reason": "current_artifact_unavailable"}
+                )
+            fit_days = {
+                timestamp.date().isoformat()
+                for row in train_rows
+                if (timestamp := _parsed_timestamp(row["decision_timestamp"])) is not None
+            }
+            comparison = {
+                "coverage_comparison": {
+                    "champion_version": current.get("version") if current else None,
+                    **evaluation,
+                },
+                "fit_coverage": {
+                    "decision_days_utc": sorted(fit_days),
+                    "symbols": len({row["symbol"] for row in train_rows}),
+                },
+            }
         return {
             "trained": False,
             "reason": "phase3_preflight_no_artifact_write",
             **metadata,
+            **comparison,
         }
     if not req.confirm_phase3_rebuild:
         return {
