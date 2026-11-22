@@ -270,11 +270,11 @@ def _coverage_timestamp(value: Any) -> datetime | None:
     return result.astimezone(UTC) if result.tzinfo is not None else None
 
 
-def _parse_coverage_cutoff(value: str) -> datetime:
-    cutoff = _coverage_timestamp(value)
-    if cutoff is None:
+def _parse_coverage_timestamp(value: str) -> datetime:
+    timestamp = _coverage_timestamp(value)
+    if timestamp is None:
         raise argparse.ArgumentTypeError("expected an ISO timestamp with timezone")
-    return cutoff
+    return timestamp
 
 
 def _snapshot(value: Any) -> dict[str, Any]:
@@ -1449,13 +1449,22 @@ async def _main() -> None:
     )
     parser.add_argument(
         "--coverage-cutoff",
-        type=_parse_coverage_cutoff,
+        type=_parse_coverage_timestamp,
         metavar="ISO8601",
         help="Run a non-persisting 14-day coverage experiment with a frozen post-cutoff holdout.",
     )
+    parser.add_argument(
+        "--coverage-frozen-at",
+        type=_parse_coverage_timestamp,
+        metavar="ISO8601",
+        help="Reuse a fixed holdout end for a coverage experiment (default: run start).",
+    )
     args = parser.parse_args()
-    frozen_at = datetime.now(UTC)
+    now = datetime.now(UTC)
+    frozen_at = args.coverage_frozen_at or now
     coverage_cutoff = args.coverage_cutoff
+    if args.coverage_frozen_at is not None and (coverage_cutoff is None or frozen_at > now):
+        parser.error("--coverage-frozen-at requires --coverage-cutoff and cannot be in the future")
     if coverage_cutoff is not None and (
         args.persist_artifact or args.confirm_phase3_rebuild or args.training_mode not in {"shadow", "walk_forward"}
         or coverage_cutoff >= frozen_at
