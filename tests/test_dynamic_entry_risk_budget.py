@@ -649,33 +649,8 @@ def test_size_aware_profit_solver_rejects_when_minimum_order_still_loses() -> No
     assert solved["expected_net_return_pct"] <= 0.0
 
 
-def test_size_aware_profit_solver_preserves_finite_negative_downside() -> None:
-    snapshot = _size_aware_book_snapshot(400.0)
-    original_cost = execution_cost_estimate(snapshot).to_dict()
-
-    solved = solve_size_aware_positive_expected_net(
-        feature_snapshot=snapshot,
-        side="long",
-        maximum_notional_usdt=400.0,
-        minimum_notional_usdt=100.0,
-        contract_step_notional_usdt=100.0,
-        expected_net_return_pct=0.5,
-        return_lcb_pct=-0.2,
-        execution_cost=original_cost,
-        paper_training_only=True,
-    )
-
-    assert solved["production_eligible"] is True
-    assert solved["reason"] == "positive_fee_after_full_risk_size"
-    assert solved["selected_notional_usdt"] == pytest.approx(400.0)
-    assert solved["expected_net_return_pct"] > 0.0
-    assert solved["return_lcb_pct"] <= 0.0
-    assert solved["execution_cost"]["order_size_complete"] is True
-    assert solved["reduced"] is False
-
-
 @pytest.mark.parametrize("with_book", [True, False])
-def test_validated_size_solver_rejects_negative_downside_including_cost_fallback(with_book) -> None:
+def test_size_solver_rejects_negative_downside_including_cost_fallback(with_book) -> None:
     snapshot = _size_aware_book_snapshot(400.0)
     cost = execution_cost_estimate(snapshot).to_dict()
     if not with_book:
@@ -994,7 +969,7 @@ async def test_normal_paper_rejects_when_native_tier_has_no_remaining_capacity()
 
 @pytest.mark.asyncio
 async def test_training_entry_uses_normal_paper_risk_budget() -> None:
-    decision = _quality_observation_decision(return_lcb_pct=-0.3)
+    decision = _quality_observation_decision(return_lcb_pct=0.3)
     _use_bounded_training_entry(decision)
     decision.raw_response["opportunity_score"]["return_distribution_contract"][
         "raw_expected_return_pct"
@@ -1009,7 +984,7 @@ async def test_training_entry_uses_normal_paper_risk_budget() -> None:
     assert sizing["final_notional_usdt"] > 0.0
     assert dynamic["policy_provenance"]["policy_scope"] == "paper"
     assert sizing["paper_training_entry_mode"] is True
-    assert sizing["return_lcb_pct"] < 0.0
+    assert sizing["return_lcb_pct"] > 0.0
     assert sizing["single_trade_risk_fraction_cap"] == pytest.approx(
         NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION
     )

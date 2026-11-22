@@ -1021,8 +1021,18 @@ def _v23_shared_risk_training_raw() -> dict[str, object]:
     return raw
 
 
-def test_v23_training_fill_retains_normal_budget_after_protocol_migration() -> None:
+@pytest.mark.parametrize("version", [
+    "2026-11-14.normal-paper-strategy-trade.v23",
+    "2026-11-22.normal-paper-strategy-trade.v26",
+])
+def test_historical_training_fill_retains_normal_budget_after_protocol_migration(version) -> None:
     raw = _v23_shared_risk_training_raw()
+    raw["normal_paper_trade"]["version"] = version
+    if version.endswith(".v26"):
+        raw["profit_risk_sizing"].update({
+            "version": "2026-11-22.normal-paper-dynamic-risk.v16",
+            "return_lcb_pct": -1.3,
+        })
     report = summarize_trade_execution_contract(
         [_decision(402, "long", raw)], orders=[_filled_order(402, quantity=1.0)],
     )

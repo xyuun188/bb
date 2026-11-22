@@ -103,7 +103,6 @@ def solve_size_aware_positive_expected_net(
     return_lcb_pct: float,
     execution_cost: dict[str, Any],
     execution_slippage_floor_pct: float = 0.0,
-    paper_training_only: bool = False,
 ) -> dict[str, Any]:
     """Maximize expected net profit within the risk budget and native book.
 
@@ -202,12 +201,9 @@ def solve_size_aware_positive_expected_net(
         # without enough native order-book levels for a second size-specific
         # VWAP pass.  Preserve that existing audited cost contract when its
         # return satisfies the same entry scope as the native-book path.
-        # Training still needs finite downside and positive fee-after mean.
         if (
             execution_cost.get("production_eligible") is True
-            and normal_paper_entry_return_ready(
-                original_expected, original_lcb, paper_training_only=paper_training_only,
-            )
+            and normal_paper_entry_return_ready(original_expected, original_lcb)
         ):
             result.update(
                 {
@@ -258,7 +254,6 @@ def solve_size_aware_positive_expected_net(
     def passes_return_gate(candidate: dict[str, Any] | None) -> bool:
         return candidate is not None and normal_paper_entry_return_ready(
             candidate["expected"], candidate["lcb"],
-            paper_training_only=paper_training_only,
         )
 
     if step > 0.0 and not passes_return_gate(upper):
@@ -2375,9 +2370,6 @@ class EntryProfitRiskSizingPolicy:
             # slippage floor. Reuse it while repricing size so its delta is
             # applied once, not once in scoring and again in sizing.
             execution_slippage_floor_pct=execution_slippage_floor_pct,
-            # Training accepts a finite negative lower bound, but the solver
-            # still requires positive size-aware fee-after expected return.
-            paper_training_only=training_mode,
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (
@@ -2645,8 +2637,12 @@ class EntryProfitRiskSizingPolicy:
             reasons.append("paper_training_order_value_below_minimum")
         if not isfinite(return_lcb):
             reasons.append("normal_paper_downside_return_missing_after_size_cost")
-        elif not training_mode and return_lcb <= 0.0:
-            reasons.append("normal_paper_return_lcb_not_positive_after_size_cost")
+        elif return_lcb <= 0.0:
+            reasons.append(
+                "paper_training_conservative_return_not_positive"
+                if training_mode
+                else "normal_paper_return_lcb_not_positive_after_size_cost"
+            )
         if existing_leverage_exceeds_dynamic_limit:
             reasons.append("normal_paper_existing_leverage_exceeds_dynamic_limit")
         if final_notional <= 0:
