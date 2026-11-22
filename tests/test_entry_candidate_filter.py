@@ -394,8 +394,10 @@ def test_unverified_market_candidate_with_full_paper_contract_is_not_promoted(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
-    ["verified", "compacted", "unverified", "wrong_symbol", "timeout", "revoked_during_probe",
-     "known_unavailable", "live", "unprofitable", "expired"],
+    [
+        "verified", "compacted", "unverified", "wrong_symbol", "timeout", "revoked_during_probe",
+        "known_unavailable", "price_drift", "live", "unprofitable", "expired",
+    ],
 )
 async def test_deferred_market_instrument_recheck_at_entry_handoff(case: str) -> None:
     service = object.__new__(TradingService)
@@ -435,10 +437,17 @@ async def test_deferred_market_instrument_recheck_at_entry_handoff(case: str) ->
             ],
         },
     })
-    if case == "compacted":
+    if case in {"compacted", "known_unavailable", "price_drift"}:
         decision.raw_response["market_candidate_funnel"] = {
             "analysis_only_selected_symbols": [symbol],
+            "rank_top_symbols": [
+                {"symbol": symbol, "non_selected_reason": "selected_for_market_analysis"},
+            ],
         }
+    if case == "compacted":
+        service._verified_entry_symbols_by_mode["paper"].add(symbol)
+        # A symbol-wide positive cache entry cannot replace this decision's recheck.
+        assert service._market_analysis_only_entry_reason(decision, model_mode="paper")
 
     async def probe(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         if case == "timeout":
@@ -447,6 +456,15 @@ async def test_deferred_market_instrument_recheck_at_entry_handoff(case: str) ->
             service._remember_unavailable_entry_symbol(
                 "paper", symbol, {"error_code": "51001"}, persist=False,
             )
+        if case == "price_drift":
+            return {
+                "available": False,
+                "symbol": symbol,
+                "demo": True,
+                "mode": "paper",
+                "reason": "okx_entry_live_execution_environment_incompatible",
+                "environment_compatibility": {"blockers": ["environment_price_drift_exceeded"]},
+            }
         return {
             "available": None if case == "unverified" else True,
             "symbol": "BTC/USDT" if case == "wrong_symbol" else symbol,
@@ -498,111 +516,33 @@ async def test_deferred_market_instrument_recheck_at_entry_handoff(case: str) ->
         assert decision.raw_response["market_analysis_only_contract"]["promoted_for_execution"]
         assert decision.raw_response["normal_paper_trade"] == contract
         record_skip.assert_not_awaited()
+        if case == "compacted":
+            del decision.raw_response["market_entry_instrument_recheck"]
+            assert service._market_analysis_only_entry_reason(decision, model_mode="paper")
     else:
         await service._run_market_entry_pipeline(**kwargs)
         assert not prepared
         assert record_skip.await_args.kwargs["skip_kind"] == "market_analysis_only"
+        if case in {"known_unavailable", "price_drift", "revoked_during_probe"}:
+            recheck = decision.raw_response["market_entry_instrument_recheck"]
+            assert recheck["available"] is False
+            assert decision.raw_response["market_analysis_only_contract"][
+                "execution_candidate_state"
+            ] == "analysis_only_execution_unverified"
+            if case == "price_drift":
+                assert recheck["environment_compatibility_blockers"] == [
+                    "environment_price_drift_exceeded",
+                ]
+                assert "价格偏差超限" in record_skip.await_args.kwargs["reason"]
+            else:
+                assert recheck["error_code"] == "51001"
+                assert recheck["source_status"] == (
+                    "cached_restriction" if case == "known_unavailable" else "concurrent_restriction"
+                )
     if case in {"known_unavailable", "live", "unprofitable", "expired"}:
         availability.assert_not_awaited()
     else:
         availability.assert_awaited_once_with(symbol, force=True)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("instrument_available", "expected_accepted"),
-    [(True, True), (False, False)],
-)
-async def test_deferred_instrument_is_rechecked_before_synchronous_candidate_filter(
-    instrument_available: bool,
-    expected_accepted: bool,
-) -> None:
-    service = object.__new__(TradingService)
-    symbol = "ARB/USDT"
-    service._market_analysis_only_symbols = {symbol}
-    service._verified_entry_symbols_by_mode = {"paper": set(), "live": set()}
-    service._unavailable_entry_symbols_by_mode = {"paper": {}, "live": {}}
-    service._get_model_execution_mode = lambda _model_name: "paper"
-    service.entry_policy = SimpleNamespace(gate_reason=lambda _decision: None)
-
-    decision = _decision(symbol, Action.SHORT)
-    decision.raw_response = {
-        "paper_trade_selection": {"selected": True},
-        "entry_permission": {"granted": True},
-        "normal_paper_trade": build_normal_paper_trade_contract(
-            symbol=symbol,
-            side="short",
-            selection_reason="paper_training_entry",
-            direction_support={
-                "eligible": True,
-                "selected_side": "short",
-                "prediction_horizon_minutes": 240.0,
-                "expected_net_return_pct": 2.425,
-                "raw_expected_return_pct": 2.537,
-                "paper_training_only": True,
-                "objective_net_return_pct": 0.088,
-                "loss_probability": 0.236,
-                "quant_evidence_families": ["local_ml"],
-                "quant_quality_permissions": {
-                    "local_ml": {"paper_execution_permission": False},
-                },
-                "strong_expert_opposition": False,
-            },
-        ),
-        "market_candidate_funnel": {
-            "execution_availability": {
-                "analysis_only_execution_unverified": [
-                    {
-                        "symbol": symbol,
-                        "reason": "okx_private_entry_instrument_probe_deferred",
-                    },
-                ],
-            },
-        },
-    }
-    availability = AsyncMock(
-        return_value={
-            "available": instrument_available,
-            "symbol": symbol,
-            "demo": True,
-            "mode": "paper",
-            "reason": None if instrument_available else "okx_entry_instrument_unavailable",
-        }
-    )
-    service._get_okx_executor_for_mode = AsyncMock(
-        return_value=SimpleNamespace(entry_instrument_availability=availability)
-    )
-    candidate = (symbol, decision.model_name, decision, object(), None)
-
-    await service._recheck_deferred_paper_entry_candidates_before_filter([candidate])
-    if instrument_available:
-        # Only a passing candidate reaches the execution handoff.
-        await service._recheck_deferred_paper_entry_candidates_before_filter([candidate])
-
-    policy = EntryCandidateFilterPolicy(
-        gate_reason=lambda item: service._entry_gate_reason_with_market_boundary(item),
-        market_regime_reason=lambda _decision, _context: None,
-        capacity_reason=lambda *_args: None,
-        reserve_capacity=lambda *_args: None,
-    )
-    result = policy.filter(
-        [candidate],
-        strategy_context=None,
-        market_regime_context=None,
-        open_positions=[],
-        staged_entry_counts={},
-    )
-
-    assert bool(result.accepted_candidates) is expected_accepted
-    assert availability.await_count == 1
-    if expected_accepted:
-        assert result.rejected_candidates == []
-        assert decision.raw_response["market_analysis_only_contract"][
-            "promoted_for_execution"
-        ]
-    else:
-        assert result.rejected_candidates[0].blocker == "entry_gate"
-        assert decision.raw_response["market_entry_instrument_recheck"]["available"] is False
 
 
 def test_market_analysis_only_training_contract_is_not_promoted() -> None:

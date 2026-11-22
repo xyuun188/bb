@@ -90,7 +90,7 @@ from services.dynamic_exit_policy import (
 from services.dynamic_position_capacity import DynamicPositionCapacityPolicy
 from services.entry_candidate_evidence import EntryCandidateEvidencePolicy
 from services.entry_candidate_filter import EntryCandidateFilterPolicy
-from services.entry_candidate_queue import EntryCandidate, EntryCandidateQueuePolicy
+from services.entry_candidate_queue import EntryCandidateQueuePolicy
 from services.entry_capacity import EntryCapacityPolicy
 from services.entry_direction_competition import EntryDirectionCompetitionPolicy
 from services.entry_execution_handoff import (
@@ -303,7 +303,6 @@ MARKET_INSTRUMENT_SHORTLIST_TIMEOUT_SECONDS = 30.0
 MARKET_INSTRUMENT_SHORTLIST_WAIT_SECONDS = 8.0
 MARKET_INSTRUMENT_REFRESH_BATCH_SIZE = 24
 MARKET_INSTRUMENT_REFRESH_QUEUE_LIMIT = 96
-MARKET_ENTRY_INSTRUMENT_RECHECK_CONCURRENCY = 2
 AUTHORITATIVE_OUTCOME_FEEDBACK_TIMEOUT_SECONDS = 120.0
 AUTHORITATIVE_OUTCOME_FEEDBACK_MAX_ATTEMPTS = 3
 AUTHORITATIVE_OUTCOME_FEEDBACK_RETRY_DELAY_SECONDS = 15.0
@@ -8346,6 +8345,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             for item in (getattr(self, "_market_analysis_only_symbols", set()) or set())
         }:
             return None
+        marker = self._market_entry_boundary_marker(raw, symbol)
         if self._market_analysis_only_can_promote(decision, model_mode=model_mode):
             raw["market_analysis_only"] = True
             raw["market_analysis_only_contract"] = {
@@ -8355,15 +8355,15 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 "reason": "full_paper_entry_contract_passed",
                 "original_reason": "ranker_analysis_only_fill",
             }
+            if (marker or {}).get("state") == "analysis_only_execution_unverified":
+                raw["market_analysis_only_contract"].update(
+                    execution_candidate_state=marker["state"],
+                    original_reason=marker["reason"],
+                )
             decision.raw_response = raw
             return None
         raw["market_analysis_only"] = True
         funnel = self._safe_dict(raw.get("market_candidate_funnel"))
-        marker = (
-            self._market_analysis_only_marker(funnel, symbol)
-            if funnel
-            else None
-        )
         blocked_contract = {
             "selected_for_market_analysis": True,
             "entry_permission": False,
@@ -8413,18 +8413,17 @@ class TradingService(ModelTrainingCoordinatorMixin):
         # Check current capability again before accepting a paper contract.
         unavailable_by_mode = dict(self._entry_unavailable_cache_for_mode(selected_mode))
         symbol = self._normalize_position_symbol(getattr(decision, "symbol", ""))
-        funnel = self._safe_dict(raw.get("market_candidate_funnel"))
-        marker = (
-            self._market_analysis_only_marker(funnel, symbol)
-            if funnel
-            else None
-        )
+        marker = self._market_entry_boundary_marker(raw, symbol)
         marker_state = str((marker or {}).get("state") or "").strip()
         if marker_state == "execution_unavailable":
             return False
         if marker_state == "analysis_only_execution_unverified":
             recheck = self._safe_dict(raw.get("market_entry_instrument_recheck"))
-            if recheck.get("available") is not True or recheck.get("symbol") != symbol:
+            if (
+                recheck.get("available") is not True
+                or recheck.get("symbol") != symbol
+                or recheck.get("mode") != selected_mode
+            ):
                 return False
         verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
         verified_symbols = (
@@ -8450,6 +8449,32 @@ class TradingService(ModelTrainingCoordinatorMixin):
             and not normal_paper_entry_contract_reasons(contract)
         )
 
+    def _market_entry_boundary_marker(
+        self, raw: dict[str, Any], symbol: str,
+    ) -> dict[str, Any] | None:
+        marker = self._market_analysis_only_marker(
+            self._safe_dict(raw.get("market_candidate_funnel")), symbol,
+        )
+        contract = self._safe_dict(raw.get("market_analysis_only_contract"))
+        state = contract.get("execution_candidate_state")
+        reason = (
+            contract.get("original_reason")
+            if contract.get("promoted_for_execution") is True
+            else contract.get("reason")
+        )
+        if (marker or {}).get("state") == "execution_unavailable":
+            return marker
+        if contract.get("selected_for_market_analysis") is True and (
+            state == "execution_unavailable"
+            or (
+                state == "analysis_only_execution_unverified"
+                and reason == "okx_private_entry_instrument_probe_deferred"
+                and (marker or {}).get("state") != "execution_verified"
+            )
+        ):
+            return {"state": state, "reason": reason}
+        return marker
+
     async def _recheck_deferred_paper_entry_instrument(
         self,
         decision: DecisionOutput,
@@ -8461,26 +8486,10 @@ class TradingService(ModelTrainingCoordinatorMixin):
             return
         raw = self._safe_dict(decision.raw_response)
         symbol = self._normalize_position_symbol(decision.symbol)
-        funnel = self._safe_dict(raw.get("market_candidate_funnel"))
-        marker = self._market_analysis_only_marker(funnel, symbol) or {}
-        persisted = self._safe_dict(raw.get("market_analysis_only_contract"))
+        marker = self._market_entry_boundary_marker(raw, symbol) or {}
         if (
-            marker.get("state") == "execution_unavailable"
-            or persisted.get("execution_candidate_state") == "execution_unavailable"
-        ):
-            return
-        deferred = (
-            marker.get("state") == "analysis_only_execution_unverified"
-            and marker.get("reason") == "okx_private_entry_instrument_probe_deferred"
-        ) or (
-            persisted.get("selected_for_market_analysis") is True
-            and persisted.get("entry_permission") is False
-            and persisted.get("execution_candidate_state") == "analysis_only_execution_unverified"
-            and persisted.get("reason") == "okx_private_entry_instrument_probe_deferred"
-        )
-        if (
-            not deferred
-            or symbol in self._entry_unavailable_cache_for_mode(model_mode)
+            marker.get("state") != "analysis_only_execution_unverified"
+            or marker.get("reason") != "okx_private_entry_instrument_probe_deferred"
         ):
             return
         contract = self._safe_dict(raw.get("normal_paper_trade"))
@@ -8497,41 +8506,30 @@ class TradingService(ModelTrainingCoordinatorMixin):
         ).total_seconds() <= float(contract["valid_for_seconds"]):
             return
 
-        previous_recheck = self._safe_dict(raw.get("market_entry_instrument_recheck"))
-        previous_checked_at = self._parse_datetime(previous_recheck.get("checked_at"))
-        verified_symbols = self._verified_entry_symbols_by_mode.get(model_mode, set())
-        if (
-            previous_recheck.get("available") is True
-            and previous_recheck.get("symbol") == symbol
-            and previous_recheck.get("mode") == model_mode
-            and symbol in verified_symbols
-            and previous_checked_at is not None
-            and 0
-            <= (datetime.now(UTC) - previous_checked_at).total_seconds()
-            <= MARKET_ENTRY_INSTRUMENT_RECHECK_TIMEOUT_SECONDS * 2
-        ):
-            return
-
-        try:
-            async with asyncio.timeout(MARKET_ENTRY_INSTRUMENT_RECHECK_TIMEOUT_SECONDS):
-                executor = await self._get_okx_executor_for_mode(model_mode)
-                facts = self._safe_dict(
-                    await executor.entry_instrument_availability(symbol, force=True)
-                )
-        except Exception as exc:
-            facts = {
-                "reason": (
-                    "okx_entry_instrument_recheck_timeout"
-                    if isinstance(exc, TimeoutError)
-                    else "okx_entry_instrument_recheck_failed"
-                ),
-                "error": safe_error_text(exc, limit=160),
-            }
+        cached = self._entry_unavailable_cache_for_mode(model_mode).get(symbol)
+        facts = cached
+        if cached is None:
+            try:
+                async with asyncio.timeout(MARKET_ENTRY_INSTRUMENT_RECHECK_TIMEOUT_SECONDS):
+                    executor = await self._get_okx_executor_for_mode(model_mode)
+                    facts = self._safe_dict(
+                        await executor.entry_instrument_availability(symbol, force=True)
+                    )
+            except Exception as exc:
+                facts = {
+                    "reason": (
+                        "okx_entry_instrument_recheck_timeout"
+                        if isinstance(exc, TimeoutError)
+                        else "okx_entry_instrument_recheck_failed"
+                    ),
+                }
 
         # Do not overwrite an exchange restriction recorded while the probe was in flight.
-        blocked = symbol in self._entry_unavailable_cache_for_mode(model_mode)
+        restriction = self._entry_unavailable_cache_for_mode(model_mode).get(symbol)
+        if restriction is not None:
+            facts = restriction
         verified = (
-            not blocked
+            restriction is None
             and facts.get("available") is True
             and facts.get("demo") is True
             and facts.get("mode") == model_mode
@@ -8539,7 +8537,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         )
         if verified:
             self._verified_entry_symbols_by_mode.setdefault(model_mode, set()).add(symbol)
-        elif not blocked:
+        elif restriction is None:
             ttl = entry_instrument_unavailable_cache_ttl(facts)
             if ttl is not None:
                 self._remember_unavailable_entry_symbol(
@@ -8550,49 +8548,25 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "mode": model_mode,
             "available": verified,
             "reason": (
-                "okx_entry_instrument_recheck_superseded"
-                if blocked
-                else "okx_entry_instrument_recheck_fact_mismatch"
+                "okx_entry_instrument_recheck_fact_mismatch"
                 if facts.get("available") is True and not verified
                 else facts.get("reason") or "okx_entry_instrument_recheck_unverified"
             ),
+            "source_status": (
+                "cached_restriction"
+                if cached is not None
+                else "concurrent_restriction"
+                if restriction is not None
+                else "probe"
+            ),
             "error_code": facts.get("error_code"),
             "source": facts.get("source"),
+            "environment_compatibility_blockers": self._safe_list(
+                self._safe_dict(facts.get("environment_compatibility")).get("blockers")
+            ),
             "checked_at": datetime.now(UTC).isoformat(),
         }
         decision.raw_response = raw
-
-    async def _recheck_deferred_paper_entry_candidates_before_filter(
-        self,
-        candidates: list[EntryCandidate],
-    ) -> None:
-        """Resolve eligible deferred paper instruments before the synchronous entry gate."""
-
-        semaphore = asyncio.Semaphore(MARKET_ENTRY_INSTRUMENT_RECHECK_CONCURRENCY)
-
-        async def recheck(candidate: EntryCandidate) -> None:
-            _symbol, model_name, decision, _assessment, _decision_db_id = candidate
-            if not decision.is_entry:
-                return
-            model_mode = self._get_model_execution_mode(model_name)
-            if model_mode != "paper":
-                return
-            entry_policy = getattr(self, "entry_policy", None)
-            if entry_policy is not None and entry_policy.gate_reason(decision):
-                return
-            async with semaphore:
-                try:
-                    await self._recheck_deferred_paper_entry_instrument(decision, model_mode)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    logger.warning(
-                        "deferred paper entry pre-filter recheck failed closed",
-                        symbol=decision.symbol,
-                        error=safe_error_text(exc, limit=160),
-                    )
-
-        await asyncio.gather(*(recheck(candidate) for candidate in candidates))
 
     def _entry_gate_reason_with_market_boundary(
         self,
@@ -10879,6 +10853,20 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 model_mode=model_mode,
             )
             if market_analysis_reason:
+                recheck = self._safe_dict(
+                    self._safe_dict(decision.raw_response).get("market_entry_instrument_recheck")
+                )
+                if model_mode == "paper" and recheck.get("available") is False:
+                    blockers = recheck.get("environment_compatibility_blockers") or []
+                    recheck_reason = recheck.get("reason") or "okx_entry_instrument_recheck_unverified"
+                    if "environment_price_drift_exceeded" in blockers:
+                        market_analysis_reason = "OKX 模拟盘与分析行情价格偏差超限，本次未提交订单。"
+                    elif recheck_reason == "okx_entry_instrument_recheck_timeout":
+                        market_analysis_reason = "OKX 模拟合约复核超时，本次未提交订单。"
+                    else:
+                        market_analysis_reason = (
+                            f"OKX 模拟合约复核未通过（{recheck_reason}），本次未提交订单。"
+                        )
                 self._finalize_unsubmitted_entry_contract(
                     decision,
                     model_mode,
@@ -13166,7 +13154,6 @@ class TradingService(ModelTrainingCoordinatorMixin):
                     )
                     await self._mark_decision_reason(decision_db_id, ranked.wait_reason)
 
-            await self._recheck_deferred_paper_entry_candidates_before_filter(all_candidates)
             filtered_entry_candidates = self._entry_candidate_filter_policy().filter(
                 all_candidates,
                 strategy_context=strategy_mode_context,
