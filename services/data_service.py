@@ -390,7 +390,7 @@ class DataService:
         self._ticker_persist_dropped_count = 0
         self._native_consistency_bars_cache: dict[str, tuple[float, list[Any]]] = {}
         self._native_consistency_bars_tasks: dict[
-            tuple[str, int, int, bool], asyncio.Task[list[Any]]
+            tuple[str, int, int, bool, bool, bool], asyncio.Task[list[Any]]
         ] = {}
         self._native_derivatives_cache_diagnostics: deque[dict[str, Any]] = deque(
             maxlen=64
@@ -1542,6 +1542,7 @@ class DataService:
         wait_for_completion: bool = True,
         include_result_candle: bool = False,
         priority: bool = False,
+        refresh: bool = False,
     ) -> list[Any]:
         normalized = self._normalize_symbols([symbol])[0]
         now = asyncio.get_running_loop().time()
@@ -1594,7 +1595,7 @@ class DataService:
             )
             return bool(expected and expected.issubset(open_times))
 
-        cached = cache.get(normalized)
+        cached = None if refresh else cache.get(normalized)
         if cached is not None:
             cached_at, cached_rows = cached
             if (
@@ -1622,6 +1623,7 @@ class DataService:
             required_last_open,
             bool(include_result_candle),
             bool(priority),
+            bool(refresh),
         )
         existing = tasks.get(task_key)
         if existing is not None and not existing.done():
@@ -2755,7 +2757,29 @@ class DataService:
             include_result_candle=True,
             priority=False,
         )
-        return verify_native_market_fact_path(entry_fact, result_fact, rows)
+        path = verify_native_market_fact_path(entry_fact, result_fact, rows)
+        out_of_range = {"result_price_not_reachable_on_native_path"}
+        if set(path["reasons"]) != out_of_range:
+            return path
+
+        # A cached, still-forming candle can predate the result quote even
+        # though its open time covers the entire requested window.
+        refresh_started_ms = int(datetime.now(UTC).timestamp() * 1000)
+        fresh_rows = await self._fetch_native_consistency_bars(
+            symbol,
+            [entry_fact, result_fact],
+            include_result_candle=True,
+            refresh=True,
+        )
+        fresh_path = verify_native_market_fact_path(entry_fact, result_fact, fresh_rows)
+        result_ms = path["result_source_timestamp_ms"]
+        if (
+            set(fresh_path["reasons"]) == out_of_range
+            and result_ms is not None
+            and refresh_started_ms // 60_000 == result_ms // 60_000
+        ):
+            fresh_path["pending_result_candle"] = True
+        return fresh_path
 
     async def get_historical_shadow_market_path(
         self,

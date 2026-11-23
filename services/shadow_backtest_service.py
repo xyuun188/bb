@@ -1450,18 +1450,22 @@ class ShadowBacktestService:
                     if (
                         not label_timing["reasons"]
                         and self.price_path_provider is not None
-                        and path_reasons.intersection(
-                            {
-                                "one_minute_price_path_incomplete",
-                                "one_minute_price_path_missing",
-                            }
+                        and (
+                            price_path.get("pending_result_candle") is True
+                            or path_reasons.intersection(
+                                {
+                                    "one_minute_price_path_incomplete",
+                                    "one_minute_price_path_missing",
+                                }
+                            )
                         )
                     ):
                         logger.info(
-                            "shadow native price path incomplete; keeping sample pending",
+                            "shadow native price path not ready; keeping sample pending",
                             symbol=_symbol,
                             shadow_backtest_id=row_id,
                             bar_count=price_path.get("bar_count"),
+                            pending_result_candle=price_path.get("pending_result_candle") is True,
                         )
                         continue
                     market_contract = build_shadow_market_fact_contract(

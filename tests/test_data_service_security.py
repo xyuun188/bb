@@ -2248,6 +2248,83 @@ async def test_shadow_market_fact_path_prefers_isolated_native_lane() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cached_high", "fresh_high", "result_minute_open", "expected_status", "pending", "calls"),
+    [
+        (103.0, 103.0, True, "clean", False, 0),
+        (101.0, 103.0, True, "clean", False, 1),
+        (101.0, 101.0, True, "quarantined", True, 1),
+        (101.0, 101.0, False, "quarantined", False, 1),
+    ],
+)
+async def test_shadow_path_rechecks_outdated_result_candle(
+    monkeypatch: pytest.MonkeyPatch,
+    cached_high: float,
+    fresh_high: float,
+    result_minute_open: bool,
+    expected_status: str,
+    pending: bool,
+    calls: int,
+) -> None:
+    service = _service()
+    symbol = "BTC/USDT"
+    last_open = 1_780_000_320_000
+    first_open = last_open - 60_000
+    result_ms = last_open + 15_000
+    clock_ms = last_open + (16_000 if result_minute_open else 61_000)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromtimestamp(clock_ms / 1000, tz)
+
+    monkeypatch.setattr(data_service_module, "datetime", FixedDateTime)
+    identity = {
+        "inst_id": "BTC-USDT-SWAP",
+        "inst_type": "SWAP",
+        "uly": "BTC-USDT",
+        "contract_spec_version": "test-spec",
+    }
+    entry = {
+        "symbol": symbol,
+        "source_timestamp_ms": first_open + 10_000,
+        "prices": {"last": 100.0},
+        "native_identity": identity,
+    }
+    result = {
+        **entry,
+        "source_timestamp_ms": result_ms,
+        "prices": {"last": 102.0},
+    }
+
+    def candles(result_high: float) -> list[list[float]]:
+        return [
+            [first_open, 100.0, 101.0, 99.0, 100.0, 10.0],
+            [last_open, 100.0, result_high, 99.0, 100.0, 10.0],
+        ]
+
+    requests = []
+
+    class FakeRestClient:
+        async def fetch_native_consistency_ohlcv(
+            self, requested_symbol, *, limit, end_timestamp_ms, priority
+        ):
+            requests.append((requested_symbol, end_timestamp_ms, priority))
+            return candles(fresh_high)
+
+    service.rest_client = FakeRestClient()
+    service._native_consistency_bars_cache = {
+        symbol: (asyncio.get_running_loop().time(), candles(cached_high)),
+    }
+
+    path = await service.verify_market_fact_path(entry, result)
+
+    assert path["status"] == expected_status
+    assert path.get("pending_result_candle", False) is pending
+    assert requests == [(symbol, last_open, False)] * calls
+
+
+@pytest.mark.asyncio
 async def test_feature_vector_can_defer_ticker_rest_for_market_batch_scan() -> None:
     service = _service()
     stale_timestamp_ms = int(

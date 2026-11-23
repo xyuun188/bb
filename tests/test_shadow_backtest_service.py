@@ -1581,8 +1581,10 @@ async def test_unavailable_historical_rows_yield_queue_capacity_until_cooldown_e
 
 
 @pytest.mark.asyncio
-async def test_shadow_backtest_path_timeout_keeps_row_pending_for_retry(
+@pytest.mark.parametrize("failure", ["timeout", "result_candle_open"])
+async def test_shadow_backtest_path_not_ready_keeps_row_pending_for_retry(
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
 ) -> None:
     repo = _FakeRepo()
     row = SimpleNamespace(
@@ -1604,6 +1606,11 @@ async def test_shadow_backtest_path_timeout_keeps_row_pending_for_retry(
         _entry_fact: dict[str, Any],
         _result_fact: dict[str, Any],
     ) -> dict[str, Any]:
+        if failure == "result_candle_open":
+            return {
+                "reasons": ["result_price_not_reachable_on_native_path"],
+                "pending_result_candle": True,
+            }
         await asyncio.sleep(0.05)
         return {}
 
