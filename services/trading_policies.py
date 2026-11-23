@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai_brain.base_model import Action, DecisionOutput
+from core.reason_codes import ReasonCode
 from services.dynamic_exit_policy import (
     apply_dynamic_exit,
     evaluate_dynamic_exit_execution_contract,
@@ -449,6 +450,19 @@ class EntryPolicy:
         reasons = paper_trade_recommendation_reasons(decision)
         if not reasons:
             return None
+        sizing = decision.raw_response.get("profit_risk_sizing")
+        sizing = sizing if isinstance(sizing, dict) else {}
+        return_lcb = _safe_float(sizing.get("return_lcb_pct"), math.nan)
+        reason_fields: dict[str, Any] = {}
+        if math.isfinite(return_lcb) and return_lcb <= 0 and (
+            "normal_paper_size_aware_no_positive_return_lcb_at_executable_size" in reasons
+            or "paper_training_conservative_return_not_positive" in reasons
+        ):
+            reason_fields = {
+                "reason_code": ReasonCode.PROFIT_GATE_NON_POSITIVE,
+                "observed_value": return_lcb,
+                "threshold": 0.0,
+            }
         return PolicyGateResult.block(
             "paper_trade_recommendation_incomplete",
             paper_trade_recommendation_reason_text(reasons),
@@ -456,6 +470,7 @@ class EntryPolicy:
                 "pipeline_context": context.public_data(),
                 "stage_status": "blocked",
                 "block_reasons": reasons,
+                **reason_fields,
             },
         )
 

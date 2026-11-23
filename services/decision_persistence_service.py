@@ -289,13 +289,17 @@ class DecisionPersistenceService:
         """Append one state-machine event to a decision raw payload."""
 
         raw = decision.raw_response if isinstance(decision.raw_response, dict) else {}
+        stage_data = self.json_safe_payload(data or {}) if data else {}
         raw = append_decision_stage(
             raw,
             stage,
             status,
             str(sanitize_runtime_text(reason) or "") if reason else "",
-            data=self.json_safe_payload(data or {}) if data else None,
+            data=stage_data or None,
             duration_sec=duration_sec,
+            reason_code=stage_data.get("reason_code"),
+            observed_value=stage_data.get("observed_value"),
+            threshold=stage_data.get("threshold"),
         )
         decision.raw_response = raw
         return raw

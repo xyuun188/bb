@@ -6,6 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 from ai_brain.base_model import Action, DecisionOutput
+from core.reason_codes import ReasonCode
+from services.decision_persistence_service import DecisionPersistenceService
+from services.decision_state import DecisionStage, DecisionStageStatus
+from services.entry_funnel_diagnostics import classify_entry_funnel_reason
+from services.pipeline_context import EntryPipelineContext
 from services.trade_recommendation_contract import (
     attach_initial_trade_recommendation,
     attach_risk_adjusted_trade_recommendation,
@@ -13,6 +18,7 @@ from services.trade_recommendation_contract import (
     paper_trade_recommendation_reasons,
     trade_recommendation_snapshot,
 )
+from services.trading_policies import EntryPolicy
 
 
 def _raw() -> dict:
@@ -144,6 +150,7 @@ def test_missing_required_plan_sections_block_entry(
 
 def test_ineligible_sizing_reports_authoritative_blocker_not_missing_size() -> None:
     decision = _decision()
+    decision.position_size_pct = 0.0
     decision.raw_response["profit_risk_sizing"] = {
         "contract_lifecycle": "normal_paper_trade",
         "production_eligible": False,
@@ -155,6 +162,42 @@ def test_ineligible_sizing_reports_authoritative_blocker_not_missing_size() -> N
         "normal_paper_exchange_facts_ineligible",
         "okx_leverage_tiers_missing",
     ]
+
+
+def test_final_negative_paper_return_is_persisted_as_profit_gate() -> None:
+    decision = _decision(action=Action.SHORT)
+    decision.position_size_pct = 0.0
+    decision.raw_response["profit_risk_sizing"].update(
+        contract_lifecycle="normal_paper_trade",
+        production_eligible=False,
+        return_lcb_pct=-0.00045166,
+        reason=(
+            "normal_paper_size_aware_no_positive_return_lcb_at_executable_size,"
+            "paper_training_conservative_return_not_positive"
+        ),
+    )
+    _prepare(decision)
+    context = EntryPipelineContext(decision, decision.model_name, "paper", ())
+
+    result = EntryPolicy._paper_trade_plan_gate(decision, "paper", context)
+
+    assert result is not None and not result.passed and result.data is not None
+    assert result.blocker == "paper_trade_recommendation_incomplete"
+    assert "trade_plan_position_size_missing" not in result.data["block_reasons"]
+    persistence = DecisionPersistenceService.__new__(DecisionPersistenceService)
+    raw = persistence.record_stage(
+        decision, DecisionStage.RISK_CHECK, DecisionStageStatus.BLOCKED, result.reason, result.data
+    )
+    evidence = raw["decision_state_machine"]["summary"]["final_reason_evidence"]
+    assert evidence["code"] == ReasonCode.PROFIT_GATE_NON_POSITIVE
+    assert evidence["observed_value"] == -0.00045166
+    assert evidence["threshold"] == 0.0
+    assert classify_entry_funnel_reason(
+        raw={"decision_state_machine": raw["decision_state_machine"]},
+        action="short",
+        was_executed=False,
+        has_order=False,
+    ) == "profit_gate_blocked"
 
 
 def test_positive_gross_but_negative_fee_after_return_can_remain_hold() -> None:

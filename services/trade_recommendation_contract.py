@@ -546,12 +546,9 @@ def paper_trade_recommendation_reasons(decision: DecisionOutput) -> list[str]:
     if str(risk.get("status") or "") not in {"prepared", "approved", "passed"}:
         reasons.append("trade_plan_risk_adjustment_not_approved")
     if risk.get("complete") is not True:
-        plan_reasons = _entry_plan_reasons(plan)
-        if sizing_reasons:
-            plan_reasons = [
-                item for item in plan_reasons if item != "trade_plan_position_size_missing"
-            ]
-        reasons.extend(plan_reasons)
+        reasons.extend(_entry_plan_reasons(plan))
+    if sizing_reasons:
+        reasons = [item for item in reasons if item != "trade_plan_position_size_missing"]
     return list(dict.fromkeys(reasons or _entry_plan_reasons(plan)))
 
 
@@ -562,6 +559,12 @@ def paper_trade_recommendation_reason_text(reasons: list[str]) -> str:
         "paper_training_review_capacity_full": "模拟训练开仓的持仓复盘名额已满",
         "paper_training_order_value_below_minimum": "模拟训练单的预计费后收益未达到最低价值",
         "paper_training_conservative_return_not_positive": "模拟训练单的费后保守收益未转正",
+        "normal_paper_trade_not_authorized": "模拟开仓未获最终授权",
+        "normal_paper_trade_return_lcb_not_positive": "费后保守收益未转正",
+        "normal_paper_trade_contract_incomplete": "模拟开仓收益条件未满足",
+        "normal_paper_size_aware_no_positive_return_lcb_at_executable_size": (
+            "按当前盘口重算，所有可执行仓位的费后保守收益均未转正"
+        ),
         "trade_recommendation_contract_missing": "完整交易方案尚未生成",
         "trade_plan_symbol_missing": "交易币种缺失",
         "trade_plan_side_missing": "交易方向缺失",
