@@ -2544,17 +2544,20 @@ async def test_okx_executor_initialization_cancellation_does_not_publish_partial
 
 
 @pytest.mark.asyncio
-async def test_market_execution_cost_facts_use_isolated_read_only_fallback_after_timeout(
+@pytest.mark.parametrize("consumer", ["market", "shadow_settlement"])
+async def test_execution_cost_facts_use_isolated_read_only_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    consumer: str,
 ) -> None:
-    service = TradingService.__new__(TradingService)
     primary_calls: list[str] = []
 
-    async def primary(_mode: str) -> dict[str, Any]:
+    async def primary(_service: TradingService, _mode: str) -> dict[str, Any]:
         primary_calls.append("primary")
+        if consumer == "shadow_settlement":
+            raise ValueError("account_fee_source_after_receipt")
         raise TimeoutError("busy shared executor")
 
-    service._shadow_execution_cost_facts = primary  # type: ignore[method-assign]
+    monkeypatch.setattr(TradingService, "_shadow_execution_cost_facts", primary)
     lifecycle: list[str] = []
 
     class IsolatedExecutor:
@@ -2577,7 +2580,14 @@ async def test_market_execution_cost_facts_use_isolated_read_only_fallback_after
 
     monkeypatch.setattr(trading_service, "OKXExecutor", IsolatedExecutor)
 
-    facts = await service._market_execution_cost_facts("paper")
+    if consumer == "shadow_settlement":
+        service = TradingService(trading_service.ModelRegistry(), trading_service.DataService())
+        provider = service.shadow_backtest_service.execution_cost_facts_provider
+        assert provider is not None
+    else:
+        service = TradingService.__new__(TradingService)
+        provider = service._market_execution_cost_facts
+    facts = await provider("paper")
 
     assert facts["taker_fee_rate"] == pytest.approx(0.0004)
     assert primary_calls == ["primary"]

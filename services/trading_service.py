@@ -950,7 +950,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             latest_price_provider=self._latest_price_for_symbol,
             symbol_normalizer=self._normalize_position_symbol,
             float_parser=self._safe_float,
-            execution_cost_facts_provider=self._shadow_execution_cost_facts,
+            execution_cost_facts_provider=self._market_execution_cost_facts,
             latest_market_fact_provider=self.data_service.get_latest_market_fact,
             price_path_provider=self.data_service.verify_market_fact_path,
             historical_market_path_provider=self.data_service.get_historical_shadow_market_path,
@@ -16105,7 +16105,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 tasks.pop(selected_mode, None)
 
     async def _shadow_execution_cost_facts(self, mode: str) -> dict[str, Any]:
-        """Read current account fee facts once for each due-shadow mode batch."""
+        """Read current account fee facts through the shared executor."""
 
         executor = await asyncio.wait_for(
             self._get_okx_executor_for_mode(mode),
@@ -16144,7 +16144,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 )
 
     async def _market_execution_cost_facts(self, mode: str) -> dict[str, Any]:
-        """Read the same authoritative fee facts used by shadow evaluation."""
+        """Read authoritative fee facts for market analysis and shadow settlement."""
 
         try:
             facts = await self._shadow_execution_cost_facts(mode)
