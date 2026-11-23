@@ -132,6 +132,38 @@ def test_historical_replay_observations_build_in_background_helper(
     assert excluded == {}
 
 
+def test_replay_preserves_registered_identity_without_using_expired_funding(
+    historical_replay_row: SimpleNamespace,
+) -> None:
+    snapshot = historical_replay_row.training_feature_snapshot
+    snapshot.update(
+        original_decision_timestamp="2026-07-02T00:00:00Z",
+        funding_rate_observed_at="2026-07-01T23:55:00Z",
+        funding_time="2026-07-02T00:00:00Z",
+        next_funding_time="2026-07-02T08:00:00Z",
+    )
+    epoch_start = datetime(2026, 7, 1, tzinfo=UTC)
+
+    observations, excluded = _build_historical_replay_observations(
+        [historical_replay_row], epoch_start=epoch_start,
+    )
+    assert observations == []
+    assert excluded == {"funding_rate_settlement_passed": 1}
+
+    observations, excluded = _build_historical_replay_observations(
+        [historical_replay_row], epoch_start=epoch_start, registered_holdout_ids={1},
+    )
+    assert excluded == {"funding_rate_settlement_passed": 1}
+    assert len(observations) == 1
+    retained = observations[0]
+    assert retained["source_id"] == 1
+    assert retained["decision_timestamp"] == "2026-07-02T00:00:00+00:00"
+    assert retained["label_timestamp"] == "2026-07-02T00:25:00+00:00"
+    assert retained["replay_entry_blocker"] == "funding_rate_settlement_passed"
+    assert "feature_snapshot" not in retained
+    assert "long_net_return_after_all_cost_pct" not in retained
+
+
 @pytest.mark.parametrize("nested", [False, True])
 def test_replay_uses_immutable_label_availability_not_due_or_update_time(
     historical_replay_row: SimpleNamespace, nested: bool,
@@ -209,8 +241,9 @@ async def test_runtime_feedback_limits_and_orders_historical_replay_rows(
         rows: list[Any],
         *,
         epoch_start: datetime,
+        registered_holdout_ids: set[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-        del epoch_start
+        del epoch_start, registered_holdout_ids
         replay_row_ids.extend(int(row.id) for row in rows)
         return [], {}
 

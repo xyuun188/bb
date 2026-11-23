@@ -193,13 +193,20 @@ def _historical_replay_observation(
     row: Any,
     *,
     epoch_start: datetime,
+    registered_holdout: bool = False,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     replay_snapshot = _safe_dict(getattr(row, "training_feature_snapshot", None))
     snapshot, long_gross, short_gross, outcome, reasons = _shadow_cost_evidence(
         row,
         snapshot_override=replay_snapshot,
     )
-    if reasons or long_gross is None or short_gross is None:
+    # Older artifacts registered rows before the current settlement check.
+    # Keep their identity and time bounds, without scoring expired funding.
+    funding_blocked = (
+        registered_holdout
+        and reasons == ["funding_rate_settlement_passed"]
+    )
+    if (reasons and not funding_blocked) or long_gross is None or short_gross is None:
         return None, reasons
     created_at = getattr(row, "created_at", None)
     if isinstance(created_at, datetime) and created_at.tzinfo is None:
@@ -227,16 +234,22 @@ def _historical_replay_observation(
     decision_cost = execution_cost_estimate(snapshot)
     if not decision_cost.production_eligible:
         return None, [decision_cost.reason]
-    return {
+    identity = {
         "source_id": _safe_int(getattr(row, "id", None)),
         "decision_id": _safe_int(getattr(row, "decision_id", None)) or None,
-        "symbol": str(getattr(row, "symbol", "") or "").upper(),
-        "market_regime": _regime_label(snapshot),
         "horizon_minutes": _safe_int(getattr(row, "horizon_minutes", None), 10),
         "created_at": _timestamp_text(created_at),
         "completed_at": _timestamp_text(label_available_at),
         "decision_timestamp": _timestamp_text(created_at),
         "label_timestamp": _timestamp_text(label_available_at),
+        "training_eligible": training_eligible,
+    }
+    if funding_blocked:
+        return {**identity, "replay_entry_blocker": reasons[0]}, reasons
+    return {
+        **identity,
+        "symbol": str(getattr(row, "symbol", "") or "").upper(),
+        "market_regime": _regime_label(snapshot),
         "feature_snapshot": snapshot,
         "execution_cost_pct": decision_cost.total_pct,
         "side_realized_execution_cost_pct": outcome.get("side_execution_cost_pct"),
@@ -248,7 +261,6 @@ def _historical_replay_observation(
         "short_net_return_after_all_cost_pct": outcome.get("short_net_return_after_all_cost_pct"),
         "long_funding_return_pct": outcome.get("funding_return_long_pct"),
         "short_funding_return_pct": outcome.get("funding_return_short_pct"),
-        "training_eligible": training_eligible,
         "training_quality_status": quality.status,
         "training_quality_reasons": list(quality.reasons),
     }, []
@@ -258,6 +270,7 @@ def _build_historical_replay_observations(
     rows: list[Any],
     *,
     epoch_start: datetime,
+    registered_holdout_ids: set[int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Build replay evidence off the event loop's latency-sensitive thread."""
 
@@ -267,11 +280,15 @@ def _build_historical_replay_observations(
         observation, reasons = _historical_replay_observation(
             row,
             epoch_start=epoch_start,
+            registered_holdout=_safe_int(getattr(row, "id", None)) in (
+                registered_holdout_ids or ()
+            ),
         )
         if observation is not None:
             observations.append(observation)
-            continue
-        for reason in reasons or ["historical_replay_observation_incomplete"]:
+        elif not reasons:
+            reasons = ["historical_replay_observation_incomplete"]
+        for reason in reasons:
             reason_text = str(reason)
             excluded[reason_text] = excluded.get(reason_text, 0) + 1
     return observations, excluded
@@ -1864,6 +1881,7 @@ class StrategyLearningService:
             _build_historical_replay_observations,
             replay_shadows,
             epoch_start=replay_data_start,
+            registered_holdout_ids=replay_holdout_source_ids,
         )
 
         side_performance = {

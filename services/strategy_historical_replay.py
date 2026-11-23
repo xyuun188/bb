@@ -16,7 +16,7 @@ from services.model_strategy_blueprint import (
     strategy_evidence_contract,
 )
 
-STRATEGY_HISTORICAL_REPLAY_VERSION = "2026-11-13.purged-forward-fee-after-replay.v3"
+STRATEGY_HISTORICAL_REPLAY_VERSION = "2026-11-23.holdout-entry-blockers.v4"
 
 ModelPredictor = Callable[..., dict[str, Any]]
 
@@ -475,13 +475,22 @@ def _partition_observations(
     explicit_holdout_ids = _expand_integer_ranges(
         holdout_contract.get("shadow_source_id_ranges")
     )
+    explicit_holdout_diagnostics = {}
     if explicit_holdout_ids:
         explicit_rows = [
             row for row in eligible if _int(row.get("source_id")) in explicit_holdout_ids
         ]
         explicit_bounds = _group_bounds(explicit_rows)
+        reconstructed_ids = {_int(row.get("source_id")) for row in explicit_rows}
+        explicit_holdout_diagnostics = {
+            "artifact_holdout_reconstructed_count": len(reconstructed_ids),
+            "artifact_holdout_entry_blocked_count": sum(
+                bool(row.get("replay_entry_blocker")) for row in explicit_rows
+            ),
+        }
         if (
             len(explicit_rows) == expected_test_count
+            and reconstructed_ids == explicit_holdout_ids
             and len(explicit_holdout_ids) == expected_test_count
         ):
             historical_bounds = explicit_bounds
@@ -509,6 +518,7 @@ def _partition_observations(
                 "post_training_observation_count": len(post_training),
                 "expected_holdout_sample_count": expected_test_count,
                 "holdout_identity_method": holdout_identity_method,
+                **explicit_holdout_diagnostics,
             },
         }
     split_at = max(len(holdout_groups) // 2, 1)
@@ -593,6 +603,7 @@ def _partition_observations(
             "post_training_observation_count": len(post_training),
             "expected_holdout_sample_count": expected_test_count,
             "holdout_identity_method": holdout_identity_method,
+            **explicit_holdout_diagnostics,
             "artifact_holdout_group_count": len(holdout_groups),
             "strategy_development_group_count": len(development_groups),
             "strategy_exam_historical_group_count": len(exam_groups),
@@ -673,6 +684,9 @@ def build_strategy_historical_replay(
             )
             if observation is None:
                 excluded["historical_replay_horizon_row_missing"] += 1
+                continue
+            if blocker := observation.get("replay_entry_blocker"):
+                excluded[str(blocker)] += 1
                 continue
             replay_observations[partition_name].append(observation)
     try:

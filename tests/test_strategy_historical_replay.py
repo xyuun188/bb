@@ -505,6 +505,37 @@ def test_replay_fails_closed_when_artifact_holdout_cannot_be_reconstructed() -> 
     assert report["exam_samples"] == []
 
 
+def test_registered_funding_block_preserves_partition_but_cannot_produce_a_signal() -> None:
+    observations = _observations()
+    row = next(row for row in observations if row["source_id"] == 13)
+    row["replay_entry_blocker"] = "funding_rate_settlement_passed"
+    row["feature_snapshot"]["current_price"] = -1
+
+    def predictor(features: dict, *, horizons: tuple[int, ...]) -> dict:
+        assert features["current_price"] > 0
+        return _predictor(features, horizons=horizons)
+
+    report = build_strategy_historical_replay(
+        blueprint=_blueprint(), observations=observations, predictor=predictor,
+    )
+
+    assert report["status"] == "complete"
+    assert report["partition"]["artifact_holdout_reconstructed_count"] == 12
+    assert report["partition"]["artifact_holdout_entry_blocked_count"] == 1
+    assert report["partition"]["chronological_partition_disjoint"] is True
+    assert report["excluded_reason_counts"] == {"funding_rate_settlement_passed": 1}
+    assert report["development_selected_entry_count"] == 1
+    assert report["exam_selected_entry_count"] == 3
+
+    observations.remove(row)
+    observations.append(dict(next(row for row in observations if row["source_id"] == 14)))
+    missing = build_strategy_historical_replay(
+        blueprint=_blueprint(), observations=observations, predictor=predictor,
+    )
+    assert missing["status"] == "artifact_holdout_rows_not_reconstructable"
+    assert missing["partition"]["artifact_holdout_reconstructed_count"] == 11
+
+
 def test_replay_reconstructs_explicit_holdout_crossing_training_timestamp() -> None:
     observations = _observations()
     blueprint = _blueprint()
