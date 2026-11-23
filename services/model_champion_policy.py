@@ -8,7 +8,7 @@ from typing import Any
 from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.ml_training_contract import MIN_TRAINING_SAMPLE_COUNT
 
-MODEL_CHAMPION_POLICY_VERSION = "2026-11-13.positive-entry-portfolio-champion.v5"
+MODEL_CHAMPION_POLICY_VERSION = "2026-11-23.positive-entry-portfolio-champion.v6"
 PAIRED_COMPARISON_VERSION = "2026-11-13.positive-entry-common-holdout.v2"
 
 _STAGE_RANK = {
@@ -64,6 +64,21 @@ def _comparison_entry_evidence(
         return {}
     # Use the chronological pooled outcomes, including a legitimately empty side.
     return _dict(report.get("portfolio")) if len(sides) == 2 else side_reports[sides[0]]
+
+
+def _confirmed_no_entries(evaluation: dict[str, Any]) -> bool:
+    side_evidence = (
+        _comparison_entry_evidence(evaluation, "champion", sides)
+        for sides in (("long", "short"), ("long",), ("short",))
+    )
+    return all(
+        evidence.get("profit_factor_status") == "no_observations"
+        and all(
+            _float(evidence.get(key)) == 0.0
+            for key in ("count", "gross_profit_pct", "gross_loss_pct")
+        )
+        for evidence in side_evidence
+    )
 
 
 def _training_data_version(metadata: dict[str, Any] | None) -> str:
@@ -237,6 +252,33 @@ def compare_candidate_to_champion(
         )
         for key in candidate_aggregate
     }
+    if (
+        candidate_stage == champion_stage == "canary"
+        and all(value is not None for value in candidate_aggregate.values())
+        and _confirmed_no_entries(evaluation)
+    ):
+        # An all-hold champion has no per-trade metrics on this window.
+        # A paper challenger must establish positive economics on its own.
+        report["comparison_baseline"] = "no_trade"
+        blockers = [
+            f"candidate_{key}_insufficient_vs_no_trade"
+            for key, minimum in (
+                ("avg_return_pct", 0.0),
+                ("return_lcb_pct", 0.0),
+                ("profit_factor", 1.0),
+            )
+            if candidate_aggregate[key] <= minimum
+        ]
+        return {
+            **report,
+            "accepted": not blockers,
+            "reason": (
+                "paper_canary_beats_inactive_champion"
+                if not blockers
+                else "paper_canary_break_even_not_established"
+            ),
+            "blocking_reasons": blockers,
+        }
     missing = [
         key
         for key in candidate_aggregate

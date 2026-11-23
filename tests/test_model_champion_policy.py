@@ -523,6 +523,62 @@ def test_comparison_uses_pooled_entry_outcomes_with_empty_direction(empty: bool)
         assert report["candidate_metrics"]["profit_factor"] == pytest.approx(7.5)
 
 
+@pytest.mark.parametrize(
+    ("stage", "returns", "accepted", "reason"),
+    [
+        ("canary", [-0.01, 0.9, 1.0, 1.1, 1.0], True,
+         "paper_canary_beats_inactive_champion"),
+        ("canary", [-0.1, 0.2], False, "paper_canary_break_even_not_established"),
+        ("canary", [-0.8, 0.2], False, "paper_canary_break_even_not_established"),
+        ("canary", [], False, "comparison_incomplete"),
+        ("active", [-0.01, 0.9, 1.0, 1.1, 1.0], False, "comparison_incomplete"),
+    ],
+)
+@pytest.mark.parametrize("champion_scope", ["both_empty", "other_side_traded", "incomplete"])
+def test_no_trade_baseline_requires_a_verified_all_hold_champion(
+    stage, returns, accepted, reason, champion_scope,
+) -> None:
+    from services.ml_signal_service import _return_evidence
+
+    candidate, champion = _metadata(), _metadata()
+    evaluation = _paired_evaluation(candidate, champion)
+    empty = _return_evidence([])
+    selected = _return_evidence([
+        {"return_pct": value, "label_timestamp": str(index)}
+        for index, value in enumerate(returns)
+    ])
+    for role, short in (("candidate", selected), ("champion", empty)):
+        evaluation[f"{role}_entry_evaluation"] = {
+            "version": ENTRY_COHORT_VERSION,
+            "prediction_score_policy_version": PREDICTION_SCORE_POLICY_VERSION,
+            "sides": {"long": empty, "short": short},
+            "portfolio": short,
+        }
+    champion_entry = evaluation["champion_entry_evaluation"]
+    if champion_scope == "other_side_traded":
+        traded = _return_evidence([{"return_pct": 1.0}])
+        champion_entry["sides"]["long"] = traded
+        champion_entry["portfolio"] = traded
+    elif champion_scope == "incomplete":
+        champion_entry["sides"]["long"] = {}
+    report = _compare_candidate_to_champion(
+        candidate, champion, candidate_stage=stage, champion_stage=stage,
+        candidate_enabled_sides=["short"], comparison_evaluation=evaluation,
+    )
+    if champion_scope != "both_empty" and stage == "canary":
+        assert report["accepted"] is False
+        assert report["reason"] == "comparison_incomplete"
+        return
+    if champion_scope != "both_empty" and stage == "active":
+        assert report.get("comparison_baseline") != "no_trade"
+        return
+    assert report["accepted"] is accepted
+    assert report["reason"] == reason
+    if accepted:
+        assert report["champion_metrics"]["avg_return_pct"] is None
+        assert report["candidate_metrics"]["return_lcb_pct"] > 0
+
+
 @pytest.mark.parametrize("version", [None, "old-ranking-report"])
 def test_ranking_evidence_cannot_replace_entry_portfolio(version) -> None:
     candidate, champion = _metadata(avg=0.4), _metadata()
