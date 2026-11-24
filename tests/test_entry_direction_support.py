@@ -256,7 +256,7 @@ def test_qualified_model_keeps_normal_entry_with_unqualified_observation_tools(
     )
 
 
-def test_negative_objective_with_unproven_history_stays_observation_only() -> None:
+def test_negative_objective_with_unproven_history_uses_bounded_training_entry() -> None:
     row = _row("local_ml", raw=0.6, objective=-0.2)
     row["paper_return_quality_governance"] = {"paper_execution_permission": True}
     support = assess_paper_model_trade_support(
@@ -269,8 +269,8 @@ def test_negative_objective_with_unproven_history_stays_observation_only() -> No
 
     selection = select_normal_paper_trade_side({"long": support})
 
-    assert selection["selected"] is False
-    assert "direction_support_risk_adjusted_return_not_positive" in selection["blocking_reasons"]
+    assert selection["selected"] is True
+    assert selection["selection_reason"] == "paper_training_entry"
     assert selection["production_permission"] is False
 
 

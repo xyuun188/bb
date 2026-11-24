@@ -1730,6 +1730,7 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_size_aware_downside_return_missing")
     if (
         not executed
+        and not training_entry
         and sizing_return_lcb is not None
         and sizing_return_lcb <= 0.0
     ):

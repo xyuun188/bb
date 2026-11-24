@@ -667,6 +667,29 @@ def test_size_solver_rejects_negative_downside_including_cost_fallback(with_book
     assert solved["return_lcb_pct"] < 0.0
 
 
+def test_training_size_solver_allows_negative_lcb_as_downside_stress() -> None:
+    snapshot = _size_aware_book_snapshot(5_000.0)
+    cost = execution_cost_estimate(snapshot).to_dict()
+    solved = solve_size_aware_positive_expected_net(
+        feature_snapshot=snapshot,
+        side="long",
+        maximum_notional_usdt=5_000.0,
+        minimum_notional_usdt=100.0,
+        contract_step_notional_usdt=100.0,
+        expected_net_return_pct=0.60 - cost["total_pct"],
+        return_lcb_pct=-0.20,
+        execution_cost=cost,
+        require_positive_lcb=False,
+    )
+    assert solved["production_eligible"] is True
+    assert solved["expected_net_return_pct"] > 0.0
+    assert solved["return_lcb_pct"] < 0.0
+    assert solved["reason"] in {
+        "positive_expected_net_with_downside_stress",
+        "positive_fee_after_reduced_risk_size",
+    }
+
+
 def test_validated_size_solver_selects_positive_bound_size_instead_of_rejecting_all() -> None:
     snapshot = _size_aware_book_snapshot(5_000.0)
     cost = execution_cost_estimate(snapshot).to_dict()

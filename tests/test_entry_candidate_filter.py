@@ -508,7 +508,7 @@ async def test_deferred_market_instrument_recheck_at_entry_handoff(case: str) ->
         "market_regime_context": None,
         "new_pair_pause_reason": None,
     }
-    if case in {"verified", "compacted"}:
+    if case in {"verified", "compacted", "unprofitable"}:
         with pytest.raises(StopBeforeExecution):
             await service._run_market_entry_pipeline(**kwargs)
         assert prepared
@@ -539,7 +539,7 @@ async def test_deferred_market_instrument_recheck_at_entry_handoff(case: str) ->
                 assert recheck["source_status"] == (
                     "cached_restriction" if case == "known_unavailable" else "concurrent_restriction"
                 )
-    if case in {"known_unavailable", "live", "unprofitable", "expired"}:
+    if case in {"known_unavailable", "live", "expired"}:
         availability.assert_not_awaited()
     else:
         availability.assert_awaited_once_with(symbol, force=True)
