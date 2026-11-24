@@ -45,7 +45,10 @@ from services.model_server_config import (
     load_model_server_info_from_secure_settings,
     save_model_server_settings,
 )
-from services.okx_error_classifier import is_okx_temporary_service_error
+from services.okx_error_classifier import (
+    is_okx_temporary_service_error,
+    okx_temporary_service_error_message,
+)
 from services.secure_runtime_config import (
     scrub_ai_model_env,
     secure_ai_model_key,
@@ -911,9 +914,18 @@ async def test_okx_connection(req: OKXTestRequest):
         await executor.initialize()
         snapshot = await executor.get_balance_snapshot("USDT")
         if snapshot.get("error"):
+            error = snapshot.get("error")
+            if is_okx_temporary_service_error(error):
+                return {
+                    "success": False,
+                    "error": okx_temporary_service_error_message(error),
+                    "error_code": "50001",
+                    "retryable": True,
+                    "scope": "private_account",
+                }
             return {
                 "success": False,
-                "error": f"连接失败: {_connection_error_text(snapshot.get('error'))}",
+                "error": f"连接失败: {_connection_error_text(error)}",
             }
         usdt = float(snapshot.get("free") or 0.0)
         used = float(snapshot.get("used") or 0.0)
@@ -936,6 +948,14 @@ async def test_okx_connection(req: OKXTestRequest):
             "allocatable_balance": allocatable,
         }
     except Exception as exc:
+        if is_okx_temporary_service_error(exc):
+            return {
+                "success": False,
+                "error": okx_temporary_service_error_message(exc),
+                "error_code": "50001",
+                "retryable": True,
+                "scope": "private_account",
+            }
         return {
             "success": False,
             "error": f"连接失败: {_connection_error_text(exc)}",

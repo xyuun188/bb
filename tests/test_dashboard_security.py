@@ -615,6 +615,39 @@ async def test_dashboard_okx_connection_error_is_redacted(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_okx_connection_marks_temporary_private_outage_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import executor.okx_executor as okx_executor_module
+
+    _FakeOKXExecutor.error_text = (
+        "OKX API error [50001]: Service temporarily unavailable. "
+        "Please try again later."
+    )
+    _FakeOKXExecutor.raise_on_balance = False
+    _FakeOKXExecutor.created_kwargs.clear()
+    settings_api_module._OKX_BALANCE_CACHE.clear()
+    monkeypatch.setattr(settings, "dashboard_admin_api_key", "")
+    monkeypatch.setattr(settings, "okx_paper_api_key", "paper-key")
+    monkeypatch.setattr(settings, "okx_paper_api_secret", "paper-secret")
+    monkeypatch.setattr(settings, "okx_paper_passphrase", "paper-pass")
+    monkeypatch.setattr(okx_executor_module, "OKXExecutor", _FakeOKXExecutor)
+    app = create_app()
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post("/api/settings/okx/test", json={"mode": "paper"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is False
+    assert body["error_code"] == "50001"
+    assert body["retryable"] is True
+    assert body["scope"] == "private_account"
+    assert "50001" in body["error"]
+
+
+@pytest.mark.asyncio
 async def test_dashboard_okx_update_logs_redacted_executor_init_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
