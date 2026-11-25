@@ -1,5 +1,6 @@
 """Same-model feedback for paper training entries, using completed OKX lifecycles."""
 
+import re
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from math import isclose, isfinite
@@ -7,6 +8,7 @@ from math import isclose, isfinite
 WINDOW = timedelta(days=1)
 MIN_LIFECYCLES = 4
 ROW_LIMIT = 500
+_REGISTRY_VERSION = re.compile(r"(?P<created>\d{8}T\d{12}Z)-[0-9a-f]{8}")
 
 
 def _key(version, side, horizon, family="local_ml"):
@@ -42,21 +44,57 @@ def build_training_profiles(rows, *, now):
     return {"status": "complete", "as_of": now.isoformat(), "profiles": profiles}
 
 
-def training_feedback(snapshot, *, version, side, horizon, family="local_ml"):
-    key = _key(version, side, horizon, family)
-    available = bool(key and snapshot and snapshot.get("status") == "complete"
-                     and isinstance(snapshot.get("profiles"), dict))
-    row = snapshot["profiles"].get(key, {}) if available else {}
+def _cross_symbol_loss(row):
     # A majority vote can hide losses when a few losers outweigh more small wins.
-    loss = (
+    return (
         row.get("sample_count", 0) >= MIN_LIFECYCLES
         and row["net_usdt"] < 0
         and row["losing_symbols"] >= 2
     )
+
+
+def _previous_established_profile(profiles, *, version, side, horizon, family):
+    current = _REGISTRY_VERSION.fullmatch(version)
+    if current is None:
+        return None
+    prefix = "local_ai_tools|" if family == "local_ai_tools" else ""
+    suffix = f"|{side}|{float(horizon):g}"
+    established = []
+    for key, row in profiles.items():
+        if not key.startswith(prefix) or not key.endswith(suffix):
+            continue
+        previous = _REGISTRY_VERSION.fullmatch(key[len(prefix):-len(suffix)])
+        if (previous and previous["created"] < current["created"]
+                and row.get("sample_count", 0) >= MIN_LIFECYCLES):
+            established.append(key)
+    return max(established, default=None)
+
+
+def training_feedback(snapshot, *, version, side, horizon, family="local_ml"):
+    key = _key(version, side, horizon, family)
+    available = bool(key and snapshot and snapshot.get("status") == "complete"
+                     and isinstance(snapshot.get("profiles"), dict))
+    profiles = snapshot["profiles"] if available else {}
+    row = profiles.get(key, {})
+    loss = _cross_symbol_loss(row)
+    previous_loss = {}
+    if available and row.get("sample_count", 0) < MIN_LIFECYCLES:
+        # An artifact refresh does not establish a new track record. Keep the
+        # previous loss signal until it ages out or the new cohort has evidence.
+        previous_key = _previous_established_profile(
+            profiles, version=version, side=side, horizon=horizon, family=family,
+        )
+        if previous_key and _cross_symbol_loss(profiles[previous_key]):
+            previous_loss = {
+                "previous_losing_cohort": {"cohort": previous_key, **profiles[previous_key]},
+            }
     return {
-        "cohort": key, "available": available, **row, "blocked": not available or loss,
+        "cohort": key, "available": available, **row, **previous_loss,
+        "blocked": not available or loss or bool(previous_loss),
         "reason": "training_settlements_unavailable" if not available else
-        "cross_symbol_training_loss" if loss else "no_cross_symbol_training_loss",
+        "cross_symbol_training_loss" if loss else
+        "previous_version_cross_symbol_training_loss" if previous_loss else
+        "no_cross_symbol_training_loss",
     }
 
 

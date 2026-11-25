@@ -63,6 +63,40 @@ def test_server_settlements_do_not_contaminate_the_local_model_cohort():
     assert not _feedback(rows, family="local_ai_tools", version="model2")["blocked"]
 
 
+def test_new_registry_versions_cannot_clear_recent_losses_in_the_same_training_lane():
+    earlier = "20261120T060000000000Z-11111111"
+    intermediate = "20261120T080000000000Z-22222222"
+    current = "20261120T100000000000Z-33333333"
+    future = "20261120T120000000000Z-44444444"
+    rows = [
+        *[_row(i, version=earlier, family="local_ai_tools") for i in range(4)],
+        _row(5, version=intermediate, family="local_ai_tools", pnl=4.0),
+        *[_row(i, version=future, family="local_ai_tools", pnl=4.0) for i in range(6, 10)],
+    ]
+    result = _feedback(rows, family="local_ai_tools", version=current)
+    assert result["blocked"]
+    assert result["reason"] == "previous_version_cross_symbol_training_loss"
+    assert result["previous_losing_cohort"]["cohort"] == f"local_ai_tools|{earlier}|long|240"
+    assert "sample_count" not in result
+    for changes in ({"family": "local_ml"}, {"side": "short"}, {"horizon": 30}):
+        params = {"family": "local_ai_tools", "version": current} | changes
+        assert not _feedback(rows, **params)["blocked"]
+    assert not training_feedback(
+        build_training_profiles(rows, now=NOW + timedelta(days=1)),
+        family="local_ai_tools", version=current, side="long", horizon=240,
+    )["blocked"]
+
+    current_wins = [_row(i, version=current, family="local_ai_tools", pnl=2.0) for i in range(10, 14)]
+    assert _feedback(rows + current_wins[:3], family="local_ai_tools", version=current)["blocked"]
+    assert not _feedback(rows + current_wins, family="local_ai_tools", version=current)["blocked"]
+    intermediate_wins = [
+        _row(i, version=intermediate, family="local_ai_tools", pnl=2.0) for i in range(14, 17)
+    ]
+    assert not _feedback(
+        rows + intermediate_wins, family="local_ai_tools", version=current,
+    )["blocked"]
+
+
 def test_settlement_uses_frozen_family_version_before_legacy_route_metadata():
     families = ["local_ai_tools"]
     assert _settled_model_versions(families, {"local_ai_tools": "v2"}, "ml", "v1", "v1") == {
