@@ -175,6 +175,53 @@ def test_slippage_is_measured_but_never_deducted_twice_and_horizon_is_diagnostic
     assert result["holding_vs_forecast_horizon"]["causal_exit_loss_inferred"] is False
 
 
+def test_horizon_comparison_uses_same_trade_instrument_and_mature_native_price():
+    due = SINCE + timedelta(hours=4)
+    until = due + timedelta(minutes=1)
+    trade = outcome(
+        decision_id=1, entry_decision_ids=[1], trade_fact_trusted=True,
+        inst_id="BTC-USDT-SWAP", symbol="BTC/USDT", side="short",
+        strategy_selection_reason="paper_training_entry", net_return_after_all_cost_pct=-0.3,
+    )
+    entry = {
+        "side": "short", "selection_reason": "paper_training_entry", "horizon": 240,
+        "quote_expected_gross": 1.5, "families": [],
+    }
+    shadow = {
+        "symbol": "BTC/USDT", "due_at": due, "entry_price": 100, "actual_price": 102,
+        "market": {
+            "source": "shadow_entry_result_and_okx_native_1m_path", "status": "clean",
+            "same_contract_price_path_verified": True,
+            "entry_inst_id": "BTC-USDT-SWAP", "result_inst_id": "BTC-USDT-SWAP",
+            "result_source_timestamp_ms": int(due.timestamp() * 1000),
+            "result_received_at": due.isoformat(),
+        },
+    }
+    report = summarize_lifecycles(
+        [trade], since=SINCE, until=until, entry_evidence={1: entry},
+        horizon_observations={(1, 240): [shadow]},
+    )["forecast_horizon_comparison"]
+    assert report["overall"] == {
+        "paired_count": 1, "mean_forecast_gross_pct": 1.5, "mean_horizon_gross_pct": -2,
+        "mean_settled_net_pct": -0.3, "positive_forecast_negative_horizon_count": 1,
+    }
+    assert report["by_side"]["short"] == report["overall"]
+    assert report["counterfactual_execution_evaluated"] is False
+
+    for observations, cutoff, reason in [
+        ([shadow, shadow], until, "missing_or_ambiguous_completed_horizon_observation"),
+        ([shadow], due, "unverified_horizon_market_observation"),
+        ([shadow | {"market": shadow["market"] | {"result_inst_id": "ETH-USDT-SWAP"}}],
+         until, "unverified_horizon_market_observation"),
+    ]:
+        report = summarize_lifecycles(
+            [trade], since=SINCE, until=cutoff, entry_evidence={1: entry},
+            horizon_observations={(1, 240): observations},
+        )["forecast_horizon_comparison"]
+        assert report["overall"]["paired_count"] == 0
+        assert report["exclusions"] == {reason: 1}
+
+
 def test_risk_summary_distinguishes_missing_evidence_from_no_budget_overrun():
     report = summarize_lifecycles(
         [

@@ -22,8 +22,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.exceptions import ExchangeAPIError  # noqa: E402
+from core.training_contracts import shadow_label_timing  # noqa: E402
 from db.session import close_db, get_read_session_ctx  # noqa: E402
 from models.decision import AIDecision  # noqa: E402
+from models.learning import ShadowBacktest  # noqa: E402
 from models.trade import OkxPositionHistory  # noqa: E402
 from services.authoritative_trade_outcome import load_authoritative_trade_outcomes  # noqa: E402
 from services.okx_native_facts import (  # noqa: E402
@@ -110,6 +112,95 @@ async def _load_entry_evidence(
             rows = (await session.execute(statement)).mappings()
             result.update({row["id"]: dict(row) for row in rows})
     return result
+
+
+async def _load_horizon_observations(
+    evidence: dict[int, dict[str, Any]], *, until: datetime,
+) -> dict[tuple[int, int], list[dict[str, Any]]]:
+    shadow = ShadowBacktest
+    market = shadow.training_feature_snapshot["training_market_fact_contract"]
+    observations = defaultdict(list)
+    ids = sorted(evidence)
+    async with get_read_session_ctx(
+        statement_timeout_ms=15_000, transaction_isolation="REPEATABLE READ READ ONLY",
+    ) as session:
+        for offset in range(0, len(ids), 50):
+            rows = await session.execute(select(
+                shadow.decision_id, shadow.horizon_minutes, shadow.symbol, shadow.due_at,
+                shadow.entry_price, shadow.actual_price, market.label("market"),
+            ).where(
+                shadow.decision_id.in_(ids[offset : offset + 50]),
+                shadow.execution_mode == "paper", shadow.analysis_type == "market",
+                shadow.status == "completed", shadow.due_at < until, shadow.updated_at < until,
+            ))
+            for row in rows.mappings():
+                observations[row["decision_id"], row["horizon_minutes"]].append(dict(row))
+    return dict(observations)
+
+
+def _forecast_horizon_comparison(
+    outcomes: list[dict[str, Any]], evidence: dict[int, dict[str, Any]],
+    observations: dict[tuple[int, int], list[dict[str, Any]]], *, until: datetime,
+) -> dict[str, Any]:
+    by_side = defaultdict(list)
+    exclusions: Counter[str] = Counter()
+    decision_counts = Counter(_single_entry_decision_id(row) for row in outcomes)
+    for row in outcomes:
+        decision_id = _single_entry_decision_id(row)
+        if (decision_id is None or decision_counts[decision_id] != 1
+                or row.get("outcome_complete") is not True
+                or row.get("trade_fact_trusted") is not True):
+            exclusions["not_trusted_unique_entry"] += 1
+            continue
+        entry = evidence.get(decision_id, {})
+        forecast = _finite(entry.get("quote_expected_gross"))
+        settled = _finite(row.get("net_return_after_all_cost_pct"))
+        side = row.get("side")
+        if (side not in {"long", "short"} or entry.get("side") != side
+                or entry.get("selection_reason") != row.get("strategy_selection_reason")
+                or forecast is None or settled is None):
+            exclusions["entry_or_settlement_evidence_missing"] += 1
+            continue
+        matches = observations.get((decision_id, _finite(entry.get("horizon"))), [])
+        if len(matches) != 1:
+            exclusions["missing_or_ambiguous_completed_horizon_observation"] += 1
+            continue
+        shadow = matches[0]
+        market = shadow["market"] or {}
+        inst_id = row.get("inst_id")
+        entry_price = _finite(shadow["entry_price"])
+        result_price = _finite(shadow["actual_price"])
+        timing = shadow_label_timing(market, shadow["due_at"])
+        if (not inst_id or row.get("symbol") != shadow["symbol"]
+                or market.get("source") != "shadow_entry_result_and_okx_native_1m_path"
+                or market.get("status") != "clean"
+                or market.get("same_contract_price_path_verified") is not True
+                or market.get("entry_inst_id") != inst_id or market.get("result_inst_id") != inst_id
+                or timing["reasons"] or _utc(timing["label_available_at"]) >= until
+                or not entry_price or entry_price <= 0 or not result_price or result_price <= 0):
+            exclusions["unverified_horizon_market_observation"] += 1
+            continue
+        horizon_return = (result_price - entry_price) * 100 / entry_price
+        by_side[side].append((forecast, horizon_return if side == "long" else -horizon_return, settled))
+
+    def summary(pairs):
+        count = len(pairs)
+        return {
+            "paired_count": count,
+            "mean_forecast_gross_pct": math.fsum(f for f, _, _ in pairs) / count if count else None,
+            "mean_horizon_gross_pct": math.fsum(h for _, h, _ in pairs) / count if count else None,
+            "mean_settled_net_pct": math.fsum(s for _, _, s in pairs) / count if count else None,
+            "positive_forecast_negative_horizon_count": sum(f > 0 > h for f, h, _ in pairs),
+        }
+
+    return {
+        "scope": "same_decision_market_observation_and_settlement",
+        "horizon_price_basis": "shadow_entry_and_native_result_prices",
+        "counterfactual_execution_evaluated": False,
+        "exclusions": dict(exclusions),
+        "overall": summary([pair for pairs in by_side.values() for pair in pairs]),
+        "by_side": {side: summary(pairs) for side, pairs in by_side.items()},
+    }
 
 
 def _entry_signal_economics(
@@ -347,6 +438,8 @@ def _observed_entry_filters(
 def summarize_lifecycles(
     outcomes: list[dict[str, Any]], *, since: datetime,
     entry_evidence: dict[int, dict[str, Any]] | None = None,
+    horizon_observations: dict[tuple[int, int], list[dict[str, Any]]] | None = None,
+    until: datetime | None = None,
 ) -> dict[str, Any]:
     """Summarize canonical facts; do not invent a second settlement formula."""
     unique: dict[str, dict[str, Any]] = {}
@@ -420,7 +513,7 @@ def summarize_lifecycles(
         value for row in valid
         if (value := _finite(row.get("execution_slippage_usdt"))) is not None
     ]
-    return {
+    report = {
         "source": "services.authoritative_trade_outcome",
         "unique_lifecycle_count": len(rows),
         "identical_duplicate_count": duplicates,
@@ -478,6 +571,11 @@ def summarize_lifecycles(
             (row["lifecycle_key"], row.get("outcome_fingerprint")) for row in rows
         )),
     }
+    if horizon_observations is not None and until is not None:
+        report["forecast_horizon_comparison"] = _forecast_horizon_comparison(
+            valid, entry_evidence or {}, horizon_observations, until=until,
+        )
+    return report
 
 
 def summarize_bills(
@@ -624,6 +722,7 @@ async def audit(
     ]
     outcomes = outcomes[-limit:]
     entry_evidence = await _load_entry_evidence(outcomes)
+    horizon_observations = await _load_horizon_observations(entry_evidence, until=until)
     executor = OKXExecutor(mode="paper", load_markets_on_initialize=False)
     try:
         exchange = await executor._get_ccxt()
@@ -633,7 +732,7 @@ async def audit(
     finally:
         await executor.shutdown()
     report = {
-        "audit_version": "profitability-economics.v3",
+        "audit_version": "profitability-economics.v4",
         "generated_at": datetime.now(UTC).isoformat(),
         "window_start_utc": since.isoformat(),
         "window_end_utc_exclusive": until.isoformat(),
@@ -644,7 +743,10 @@ async def audit(
         "canonical_rows_loaded_before_cutoff_filter": canonical_rows_loaded,
         "lifecycle_limit_reached": lifecycle_limit_reached,
         "lifecycle_window_complete": not lifecycle_limit_reached,
-        "lifecycles": summarize_lifecycles(outcomes, since=since, entry_evidence=entry_evidence),
+        "lifecycles": summarize_lifecycles(
+            outcomes, since=since, entry_evidence=entry_evidence,
+            horizon_observations=horizon_observations, until=until,
+        ),
         "bill_coverage": coverage,
         "bills": summarize_bills(bills, outcomes=outcomes),
     }
@@ -654,7 +756,10 @@ async def audit(
             "opened_at_utc_inclusive": opened_since.isoformat(),
             "unknown_open_time_count": sum(not row.get("decision_timestamp") for row in outcomes),
             "lifecycle_window_complete": not lifecycle_limit_reached,
-            **summarize_lifecycles(cohort, since=opened_since, entry_evidence=entry_evidence),
+            **summarize_lifecycles(
+                cohort, since=opened_since, entry_evidence=entry_evidence,
+                horizon_observations=horizon_observations, until=until,
+            ),
         }
         if not lifecycle_limit_reached:
             report["observed_entry_filters"] = _observed_entry_filters(
