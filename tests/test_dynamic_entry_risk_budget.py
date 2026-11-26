@@ -392,6 +392,8 @@ async def test_bounded_training_with_negative_downside_passes_execution_contract
     for change, expected_reason in (
         ({"return_lcb_pct": None}, "normal_paper_size_aware_downside_return_missing"),
         ({"return_lcb_pct": -50.0}, "paper_training_downside_stress_understated"),
+        ({"return_lcb_pct": 0.0}, "normal_paper_size_aware_return_lcb_not_positive"),
+        ({"return_lcb_pct": 9.0}, "paper_training_risk_adjusted_return_mismatch"),
         ({"expected_net_return_pct": 0.001}, "paper_training_order_value_below_minimum"),
         ({"risk_budget_usdt": 0.01}, "normal_paper_planned_loss_invalid"),
     ):
@@ -445,6 +447,7 @@ async def test_training_tiny_order_is_blocked_but_confirmed_partial_fill_is_reco
     for downside, expected_reason in (
         (None, "normal_paper_size_aware_downside_return_missing"),
         (float("inf"), "normal_paper_size_aware_downside_return_missing"),
+        (0.0, "paper_training_conservative_return_not_positive"),
         (-50.0, "paper_training_downside_stress_understated"),
     ):
         candidate = deepcopy(training)
@@ -1251,6 +1254,28 @@ async def test_paper_training_negative_fee_after_return_is_shadow_only() -> None
     assert "normal_paper_size_aware_no_positive_expected_net_at_exchange_minimum" in (
         sizing["reason"]
     )
+
+
+@pytest.mark.asyncio
+async def test_paper_training_positive_mean_cannot_override_negative_size_aware_objective() -> None:
+    decision = _decision()
+    _use_bounded_training_entry(decision)
+    opportunity = decision.raw_response["opportunity_score"]
+    opportunity["return_distribution_contract"].update(
+        objective_expected_return_pct=-1.316,
+        lower_quantile_return_pct=-1.8,
+    )
+    opportunity["return_lcb_pct"] = -1.316
+
+    await EntryProfitRiskSizingPolicy(allocated_order_balance=_balance).apply(decision, "paper", [])
+
+    raw = decision.raw_response
+    sizing = raw["profit_risk_sizing"]
+    assert sizing["expected_net_return_pct"] > 0.0
+    assert sizing["production_eligible"] is False
+    assert sizing["final_notional_usdt"] == 0.0
+    assert raw["normal_paper_trade"]["authorized"] is False
+    assert "paper_training_conservative_return_not_positive" in sizing["reason"]
 
 
 @pytest.mark.asyncio

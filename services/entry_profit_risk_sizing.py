@@ -1075,8 +1075,10 @@ def reconcile_profit_risk_sizing(
             reasons.append("paper_training_order_value_below_minimum")
         if not isfinite(return_lcb):
             reasons.append("normal_paper_size_aware_downside_return_missing")
-        elif stress + 1e-8 < -return_lcb / 100.0:
-            reasons.append("paper_training_downside_stress_understated")
+        elif return_lcb <= 0.0:
+            reasons.append("paper_training_conservative_return_not_positive")
+            if stress + 1e-8 < -return_lcb / 100.0:
+                reasons.append("paper_training_downside_stress_understated")
     eligible = not reasons
     generated_at = datetime.now(UTC).isoformat()
     history = _reconciliation_history(sizing)
@@ -2437,7 +2439,6 @@ class EntryProfitRiskSizingPolicy:
             expected_net_return_pct=expected_net,
             return_lcb_pct=return_lcb,
             execution_cost=execution_cost,
-            require_positive_lcb=not training_mode,
             # The return distribution already prices this same-mode expected
             # slippage floor. Reuse it while repricing size so its delta is
             # applied once, not once in scoring and again in sizing.
@@ -2724,8 +2725,12 @@ class EntryProfitRiskSizingPolicy:
             reasons.append("paper_training_order_value_below_minimum")
         if not isfinite(return_lcb):
             reasons.append("normal_paper_downside_return_missing_after_size_cost")
-        elif return_lcb <= 0.0 and not training_mode:
-            reasons.append("normal_paper_return_lcb_not_positive_after_size_cost")
+        elif return_lcb <= 0.0:
+            reasons.append(
+                "paper_training_conservative_return_not_positive"
+                if training_mode
+                else "normal_paper_return_lcb_not_positive_after_size_cost"
+            )
         if existing_leverage_exceeds_dynamic_limit:
             reasons.append("normal_paper_existing_leverage_exceeds_dynamic_limit")
         if final_notional <= 0:

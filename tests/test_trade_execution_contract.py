@@ -33,8 +33,8 @@ def test_execution_policy_separates_normal_paper_trading_from_live_promotion() -
     assert policy["paper_entry_requires_historical_fee_after_quality_permission"] is True
     assert policy["paper_normal_entry_requires_positive_return_lcb"] is True
     assert policy["paper_validated_entry_requires_positive_return_lcb"] is True
-    assert policy["paper_training_entry_requires_positive_return_lcb"] is False
-    assert policy["paper_training_entry_allows_non_positive_return_lcb"] is True
+    assert policy["paper_training_entry_requires_positive_return_lcb"] is True
+    assert policy["paper_training_entry_allows_non_positive_return_lcb"] is False
     assert policy["paper_training_entry_requires_finite_downside_stress"] is True
     assert policy["paper_downside_return_is_sizing_stress"] is True
     assert "paper_entry_requires_positive_return_lcb" not in policy
@@ -1024,6 +1024,7 @@ def _v23_shared_risk_training_raw() -> dict[str, object]:
 @pytest.mark.parametrize("version", [
     "2026-11-14.normal-paper-strategy-trade.v23",
     "2026-11-22.normal-paper-strategy-trade.v26",
+    "2026-11-22.normal-paper-strategy-trade.v27",
 ])
 def test_historical_training_fill_retains_normal_budget_after_protocol_migration(version) -> None:
     raw = _v23_shared_risk_training_raw()
@@ -1032,6 +1033,12 @@ def test_historical_training_fill_retains_normal_budget_after_protocol_migration
         raw["profit_risk_sizing"].update({
             "version": "2026-11-22.normal-paper-dynamic-risk.v16",
             "return_lcb_pct": -1.3,
+        })
+    elif version.endswith(".v27"):
+        raw["normal_paper_trade"]["objective_net_return_pct"] = -1.316
+        raw["profit_risk_sizing"].update({
+            "contract_version": NORMAL_PAPER_TRADE_SIZING_VERSION,
+            "return_lcb_pct": -1.316,
         })
     report = summarize_trade_execution_contract(
         [_decision(402, "long", raw)], orders=[_filled_order(402, quantity=1.0)],

@@ -63,7 +63,7 @@ def _metadata(
     training_data_version: str = "2026-09-15.authoritative-trade-integrity.v6",
 ) -> dict:
     side = {
-        "count": 4,
+        "count": 16,
         "avg_return_pct": avg,
         "return_lcb_pct": lcb,
         "profit_factor": profit_factor,
@@ -196,6 +196,50 @@ def test_same_stage_challenger_must_improve_primary_metrics() -> None:
 
     assert rejected["accepted"] is False
     assert accepted["accepted"] is True
+
+
+def test_same_stage_challenger_cannot_trade_worse_mean_for_better_lcb() -> None:
+    report = compare_candidate_to_champion(
+        _metadata(avg=-0.744, lcb=-0.10, profit_factor=0.0),
+        _metadata(avg=-0.170, lcb=-0.20, profit_factor=0.544),
+        candidate_stage="shadow",
+        champion_stage="shadow",
+    )
+
+    assert report["accepted"] is False
+    assert "candidate_avg_return_pct_worsened" in report["blocking_reasons"]
+    assert "candidate_profit_factor_worsened" in report["blocking_reasons"]
+
+
+def test_canary_lcb_improvement_cannot_hide_worse_average_return() -> None:
+    report = compare_candidate_to_champion(
+        _metadata(avg=-0.30, lcb=0.02, profit_factor=1.20),
+        _metadata(avg=-0.20, lcb=-0.20, profit_factor=0.80),
+        candidate_stage="canary",
+        champion_stage="canary",
+    )
+
+    assert report["accepted"] is False
+    assert "candidate_avg_return_pct_worsened" in report["blocking_reasons"]
+
+
+def test_small_entry_cohort_cannot_replace_same_stage_champion() -> None:
+    candidate = _metadata(avg=0.8, lcb=0.3, profit_factor=2.0)
+    champion = _metadata()
+    evaluation = _paired_evaluation(candidate, champion)
+    evaluation["candidate_entry_evaluation"]["portfolio"]["count"] = 3
+
+    report = _compare_candidate_to_champion(
+        candidate,
+        champion,
+        candidate_stage="shadow",
+        champion_stage="shadow",
+        comparison_evaluation=evaluation,
+    )
+
+    assert report["accepted"] is False
+    assert report["reason"] == "paired_entry_evidence_insufficient"
+    assert "candidate_entry_evidence_count_below_minimum" in report["blocking_reasons"]
 
 
 def test_same_stage_challenger_replaces_stale_training_data_contract() -> None:
@@ -445,7 +489,7 @@ def test_comparison_pools_profits_including_loss_free_direction(loss: float) -> 
     candidate["oos_return_evaluation"] = {
         side: _return_evidence([
             {"return_pct": value, "label_timestamp": str(index)}
-            for index, value in enumerate(values)
+                for index, value in enumerate(values * 4)
         ])
         for side, values in (("long", [-loss, 1.0]), ("short", [0.3, 6.7]))
     }
@@ -502,7 +546,10 @@ def test_comparison_uses_pooled_entry_outcomes_with_empty_direction(empty: bool)
 
     candidate, champion = _metadata(), _metadata()
     evaluation = _paired_evaluation(candidate, champion)
-    for role, returns in (("candidate", [-0.2, 1.0, 0.5]), ("champion", [-0.3, 0.6, 0.4])):
+    for role, returns in (
+        ("candidate", [-0.2, 1.0, 0.5, 0.7] * 4),
+        ("champion", [-0.3, 0.6, 0.4, 0.5] * 4),
+    ):
         portfolio = _return_evidence([
             {"return_pct": value, "label_timestamp": str(index)}
             for index, value in enumerate([] if empty else returns)
@@ -519,8 +566,8 @@ def test_comparison_uses_pooled_entry_outcomes_with_empty_direction(empty: bool)
     )
     assert report["accepted"] is (not empty)
     if not empty:
-        assert report["candidate_metrics"]["avg_return_pct"] == pytest.approx(1.3 / 3)
-        assert report["candidate_metrics"]["profit_factor"] == pytest.approx(7.5)
+        assert report["candidate_metrics"]["avg_return_pct"] == pytest.approx(0.5)
+        assert report["candidate_metrics"]["profit_factor"] == pytest.approx(11.0)
 
 
 @pytest.mark.parametrize(
@@ -528,8 +575,8 @@ def test_comparison_uses_pooled_entry_outcomes_with_empty_direction(empty: bool)
     [
         ("canary", [-0.01, 0.9, 1.0, 1.1, 1.0], True,
          "paper_canary_beats_inactive_champion"),
-        ("canary", [-0.1, 0.2], False, "paper_canary_break_even_not_established"),
-        ("canary", [-0.8, 0.2], False, "paper_canary_break_even_not_established"),
+        ("canary", [-0.1, 0.2], False, "paired_entry_evidence_insufficient"),
+        ("canary", [-0.8, 0.2], False, "paired_entry_evidence_insufficient"),
         ("canary", [], False, "comparison_incomplete"),
         ("active", [-0.01, 0.9, 1.0, 1.1, 1.0], False, "comparison_incomplete"),
     ],
@@ -545,7 +592,7 @@ def test_no_trade_baseline_requires_a_verified_all_hold_champion(
     empty = _return_evidence([])
     selected = _return_evidence([
         {"return_pct": value, "label_timestamp": str(index)}
-        for index, value in enumerate(returns)
+            for index, value in enumerate(returns * 4)
     ])
     for role, short in (("candidate", selected), ("champion", empty)):
         evaluation[f"{role}_entry_evaluation"] = {

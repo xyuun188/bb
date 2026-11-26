@@ -590,8 +590,8 @@ def trade_execution_policy() -> dict[str, Any]:
         "paper_quality_observation_max_loss_probability": 0.60,
         "paper_training_entry_requires_current_raw_return": True,
         "paper_training_entry_requires_positive_size_aware_net_return": True,
-        "paper_training_entry_requires_positive_return_lcb": False,
-        "paper_training_entry_allows_non_positive_return_lcb": True,
+        "paper_training_entry_requires_positive_return_lcb": True,
+        "paper_training_entry_allows_non_positive_return_lcb": False,
         "paper_training_entry_requires_finite_downside_stress": True,
         "paper_validated_entry_requires_positive_fee_after_return": True,
         "paper_training_entry_allows_non_positive_fee_after_return": False,
@@ -1578,8 +1578,8 @@ def validate_normal_paper_entry_contract(
         str(normal_trade.get("selection_reason") or "").strip()
         == "paper_training_entry"
     )
-    # v23 already used the normal risk budget. A version migration must not
-    # reinterpret its settled fills under the older micro-training policy.
+    # v23 and later used the normal risk budget. Validate their settled fills
+    # against the caps in effect at submission.
     historical_shared_risk_training = bool(
         historical_normal_trade
         and training_entry
@@ -1730,11 +1730,22 @@ def validate_normal_paper_entry_contract(
         reasons.append("normal_paper_size_aware_downside_return_missing")
     if (
         not executed
-        and not training_entry
         and sizing_return_lcb is not None
         and sizing_return_lcb <= 0.0
     ):
         reasons.append("normal_paper_size_aware_return_lcb_not_positive")
+    if training_entry and not executed:
+        distribution = _safe_dict(opportunity.get("return_distribution_contract"))
+        objective = _finite_value(distribution.get("objective_expected_return_pct"))
+        quoted_lcb = _finite_value(opportunity.get("return_lcb_pct"))
+        contract_objective = _finite_value(normal_trade.get("objective_net_return_pct"))
+        if objective is None or any(
+            value is None or not isclose(value, objective, rel_tol=0.0, abs_tol=1e-8)
+            for value in (quoted_lcb, sizing_return_lcb, contract_objective)
+        ):
+            reasons.append("paper_training_risk_adjusted_return_mismatch")
+        if objective is not None and objective <= 0.0:
+            reasons.append("paper_training_conservative_return_not_positive")
     if training_entry and not historical_normal_trade:
         if (not executed or not historical_sizing_settlement) and (
             sizing_return_lcb is not None

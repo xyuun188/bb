@@ -8,7 +8,7 @@ from typing import Any
 from services.ml_prediction_contract import ENTRY_COHORT_VERSION, PREDICTION_SCORE_POLICY_VERSION
 from services.ml_training_contract import MIN_TRAINING_SAMPLE_COUNT
 
-MODEL_CHAMPION_POLICY_VERSION = "2026-11-23.positive-entry-portfolio-champion.v6"
+MODEL_CHAMPION_POLICY_VERSION = "2026-11-27.non_degrading_entry_champion.v7"
 PAIRED_COMPARISON_VERSION = "2026-11-13.positive-entry-common-holdout.v2"
 
 _STAGE_RANK = {
@@ -20,6 +20,7 @@ _STAGE_RANK = {
 _PRIMARY_TOLERANCE_PCT = 1e-9
 _TAIL_TOLERANCE_PCT = 0.05
 _MIN_ACTIVE_WALK_FORWARD_FOLDS = 2
+_MIN_ENTRY_COMPARISON_COUNT = MIN_TRAINING_SAMPLE_COUNT
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -49,6 +50,10 @@ def _entry_metrics(evidence: dict[str, Any]) -> dict[str, float | None]:
     if gain is not None and gain >= 0 and loss is not None and loss > 1e-12:
         metrics["profit_factor"] = gain / loss
     return metrics
+
+
+def _entry_count(evidence: dict[str, Any]) -> int:
+    return max(int(_float(evidence.get("count")) or 0), 0)
 
 
 def _comparison_entry_evidence(
@@ -239,6 +244,11 @@ def compare_candidate_to_champion(
         role: _comparison_entry_evidence(evaluation, role, comparison_sides)
         for role in ("candidate", "champion")
     }
+    entry_counts = {
+        role: _entry_count(entry_evidence[role]) for role in ("candidate", "champion")
+    }
+    report["candidate_entry_count"] = entry_counts["candidate"]
+    report["champion_entry_count"] = entry_counts["champion"]
     candidate_aggregate = _entry_metrics(entry_evidence["candidate"])
     champion_aggregate = _entry_metrics(entry_evidence["champion"])
     report["candidate_metrics"] = candidate_aggregate
@@ -257,6 +267,12 @@ def compare_candidate_to_champion(
         and all(value is not None for value in candidate_aggregate.values())
         and _confirmed_no_entries(evaluation)
     ):
+        if entry_counts["candidate"] < _MIN_ENTRY_COMPARISON_COUNT:
+            return {
+                **report,
+                "reason": "paired_entry_evidence_insufficient",
+                "blocking_reasons": ["candidate_entry_evidence_count_below_minimum"],
+            }
         # An all-hold champion has no per-trade metrics on this window.
         # A paper challenger must establish positive economics on its own.
         report["comparison_baseline"] = "no_trade"
@@ -302,6 +318,18 @@ def compare_candidate_to_champion(
                     else "champion_comparison_metric_missing:profit_factor"
                 )
         return report
+    if (
+        entry_counts["candidate"] < _MIN_ENTRY_COMPARISON_COUNT
+        or 0 < entry_counts["champion"] < _MIN_ENTRY_COMPARISON_COUNT
+    ):
+        report["reason"] = "paired_entry_evidence_insufficient"
+        report["blocking_reasons"] = [
+            f"{role}_entry_evidence_count_below_minimum"
+            for role, count in entry_counts.items()
+            if 0 < count < _MIN_ENTRY_COMPARISON_COUNT
+            or (role == "candidate" and count < _MIN_ENTRY_COMPARISON_COUNT)
+        ]
+        return report
 
     assert all(value is not None for value in candidate_aggregate.values())
     assert all(value is not None for value in champion_aggregate.values())
@@ -332,11 +360,25 @@ def compare_candidate_to_champion(
         )
         return report
 
+    # A challenger must not replace a same-stage champion merely because one
+    # uncertainty statistic moved upward.  In particular, a less-negative LCB
+    # can coexist with a worse mean and a collapsed profit factor when the
+    # selected cohort is small or directionally biased.  Preserve the
+    # incumbent unless the candidate is non-degrading on both primary economic
+    # measures and improves at least one primary metric.
+    non_degrading = all(
+        candidate_values[key] >= champion_values[key] - _PRIMARY_TOLERANCE_PCT
+        for key in ("avg_return_pct", "profit_factor")
+    )
     primary_improved = any(
         candidate_values[key] > champion_values[key] + _PRIMARY_TOLERANCE_PCT
         for key in ("avg_return_pct", "return_lcb_pct", "profit_factor")
     )
     blockers = []
+    if not non_degrading:
+        for key in ("avg_return_pct", "profit_factor"):
+            if candidate_values[key] < champion_values[key] - _PRIMARY_TOLERANCE_PCT:
+                blockers.append(f"candidate_{key}_worsened")
     if not primary_improved:
         blockers.append("candidate_primary_fee_after_metrics_not_improved")
     if (

@@ -266,7 +266,10 @@ def test_reconcile_does_not_authorize_validated_entry_with_non_positive_lcb() ->
     )
 
 
-def test_reconcile_allows_training_entry_with_non_positive_lcb_as_stressed_risk() -> None:
+@pytest.mark.parametrize("objective", [0.02, 0.0, -1.316])
+def test_training_reconciliation_requires_positive_objective_with_negative_quantile(
+    objective: float,
+) -> None:
     support = _quality_observation_support(
         "long",
         expected_net=0.2,
@@ -286,24 +289,34 @@ def test_reconcile_allows_training_entry_with_non_positive_lcb_as_stressed_risk(
     reconciled = reconcile_normal_paper_trade_contract(
         contract,
         {
-            "expected_net_return_pct": 0.08,
-            "return_lcb_pct": -0.02,
+            "expected_net_return_pct": 0.331,
+            "return_lcb_pct": objective,
             "server_profit_loss_probability": 0.4,
             "execution_cost": {"total_pct": 0.19},
             "return_distribution_contract": {
-                "gross_market_distribution": {"raw_expected_return_pct": 0.27},
-                "objective_expected_return_pct": -0.02, "lower_quantile_return_pct": -0.22,
+                "gross_market_distribution": {"raw_expected_return_pct": 0.521},
+                "objective_expected_return_pct": objective,
+                "lower_quantile_return_pct": -1.8,
             },
         },
     )
 
-    assert reconciled["authorized"] is True
-    assert reconciled["reconciliation"]["status"] == "authorized"
-    assert reconciled["reconciliation"]["reason"] is None
-    assert reconciled["reconciliation"]["current"]["new_entry_return_ready"] is True
-    assert reconciled["reconciliation"]["current"]["positive_return_lcb_required"] is False
-    assert reconciled["reconciliation"]["current"]["lower_quantile_net_return_pct"] == -0.22
-    assert normal_paper_entry_contract_reasons(reconciled) == []
+    authorized = objective > 0
+    reconciliation = reconciled["reconciliation"]
+    assert reconciled["authorized"] is authorized
+    assert reconciliation["status"] == (
+        "authorized" if authorized else "blocked_current_execution_return"
+    )
+    assert reconciliation["current"]["new_entry_return_ready"] is authorized
+    assert reconciliation["current"]["positive_return_lcb_required"] is True
+    assert reconciliation["current"]["lower_quantile_net_return_pct"] == -1.8
+    assert normal_paper_trade_observation_contract_reasons(reconciled) == []
+    if authorized:
+        assert normal_paper_entry_contract_reasons(reconciled) == []
+    else:
+        reason = "paper_training_conservative_return_not_positive"
+        assert reconciliation["reason"] == reason
+        assert reason in normal_paper_entry_contract_reasons(reconciled)
 
 
 def test_training_entry_requires_present_lcb_and_positive_current_raw_return() -> None:
@@ -1078,13 +1091,14 @@ def test_quote_cannot_replace_frozen_direction_or_resign_invalid_permission() ->
     first = reconcile_normal_paper_trade_contract(contract, quote)
     second = reconcile_normal_paper_trade_contract(first, quote)
     assert second["authorized"] and second["direction_objective_net_return_pct"] == 0.15
-    for score in (0, -0.01):
+    for score in (0, -0.01, 0.06):
         bad_quote = {**quote, "return_distribution_contract": {
             **quote["return_distribution_contract"], "objective_expected_return_pct": score,
         }}
         denied = reconcile_normal_paper_trade_contract(first, bad_quote)
-        assert denied["authorized"]
-        assert reconcile_normal_paper_trade_contract(denied, quote)["authorized"]
+        assert not denied["authorized"]
+        assert denied["reconciliation"]["reason"] == "current_execution_direction_objective_mismatch"
+        assert not reconcile_normal_paper_trade_contract(denied, quote)["authorized"]
 
     missing_objective = {**quote, "return_distribution_contract": {
         **quote["return_distribution_contract"], "objective_expected_return_pct": None,
@@ -1096,7 +1110,7 @@ def test_quote_cannot_replace_frozen_direction_or_resign_invalid_permission() ->
         assert not reconcile_normal_paper_trade_contract(
             {**first, "direction_objective_net_return_pct": score}, quote,
         )["authorized"]
-    historical = {**contract, "version": "2026-11-17.normal-paper-strategy-trade.v24"}
+    historical = {**contract, "version": "2026-11-22.normal-paper-strategy-trade.v27"}
     assert normal_paper_entry_contract_reasons(historical)
     assert not normal_paper_settlement_contract_reasons(historical)
 

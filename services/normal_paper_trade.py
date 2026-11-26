@@ -11,7 +11,7 @@ from typing import Any
 
 from ai_brain.base_model import DecisionOutput
 
-NORMAL_PAPER_TRADE_VERSION = "2026-11-22.normal-paper-strategy-trade.v27"
+NORMAL_PAPER_TRADE_VERSION = "2026-11-27.normal-paper-strategy-trade.v28"
 NORMAL_PAPER_SIDE_SELECTION_POLICY = "2026-11-22.quality-first-side-selection.v4"
 NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-11-27.normal-paper-dynamic-risk.v18"
 HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS = frozenset(
@@ -35,6 +35,7 @@ NORMAL_PAPER_ORDER_IDENTITY_VERSION = "2026-07-29.normal-paper-order-identity.v1
 NORMAL_PAPER_CLIENT_ORDER_ID_PREFIX = "BBNP"
 HISTORICAL_NORMAL_PAPER_TRADE_VERSIONS = frozenset(
     {
+        "2026-11-22.normal-paper-strategy-trade.v27",
         "2026-11-22.normal-paper-strategy-trade.v26",
         "2026-11-21.normal-paper-strategy-trade.v25",
         "2026-11-17.normal-paper-strategy-trade.v24",
@@ -82,6 +83,7 @@ HISTORICAL_SHARED_RISK_PAPER_TRAINING_VERSIONS = frozenset(
         "2026-11-17.normal-paper-strategy-trade.v24",
         "2026-11-21.normal-paper-strategy-trade.v25",
         "2026-11-22.normal-paper-strategy-trade.v26",
+        "2026-11-22.normal-paper-strategy-trade.v27",
     }
 )
 NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY = 0.60
@@ -975,6 +977,17 @@ def reconcile_normal_paper_trade_contract(
     training_entry = contract.get("selection_reason") == "paper_training_entry"
     quote_objective = _float(distribution.get("objective_expected_return_pct"), None)
     quote_lower = _float(distribution.get("lower_quantile_return_pct"), None)
+    training_objective_consistent = (
+        quote_objective is not None
+        and return_lcb is not None
+        and isclose(quote_objective, return_lcb, rel_tol=0.0, abs_tol=1e-8)
+    )
+    training_return_ready = (
+        normal_paper_entry_return_ready(expected_net, quote_objective)
+        and normal_paper_entry_return_ready(expected_net, return_lcb)
+        and training_objective_consistent
+        and quote_lower is not None
+    )
     gross_distribution = _dict(distribution.get("gross_market_distribution"))
     gross_expected = _float(gross_distribution.get("raw_expected_return_pct"), None)
     previous = {
@@ -1019,9 +1032,7 @@ def reconcile_normal_paper_trade_contract(
         and contract["current_edge_validated"]
         and current_raw is not None
         and current_raw > 0.0
-        and quote_objective is not None
-        and quote_lower is not None
-        and normal_paper_current_return_ready(expected_net, return_lcb)
+        and training_return_ready
         and current_loss_probability is not None
         and 0.0 <= current_loss_probability <= (
             NORMAL_PAPER_TRADE_MAX_QUALITY_OBSERVATION_LOSS_PROBABILITY
@@ -1049,6 +1060,10 @@ def reconcile_normal_paper_trade_contract(
         if not training_entry and return_lcb <= 0.0
         else "current_execution_direction_objective_missing"
         if training_entry and quote_objective is None
+        else "current_execution_direction_objective_mismatch"
+        if training_entry and not training_objective_consistent
+        else "paper_training_conservative_return_not_positive"
+        if training_entry and (quote_objective <= 0.0 or return_lcb <= 0.0)
         else "current_execution_lower_quantile_missing"
         if training_entry and quote_lower is None
         else "current_execution_loss_probability_missing"
@@ -1084,13 +1099,9 @@ def reconcile_normal_paper_trade_contract(
             "new_entry_return_ready": (
                 normal_paper_entry_return_ready(expected_net, return_lcb)
                 if not training_entry
-                else (
-                    normal_paper_current_return_ready(expected_net, return_lcb)
-                    and quote_objective is not None
-                    and quote_lower is not None
-                )
+                else training_return_ready
             ),
-            "positive_return_lcb_required": not training_entry,
+            "positive_return_lcb_required": True,
             "gross_expected_return_pct": (
                 round(gross_expected, 8) if gross_expected is not None else None
             ),
@@ -1257,6 +1268,17 @@ def _normal_strategy_trade_contract_reasons(
         reasons.append("normal_paper_trade_training_raw_return_not_positive")
     if objective_net is None:
         reasons.append("normal_paper_trade_objective_net_missing")
+    elif require_new_entry_permission and training_mode and contract.get("reconciliation"):
+        current = _dict(_dict(contract.get("reconciliation")).get("current"))
+        reconciled_objective = _float(current.get("risk_adjusted_net_return_pct"), None)
+        if reconciled_objective is None or not isclose(
+            objective_net, reconciled_objective, rel_tol=0.0, abs_tol=1e-8
+        ):
+            reasons.append("current_execution_direction_objective_mismatch")
+        if objective_net <= 0.0 or (
+            reconciled_objective is not None and reconciled_objective <= 0.0
+        ):
+            reasons.append("paper_training_conservative_return_not_positive")
     elif (
         require_new_entry_permission
         and not training_mode
