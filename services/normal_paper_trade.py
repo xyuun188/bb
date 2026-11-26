@@ -13,9 +13,10 @@ from ai_brain.base_model import DecisionOutput
 
 NORMAL_PAPER_TRADE_VERSION = "2026-11-22.normal-paper-strategy-trade.v27"
 NORMAL_PAPER_SIDE_SELECTION_POLICY = "2026-11-22.quality-first-side-selection.v4"
-NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-11-22.normal-paper-dynamic-risk.v17"
+NORMAL_PAPER_TRADE_SIZING_VERSION = "2026-11-27.normal-paper-dynamic-risk.v18"
 HISTORICAL_NORMAL_PAPER_TRADE_SIZING_VERSIONS = frozenset(
     {
+        "2026-11-22.normal-paper-dynamic-risk.v17",
         "2026-11-22.normal-paper-dynamic-risk.v16",
         "2026-11-20.normal-paper-dynamic-risk.v15",
         "2026-11-19.normal-paper-dynamic-risk.v14",

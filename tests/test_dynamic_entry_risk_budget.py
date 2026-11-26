@@ -18,6 +18,8 @@ from services.execution_cost_model import execution_cost_estimate
 from services.execution_service import _return_entry_contract_result
 from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
+    PAPER_TRAINING_MIN_EXPECTED_PROFIT_TO_STRESS,
+    PAPER_TRAINING_MIN_EXPECTED_PROFIT_USDT,
     PAPER_TRAINING_REVIEW_GROUP_LIMIT,
     _contract_fingerprint_payload,
     build_normal_paper_trade_contract,
@@ -608,6 +610,33 @@ def test_size_aware_profit_solver_reduces_even_when_full_size_is_positive() -> N
     assert solved["expected_net_profit_usdt"] > (
         5_000.0 * (gross_expected - original_cost["total_pct"]) / 100.0
     )
+
+
+def test_training_size_solver_selects_smaller_size_that_clears_order_economics() -> None:
+    snapshot = _size_aware_book_snapshot(5_000.0)
+    original_cost = execution_cost_estimate(snapshot).to_dict()
+    gross_expected = 0.55
+
+    solved = solve_size_aware_positive_expected_net(
+        feature_snapshot=snapshot,
+        side="long",
+        maximum_notional_usdt=5_000.0,
+        minimum_notional_usdt=100.0,
+        contract_step_notional_usdt=100.0,
+        expected_net_return_pct=gross_expected - original_cost["total_pct"],
+        return_lcb_pct=0.5,
+        execution_cost=original_cost,
+        require_positive_lcb=False,
+        stressed_loss_fraction=0.04,
+        minimum_expected_profit_usdt=PAPER_TRAINING_MIN_EXPECTED_PROFIT_USDT,
+        minimum_expected_profit_to_stress=PAPER_TRAINING_MIN_EXPECTED_PROFIT_TO_STRESS,
+    )
+
+    assert solved["production_eligible"] is True
+    assert solved["training_economics_passed"] is True
+    assert solved["selected_notional_usdt"] == pytest.approx(500.0)
+    assert solved["expected_net_profit_usdt"] == pytest.approx(2.25, abs=1e-6)
+    assert solved["minimum_expected_profit_usdt"] == pytest.approx(2.0, abs=1e-6)
 
 
 def test_size_aware_profit_solver_never_rounds_up_past_risk_budget() -> None:

@@ -30,6 +30,8 @@ from services.normal_paper_trade import (
     NORMAL_PAPER_TRADE_MAX_SINGLE_TRADE_RISK_FRACTION,
     NORMAL_PAPER_TRADE_MIN_FILL_DRIFT_RESERVE_FRACTION,
     NORMAL_PAPER_TRADE_SIZING_VERSION,
+    PAPER_TRAINING_MIN_EXPECTED_PROFIT_TO_STRESS,
+    PAPER_TRAINING_MIN_EXPECTED_PROFIT_USDT,
     is_normal_paper_trade_decision,
     normal_paper_trade_contract_reasons,
     paper_training_order_economics,
@@ -103,6 +105,9 @@ def solve_size_aware_positive_expected_net(
     execution_cost: dict[str, Any],
     execution_slippage_floor_pct: float = 0.0,
     require_positive_lcb: bool = True,
+    stressed_loss_fraction: float = 0.0,
+    minimum_expected_profit_usdt: float = 0.0,
+    minimum_expected_profit_to_stress: float = 0.0,
 ) -> dict[str, Any]:
     """Maximize expected net profit within the risk budget and native book.
 
@@ -116,6 +121,18 @@ def solve_size_aware_positive_expected_net(
     original_cost_pct = max(_safe_float(execution_cost.get("total_pct"), 0.0), 0.0)
     original_expected = _safe_float(expected_net_return_pct, float("nan"))
     original_lcb = _safe_float(return_lcb_pct, float("nan"))
+    economics_stress_fraction = max(_safe_float(stressed_loss_fraction, 0.0), 0.0)
+    economics_minimum_profit = max(
+        _safe_float(minimum_expected_profit_usdt, 0.0),
+        0.0,
+    )
+    economics_profit_to_stress = max(
+        _safe_float(minimum_expected_profit_to_stress, 0.0),
+        0.0,
+    )
+    economics_enabled = bool(
+        economics_minimum_profit > 0.0 or economics_profit_to_stress > 0.0
+    )
     result = {
         "production_eligible": False,
         "reason": "size_aware_inputs_incomplete",
@@ -130,6 +147,10 @@ def solve_size_aware_positive_expected_net(
         "iterations": 0,
         "reduced": False,
         "objective": "maximize_expected_net_profit_usdt",
+        "minimum_expected_profit_usdt": economics_minimum_profit,
+        "minimum_expected_profit_to_stress": economics_profit_to_stress,
+        "stressed_loss_fraction": economics_stress_fraction,
+        "training_economics_applied": economics_enabled,
     }
     normalized_side = str(side or "").lower()
     if (
@@ -186,11 +207,35 @@ def solve_size_aware_positive_expected_net(
             execution_cost.get("slippage_pct"),
             execution_slippage_floor_pct,
         )
+        expected_profit = candidate_notional * (
+            original_expected - cost_delta
+        ) / 100.0
+        minimum_profit = max(
+            economics_minimum_profit,
+            candidate_notional
+            * economics_stress_fraction
+            * economics_profit_to_stress,
+        )
+        economics_passed = (
+            not economics_enabled
+            or (
+                isfinite(expected_profit)
+                and isfinite(minimum_profit)
+                and (
+                    economics_profit_to_stress <= 0.0
+                    or economics_stress_fraction > 0.0
+                )
+                and expected_profit + 1e-8 >= minimum_profit
+            )
+        )
         return {
             "notional": candidate_notional,
             "cost": candidate_cost,
             "expected": original_expected - cost_delta,
             "lcb": original_lcb - cost_delta,
+            "expected_profit": expected_profit,
+            "minimum_expected_profit": minimum_profit,
+            "economics_passed": economics_passed,
         }
 
     upper = evaluate(maximum)
@@ -261,6 +306,12 @@ def solve_size_aware_positive_expected_net(
             and (not require_positive_lcb or candidate["lcb"] > 0.0)
         )
 
+    def passes_selection_gate(candidate: dict[str, Any] | None) -> bool:
+        return bool(
+            passes_return_gate(candidate)
+            and candidate.get("economics_passed") is True
+        )
+
     if step > 0.0 and not passes_return_gate(upper):
         best_passing = max(
             (candidate for candidate in evaluated if passes_return_gate(candidate)),
@@ -285,10 +336,16 @@ def solve_size_aware_positive_expected_net(
     if not evaluated:
         result["reason"] = "round_trip_size_cost_incomplete"
         return result
-    profitable = [candidate for candidate in evaluated if passes_return_gate(candidate)]
+    return_profitable = [
+        candidate for candidate in evaluated if passes_return_gate(candidate)
+    ]
+    profitable = [
+        candidate for candidate in evaluated if passes_selection_gate(candidate)
+    ]
+    selection_pool = profitable or return_profitable or evaluated
     selected = (
         max(
-            profitable,
+            selection_pool,
             key=lambda candidate: (
                 candidate["notional"] * candidate["expected"] / 100.0,
                 candidate["expected"],
@@ -309,14 +366,19 @@ def solve_size_aware_positive_expected_net(
             "execution_cost": selected["cost"],
             "iterations": iterations,
             "reduced": reduced,
-            "expected_net_profit_usdt": selected["notional"] * selected["expected"] / 100.0,
+            "expected_net_profit_usdt": selected["expected_profit"],
+            "minimum_expected_profit_usdt": selected["minimum_expected_profit"],
+            "training_economics_passed": selected["economics_passed"],
         }
     )
     if selected["expected"] <= 0.0:
         result["reason"] = "no_positive_expected_net_at_exchange_minimum"
         return result
-    if not profitable and require_positive_lcb:
+    if not return_profitable and require_positive_lcb:
         result["reason"] = "no_positive_return_lcb_at_executable_size"
+        return result
+    if economics_enabled and not profitable:
+        result["reason"] = "no_training_size_meets_minimum_expected_profit"
         return result
     result.update(
         {
@@ -2380,6 +2442,21 @@ class EntryProfitRiskSizingPolicy:
             # slippage floor. Reuse it while repricing size so its delta is
             # applied once, not once in scoring and again in sizing.
             execution_slippage_floor_pct=execution_slippage_floor_pct,
+            # Training entries must be selected at a size whose expected
+            # profit clears the same pressure-loss economics checked again
+            # by the execution contract. Otherwise the profit-maximizing
+            # full size can incorrectly hide a smaller valid size.
+            stressed_loss_fraction=stress_fraction if training_mode else 0.0,
+            minimum_expected_profit_usdt=(
+                PAPER_TRAINING_MIN_EXPECTED_PROFIT_USDT
+                if training_mode
+                else 0.0
+            ),
+            minimum_expected_profit_to_stress=(
+                PAPER_TRAINING_MIN_EXPECTED_PROFIT_TO_STRESS
+                if training_mode
+                else 0.0
+            ),
         )
         selected_size_cost = _safe_dict(size_aware_solution.get("execution_cost"))
         size_aware_solution_eligible = (
