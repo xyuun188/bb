@@ -8299,6 +8299,50 @@ def test_auto_scan_feature_budget_reserves_rotation_when_verified_pool_fills_cap
     assert service._last_auto_feature_fetch_budget_diagnostics["rotating_symbol_reserve"] == 4
 
 
+@pytest.mark.parametrize("mode", ["paper", "live"])
+def test_auto_scan_feature_priority_preserves_verified_paper_slots(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "").replace(":USDT", "")
+    service._get_model_execution_mode = lambda _model_name: mode
+    service._auto_scan_feature_cursor = 0
+    service._verified_entry_symbols_by_mode = {mode: {"S6/USDT", "S7/USDT"}}
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    service.market_analysis_defer_tracker = MarketAnalysisDeferTracker(
+        normalize_symbol=service._normalize_position_symbol,
+    )
+    service.market_analysis_defer_tracker.defer_many(
+        ["S0/USDT", "S1/USDT", "S2/USDT", "S7/USDT"],
+        "shortlist_capacity",
+    )
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MIN", 4)
+    monkeypatch.setattr(trading_service, "AUTO_SCAN_FEATURE_FETCH_POOL_MAX", 4)
+    symbols = [f"S{i}/USDT:USDT" for i in range(8)] + ["POS/USDT:USDT"]
+    expected_priority = (
+        ["S7/USDT:USDT", "S6/USDT:USDT"]
+        if mode == "paper"
+        else ["S0/USDT:USDT", "S1/USDT:USDT"]
+    )
+
+    first = service._budget_auto_scan_feature_symbols(
+        symbols, ["POS/USDT"], configured_limit=4,
+    )
+    second = service._budget_auto_scan_feature_symbols(
+        symbols, ["POS/USDT"], configured_limit=4,
+    )
+
+    assert first[:3] == second[:3] == ["POS/USDT:USDT", *expected_priority]
+    assert len(first) == len(second) == 5
+    assert set(first[3:]).isdisjoint(second[3:])
+    diagnostics = service._last_auto_feature_fetch_budget_diagnostics
+    assert diagnostics["selected_verified_priority_symbol_count"] == (2 if mode == "paper" else 0)
+    assert diagnostics["rotating_symbol_reserve"] == 2
+
+
 def test_auto_scan_feature_budget_prioritizes_deferred_candidate_queue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

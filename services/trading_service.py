@@ -7401,12 +7401,16 @@ class TradingService(ModelTrainingCoordinatorMixin):
             for symbol in market_symbols
             if self._normalize_position_symbol(symbol) in major_symbol_keys
         ]
+        priority_order = [*deferred_market_symbols, *verified_market_symbols]
+        if model_mode == "paper":
+            # Unverified retries can fill the priority half before any
+            # executable symbol reaches the downstream shortlist. Keep
+            # verified retries in FIFO order and leave discovery to rotation.
+            priority_order.sort(
+                key=lambda symbol: self._normalize_position_symbol(symbol) not in verified_symbols,
+            )
         priority_market_symbols = self.entry_symbol_universe.dedupe_symbols(
-            [
-                *deferred_market_symbols,
-                *verified_market_symbols,
-                *bootstrap_major_symbols,
-            ]
+            [*priority_order, *bootstrap_major_symbols]
         )
         # Deferred/verified retries are important, but cannot consume the whole
         # fetch budget.  Always reserve half of the market slots for a rotating
@@ -7423,7 +7427,11 @@ class TradingService(ModelTrainingCoordinatorMixin):
             priority_budget,
             len(priority_market_symbols),
         )
-        selected_verified = priority_market_symbols[:priority_limit]
+        selected_priority = priority_market_symbols[:priority_limit]
+        verified_priority_count = sum(
+            self._normalize_position_symbol(symbol) in verified_symbols
+            for symbol in selected_priority
+        )
         self._last_auto_feature_fetch_budget_diagnostics = {
             "read_only": True,
             "is_entry_gate": False,
@@ -7440,7 +7448,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "verified_execution_symbol_count": len(verified_market_symbols),
             "deferred_candidate_symbol_count": len(deferred_market_symbols),
             "bootstrap_major_symbol_count": len(bootstrap_major_symbols),
-            "selected_priority_symbol_count": len(selected_verified),
+            "selected_priority_symbol_count": len(selected_priority),
+            "selected_verified_priority_symbol_count": verified_priority_count,
             "priority_budget": int(priority_budget),
             "rotating_symbol_reserve": max(market_budget - priority_limit, 0),
             "execution_mode": model_mode,
@@ -7452,8 +7461,8 @@ class TradingService(ModelTrainingCoordinatorMixin):
         if market_budget <= 0:
             return self.entry_symbol_universe.dedupe_symbols(position_symbols)
 
-        selected_verified_keys = {
-            self._normalize_position_symbol(symbol) for symbol in selected_verified
+        selected_priority_keys = {
+            self._normalize_position_symbol(symbol) for symbol in selected_priority
         }
         priority_symbol_keys = {
             self._normalize_position_symbol(symbol)
@@ -7471,7 +7480,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
         deferred_rotation_symbols = [
             symbol
             for symbol in deferred_market_symbols
-            if self._normalize_position_symbol(symbol) not in selected_verified_keys
+            if self._normalize_position_symbol(symbol) not in selected_priority_keys
         ]
         non_priority_rotation_symbols = [
             symbol
@@ -7482,7 +7491,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             symbol
             for symbol in priority_market_symbols
             if (
-                self._normalize_position_symbol(symbol) not in selected_verified_keys
+                self._normalize_position_symbol(symbol) not in selected_priority_keys
                 and self._normalize_position_symbol(symbol) not in deferred_symbol_keys
             )
         ]
@@ -7493,7 +7502,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
                 *remaining_priority_symbols,
             ]
         )
-        rotating_budget = max(market_budget - len(selected_verified), 0)
+        rotating_budget = max(market_budget - len(selected_priority), 0)
         cursor = int(getattr(self, "_auto_scan_feature_cursor", 0) or 0)
         start = cursor % len(rotating_market_symbols) if rotating_market_symbols else 0
         rotated = (
@@ -7501,7 +7510,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             if rotating_market_symbols
             else []
         )
-        selected_market = [*selected_verified, *rotated[:rotating_budget]]
+        selected_market = [*selected_priority, *rotated[:rotating_budget]]
         self._auto_scan_feature_cursor = (
             (start + rotating_budget) % len(rotating_market_symbols)
             if rotating_market_symbols
@@ -7515,6 +7524,9 @@ class TradingService(ModelTrainingCoordinatorMixin):
             market_candidates=len(market_symbols),
             selected=len(selected),
             market_budget=market_budget,
+            execution_mode=model_mode,
+            selected_verified_priority_count=verified_priority_count,
+            rotating_reserve=rotating_budget,
             next_cursor=self._auto_scan_feature_cursor,
         )
         self._last_auto_feature_fetch_budget_diagnostics.update(
