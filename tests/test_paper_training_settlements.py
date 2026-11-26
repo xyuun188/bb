@@ -97,6 +97,36 @@ def test_new_registry_versions_cannot_clear_recent_losses_in_the_same_training_l
     )["blocked"]
 
 
+@pytest.mark.parametrize(("losing_family", "candidate_family"), [
+    ("local_ai_tools", "local_ml"), ("local_ml", "local_ai_tools"),
+])
+def test_unproven_family_cannot_replace_losing_training_exposure(losing_family, candidate_family):
+    candidate = "20261117T122054073866Z-1c026b5b"
+    profitable = "20261119T080000000000Z-11111111"
+    losing = "20261120T080000000000Z-22222222"
+    recovered = "20261120T100000000000Z-33333333"
+    rows = [
+        *[_row(i, version=profitable, family=losing_family, pnl=5.0) for i in range(4)],
+        *[_row(i, version=losing, family=losing_family) for i in range(4, 8)],
+    ]
+    params = {"family": candidate_family, "version": candidate}
+    result = _feedback(rows, **params)
+    assert result["blocked"]
+    assert result["reason"] == "other_model_family_cross_symbol_training_loss"
+    assert result["other_family_losing_cohort"]["family"] == losing_family
+    assert "sample_count" not in result
+    assert not _feedback(rows, **(params | {"side": "short"}))["blocked"]
+    assert not _feedback(rows, **(params | {"horizon": 60}))["blocked"]
+
+    wins = [_row(i, version=candidate, family=candidate_family, pnl=1.0) for i in range(8, 12)]
+    assert _feedback(rows + wins[:3], **params)["blocked"]
+    assert not _feedback(rows + wins, **params)["blocked"]
+    recovered_wins = [
+        _row(i, version=recovered, family=losing_family, pnl=1.0) for i in range(12, 16)
+    ]
+    assert not _feedback(rows + recovered_wins, **params)["blocked"]
+
+
 def test_settlement_uses_frozen_family_version_before_legacy_route_metadata():
     families = ["local_ai_tools"]
     assert _settled_model_versions(families, {"local_ai_tools": "v2"}, "ml", "v1", "v1") == {

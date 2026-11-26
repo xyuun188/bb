@@ -1,4 +1,4 @@
-"""Same-model feedback for paper training entries, using completed OKX lifecycles."""
+"""Paper training loss feedback from completed OKX lifecycles."""
 
 import re
 from collections import defaultdict
@@ -53,18 +53,15 @@ def _cross_symbol_loss(row):
     )
 
 
-def _previous_established_profile(profiles, *, version, side, horizon, family):
-    current = _REGISTRY_VERSION.fullmatch(version)
-    if current is None:
-        return None
+def _latest_established_profile(profiles, *, side, horizon, family, before=None):
     prefix = "local_ai_tools|" if family == "local_ai_tools" else ""
     suffix = f"|{side}|{float(horizon):g}"
     established = []
     for key, row in profiles.items():
         if not key.startswith(prefix) or not key.endswith(suffix):
             continue
-        previous = _REGISTRY_VERSION.fullmatch(key[len(prefix):-len(suffix)])
-        if (previous and previous["created"] < current["created"]
+        artifact = _REGISTRY_VERSION.fullmatch(key[len(prefix):-len(suffix)])
+        if (artifact and (before is None or artifact["created"] < before)
                 and row.get("sample_count", 0) >= MIN_LIFECYCLES):
             established.append(key)
     return max(established, default=None)
@@ -78,22 +75,38 @@ def training_feedback(snapshot, *, version, side, horizon, family="local_ml"):
     row = profiles.get(key, {})
     loss = _cross_symbol_loss(row)
     previous_loss = {}
-    if available and row.get("sample_count", 0) < MIN_LIFECYCLES:
+    other_family_loss = {}
+    artifact = _REGISTRY_VERSION.fullmatch(version) if available else None
+    if artifact and row.get("sample_count", 0) < MIN_LIFECYCLES:
         # An artifact refresh does not establish a new track record. Keep the
         # previous loss signal until it ages out or the new cohort has evidence.
-        previous_key = _previous_established_profile(
-            profiles, version=version, side=side, horizon=horizon, family=family,
+        previous_key = _latest_established_profile(
+            profiles, side=side, horizon=horizon, family=family, before=artifact["created"],
         )
         if previous_key and _cross_symbol_loss(profiles[previous_key]):
             previous_loss = {
                 "previous_losing_cohort": {"cohort": previous_key, **profiles[previous_key]},
             }
+        else:
+            # A different model can propose the same exposure in the same
+            # market. Keep its track record separate from the shared guard.
+            other_family = "local_ai_tools" if family == "local_ml" else "local_ml"
+            other_key = _latest_established_profile(
+                profiles, side=side, horizon=horizon, family=other_family,
+            )
+            if other_key and _cross_symbol_loss(profiles[other_key]):
+                other_family_loss = {
+                    "other_family_losing_cohort": {
+                        "cohort": other_key, "family": other_family, **profiles[other_key],
+                    },
+                }
     return {
-        "cohort": key, "available": available, **row, **previous_loss,
-        "blocked": not available or loss or bool(previous_loss),
+        "cohort": key, "available": available, **row, **previous_loss, **other_family_loss,
+        "blocked": not available or loss or bool(previous_loss) or bool(other_family_loss),
         "reason": "training_settlements_unavailable" if not available else
         "cross_symbol_training_loss" if loss else
         "previous_version_cross_symbol_training_loss" if previous_loss else
+        "other_model_family_cross_symbol_training_loss" if other_family_loss else
         "no_cross_symbol_training_loss",
     }
 
