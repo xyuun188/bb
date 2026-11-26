@@ -8540,6 +8540,27 @@ class OKXExecutor(AbstractExecutor):
                 else await self._entry_environment_compatibility(ccxt, symbol)
             )
             if compatibility.get("compatible") is False:
+                if (
+                    environment_compatibility is not None
+                    and settings.is_okx_demo(self.executor_mode)
+                    and {"execution_instrument_missing", "environment_price_missing"} <= set(
+                        compatibility.get("blockers") or ()
+                    )
+                ):
+                    # A bulk omission is temporary unless the demo endpoint
+                    # explicitly rejects this instrument.
+                    fetch_instrument = getattr(ccxt, "executionGetPublicInstruments", None)
+                    if callable(fetch_instrument):
+                        try:
+                            await self._with_retry(
+                                fetch_instrument,
+                                {"instType": "SWAP", "instId": inst_id},
+                                _expected_error_codes={"51001"},
+                                _max_attempts=1,
+                            )
+                        except Exception as exc:
+                            if self._exchange_error_code(exc, safe_error_text(exc)) == "51001":
+                                raise
                 result = {
                     "available": False,
                     "reason": "okx_entry_live_execution_environment_incompatible",

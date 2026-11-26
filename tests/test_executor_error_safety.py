@@ -3042,6 +3042,63 @@ async def test_okx_missing_execution_metadata_recovers_after_short_retry(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("probe_code", ["51001", "50001", None])
+async def test_demo_shortlist_confirms_bulk_omission_before_long_cache(
+    probe_code: str | None,
+) -> None:
+    class DemoCatalog(_IncompatibleEntryEnvironmentCcxt):
+        probes: list[str]
+
+        async def publicGetPublicInstruments(self, params):
+            rows = (await super().publicGetPublicInstruments(params))["data"]
+            return {"data": [*rows, {"instId": "AKE-USDT-SWAP"}]}
+
+        async def executionGetPublicInstruments(self, params):
+            if inst_id := params.get("instId"):
+                self.probes.append(inst_id)
+                if probe_code:
+                    raise ExchangeAPIError(f"OKX API error [{probe_code}]", code=probe_code)
+                return {"data": [{"instId": inst_id}]}
+            return await super().executionGetPublicInstruments(params)
+
+        async def publicGetMarketTickers(self, params):
+            ticker = (await self.publicGetMarketTicker(params))["data"][0]
+            return {"data": [
+                {"instId": "BTC-USDT-SWAP", **ticker},
+                {"instId": "AKE-USDT-SWAP", **ticker},
+            ]}
+
+        async def executionGetMarketTickers(self, params):
+            rows = (await self.publicGetMarketTickers(params))["data"]
+            return {"data": rows[:1]}
+
+    exchange = DemoCatalog()
+    exchange.probes = []
+    executor = _executor(exchange)
+    result = await executor.entry_instrument_availability_shortlist(
+        ["AKE/USDT", "BTC/USDT"], target_count=1,
+    )
+
+    assert result["selected_symbols"] == ["BTC/USDT"]
+    assert exchange.probes == ["AKE-USDT-SWAP"]
+    assert exchange.fetch_leverage_calls == ["BTC/USDT:USDT"]
+    facts = result["availability"]["AKE/USDT"]
+    assert facts["available"] is False
+    _, _, ttl = executor._entry_instrument_availability_cache["AKE-USDT-SWAP"]
+    if probe_code == "51001":
+        assert facts["error_code"] == "51001"
+        assert facts["reason"] == "okx_private_entry_instrument_unavailable"
+        assert ttl == 6 * 60 * 60
+    else:
+        assert facts["reason"] == "okx_entry_live_execution_environment_incompatible"
+        assert ttl == okx_module.OKX_ENTRY_ENVIRONMENT_COMPATIBILITY_CACHE_SECONDS
+
+    cached = await executor.entry_instrument_availability("AKE/USDT")
+    assert cached["cache_hit"] is True
+    assert exchange.probes == ["AKE-USDT-SWAP"]
+
+
+@pytest.mark.asyncio
 async def test_okx_entry_instrument_shortlist_stops_after_ranked_target() -> None:
     exchange = _EntryInstrumentAvailabilityCcxt()
     executor = _executor(exchange)

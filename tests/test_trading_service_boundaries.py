@@ -8343,6 +8343,36 @@ def test_auto_scan_feature_priority_preserves_verified_paper_slots(
     assert diagnostics["rotating_symbol_reserve"] == 2
 
 
+def test_paper_feature_budget_skips_confirmed_unavailable_market_symbols() -> None:
+    service = TradingService.__new__(TradingService)
+    service._normalize_position_symbol = lambda symbol: str(symbol or "")
+    service._get_model_execution_mode = lambda _model_name: "paper"
+    service._auto_scan_feature_cursor = 0
+    service.entry_symbol_universe = SimpleNamespace(
+        dedupe_symbols=lambda symbols: list(dict.fromkeys(symbols))
+    )
+    service._remember_unavailable_entry_symbol("paper", "AKE/USDT", {"error_code": "51001"})
+    service._remember_unavailable_entry_symbol("paper", "POS/USDT", {"error_code": "51001"})
+    service._remember_unavailable_entry_symbol(
+        "paper", "BTC/USDT", {
+            "reason": "okx_entry_live_execution_environment_incompatible",
+            "environment_compatibility": {"blockers": ["environment_price_missing"]},
+        },
+    )
+    symbols = ["AKE/USDT", "BTC/USDT", "POS/USDT"]
+
+    selected = service._budget_auto_scan_feature_symbols(
+        symbols, ["POS/USDT"], configured_limit=4,
+    )
+
+    assert selected == ["POS/USDT", "BTC/USDT"]
+    assert (
+        service._last_auto_feature_fetch_budget_diagnostics[
+            "definitively_unavailable_market_symbol_count"
+        ] == 1
+    )
+
+
 def test_auto_scan_feature_budget_prioritizes_deferred_candidate_queue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

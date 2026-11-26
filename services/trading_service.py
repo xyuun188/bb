@@ -177,6 +177,7 @@ from services.okx_balance_snapshot import (
     balance_snapshot_verified,
 )
 from services.okx_entry_environment_compatibility import (
+    entry_instrument_definitively_unavailable,
     entry_instrument_unavailable_cache_ttl,
 )
 from services.okx_error_classifier import (
@@ -7356,6 +7357,19 @@ class TradingService(ModelTrainingCoordinatorMixin):
             for symbol in fetch_symbols
             if self._normalize_position_symbol(symbol) not in normalized_position
         ]
+        model_mode = self._get_model_execution_mode(ENSEMBLE_TRADER_NAME)
+        unavailable_count = 0
+        if model_mode == "paper":
+            unavailable = self._entry_unavailable_cache_for_mode(model_mode)
+            eligible = [
+                symbol
+                for symbol in market_symbols
+                if not entry_instrument_definitively_unavailable(
+                    unavailable.get(self._normalize_position_symbol(symbol))
+                )
+            ]
+            unavailable_count = len(market_symbols) - len(eligible)
+            market_symbols = eligible
         target_market_budget = max(
             configured_limit,
             configured_limit * int(AUTO_SCAN_FEATURE_FETCH_POOL_MULTIPLIER),
@@ -7363,7 +7377,6 @@ class TradingService(ModelTrainingCoordinatorMixin):
         )
         max_pool = max(int(AUTO_SCAN_FEATURE_FETCH_POOL_MAX), configured_limit)
         market_budget = min(len(market_symbols), target_market_budget, max_pool)
-        model_mode = self._get_model_execution_mode(ENSEMBLE_TRADER_NAME)
         verified_by_mode = getattr(self, "_verified_entry_symbols_by_mode", {})
         verified_by_mode = verified_by_mode if isinstance(verified_by_mode, dict) else {}
         verified_symbols = set(verified_by_mode.get(model_mode, set()) or set())
@@ -7438,6 +7451,7 @@ class TradingService(ModelTrainingCoordinatorMixin):
             "total_candidates": len(fetch_symbols),
             "position_symbols": len(position_symbols),
             "market_candidates": len(market_symbols),
+            "definitively_unavailable_market_symbol_count": unavailable_count,
             "configured_market_symbol_limit": int(configured_limit),
             "target_market_feature_fetch_count": int(target_market_budget),
             "max_market_feature_fetch_count": int(max_pool),
