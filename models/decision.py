@@ -73,6 +73,24 @@ _LEARNING_SNAPSHOT_MAX_STRING_CHARS = 1_024
 _LEARNING_SNAPSHOT_MAX_CONTAINER_BYTES = 16_384
 _LEARNING_SNAPSHOT_MAX_DEPTH = 3
 _MISSING_LEARNING_VALUE = object()
+_DIRECTION_SOURCE_DIAGNOSTIC_KEYS = (
+    "source",
+    "model_version",
+    "side",
+    "horizon_minutes",
+    "profit_supervision_version",
+    "available",
+    "decision_eligible",
+    "paper_eligible",
+    "production_eligible",
+    "eligibility_reason",
+    "paper_governance_reason",
+    "loss_probability",
+    "model_fee_after_objective_pct",
+    "objective_expected_return_pct",
+    "paper_quality_governance_reason",
+    "paper_quality_observation_reasons",
+)
 _PROFIT_RISK_SIZING_SNAPSHOT_KEYS = {
     "account_equity_usdt",
     "available_margin_usdt",
@@ -241,6 +259,29 @@ def _compact_ml_signal(value: object) -> object:
     return compact
 
 
+def _compact_direction_competition(value: object) -> object:
+    compact = _compact_learning_value(value)
+    if not isinstance(value, dict) or not isinstance(compact, dict):
+        return compact
+    for side in ("long", "short"):
+        original = value.get(side)
+        projected = compact.get(side)
+        if not isinstance(original, dict) or not isinstance(projected, dict):
+            continue
+        evidence = original.get("evidence")
+        if not isinstance(evidence, list):
+            continue
+        diagnostics = [
+            {key: row[key] for key in _DIRECTION_SOURCE_DIAGNOSTIC_KEYS if key in row}
+            for row in evidence
+            if isinstance(row, dict)
+        ]
+        projection = _compact_learning_value(diagnostics)
+        if projection is not _MISSING_LEARNING_VALUE:
+            projected["evidence"] = projection
+    return compact
+
+
 def _compact_decision_learning_snapshot(raw: object) -> dict[str, object]:
     if not isinstance(raw, dict):
         return {}
@@ -255,6 +296,8 @@ def _compact_decision_learning_snapshot(raw: object) -> dict[str, object]:
             if key == "normal_paper_trade"
             else _compact_ml_signal(value)
             if key in {"ml_signal", "local_ml_signal"}
+            else _compact_direction_competition(value)
+            if key == "direction_competition"
             else _compact_learning_value(value)
         )
         if compact_value is not _MISSING_LEARNING_VALUE:

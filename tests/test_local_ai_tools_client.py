@@ -12,6 +12,7 @@ import pytest
 from config.settings import settings
 from data_feed.feature_vector import FeatureVector
 from services import local_ai_tools_client as local_ai_tools_client_module
+from services.entry_signal_extraction import signal_analysis_eligibility, signal_paper_eligibility
 from services.local_ai_tools_client import LocalAIToolsClient
 from services.profit_supervision import PROFIT_SUPERVISION_VERSION
 from services.return_objective import (
@@ -1129,19 +1130,79 @@ def test_local_ai_tools_builds_standard_contract_from_remote_distribution_inputs
     assert profit["prediction_quality"]["production_eligible"] is True
 
 
-def test_local_ai_tools_keeps_valid_shadow_prediction_paper_eligible(
-    local_tools_settings: None,
+@pytest.mark.parametrize("paper_permission", [True, False, None])
+def test_local_ai_tools_preserves_remote_paper_permission(
+    local_tools_settings: None, paper_permission: bool | None,
 ) -> None:
     client = LocalAIToolsClient()
 
-    profit = client._normalize_signal(
-        "profit_prediction",
-        {
+    distributions = {
+        "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
+        "return_distribution_inputs": {
+            "long": _distribution_input("long", 0.8, 0.5),
+            "short": _distribution_input("short", 0.2, 0.1),
+        },
+    }
+    remote_quality = {
+        "contract_complete": True,
+        "production_eligible": False,
+        "anomalous": False,
+        "blockers": [],
+        "production_blockers": ["artifact_activation_not_production_authorized"],
+    }
+    if paper_permission is not None:
+        remote_quality["paper_eligible"] = paper_permission
+    paper_blocker = "artifact_activation_not_paper_authorized"
+    permission_metadata = (
+        {"paper_trading_permission": False, "paper_trading_blockers": [paper_blocker]}
+        if paper_permission is False
+        else {}
+    )
+    prediction = client._normalize_signal(
+        "time_series_prediction",
+        {"result": {
             "available": True,
             "best_side": "long",
             "route_mode": "paper_analysis",
             "production_permission": False,
             "live_ml_ready": False,
+            **distributions,
+            "prediction_quality": remote_quality,
+            "predictions": [{
+                **distributions,
+                "prediction_quality": {
+                    "contract_complete": True,
+                    "paper_eligible": True,
+                },
+            }],
+        }, **permission_metadata},
+    )
+
+    quality = prediction["prediction_quality"]
+    eligible = paper_permission is not False
+    assert quality["contract_complete"] is True
+    assert quality["paper_eligible"] is eligible
+    assert quality["production_eligible"] is False
+    assert quality["anomalous"] is False
+    assert quality["blockers"] == []
+    assert quality["production_blockers"] == ["artifact_activation_not_production_authorized"]
+    assert signal_analysis_eligibility(prediction)["eligible"] is True
+    for result in (prediction, prediction["predictions"][0]):
+        paper = signal_paper_eligibility(result, "long")
+        assert paper["eligible"] is eligible
+        if not eligible:
+            assert paper["reason"] == paper_blocker
+    if not eligible:
+        assert prediction["governance_reason"] == paper_blocker
+
+
+def test_explicit_paper_denial_overrides_production_claim(local_tools_settings: None) -> None:
+    prediction = LocalAIToolsClient()._normalize_signal(
+        "profit_prediction",
+        {
+            "available": True,
+            "production_permission": True,
+            "live_ml_ready": True,
             "return_distribution_input_version": RETURN_DISTRIBUTION_INPUT_VERSION,
             "return_distribution_inputs": {
                 "long": _distribution_input("long", 0.8, 0.5),
@@ -1149,22 +1210,13 @@ def test_local_ai_tools_keeps_valid_shadow_prediction_paper_eligible(
             },
             "prediction_quality": {
                 "contract_complete": True,
-                "paper_eligible": True,
-                "production_eligible": False,
-                "anomalous": False,
-                "blockers": [],
-                "production_blockers": ["artifact_activation_not_production_authorized"],
+                "paper_eligible": False,
+                "production_eligible": True,
             },
         },
     )
-
-    quality = profit["prediction_quality"]
-    assert quality["contract_complete"] is True
-    assert quality["paper_eligible"] is True
-    assert quality["production_eligible"] is False
-    assert quality["anomalous"] is False
-    assert quality["blockers"] == []
-    assert quality["production_blockers"] == ["artifact_activation_not_production_authorized"]
+    assert prediction["prediction_quality"]["production_eligible"] is True
+    assert signal_paper_eligibility(prediction, "long")["eligible"] is False
 
 
 def test_local_ai_tools_blocks_remote_lower_above_expected_without_clamping(

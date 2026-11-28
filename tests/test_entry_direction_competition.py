@@ -251,6 +251,32 @@ def test_primary_prediction_survives_persistence_and_replay(key):
     assert selection["by_side"]["long"]["reason"] == "model_fee_after_objective_not_positive"
 
 
+def test_compacted_direction_evidence_explains_why_available_horizons_did_not_qualify():
+    signal = _governed_ml(-0.8, -0.6)
+    signal["model_version"] = "local-version"
+    server = _paper_payload(0.8, 0.6)
+    server["artifact_version"] = "shadow-version"
+    server["prediction_quality"]["paper_eligible"] = False
+    server["paper_trading_blockers"] = ["artifact_activation_not_paper_authorized"]
+    del server["long_loss_probability"]
+    context = _context(
+        ml=signal, tools={"profit_prediction": server}, strategy={"execution_mode": "paper"},
+    )
+    raw = {"direction_competition": context}
+    stored = compact_runtime_decision_payload(raw)
+    assert compact_runtime_decision_payload(stored) == stored
+    rows = {row["source"]: row for row in stored["direction_competition"]["long"]["evidence"]}
+    assert rows["local_ml"]["model_version"] == "local-version"
+    assert rows["local_ml"]["model_fee_after_objective_pct"] == -0.8
+    assert rows["local_ml"]["eligibility_reason"] == "model_fee_after_objective_not_positive"
+    assert rows["server_profit"]["model_version"] == "shadow-version"
+    assert rows["server_profit"]["horizon_minutes"] == 30
+    assert rows["server_profit"]["paper_eligible"] is False
+    assert rows["server_profit"]["eligibility_reason"] == "ordinary_loss_probability_missing"
+    assert rows["server_profit"]["paper_governance_reason"] == "artifact_activation_not_paper_authorized"
+    assert "return_distribution_contract" not in rows["server_profit"]
+
+
 def test_only_governed_return_models_choose_observed_side() -> None:
     context = _context(
         ml=_governed_ml(0.8, -0.2),
@@ -658,7 +684,7 @@ def test_high_weight_tool_horizon_cannot_displace_authorized_model_horizon() -> 
     assert context["authorized_prediction_horizon_source"] == "local_ml_primary_horizon"
 
 
-def test_unavailable_authorized_horizon_fails_closed_for_paper_execution() -> None:
+def test_unavailable_authorized_horizon_uses_available_paper_cohort() -> None:
     ml = _governed_ml(0.8, -0.2)
     ml["primary_horizon_minutes"] = 5
     server = _paper_payload(0.0, 0.7)
@@ -680,10 +706,17 @@ def test_unavailable_authorized_horizon_fails_closed_for_paper_execution() -> No
         },
     )
 
-    assert context["preferred_side"] == "neutral"
-    assert context["decision_source_count"] == 0
-    assert context["selected_horizon_minutes"] is None
-    assert "paper_prediction_horizon_unavailable" in context["aggregate_blockers"]
+    assert context["preferred_side"] == "short"
+    assert context["decision_source_count"] == 2
+    assert context["selected_horizon_minutes"] == 240
+    assert context["aggregate_blockers"] == []
+    assert context["horizon_cohort_selection"]["selection_reason"] == (
+        "authorized_prediction_horizon_unavailable_fallback_to_available_cohort"
+    )
+    assert context["horizon_cohort_selection"]["preferred_horizon_minutes"] == 5
+    assert context["horizon_cohort_selection"]["fallback_used"] is True
+    assert context["funding_projection"]["selected_horizon_minutes"] == 240
+    assert context["training_short"]["horizon_minutes"] == 240
 
 
 def test_model_blueprint_only_blocks_its_owned_local_ml_short() -> None:

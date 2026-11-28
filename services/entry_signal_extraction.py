@@ -57,6 +57,8 @@ _WRAPPER_METADATA_KEYS = (
     "route_mode",
     "live_ml_ready",
     "production_permission",
+    "paper_trading_permission",
+    "paper_trading_blockers",
     "execution_scope",
     "readiness",
     "objective",
@@ -365,6 +367,17 @@ def signal_paper_eligibility(
             return {
                 "eligible": False,
                 "reason": str(quality.get("reason") or "prediction_quality_anomalous"),
+                "side": side,
+            }
+        if quality.get("paper_eligible") is False or node.get("paper_trading_permission") is False:
+            blockers = safe_list(node.get("paper_trading_blockers"))
+            return {
+                "eligible": False,
+                "reason": str(
+                    (blockers[0] if blockers else None)
+                    or quality.get("reason")
+                    or "remote_paper_permission_denied"
+                ),
                 "side": side,
             }
         quality_approved = bool(

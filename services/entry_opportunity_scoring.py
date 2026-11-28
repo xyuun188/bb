@@ -375,12 +375,12 @@ class EntryOpportunityScoringPolicy:
                     model_direction.get("reason")
                     if model_direction.get("enforced") is True
                     and model_direction.get("eligible") is not True
-                    else distribution_eligibility.get("reason")
-                    or (
+                    else (
                         paper_governance.get("reason")
                         if execution_scope == "paper"
                         else governance.get("reason")
                     )
+                    or distribution_eligibility.get("reason")
                     or "server_model_execution_governance_incomplete"
                 )
             ),
@@ -559,13 +559,12 @@ class EntryOpportunityScoringPolicy:
             normal_paper_trade = safe_dict(raw.get("normal_paper_trade"))
             direction_competition = safe_dict(raw.get("direction_competition"))
             model_signal = safe_dict(raw.get("ml_signal"))
-            preferred_horizon = next(
+            selected_upstream_horizon = next(
                 (
                     horizon
                     for value in (
                         normal_paper_trade.get("prediction_horizon_minutes"),
                         direction_competition.get("selected_horizon_minutes"),
-                        model_signal.get("primary_horizon_minutes"),
                     )
                     if (horizon := _finite(value)) is not None and horizon > 0.0
                 ),
@@ -573,8 +572,13 @@ class EntryOpportunityScoringPolicy:
             )
             horizon_selection = select_paper_horizon_cohort(
                 selected_components,
-                preferred_horizon_minutes=preferred_horizon,
+                preferred_horizon_minutes=(
+                    selected_upstream_horizon
+                    if selected_upstream_horizon is not None
+                    else model_signal.get("primary_horizon_minutes")
+                ),
                 source_weights=quant_multipliers,
+                allow_horizon_fallback=selected_upstream_horizon is None,
             )
             selected_paper_horizon = _finite(
                 horizon_selection.get("selected_horizon_minutes")

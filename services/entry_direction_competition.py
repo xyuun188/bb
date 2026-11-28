@@ -556,6 +556,7 @@ class EntryDirectionCompetitionPolicy:
                 (item for item in all_rows if item.get("decision_eligible") is True),
                 preferred_horizon_minutes=authorized_horizon,
                 source_weights=quant_weights,
+                allow_horizon_fallback=True,
             )
             aggregate_blockers.extend(horizon_selection.get("blockers") or [])
             selected_horizon = _safe_float(
@@ -576,7 +577,8 @@ class EntryDirectionCompetitionPolicy:
         training_horizon_selection = select_paper_horizon_cohort(
             training_rows,
             preferred_horizon_minutes=(
-                authorized_horizon if execution_scope == "paper" else None
+                selected_horizon if horizon_selection.get("fallback_used")
+                else authorized_horizon if execution_scope == "paper" else None
             ),
             source_weights=quant_weights,
         )
@@ -779,11 +781,12 @@ class EntryDirectionCompetitionPolicy:
                         model_score if model_score is not None and isfinite(model_score) else None
                     ),
                     "paper_eligible": paper_eligible,
+                    "paper_governance_reason": paper.get("reason"),
                     "production_eligible": production_eligible,
                     "observation_only": bool(contract and not eligible),
                     "eligibility_reason": (
-                        "live_influence_and_side_readiness_confirmed"
-                        if eligible
+                        str(paper.get("reason")) if eligible and execution_scope == "paper"
+                        else "live_influence_and_side_readiness_confirmed" if eligible
                         else score_reason or str(
                             (
                                 paper.get("reason")
@@ -861,6 +864,7 @@ class EntryDirectionCompetitionPolicy:
                     "available": signal_available(payload),
                     "decision_eligible": eligible,
                     "paper_eligible": paper_eligible,
+                    "paper_governance_reason": paper.get("reason"),
                     "production_eligible": production_eligible,
                     "observation_only": bool(contract and not eligible),
                     "eligibility_reason": (

@@ -28,6 +28,7 @@ def select_paper_horizon_cohort(
     *,
     preferred_horizon_minutes: Any = None,
     source_weights: Mapping[str, Any] | None = None,
+    allow_horizon_fallback: bool = False,
 ) -> dict[str, Any]:
     """Select one coherent model horizon without mixing return semantics.
 
@@ -42,6 +43,10 @@ def select_paper_horizon_cohort(
     change the round-trip cost, so the short horizon systematically lost the
     cost/edge comparison. This picks the best net evidence instead; it never
     relaxes a return, cost or data-quality gate.
+
+    Callers selecting an initial horizon may opt into fallback when the
+    preferred horizon has no eligible evidence. Repricing a selected horizon
+    requires an exact match.
     """
 
     weights = source_weights or {}
@@ -95,20 +100,23 @@ def select_paper_horizon_cohort(
         }
         for horizon, source_rows in sorted(groups.items())
     ]
+
     preferred = _positive_float(preferred_horizon_minutes)
     blockers: list[str] = []
     selection_reason = (
-        "highest_continuous_weight_then_best_fee_after_return_then_shortest_horizon"
+        "authorized_prediction_horizon"
+        if preferred is not None
+        else "highest_continuous_weight_then_best_fee_after_return_then_shortest_horizon"
     )
     selected: float | None = None
-    if preferred is not None:
-        selection_reason = "authorized_prediction_horizon"
-        if preferred in groups:
-            selected = preferred
-        else:
-            blockers.append("paper_prediction_horizon_unavailable")
-    elif groups:
-        totals = {horizon: sum(source_rows.values()) for horizon, source_rows in groups.items()}
+    fallback_used = False
+    if preferred in groups:
+        selected = preferred
+    elif groups and (preferred is None or allow_horizon_fallback):
+        totals = {
+            horizon: sum(source_rows.values())
+            for horizon, source_rows in groups.items()
+        }
         top_weight = max(totals.values())
         # Weights are compared with a tolerance because they are sums of
         # independently rounded continuous multipliers.
@@ -117,11 +125,17 @@ def select_paper_horizon_cohort(
             for horizon, total in totals.items()
             if abs(total - top_weight) <= max(abs(top_weight), 1.0) * 1e-9
         ]
+
         def _rank(horizon: float) -> tuple[float, float]:
             net = _cohort_net(horizon)
             return (float("-inf") if net is None else net, -horizon)
 
         selected = max(tied, key=_rank)
+        if preferred is not None:
+            selection_reason = (
+                "authorized_prediction_horizon_unavailable_fallback_to_available_cohort"
+            )
+            fallback_used = True
     else:
         blockers.append("paper_prediction_horizon_unavailable")
 
@@ -139,6 +153,8 @@ def select_paper_horizon_cohort(
     return {
         "selected_horizon_minutes": selected,
         "selection_reason": selection_reason,
+        "preferred_horizon_minutes": preferred,
+        "fallback_used": fallback_used,
         "available_horizon_groups": available_groups,
         "selected_sources": selected_sources,
         "excluded_sources": excluded_sources,

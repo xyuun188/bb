@@ -1029,6 +1029,39 @@ def test_paper_scoring_keeps_model_primary_horizon_when_upstream_selection_missi
     ]
 
 
+@pytest.mark.parametrize(
+    ("upstream_key", "horizon_key"),
+    [
+        ("normal_paper_trade", "prediction_horizon_minutes"),
+        ("direction_competition", "selected_horizon_minutes"),
+    ],
+)
+def test_paper_scoring_requires_exact_upstream_horizon(
+    upstream_key: str, horizon_key: str,
+) -> None:
+    decision = _decision()
+    decision.raw_response["ml_signal"] = {}
+    decision.raw_response["local_ai_tools"] = {
+        "profit_prediction": _paper_payload(side="long", long_return=1.0, short_return=-0.2)
+    }
+    strategy = {"execution_mode": "paper"}
+
+    _scorer().score_candidate(decision, strategy)
+    initial = decision.raw_response["opportunity_score"]
+    assert initial["selected_horizon_minutes"] == 30
+    assert initial["horizon_cohort_selection"]["fallback_used"] is False
+    assert initial["paper_eligible"] is True
+
+    decision.raw_response[upstream_key] = {horizon_key: 240}
+    _scorer().score_candidate(decision, strategy)
+    repriced = decision.raw_response["opportunity_score"]
+    assert repriced["selected_horizon_minutes"] is None
+    assert repriced["horizon_cohort_selection"]["blockers"] == [
+        "paper_prediction_horizon_unavailable"
+    ]
+    assert repriced["paper_eligible"] is False
+
+
 def test_shadow_server_models_remain_blocked_in_live_scoring() -> None:
     decision = _decision()
     decision.raw_response["ml_signal"] = {}

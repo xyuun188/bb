@@ -632,6 +632,8 @@ class LocalAIToolsClient:
     def _attach_return_distribution_contract(
         self,
         payload: dict[str, Any],
+        *,
+        inherited_paper_blocker: str | None = None,
     ) -> dict[str, Any]:
         normalized = dict(payload)
         input_version = str(normalized.get("return_distribution_input_version") or "")
@@ -739,6 +741,17 @@ class LocalAIToolsClient:
         contract_complete = bool(
             remote_contract_ready and contract_ready and not structural_blockers
         )
+        paper_blocker = inherited_paper_blocker
+        if (
+            quality.get("paper_eligible") is False
+            or normalized.get("paper_trading_permission") is False
+        ):
+            remote_paper_blockers = normalized.get("paper_trading_blockers")
+            if isinstance(remote_paper_blockers, list) and remote_paper_blockers:
+                paper_blocker = str(remote_paper_blockers[0])
+            else:
+                paper_blocker = paper_blocker or "remote_paper_permission_denied"
+        paper_eligible = contract_complete and paper_blocker is None
         live_authorized = bool(
             normalized.get("production_permission") is True
             and normalized.get("live_ml_ready") is True
@@ -752,13 +765,15 @@ class LocalAIToolsClient:
         normalized["prediction_quality"] = {
             **quality,
             "contract_complete": contract_complete,
-            "paper_eligible": contract_complete,
+            "paper_eligible": paper_eligible,
             "production_eligible": production_eligible,
             "anomalous": not contract_complete,
             "reason": (
                 "standardized_return_distribution_ready"
-                if production_eligible
+                if production_eligible and paper_eligible
                 else "standardized_return_distribution_ready_for_paper"
+                if paper_eligible
+                else paper_blocker
                 if contract_complete
                 else structural_blockers[0]
                 if structural_blockers
@@ -772,7 +787,9 @@ class LocalAIToolsClient:
         predictions = normalized.get("predictions")
         if isinstance(predictions, list):
             normalized["predictions"] = [
-                self._attach_return_distribution_contract(item)
+                self._attach_return_distribution_contract(
+                    item, inherited_paper_blocker=paper_blocker,
+                )
                 if isinstance(item, dict) and item.get("return_distribution_inputs")
                 else item
                 for item in predictions

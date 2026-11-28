@@ -88,3 +88,40 @@ def test_authorized_horizon_still_overrides_evidence() -> None:
 
     assert selection["selected_horizon_minutes"] == 5.0
     assert selection["selection_reason"] == "authorized_prediction_horizon"
+    assert selection["preferred_horizon_minutes"] == 5.0
+    assert selection["fallback_used"] is False
+
+
+def test_unavailable_authorized_horizon_falls_back_to_available_cohort() -> None:
+    rows = [
+        _row("server_profit", 30.0, 0.4),
+        _row("timeseries", 30.0, 0.2),
+        _row("server_profit", 60.0, 0.8),
+    ]
+
+    selection = select_paper_horizon_cohort(
+        rows,
+        preferred_horizon_minutes=240,
+        source_weights={"server_profit": 1.0, "timeseries": 1.0},
+        allow_horizon_fallback=True,
+    )
+
+    assert selection["selected_horizon_minutes"] == 30.0
+    assert selection["selection_reason"] == (
+        "authorized_prediction_horizon_unavailable_fallback_to_available_cohort"
+    )
+    assert selection["preferred_horizon_minutes"] == 240.0
+    assert selection["fallback_used"] is True
+    assert selection["blockers"] == []
+
+
+def test_unavailable_authorized_horizon_still_blocks_when_no_cohort_exists() -> None:
+    selection = select_paper_horizon_cohort(
+        [],
+        preferred_horizon_minutes=240,
+        allow_horizon_fallback=True,
+    )
+
+    assert selection["selected_horizon_minutes"] is None
+    assert selection["fallback_used"] is False
+    assert selection["blockers"] == ["paper_prediction_horizon_unavailable"]

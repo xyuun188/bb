@@ -77,6 +77,7 @@ def _horizon_diagnostic(raw):
             contract = _dict(item.get("return_distribution_contract"))
             sources.append({
                 "source": str(item.get("source") or "unavailable"),
+                "model_version": item.get("model_version"),
                 "side": side,
                 "horizon_minutes": item.get("horizon_minutes"),
                 "profit_supervision_version": (
@@ -87,6 +88,9 @@ def _horizon_diagnostic(raw):
                 "paper_eligible": item.get("paper_eligible") is True,
                 "production_eligible": item.get("production_eligible") is True,
                 "eligibility_reason": str(item.get("eligibility_reason") or ""),
+                "paper_governance_reason": item.get("paper_governance_reason"),
+                "loss_probability": item.get("loss_probability"),
+                "model_fee_after_objective_pct": item.get("model_fee_after_objective_pct"),
             })
     return {
         "authorized_prediction_horizon_minutes": competition.get(
@@ -399,10 +403,12 @@ async def main():
                 if not isinstance(item, dict):
                     continue
                 permission = _dict(item.get("paper_return_quality_governance"))
-                if not permission or permission.get("paper_execution_permission") is True:
+                if permission.get("paper_execution_permission") is True:
                     continue
-                blockers = _list(permission.get("paper_execution_blockers")) or [
-                    permission.get("paper_execution_reason")
+                blockers = _list(permission.get("paper_execution_blockers")) or _list(
+                    item.get("paper_quality_observation_reasons")
+                ) or [
+                    permission.get("paper_execution_reason") or item.get("paper_quality_governance_reason")
                 ]
                 for blocker in blockers:
                     if str(blocker or "").strip():
